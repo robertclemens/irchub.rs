@@ -119,8 +119,7 @@ fn utf8_len(p: &[u8]) -> usize {
 }
 
 /// hub_log_write_sanitized().
-fn sanitize(msg: &str) -> String {
-    let p = msg.as_bytes();
+fn sanitize(p: &[u8]) -> String {
     let mut out = String::with_capacity(p.len() + 8);
     let mut i = 0;
     while i < p.len() {
@@ -137,7 +136,7 @@ fn sanitize(msg: &str) -> String {
         } else if c >= 0x80 {
             let ul = utf8_len(&p[i..]);
             if ul > 0 {
-                out.push_str(&msg[i..i + ul]);
+                out.push_str(std::str::from_utf8(&p[i..i + ul]).unwrap_or("?"));
                 i += ul;
             } else {
                 out.push_str(&format!("\\x{c:02X}"));
@@ -154,6 +153,27 @@ fn sanitize(msg: &str) -> String {
 /// hub_log(): one already-formatted message (its trailing newline included,
 /// as in the C call sites).
 pub fn hub_log(msg: &str) {
+    hub_log_bytes(msg.as_bytes());
+}
+
+/// hub_log() for a line that carries raw, attacker-controlled bytes.
+///
+/// The C passed such a line to `hub_log` as a `char *` and let the sanitizer
+/// render whatever was in it.  Rust protocol text is `String`, and the
+/// `from_utf8_lossy` at the boundary has already replaced anything invalid
+/// with U+FFFD — which is valid UTF-8, so the sanitizer passes it through and
+/// the log no longer shows what was actually received.  This takes the bytes
+/// as they arrived, so a lone `0xFF` still reads `\xFF` in the log.
+pub fn hub_log_with_raw(prefix: &str, raw: &[u8], suffix: &str) {
+    let mut line = Vec::with_capacity(prefix.len() + raw.len() + suffix.len());
+    line.extend_from_slice(prefix.as_bytes());
+    line.extend_from_slice(raw);
+    line.extend_from_slice(suffix.as_bytes());
+    hub_log_bytes(&line);
+}
+
+/// The byte-level writer both of the above funnel into.
+pub fn hub_log_bytes(msg: &[u8]) {
     LOG.with_borrow_mut(|l| {
         if l.attached && l.level == LOG_NONE {
             return;
@@ -274,12 +294,29 @@ mod tests {
 
     #[test]
     fn sanitize_neutralizes_forged_lines() {
-        assert_eq!(sanitize("plain\n"), "plain\n");
+        assert_eq!(sanitize(b"plain\n"), "plain\n");
         // An embedded newline cannot start a line that looks like an entry.
-        assert_eq!(sanitize("a\n[2020] fake\n"), "a\n    [2020] fake\n");
-        assert_eq!(sanitize("bell\x07\n"), "bell\\x07\n");
-        assert_eq!(sanitize("caf\u{e9}\n"), "caf\u{e9}\n");
-        assert_eq!(sanitize("tab\there\n"), "tab\there\n");
+        assert_eq!(sanitize(b"a\n[2020] fake\n"), "a\n    [2020] fake\n");
+        assert_eq!(sanitize(b"bell\x07\n"), "bell\\x07\n");
+        assert_eq!(sanitize("caf\u{e9}\n".as_bytes()), "caf\u{e9}\n");
+        assert_eq!(sanitize(b"tab\there\n"), "tab\there\n");
+    }
+
+    /// The shape the pre-auth bot-UUID path must produce: CR escaped, the
+    /// smuggled newline indented so it cannot forge an entry, and SOH / ESC /
+    /// a lone 0xFF written as \xHH rather than swallowed.
+    #[test]
+    fn sanitize_renders_hostile_preauth_bytes() {
+        let raw = b"tnlog\r\n[2026-01-01 00:00:00] [HUB] FORGED\x01\x1b[31m\xff";
+        let out = sanitize(raw);
+        assert!(out.contains("tnlog\\x0D"));
+        assert!(out.contains("\\x01\\x1B[31m\\xFF"), "{out}");
+        assert!(out.contains("\n    [2026-01-01 00:00:00] [HUB] FORGED"));
+        // Nothing raw survives that could start or garble a line.
+        assert!(!out.contains('\r'));
+        assert!(!out.chars().any(|c| (c as u32) < 0x20 && c != '\n'));
+        // A lossy UTF-8 conversion would have lost the 0xFF to U+FFFD.
+        assert!(!out.contains('\u{FFFD}'));
     }
 
     #[test]

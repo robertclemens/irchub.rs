@@ -69,11 +69,23 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         }
         let uuid = String::from_utf8_lossy(data).into_owned();
         let ip = state.clients[ci].ip.clone();
-        hlog!("[HUB] Bot auth attempt from {ip} with UUID: {uuid}\n");
+        // The claimed UUID is raw pre-authentication input, so it reaches the
+        // log as the bytes that arrived — `uuid` above has already lost any
+        // invalid byte to U+FFFD, which is exactly what the sanitizer is
+        // there to show.
+        crate::logging::hub_log_with_raw(
+            &format!("[HUB] Bot auth attempt from {ip} with UUID: "),
+            data,
+            "\n",
+        );
 
         let authorized = state.bots.iter().any(|b| b.uuid == uuid && b.is_active);
         if !authorized {
-            hlog!("[HUB] Unauthorized bot UUID: {uuid} from {ip}\n");
+            crate::logging::hub_log_with_raw(
+                "[HUB] Unauthorized bot UUID: ",
+                data,
+                &format!(" from {ip}\n"),
+            );
             add_pending_bot(state, &uuid, &ip);
             ratelimit::record_failed_auth(state, &ip);
             return false;
