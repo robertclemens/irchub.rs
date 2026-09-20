@@ -572,6 +572,78 @@ mod tests {
         assert_eq!(safe_op("del"), "del");
     }
 
+    /// The payload every bot consumes.  v2 gets the passwordless shapes and
+    /// the T| trusted-set marker; anything else gets the fail-closed legacy
+    /// shapes with an EMPTY password slot.
+    #[test]
+    fn bot_payload_shapes_per_protocol() {
+        let mut s = st();
+        let (_, pubk) = crypto::generate_combined_keypair().unwrap();
+        let k = crypto::b64_encode(&pubk);
+
+        update_global_entry(&mut s, "c", "#chan", "key|0", "add", 100);
+        s.user_records.push(crate::state::UserRecord {
+            uuid: "11111111-2222-3333-4444-555555555555".into(),
+            name: "rob".into(),
+            pubkey_b64: k.clone(),
+            has_pubkey: true,
+            typ: 'a',
+            is_active: true,
+            last_seen: 10,
+            timestamp: 20,
+        });
+        s.mask_records.push(crate::state::MaskRecord {
+            uuid: "11111111-2222-3333-4444-555555555555".into(),
+            mask: "rob!*@*".into(),
+            is_active: true,
+            last_used: 0,
+            timestamp: 20,
+        });
+        s.opt_flags = "h".into();
+        s.opt_flags_ts = 500;
+        // The bot being served, plus one other bot it should learn to trust.
+        update_entry(&mut s, "me", "n", "mybot", "", "", 100);
+        update_entry(&mut s, "me", "h", "mybot!u@h", "", "", 100);
+        update_entry(&mut s, "other", "h", "otherbot!u@h", "", "", 100);
+        update_entry(&mut s, "other", "pub", &k, "", "", 300);
+
+        let v2 = generate_bot_payload(&s, "me", true);
+        assert!(v2.contains("c|#chan|key|0|add|100\n"));
+        assert!(v2.contains(&format!(
+            "a|11111111-2222-3333-4444-555555555555|rob|{k}|add|10|20|\n"
+        )));
+        assert!(v2.contains("m|11111111-2222-3333-4444-555555555555|rob!*@*|add|0|20\n"));
+        assert!(v2.contains("O|h|500\n"));
+        // The trusted-bot line carries the key, stamped with the later of the
+        // hostmask and pubkey timestamps so a rekey alone reads as newer.
+        assert!(v2.contains(&format!("b|otherbot!u@h|other|{k}|300\n")));
+        assert!(v2.ends_with("T|1\n"));
+        // Hub-only metadata never reaches a bot.
+        assert!(!v2.contains("\nh|"));
+        assert!(!v2.contains("\nn|"));
+
+        let legacy = generate_bot_payload(&s, "me", false);
+        // Field 3 EMPTY so an old bot refuses every admin command; the key
+        // still rides in field 7.
+        assert!(legacy.contains(&format!(
+            "a|11111111-2222-3333-4444-555555555555|rob||add|10|20|{k}\n"
+        )));
+        // No key on the b| line, and no T| marker for a bot that predates it.
+        assert!(legacy.contains("b|otherbot!u@h|other|100\n"));
+        assert!(!legacy.contains("T|"));
+    }
+
+    /// A bot that is not registered gets the globals but no b| line for
+    /// itself, and is never listed as its own trusted peer.
+    #[test]
+    fn bot_payload_never_trusts_the_bot_itself() {
+        let mut s = st();
+        update_entry(&mut s, "me", "h", "mybot!u@h", "", "", 100);
+        let p = generate_bot_payload(&s, "me", true);
+        assert!(!p.contains("b|mybot!u@h|me"));
+        assert!(p.ends_with("T|0\n"));
+    }
+
     #[test]
     fn oper_password_slot_is_dropped_globally() {
         let mut s = st();

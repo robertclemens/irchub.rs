@@ -1217,6 +1217,61 @@ mod tests {
         assert_eq!(s.mask_records.len(), 1);
     }
 
+    /// A legacy-shaped a| line carries a password in field 3.  It may be
+    /// ingested (the key is taken from field 7), but what this hub forwards
+    /// on must be its own canonical line — the password must not travel one
+    /// hop further.
+    #[test]
+    fn peer_sync_forwards_canonically_never_a_password() {
+        let mut s = HubState::new();
+        s.hub_uuid = "me".into();
+        let (_, pubk) = crypto::generate_combined_keypair().unwrap();
+        let k = crypto::b64_encode(&pubk);
+        // Stand in a peer so the forward path has somewhere to go.
+        s.peers.push(crate::state::PeerConfig {
+            uuid: "them".into(),
+            ..Default::default()
+        });
+
+        let legacy = format!("a|11111111-2222-3333-4444-555555555555|rob|hunter2|add|10|20|{k}\n");
+        process_peer_sync(&mut s, &legacy, -1);
+
+        let u = &s.user_records[0];
+        assert_eq!(u.name, "rob");
+        assert!(u.has_pubkey);
+        assert_eq!(u.pubkey_b64, k);
+        // Nothing anywhere in this hub's state holds the password.
+        let canonical = config::format_user_record(u, false);
+        assert!(!canonical.contains("hunter2"));
+        assert_eq!(
+            canonical,
+            format!("a|11111111-2222-3333-4444-555555555555|rob|{k}|add|10|20|\n")
+        );
+        // And the sync packet it will hand any peer carries only that shape.
+        assert!(!generate_sync_packet(&s).contains("hunter2"));
+    }
+
+    /// The `b|` re-forward must be byte-identical to what arrived: splitting
+    /// the value in place forwarded "b|uuid|c|#chan|ts" — no key, modes or op
+    /// — which the next hub stored as an add, turning deletes into adds one
+    /// hop out.
+    #[test]
+    fn peer_sync_reforwards_bot_values_unsplit() {
+        let mut s = HubState::new();
+        // A channel arrives on the per-bot wire shape; `c` is a global key,
+        // so the storage layer routes it to the global table.
+        process_peer_sync(&mut s, "b|bot-1|c|#chan|key|0|del|500\n", -1);
+        let e = s.global_entries.iter().find(|e| e.key == "c").unwrap();
+        // All four fields survived the split, so the op is still read as the
+        // last one and the delete stayed a delete.
+        assert_eq!(e.value, "#chan|key|0|del");
+        assert_eq!(e.timestamp, 500);
+        assert!(!global_value_active(&e.value));
+        // A hub that split the value in place would have stored "#chan" with
+        // no op, which reads as an add.
+        assert!(!s.bots.iter().any(|b| b.uuid == "bot-1"));
+    }
+
     #[test]
     fn peer_sync_drops_retired_shapes() {
         let mut s = HubState::new();
