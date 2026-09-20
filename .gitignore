@@ -1,0 +1,31 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Built binaries (a copy of the hub run in place) and the C tree's output
+/irchub
+/hub_admin
+/keygen
+/hub_encrypt
+/hub_decrypt
+/bin/
+/build/
+*.o
+
+# Runtime state, logs and secrets
+*.log
+*.b64
+.irchub.cnf
+.irchub.cnf.tmp
+.irchub.log
+.irchub.pid
+.irchub.pass
+hub_private.b64
+hub_public.b64
+
+# Local tooling and notes
+.claude
+CLAUDE.md
+docs/*
+compile_commands.json

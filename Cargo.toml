@@ -1,0 +1,78 @@
+[package]
+name = "irchub"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Encrypted hub mesh for ircbot (safe-Rust port of irchub.c)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "irchub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "irchub"
+path = "src/main.rs"
+
+[[bin]]
+name = "hub_admin"
+path = "src/bin/hub_admin.rs"
+
+[[bin]]
+name = "keygen"
+path = "src/bin/keygen.rs"
+
+[[bin]]
+name = "hub_encrypt"
+path = "src/bin/hub_encrypt.rs"
+
+[[bin]]
+name = "hub_decrypt"
+path = "src/bin/hub_decrypt.rs"
+
+[dependencies]
+# Cryptography (RustCrypto + dalek), matched to ircbot.rs so the two trees
+# agree bit for bit on the wire: AES-256-GCM, PBKDF2/HKDF-SHA256, Ed25519
+# signatures and X25519 key agreement.
+aes-gcm = "0.11"
+ed25519-dalek = "3.0"
+x25519-dalek = { version = "3.0", features = ["static_secrets"] }
+hkdf = "0.13"
+pbkdf2 = "0.13"
+sha2 = "0.11"
+getrandom = "0.4"
+zeroize = "1.9"
+base64 = "0.23"
+
+# Networking: the poll(2) loop lives in nix; socket2 gives the listener and
+# the outbound peer connects with their timeouts.
+socket2 = "0.6"
+
+# OS integration through safe wrappers (poll, daemon, mlock, termios,
+# RLIMIT_CORE, PR_SET_DUMPABLE).
+nix = { version = "0.31", features = ["user", "fs", "process", "term", "resource", "feature", "poll", "socket"] }
+region = "4"
+signal-hook = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+# Forgetting a Zeroizing/Locked value skips its wipe.
+mem_forget = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Keep unwinding: secret wiping is Drop-based (Zeroizing, Locked's mlock
+# guard) and panic = "abort" runs no destructors.  Core dumps are already
+# off via RLIMIT_CORE 0 + set_dumpable(false) in harden_process().
+panic = "unwind"
+# Drops DWARF but keeps the symbol table, so a field backtrace stays readable.
+strip = "debuginfo"
+# A wraparound on hostile input becomes a controlled panic, not a bad index.
+overflow-checks = true
