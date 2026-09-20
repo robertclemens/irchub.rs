@@ -9,7 +9,7 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
 
 irchub handles encrypted configuration distribution, bot registration, and inter-hub mesh networking — so your bots always have up-to-date users, keys and settings without manual intervention.
 
-There are no admin, oper or bot passwords: every hub, bot, admin and oper has its own Curve25519 keypair (Ed25519 for signatures + X25519 for encryption), and only public keys are ever exchanged. The one password left is each program's config-file password. Design: `irchub/docs/passwordless.md`.
+There are no admin, oper or bot passwords: every hub, bot, admin and oper has its own Curve25519 keypair (Ed25519 for signatures + X25519 for encryption), and only public keys are ever exchanged. The one password left is each program's config-file password. Design: [`irchub/docs/passwordless.md`](https://github.com/robertclemens/irchub/blob/main/docs/passwordless.md).
 
 > **Companion project:** irchub is designed to work with [ircbot](https://github.com/robertclemens/ircbot/) (C) or [ircbot.rs](https://github.com/robertclemens/ircbot.rs) (Rust) — an IRC bot that connects to irchub for secure configuration sync, op coordination, and inter-bot communication. You need both projects to run a complete setup.
 
@@ -274,11 +274,11 @@ Writes `YYYYMMDDHHMMSS_<name>.private.b64` (mode 0600) and `YYYYMMDDHHMMSS_<name
 - The config password is never passed on the command line or stored in an environment variable. It is read from `.irchub.pass` (if present) or prompted on stdin at startup.
 - `.irchub.pass` is AES-256-GCM encrypted and machine-bound — it cannot be decrypted on a different host. The file must be owned by the current user with permissions `0600`; any deviation is rejected and irchub falls back to the stdin prompt.
 - All bot-to-hub communication is encrypted with AES-256-GCM using per-session keys negotiated via Curve25519 (sealed-box).
-- Failed authentication attempts are tracked per IP. After 3 failures the IP is blocked for 5 minutes; the failure counter resets after 1 hour. These thresholds are compile-time constants (`MAX_FAILED_AUTH_ATTEMPTS`, `FAILED_AUTH_BLOCK_DURATION`, `FAILED_AUTH_RESET_TIME` in `src/consts.rs`) — adjust and rebuild to change them. Specific IPs and ranges can be permanently allowed or blocked at runtime via **Manage Peer Config → Manage IP Allowlist / Manage IP Denylist** in `hub_admin` (supports CIDR notation).
+- Failed authentication attempts are tracked per IP. After 3 failures the IP is blocked for 5 minutes; the failure counter resets after 1 hour. These thresholds are compile-time constants (`MAX_FAILED_AUTH_ATTEMPTS`, `FAILED_AUTH_BLOCK_DURATION`, `FAILED_AUTH_RESET_TIME` in `src/consts.rs`) — adjust and rebuild to change them. Specific IPs and ranges can be permanently allowed or blocked at runtime via **Manage Local Peer Config → Manage IP Allowlist / Manage IP Denylist** in `hub_admin` (supports CIDR notation).
 - Each IP is limited to 5 simultaneous connections (`MAX_CONNECTIONS_PER_IP` in `src/consts.rs` — compile-time constant).
 - Private key material is wiped from memory as soon as it is no longer needed: secrets live in `Zeroizing` buffers, and the config password and the hub's two private key halves sit in heap-pinned, `mlock`'d `Locked` buffers that wipe on drop.
 - No private key ever crosses the network: bots, admins and opers make their own keypairs and only public keys are registered and synced. `hub_admin` logins sign a one-time challenge; captured logins cannot be replayed.
-- Mixed-version rollout is fail-closed: bots that have not advertised protocol `v|2` get records with an empty password slot, and pre-passwordless hubs are refused as peers (`docs/passwordless.md` §9).
+- Mixed-version rollout is fail-closed: bots that have not advertised protocol `v|2` get records with an empty password slot, and pre-passwordless hubs are refused as peers ([`irchub/docs/passwordless.md`](https://github.com/robertclemens/irchub/blob/main/docs/passwordless.md) §9).
 
 ## Files
 
