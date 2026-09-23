@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "irchub"
-version = "2.4.0"
+version = "2.4.1"
 dependencies = [
  "aes-gcm",
  "base64",

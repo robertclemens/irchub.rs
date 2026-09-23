@@ -88,7 +88,7 @@ pub const HIDEPINGPONG: bool = true;
 /// the bots tree and the one every upgrade comparison is made against.
 pub const HUB_VERSION: &str = match option_env!("IRCHUB_VERSION") {
     Some(v) => v,
-    None => "2.4.0",
+    None => "2.4.1",
 };
 
 /// Signed-release channel for the hub (irchub-releases).  Same Ed25519 key
@@ -383,6 +383,8 @@ pub const BOT_PRESENCE_INTERVAL: i64 = 60;
 pub const BOT_TREE_REFRESH: i64 = 300;
 pub const BOT_ROSTER_TTL: i64 = 240;
 pub const ROSTER_VERSION_MAX: usize = 15;
+/// Code base: "c" / "rs".
+pub const ROSTER_VARIANT_MAX: usize = 7;
 pub const ROSTER_SERVER_MAX: usize = 63;
 pub const ROSTER_FRAME_BUDGET: usize = 8192;
 pub const TREE_ROW_MAX: usize = 256;

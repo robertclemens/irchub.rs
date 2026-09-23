@@ -218,6 +218,29 @@ fn list_full(state: &mut HubState, ci: usize) -> bool {
             }
         }
 
+        // Still not found: the live presence roster (CMD_BOT_ROSTER) knows
+        // every bot a peer hub has right now, TTL'd, whatever the legacy
+        // gossip above carries.
+        if !is_connected {
+            let mut best: Option<&crate::state::BotRoster> = None;
+            for e in state.roster.iter().filter(|e| e.bot_uuid == uuid) {
+                if best.is_none_or(|b| e.reported_at >= b.reported_at) {
+                    best = Some(e);
+                }
+            }
+            if let Some(e) = best {
+                is_connected = true;
+                connected_to = match state
+                    .peers
+                    .iter()
+                    .find(|p| !p.uuid.is_empty() && p.uuid == e.hub_uuid)
+                {
+                    Some(p) => format!("PEER ({}:{})", trunc_string(&p.ip, 64), p.port),
+                    None => format!("PEER ({})", trunc_string(&e.hub_name, 100)),
+                };
+            }
+        }
+
         // Key fingerprint: compare with what a client script prints on ~A2A
         // auth, and with the bot's own 'status'.
         let bfp = state.bots[bi].entry("pub").map_or_else(
@@ -225,11 +248,20 @@ fn list_full(state: &mut HubState, ci: usize) -> bool {
             |e| crypto::key_fingerprint_b64(&e.value),
         );
 
+        // Version and code base, e.g. "2.4.0 (rs)", from the volatile
+        // presence data — known only while the bot is on the mesh.
+        let ver = if is_connected {
+            presence::bot_version_label(state, &uuid)
+        } else {
+            "-".to_string()
+        };
+
         out.push_str(&format!(
-            "[{uuid}] {} | Status: {} | Peer: {} | Key: {bfp} | Last: {}\n",
+            "[{uuid}] {} | Status: {} | Peer: {} | Version: {} | Key: {bfp} | Last: {}\n",
             pad_right(&nick, 15),
             pad_right(if is_connected { "CONNECTED" } else { "OFFLINE" }, 10),
             pad_right(if is_connected { &connected_to } else { "N/A" }, 20),
+            pad_right(&ver, 12),
             local_time(last_seen)
         ));
     }
@@ -480,7 +512,8 @@ fn list_peers(state: &mut HubState, ci: usize) -> bool {
         .unwrap_or(0)
         .max(25)
         + 3;
-    let line_len = peer_col_width + 3 + 24 + count * 5 + 15 + 10;
+    // Add 24 for the IP:Port column (21 chars + " | "); 7 for Code.
+    let line_len = peer_col_width + 3 + 24 + count * 5 + 15 + 10 + 7;
 
     let mut out = String::with_capacity(8192);
     out.push_str("\n [M] MESH CONNECTION MATRIX        You are connected to peer 1\n");
@@ -494,7 +527,7 @@ fn list_peers(state: &mut HubState, ci: usize) -> bool {
     for i in 0..count {
         out.push_str(&format!(" {} |", pad_right(&(i + 1).to_string(), 2)));
     }
-    out.push_str(" Mesh State    | Bots |\n");
+    out.push_str(" Mesh State    | Bots | Code |\n");
     out.push_str(&"-".repeat(line_len));
     out.push('\n');
 
@@ -640,8 +673,23 @@ fn list_peers(state: &mut HubState, ci: usize) -> bool {
             issues += 1;
         }
 
+        // Code base (c / rs): ours is compiled in; a peer's comes from the v|
+        // line of its roster gossip, so only hubs we peer with directly (and
+        // that send one) are known — anything else shows "?".
+        let code = if all[row].is_me {
+            HUB_UPDATE_VARIANT
+        } else {
+            state
+                .peers
+                .iter()
+                .find(|p| all[row].matches(&p.uuid, &p.ip, p.port))
+                .map(|p| p.remote_variant.as_str())
+                .filter(|v| !v.is_empty())
+                .unwrap_or("?")
+        };
+
         if is_offline {
-            out.push_str(" ??   |\n");
+            out.push_str(&format!(" ??   | {} |\n", pad_right(code, 4)));
         } else {
             let bot_cnt = if all[row].is_me {
                 state.bot_clients().len() as i32
@@ -656,7 +704,11 @@ fn list_peers(state: &mut HubState, ci: usize) -> bool {
                     })
                     .unwrap_or(0)
             };
-            out.push_str(&format!(" {} |\n", pad_right(&bot_cnt.to_string(), 4)));
+            out.push_str(&format!(
+                " {} | {} |\n",
+                pad_right(&bot_cnt.to_string(), 4),
+                pad_right(code, 4)
+            ));
         }
 
         if all[row].is_me {

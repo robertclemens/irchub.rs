@@ -276,6 +276,9 @@ pub struct PeerConfig {
     /// columns.
     pub remote_started: i64,
     pub remote_version: String,
+    /// Its code base ("c" / "rs"), from the roster's v| line; empty until a
+    /// hub that sends one reports in.
+    pub remote_variant: String,
     pub last_gossip: String,
     /// Peer auth (HUBv3): per-peer Curve25519 public keys.  `has_pubkey` is
     /// required — a peer without one is refused (there is no shared secret).
@@ -299,6 +302,7 @@ impl Default for PeerConfig {
             last_mesh_report: 0,
             remote_started: 0,
             remote_version: String::new(),
+            remote_variant: String::new(),
             last_gossip: String::new(),
             ed_pub: [0; ED25519_KEY_LEN],
             x25519_pub: [0; X25519_KEY_LEN],
@@ -534,6 +538,8 @@ pub struct BotRoster {
     pub bot_uuid: String,
     pub nick: String,
     pub version: String,
+    /// Code base: "c" / "rs" / "".
+    pub variant: String,
     /// The bot's IRC link.
     pub server: String,
     /// bot -> hub, for uptime.
@@ -722,6 +728,8 @@ pub struct HubClient {
     /// never reports simply shows blank fields in the tree.  Never persisted.
     pub bot_version: String,
     pub bot_server: String,
+    /// "c" / "rs", empty = unreported.
+    pub bot_variant: String,
     /// The bot's own start time, 0 = unreported.
     pub bot_started: i64,
 }
@@ -764,6 +772,7 @@ impl HubClient {
             bw_bytes_in_window: 0,
             bot_version: String::new(),
             bot_server: String::new(),
+            bot_variant: String::new(),
             bot_started: 0,
         }
     }

@@ -70,6 +70,7 @@ fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
         // worth re-rendering every bot's tree for.
         let changed = e.nick != incoming.nick
             || e.version != incoming.version
+            || e.variant != incoming.variant
             || e.server != incoming.server
             || e.connected_at != incoming.connected_at;
         state.roster[i] = incoming;
@@ -92,19 +93,31 @@ fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
 /// process_bot_presence(): this bot just told us what it is running.  Per
 /// connection and volatile.
 pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
-    // "<version>|<server>|<started>" — a short, fixed shape.  Anything longer
-    // than the field caps is truncated by roster_clean, never rejected, so a
-    // newer bot advertising more never drops off the tree entirely.
-    let work = trunc_string(payload, ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + 64);
+    // "<version>|<server>|<started>|<variant>" — a short, fixed shape.  The
+    // variant (code base, c / rs) is the newest field; a bot that predates it
+    // sends three and simply shows no code base.  Anything longer than the
+    // field caps is truncated by roster_clean, never rejected, so a newer bot
+    // advertising more never drops off the tree entirely.
+    let work = trunc_string(
+        payload,
+        ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + ROSTER_VARIANT_MAX + 64,
+    );
     let mut version_src = work.as_str();
     let mut server = String::new();
+    let mut variant = String::new();
     let mut started = 0i64;
     if let Some(p1) = work.find('|') {
         version_src = &work[..p1];
         let rest = &work[p1 + 1..];
         let server_src = match rest.find('|') {
             Some(p2) => {
-                started = atoll(&rest[p2 + 1..]);
+                let tail = &rest[p2 + 1..];
+                started = atoll(tail);
+                if let Some(p3) = tail.find('|') {
+                    // Room for fields after it: stop at the next '|'.
+                    let v = tail[p3 + 1..].split('|').next().unwrap_or("");
+                    variant = roster_clean(v, ROSTER_VARIANT_MAX + 1);
+                }
                 &rest[..p2]
             }
             None => rest,
@@ -121,16 +134,21 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
     }
 
     let c = &mut state.clients[ci];
-    let changed = c.bot_version != version || c.bot_server != server || c.bot_started != started;
+    let changed = c.bot_version != version
+        || c.bot_server != server
+        || c.bot_variant != variant
+        || c.bot_started != started;
     c.bot_version = version.clone();
     c.bot_server = server.clone();
+    c.bot_variant = variant.clone();
     c.bot_started = started;
 
     if changed {
         let id = c.id.clone();
         hlog!(
-            "[PRESENCE] Bot {id}: version {} on {}\n",
+            "[PRESENCE] Bot {id}: version {} ({}) on {}\n",
             if version.is_empty() { "?" } else { &version },
+            if variant.is_empty() { "?" } else { &variant },
             if server.is_empty() {
                 "(no server)"
             } else {
@@ -192,13 +210,26 @@ fn roster_send_to_peers(state: &mut HubState, frame: &str) {
 /// Gossip the bots connected to THIS hub out to the peers.  Chunked to a byte
 /// budget: each frame repeats the h| header and carries whole rows only, so a
 /// receiver can apply any frame on its own without waiting for the rest.
+///
+/// Frame shape:
+/// ```text
+/// h|<hub_uuid>|<name>|<started>|<hub_version>
+/// v|<hub_variant>                          (this hub's code base: c / rs)
+/// b|<bot_uuid>|<nick>|<version>|<server>|<started>|<variant>
+/// ```
+/// The hub's variant is a line of its own, not a sixth h| field: a hub that
+/// predates it reads everything after the version's '|' into the version
+/// (roster_clean drops the '|'), which would read as "2.4.0c" and stall any
+/// upgrade run waiting on "2.4.0".  Older hubs skip an unknown line.  The b|
+/// variant can ride last because older hubs split five fields and atoll() the
+/// start time, which stops at the '|'.
 fn gossip_bot_roster(state: &mut HubState) {
     if state.peers.is_empty() {
         return;
     }
     let now_ts = now();
     let header = format!(
-        "h|{}|{}|{}|{HUB_VERSION}\n",
+        "h|{}|{}|{}|{HUB_VERSION}\nv|{HUB_UPDATE_VARIANT}\n",
         if state.hub_uuid.is_empty() {
             "-"
         } else {
@@ -224,7 +255,7 @@ fn gossip_bot_roster(state: &mut HubState) {
         let nick = bot_nick_from_config(state, &c.id);
         let c = &state.clients[ci];
         let row = format!(
-            "b|{}|{}|{}|{}|{}\n",
+            "b|{}|{}|{}|{}|{}|{}\n",
             c.id,
             if nick.is_empty() { "-" } else { &nick },
             if c.bot_version.is_empty() {
@@ -237,7 +268,12 @@ fn gossip_bot_roster(state: &mut HubState) {
             } else {
                 &c.bot_server
             },
-            c.bot_started
+            c.bot_started,
+            if c.bot_variant.is_empty() {
+                "-"
+            } else {
+                &c.bot_variant
+            }
         );
         if row.len() >= TREE_ROW_MAX {
             continue; // an unrepresentable row
@@ -325,6 +361,23 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
             }
             continue;
         }
+        if let Some(v) = line.strip_prefix("v|") {
+            // The code base of the hub whose h| header this frame opened with.
+            if hub_uuid.is_empty() || hub_uuid == "-" {
+                continue;
+            }
+            let hv = roster_clean(v, ROSTER_VARIANT_MAX + 1);
+            if let Some(p) = state
+                .peers
+                .iter_mut()
+                .find(|p| !p.uuid.is_empty() && p.uuid == hub_uuid)
+                && p.remote_variant != hv
+            {
+                p.remote_variant = hv;
+                state.tree_dirty = true;
+            }
+            continue;
+        }
         let Some(body) = line.strip_prefix("b|") else {
             continue;
         };
@@ -340,7 +393,9 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
             continue;
         }
 
-        let f = crate::cstr::split_fields(body, 5);
+        // Five fields from any hub; a sixth (the bot's code base) from one
+        // that knows it.
+        let f = crate::cstr::split_fields(body, 6);
         if f.len() < 5 || f[0].is_empty() {
             continue;
         }
@@ -367,6 +422,11 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
             } else {
                 roster_clean(f[2], ROSTER_VERSION_MAX + 1)
             },
+            variant: if f.len() < 6 || f[5] == "-" {
+                String::new()
+            } else {
+                roster_clean(f[5], ROSTER_VARIANT_MAX + 1)
+            },
             server: if f[3] == "-" {
                 String::new()
             } else {
@@ -389,10 +449,14 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
 ///
 /// Row shapes:
 /// ```text
-/// H|<depth>|<name>|<uuid>|<online>|<uptime>|<version>
-/// B|<depth>|<nick>|<uuid>|<version>|<server>|<uptime>
+/// H|<depth>|<name>|<uuid>|<online>|<uptime>|<version>|<variant>
+/// B|<depth>|<nick>|<uuid>|<version>|<server>|<uptime>|<variant>
 /// D|<nick>|<uuid>|<last_seen>            (offline; always the tail)
 /// ```
+///
+/// `<variant>` is the code base (c / rs), always the last field: a bot that
+/// predates it splits a fixed field count and never looks past uptime or
+/// version, so the extra field is invisible to it.
 ///
 /// Depth plus pre-order is all a renderer needs to draw the connectors: a
 /// node is the last child at its level when no later row shares its depth
@@ -406,7 +470,7 @@ pub fn build_tree(state: &HubState) -> String {
     let max_len = MAX_TREE_PAYLOAD;
     let now_ts = now();
     let mut out = format!(
-        "H|0|{}|{}|1|{}|{HUB_VERSION}\n",
+        "H|0|{}|{}|1|{}|{HUB_VERSION}|{HUB_UPDATE_VARIANT}\n",
         if state.hub_friendly_name.is_empty() {
             "hub"
         } else {
@@ -435,7 +499,7 @@ pub fn build_tree(state: &HubState) -> String {
         let c = &state.clients[ci];
         let nick = bot_nick_from_config(state, &c.id);
         out.push_str(&format!(
-            "B|1|{}|{}|{}|{}|{}\n",
+            "B|1|{}|{}|{}|{}|{}|{}\n",
             if nick.is_empty() { "-" } else { &nick },
             c.id,
             if c.bot_version.is_empty() {
@@ -452,6 +516,11 @@ pub fn build_tree(state: &HubState) -> String {
                 now_ts - c.bot_started
             } else {
                 0
+            },
+            if c.bot_variant.is_empty() {
+                "-"
+            } else {
+                &c.bot_variant
             }
         ));
     }
@@ -477,7 +546,7 @@ pub fn build_tree(state: &HubState) -> String {
             64,
         );
         out.push_str(&format!(
-            "H|1|{}|{}|{}|{}|{}\n",
+            "H|1|{}|{}|{}|{}|{}|{}\n",
             if pname.is_empty() { "peer" } else { &pname },
             if peer.uuid.is_empty() {
                 "-"
@@ -494,6 +563,11 @@ pub fn build_tree(state: &HubState) -> String {
                 "-"
             } else {
                 &peer.remote_version
+            },
+            if peer.remote_variant.is_empty() {
+                "-"
+            } else {
+                &peer.remote_variant
             }
         ));
 
@@ -505,7 +579,7 @@ pub fn build_tree(state: &HubState) -> String {
                 break;
             }
             out.push_str(&format!(
-                "B|2|{}|{}|{}|{}|{}\n",
+                "B|2|{}|{}|{}|{}|{}|{}\n",
                 if e.nick.is_empty() { "-" } else { &e.nick },
                 e.bot_uuid,
                 if e.version.is_empty() {
@@ -518,6 +592,11 @@ pub fn build_tree(state: &HubState) -> String {
                     now_ts - e.connected_at
                 } else {
                     0
+                },
+                if e.variant.is_empty() {
+                    "-"
+                } else {
+                    &e.variant
                 }
             ));
         }
@@ -605,6 +684,36 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
     }
 }
 
+/// bot_version_label(): "<version> (<code base>)" for a bot that is on the
+/// mesh right now, e.g. "2.4.0 (rs)": our own live client first, else the
+/// freshest peer report.  The bare version when the reporter did not say
+/// which code base, "-" when nobody reports the bot at all.  For hub_admin's
+/// bot list.
+pub fn bot_version_label(state: &HubState, uuid: &str) -> String {
+    let (ver, var) = if let Some(c) = state
+        .clients
+        .iter()
+        .find(|c| c.typ == ClientType::Bot && c.authenticated && c.id == uuid)
+    {
+        (c.bot_version.as_str(), c.bot_variant.as_str())
+    } else {
+        let mut best: Option<&BotRoster> = None;
+        for e in state.roster.iter().filter(|e| e.bot_uuid == uuid) {
+            if best.is_none_or(|b| e.reported_at >= b.reported_at) {
+                best = Some(e);
+            }
+        }
+        best.map_or(("", ""), |e| (e.version.as_str(), e.variant.as_str()))
+    };
+    if ver.is_empty() {
+        "-".to_string()
+    } else if var.is_empty() {
+        ver.to_string()
+    } else {
+        format!("{ver} ({var})")
+    }
+}
+
 /// The `seen`/nick lookup the offline tail of the tree uses, exported for the
 /// admin listing that shows the same value.
 pub fn bot_last_seen(state: &HubState, uuid: &str) -> i64 {
@@ -681,6 +790,30 @@ mod tests {
     }
 
     #[test]
+    fn roster_carries_the_code_base_and_tolerates_its_absence() {
+        let mut s = HubState::new();
+        s.peers.push(crate::state::PeerConfig {
+            uuid: "them".into(),
+            ..Default::default()
+        });
+        // A new hub: v| line for itself, a sixth b| field per bot.
+        process_bot_roster(
+            &mut s,
+            "h|them|Them|0|2.4.0\nv|rs\nb|bot-1|n|2.4.0|srv|0|c\n",
+        );
+        assert_eq!(s.peers[0].remote_version, "2.4.0");
+        assert_eq!(s.peers[0].remote_variant, "rs");
+        assert_eq!(s.roster[0].version, "2.4.0");
+        assert_eq!(s.roster[0].variant, "c");
+        assert_eq!(bot_version_label(&s, "bot-1"), "2.4.0 (c)");
+        // A pre-variant hub: five fields, no v| line.
+        process_bot_roster(&mut s, "h|them|Them|0|2.3.0\nb|bot-2|n|2.3.0|srv|0\n");
+        assert_eq!(s.roster[1].variant, "");
+        assert_eq!(bot_version_label(&s, "bot-2"), "2.3.0");
+        assert_eq!(bot_version_label(&s, "nobody"), "-");
+    }
+
+    #[test]
     fn roster_clamps_a_future_start_time() {
         let mut s = HubState::new();
         let future = now() + 86400;
@@ -701,7 +834,10 @@ mod tests {
         storage::update_entry(&mut s, "bot-1", "seen", "", "", "", 4242);
         let tree = build_tree(&s);
         let lines: Vec<&str> = tree.lines().collect();
-        assert_eq!(lines[0], format!("H|0|Me|me|1|60|{HUB_VERSION}"));
+        assert_eq!(
+            lines[0],
+            format!("H|0|Me|me|1|60|{HUB_VERSION}|{HUB_UPDATE_VARIANT}")
+        );
         assert_eq!(lines[1], "D|offbot|bot-1|4242");
     }
 }
