@@ -43,3 +43,5 @@ pub mod secret;
 pub mod state;
 pub mod storage;
 pub mod tool;
+pub mod update;
+pub mod upgrade;

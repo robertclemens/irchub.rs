@@ -257,6 +257,24 @@ const LENIENT: GeneralPurpose = GeneralPurpose::new(
 
 /// base64_decode: tolerant of missing padding like the OpenSSL BIO it
 /// replaces.  None for empty output or invalid characters.
+/// Lowercase hex SHA-256 of a whole file, streamed 4 KB at a time — the
+/// artifact integrity check for the hub's self-update.  Mirrors
+/// ircbot.rs's crypto::sha256_file_hex.
+pub fn sha256_file_hex(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 pub fn b64_decode(s: &str) -> Option<Zeroizing<Vec<u8>>> {
     let v = Zeroizing::new(LENIENT.decode(s.as_bytes()).ok()?);
     if v.is_empty() {

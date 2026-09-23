@@ -1,6 +1,6 @@
 [package]
 name = "irchub"
-version = "2.0.0"
+version = "2.4.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Encrypted hub mesh for ircbot (safe-Rust port of irchub.c)"
@@ -48,6 +48,16 @@ base64 = "0.23"
 # Networking: the poll(2) loop lives in nix; socket2 gives the listener and
 # the outbound peer connects with their timeouts.
 socket2 = "0.6"
+
+# HTTPS for the hub's own self-update (src/update.rs), matched to ircbot.rs so
+# both trees fetch a release the same way: rustls with the graviola provider
+# and webpki roots, no OpenSSL and no cc(1) at build time.  graviola is
+# x86_64/aarch64 only and asserts on its required CPU features, so the
+# provider is installed lazily and a failure disables the updater rather than
+# taking the daemon down (see update::tls_ready).
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-graviola = "0.4"
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
 
 # OS integration through safe wrappers (poll, daemon, mlock, termios,
 # RLIMIT_CORE, PR_SET_DUMPABLE).

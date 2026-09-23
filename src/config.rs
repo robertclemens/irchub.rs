@@ -172,6 +172,37 @@ pub fn write(state: &mut HubState) {
         buf.push_str(&format!("opt|{}|{}\n", state.opt_flags, state.opt_flags_ts));
     }
 
+    // The roll-up plan (upgrade plan, Task 13): hub-local, never replicated.
+    // rollup|target|variant|kind|min_from|hub_target|plan_set|base|hub_base —
+    // every field was checked free of '|' and line breaks before it was
+    // accepted (upgrade::plan_field_ok), and is checked again here, so the
+    // line can never split or inject another.
+    {
+        let r = &state.rollup;
+        let fields = [
+            &r.target,
+            &r.variant,
+            &r.kind,
+            &r.min_from,
+            &r.hub_target,
+            &r.base,
+            &r.hub_base,
+        ];
+        if r.have_plan && fields.iter().all(|f| crate::upgrade::plan_field_ok(f)) {
+            buf.push_str(&format!(
+                "rollup|{}|{}|{}|{}|{}|{}|{}|{}\n",
+                r.target,
+                r.variant,
+                r.kind,
+                r.min_from,
+                r.hub_target,
+                r.plan_set,
+                r.base,
+                r.hub_base
+            ));
+        }
+    }
+
     for p in &state.peers {
         // Serialize the per-peer Curve25519 pubkey (88 chars base64 of the
         // 64-byte combined Ed25519+X25519 key) as the 5th field.  An empty
@@ -713,6 +744,34 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                 if let Some((flags, ts)) = parse_opt_value(v) {
                     state.opt_flags = flags;
                     state.opt_flags_ts = ts;
+                }
+            }
+            // rollup|target|variant|kind|min_from|hub_target|plan_set|base|hub_base
+            // — see write().  A line that does not parse cleanly is dropped
+            // whole: no plan is better than half of one.
+            "rollup" => {
+                let f: Vec<&str> = v.split('|').collect();
+                let caps = [64, 8, 8, 64, 64, 0, 512, 512];
+                let ok = f.len() == 8
+                    && !f[0].is_empty()
+                    && f.iter().zip(caps).all(|(x, cap)| {
+                        cap == 0 || (x.len() < cap && crate::upgrade::plan_field_ok(x))
+                    });
+                let ts = if ok { crate::cstr::atoll(f[5]) } else { 0 };
+                if ok && ts > 0 {
+                    let r = &mut state.rollup;
+                    r.target = f[0].to_string();
+                    r.variant = f[1].to_string();
+                    r.kind = f[2].to_string();
+                    r.min_from = f[3].to_string();
+                    r.hub_target = f[4].to_string();
+                    r.plan_set = ts;
+                    r.base = f[6].to_string();
+                    r.hub_base = f[7].to_string();
+                    r.have_plan = true;
+                } else {
+                    state.rollup = Default::default();
+                    hlog!("[CONFIG] Ignoring a malformed rollup| line\n");
                 }
             }
             "lamport_seq" => {

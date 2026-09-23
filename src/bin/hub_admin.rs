@@ -1166,6 +1166,101 @@ fn menu_manage_channels(a: &mut Admin) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Network upgrade (hub-orchestrated rolling upgrade)
+// ---------------------------------------------------------------------------
+
+/// Start a run.  Everything past the version is optional: an empty variant
+/// keeps each node on the one it is already running, an empty kind lets each
+/// node pick a prebuilt binary or a source build, and an empty base uses the
+/// release URL compiled into the daemons.  Bots and hubs are separate
+/// products on separate version lines, so the hubs get their own target and
+/// base; a blank hub target leaves every hub on the build it runs.  The hub
+/// freezes the config for the
+/// duration and drives the rolling plan itself, so this is fire-and-poll: the
+/// status screen is where the run is watched.
+fn upgrade_network(a: &mut Admin) {
+    println!("\n{RULE_H}");
+    println!("                 UPGRADE NETWORK");
+    println!("{RULE_H}\n");
+    println!("  Bots are upgraded in waves, peer hubs afterwards one at a");
+    println!("  time, this hub last.  The config is frozen until the run");
+    println!("  finishes, and any failure rolls the whole mesh back.\n");
+
+    let version = a.input("Bot target version (e.g. 2.4.0, blank to cancel): ");
+    if version.is_empty() {
+        println!("[*] Cancelled.");
+        a.pause();
+        return;
+    }
+    let variant = a.input("Variant c/rs (blank = keep each node's own): ");
+    let kind = a.input("Artifact bin/src (blank = let each node choose): ");
+    let min_from = a.input("Minimum version to upgrade from (blank = any): ");
+    let base = a.input("Bot release base URL override (blank = built-in): ");
+    let hub_version = a.input("Hub target version (blank = hubs stay on their build): ");
+    let hub_base = if hub_version.is_empty() {
+        String::new()
+    } else {
+        a.input("Hub release base URL override (blank = built-in): ")
+    };
+
+    println!("\n[*] Asking the hub to upgrade the network to {version}...");
+    let r = a.ask(
+        CMD_ADMIN_UPGRADE_NET,
+        &format!("{version}|{variant}|{kind}|{min_from}|{base}|{hub_version}|{hub_base}"),
+    );
+    println!("\nHub: {r}");
+    println!("\n[*] Watch it with \"Upgrade status\"; the run continues whether");
+    println!("    or not this console stays connected.");
+    a.pause();
+}
+
+fn upgrade_status(a: &mut Admin) {
+    println!();
+    let r = a.ask(CMD_ADMIN_UPGRADE_STATUS, "");
+    println!("{r}");
+    a.pause();
+}
+
+/// Stop a run in flight: every node that already moved is told to restore its
+/// retained build, and the config freeze lifts.
+fn upgrade_abort(a: &mut Admin) {
+    println!("\n{RULE_H}");
+    println!("                  ABORT UPGRADE");
+    println!("{RULE_H}\n");
+    println!("  Every node that already upgraded rolls back to its previous");
+    println!("  build.  Type 'yes' to confirm.\n");
+    if a.input("Confirm: ") != "yes" {
+        println!("[*] Cancelled.");
+        a.pause();
+        return;
+    }
+    let r = a.ask(CMD_ADMIN_UPGRADE_STATUS, "abort");
+    println!("\nHub: {r}");
+    a.pause();
+}
+
+fn menu_upgrade_network(a: &mut Admin) {
+    loop {
+        match menu(
+            a,
+            "UPGRADE NETWORK",
+            &[
+                "Upgrade network to a version",
+                "Upgrade status",
+                "Abort the running upgrade",
+                "Back to Main Menu",
+            ],
+        ) {
+            1 => upgrade_network(a),
+            2 => upgrade_status(a),
+            3 => upgrade_abort(a),
+            4 => return,
+            _ => println!("Invalid choice."),
+        }
+    }
+}
+
 fn menu_admin_commands(a: &mut Admin) {
     loop {
         match menu(
@@ -1389,6 +1484,7 @@ fn main() {
                 "Manage Local Peer Config",
                 "Manage Global Peer Config",
                 "IRC Admin Commands",
+                "Upgrade Network",
                 "Exit",
             ],
         ) {
@@ -1397,7 +1493,8 @@ fn main() {
             3 => menu_manage_peer_config(&mut a),
             4 => opt_flags_menu(&mut a),
             5 => menu_admin_commands(&mut a),
-            6 => {
+            6 => menu_upgrade_network(&mut a),
+            7 => {
                 println!("\nExiting...");
                 return;
             }

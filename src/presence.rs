@@ -13,8 +13,8 @@
 use crate::consts::*;
 use crate::cstr::{atoll, now, trunc_string};
 use crate::queue;
-use crate::state::{BotRoster, ClientType, HubState, Lane, QueuedMsg};
-use crate::{hlog, storage};
+use crate::state::{BotRoster, ClientType, HubState, Lane, QueuedMsg, UpgradeNodeKind};
+use crate::{hlog, storage, upgrade};
 
 /// Sanitize one field arriving from a bot or a peer before it is stored or
 /// echoed into a tree row.  Presence text is attacker-controlled: it reaches
@@ -139,6 +139,25 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
         );
         state.tree_dirty = true;
         state.last_presence_gossip = 0; // gossip the change on the next tick
+    }
+
+    // A committed node coming back on the target version is the authoritative
+    // success signal for a rolling upgrade — CMD_UPGRADE_RESULT can be lost,
+    // but without this frame the bot is not on the mesh at all.
+    let uuid = state.clients[ci].id.clone();
+    upgrade::note_presence(state, &uuid, &version);
+    upgrade::rollup_note_presence(state, &uuid, UpgradeNodeKind::Bot, &version);
+
+    // If this hub is following a run another hub drives, a local bot
+    // reappearing on the followed target is that bot's authoritative success:
+    // synthesize a RESULT up to the driver so a lost bot RESULT does not stall
+    // the run.
+    if !state.follow_id.is_empty() && !version.is_empty() && state.follow_target == version {
+        let origin = state.follow_origin.clone();
+        if let Some(oi) = crate::upgrade::find_client_hub(state, &origin) {
+            let p = format!("{}|{}|ok|{}|", state.follow_id, uuid, version);
+            crate::queue::send_urgent(&mut state.clients[oi], CMD_UPGRADE_RESULT, &p);
+        }
     }
 }
 
@@ -284,12 +303,25 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
                     dirty = true;
                 }
                 if p.remote_version != hub_ver {
-                    p.remote_version = hub_ver;
+                    p.remote_version = hub_ver.clone();
                     dirty = true;
                 }
                 if dirty {
                     state.tree_dirty = true;
                 }
+                // Same authoritative signal the bots give through their
+                // presence: a hub node of a run we drive is done when it
+                // reappears in the gossip on the target version.  Its
+                // CMD_UPGRADE_RESULT can be lost — several hops more of it,
+                // now that a run reaches the whole mesh — but this gossip
+                // cannot, or the hub is not on the mesh at all.
+                upgrade::note_presence(state, &hub_uuid, &hub_ver);
+                // No roll-up here: a peer hub is never rolled up by a PREPARE
+                // from its neighbour.  A peer cannot tell a single-node
+                // roll-up PREPARE from a run's, so it would fan the frame out
+                // to the whole mesh — and every hub holding the plan would do
+                // the same to every other, which is the storm a hub-and-bot
+                // net produced.
             }
             continue;
         }
@@ -669,7 +701,7 @@ mod tests {
         storage::update_entry(&mut s, "bot-1", "seen", "", "", "", 4242);
         let tree = build_tree(&s);
         let lines: Vec<&str> = tree.lines().collect();
-        assert_eq!(lines[0], "H|0|Me|me|1|60|2.0");
+        assert_eq!(lines[0], format!("H|0|Me|me|1|60|{HUB_VERSION}"));
         assert_eq!(lines[1], "D|offbot|bot-1|4242");
     }
 }

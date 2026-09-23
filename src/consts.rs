@@ -11,6 +11,10 @@ pub const MAX_OPT_FLAGS: usize = 32;
 /// Network option flag letter: refuse bot-originated mutations of
 /// hub-authoritative records (the active set lives in `HubState::opt_flags`).
 pub const OPT_HUB_ONLY_MUTATIONS: char = 'h';
+/// Set for the duration of a network upgrade window: config mutations
+/// (admin commands + bot deltas/pushes) are refused until every node
+/// reports success, or the run aborts.
+pub const OPT_CONFIG_FROZEN: char = 'F';
 
 pub const MAX_CHAN: usize = 65;
 pub const MAX_NICK: usize = 32;
@@ -78,7 +82,46 @@ pub const MAX_SEEN_FORWARD_IDS: usize = 256;
 pub const HIDEPINGPONG: bool = true;
 
 /// This hub's version, reported in the bots tree beside each hub node.
-pub const HUB_VERSION: &str = "2.0";
+/// Overridable at build time (`IRCHUB_VERSION=2.1 cargo build --release`) so a
+/// release build can stamp its own version without editing the tree.  Mirrors
+/// the `#ifndef HUB_VERSION` guard in hub.h.  This is the version reported in
+/// the bots tree and the one every upgrade comparison is made against.
+pub const HUB_VERSION: &str = match option_env!("IRCHUB_VERSION") {
+    Some(v) => v,
+    None => "2.4.0",
+};
+
+/// Signed-release channel for the hub (irchub-releases).  Same Ed25519 key
+/// as ircbot's BOT_UPDATE_PUBKEY_B64: one key signs both repos.  An empty
+/// pubkey DISABLES hub updates (fail-closed).  Mirrors hub.h.
+///
+/// `HUB_UPDATE_BASE` is the tree ROOT; one variant subdirectory below it holds
+/// that build's manifest.  Keeping the root separate is what lets a
+/// hub-orchestrated upgrade flip a hub between the C and Rust builds:
+/// `update::commit` appends the variant it was told to install.
+pub const HUB_UPDATE_BASE: &str =
+    "https://raw.githubusercontent.com/robertclemens/irchub-releases/main/irchub";
+/// The variant THIS build is.  The C hub answers "c".
+pub const HUB_UPDATE_VARIANT: &str = "rs";
+pub const HUB_UPDATE_URL: &str =
+    "https://raw.githubusercontent.com/robertclemens/irchub-releases/main/irchub/rs/releases.txt";
+pub const HUB_UPDATE_SIG_URL: &str =
+    "https://raw.githubusercontent.com/robertclemens/irchub-releases/main/irchub/rs/releases.sig";
+pub const HUB_UPDATE_PUBKEY_B64: &str = "qkXMh/F8TC+cnKuIwrP5TJIynfrLBD+MDUwvkyh9lBU=";
+/// Hand-off note written just before an upgrade execs the new binary: the
+/// restarted process reads the upgrade id from here and answers
+/// CMD_UPGRADE_RESULT.
+pub const HUB_UPGRADE_MARKER_FILE: &str = ".irchub.upgrade";
+/// Retained previous binary/config, kept (not deleted) after an upgrade so
+/// CMD_UPGRADE_ABORT can put this hub back.
+pub const HUB_UPGRADE_PREV_SUFFIX: &str = ".prev";
+/// The generated installer, written 0700 and exec'd once the old process has
+/// let go of its pid lock.
+pub const HUB_UPGRADE_SCRIPT: &str = "hub_upgrade.sh";
+/// Ceilings on what the updater will pull down.
+pub const HUB_UPDATE_MAX_MANIFEST: u64 = 1024 * 1024;
+pub const HUB_UPDATE_MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
+pub const HUB_UPDATE_FETCH_TIMEOUT: u64 = 300;
 
 // Timeouts (seconds)
 pub const PING_INTERVAL: i64 = 60;
@@ -215,8 +258,56 @@ pub const CMD_CHAN_REPLY: u8 = 0x5B;
 pub const CMD_CHAN_FWD_REQUEST: u8 = 0x5C;
 pub const CMD_CHAN_FWD_REPLY: u8 = 0x5D;
 
+// Network-wide upgrade coordination (mirrors irchub/hub.h).
+pub const CMD_UPGRADE_PREPARE: u8 = 0x5E;
+pub const CMD_UPGRADE_READY: u8 = 0x5F;
+pub const CMD_UPGRADE_COMMIT: u8 = 0x60;
+pub const CMD_UPGRADE_RESULT: u8 = 0x61;
+pub const CMD_UPGRADE_ABORT: u8 = 0x62;
+pub const CMD_ADMIN_UPGRADE_NET: u8 = 0x63;
+pub const CMD_ADMIN_UPGRADE_STATUS: u8 = 0x64;
+
 pub const MAX_PENDING_CHAN_REQUESTS: usize = 200;
 pub const CHAN_REQUEST_TIMEOUT: i64 = 45;
+
+// ---- Network upgrade run (CMD_UPGRADE_*, CMD_ADMIN_UPGRADE_NET) -----------
+// One run at a time per hub: the whole point is that exactly one plan drives
+// the mesh while the config is frozen.
+/// Every client, plus this hub.
+pub const MAX_UPGRADE_NODES: usize = MAX_CLIENTS + 1;
+/// Downstream routes a follower remembers for a run it is only relaying: one
+/// per node it forwarded an answer for.  See `state::UpgradeRoute`.
+pub const MAX_UPGRADE_ROUTES: usize = MAX_UPGRADE_NODES;
+
+// ---- Offline roll-up (upgrade plan, Task 7) -------------------------------
+// A node that was down, or homed elsewhere, when a run went through comes back
+// on the old build.  The hub brings it up to the last completed run's target
+// by itself, ONE node at a time and WITHOUT freezing the config: a single late
+// bot is not a reason to hold the whole network's config still.  Bounded on
+// purpose — a node that keeps failing must not be re-committed on every
+// reconnect.
+/// Attempts per node, per hub lifetime.
+pub const ROLLUP_MAX_TRIES: i32 = 3;
+/// Seconds between attempts on one node.
+pub const ROLLUP_COOLDOWN: i64 = 900;
+/// Seconds after a run completes before late nodes are chased.
+pub const ROLLUP_SETTLE: i64 = 20;
+/// Give up on one attempt after this many seconds.
+pub const ROLLUP_TIMEOUT: i64 = 300;
+/// Nodes remembered in the attempt ledger.
+pub const MAX_ROLLUP_TRIES: usize = 64;
+/// Stop waiting for READY acks.
+pub const UPGRADE_PREPARE_TIMEOUT: i64 = 45;
+/// A committed node must be back, upgraded, by now.
+pub const UPGRADE_COMMIT_TIMEOUT: i64 = 420;
+/// Bots go in waves so a channel never loses every bot at once.
+pub const UPGRADE_BOT_WAVE_MAX: usize = 4;
+/// Never commit more than 1/N of the bots at once.
+pub const UPGRADE_BOT_WAVE_DIVISOR: usize = 4;
+/// How long a CMD_UPGRADE_PREPARE this hub acknowledged stays commitable.  A
+/// driver that stalls mid-roll has to ask again rather than commit against a
+/// stale plan.
+pub const UPGRADE_PREPARE_TTL: i64 = 900;
 
 pub const MESH_ANTI_ENTROPY_INTERVAL: i64 = 300;
 pub const MAX_BOT_ENTRIES: usize = 64;
@@ -265,7 +356,11 @@ pub const MAX_SYNC_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
 /// `config::write()` buffer: every serialized section at its bound, with the
 /// per-bot term scaled by the bots actually present.  A config that does not
 /// fit is NOT written (the old file is kept) — never a truncated one.
+/// The persisted roll-up plan (see `PendingRollup`): `rollup|` + target,
+/// variant, kind, min_from, hub_target, plan_set and both 512-byte bases.
+pub const ROLLUP_LINE_MAX: usize = 1536;
 pub const HUB_CONFIG_FIXED_MAX: usize = 8192
+    + ROLLUP_LINE_MAX
     + MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + MAX_HUB_USER_RECORDS * USER_LINE_MAX
     + MAX_HUB_USER_MASKS * MASK_LINE_MAX

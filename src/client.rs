@@ -15,7 +15,9 @@ use zeroize::Zeroizing;
 use crate::consts::*;
 use crate::cstr::{Fmt, Tok, atoll, now, sscanf, trunc_string};
 use crate::state::{BotAuthState, ClientType, HubClient, HubState, Lane, QueuedMsg};
-use crate::{admin, auth, crypto, hlog, mesh, net, opflow, presence, queue, ratelimit, storage};
+use crate::{
+    admin, auth, crypto, hlog, mesh, net, opflow, presence, queue, ratelimit, storage, upgrade,
+};
 
 const ADMIN_INFO: &[u8] = b"irchub-admin-session-v2";
 const PEER_INFO: &[u8] = b"irchub-peer-session-v1";
@@ -356,6 +358,17 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     // clear the flag.
     let hub_only_mutations = state.opt(OPT_HUB_ONLY_MUTATIONS);
 
+    // Task 6 — opt 'F' (OPT_CONFIG_FROZEN): an upgrade run is open, so the
+    // store holds still entirely.  Dropping the whole push (rather than
+    // filtering it) is deliberate: a bot that restarts mid-roll re-pushes its
+    // config on reconnect, and nothing here is lost that the bot will not
+    // offer again once the freeze lifts.
+    if upgrade::config_frozen(state) {
+        let id = state.clients[ci].id.clone();
+        hlog!("[UPGRADE] config frozen: REJECTED config push from {id}\n");
+        return;
+    }
+
     let work_buf = trunc_string(payload, MAX_BUFFER);
     let mut updates = 0u32;
     let mut proto_upgraded = false;
@@ -648,6 +661,14 @@ fn process_bot_delta(state: &mut HubState, ci: usize, payload: &str) {
         return;
     }
 
+    // Task 6 — opt 'F' (OPT_CONFIG_FROZEN): while an upgrade run is open the
+    // store does not move at all, or a node that restarts mid-roll comes back
+    // against a config its neighbours have not seen.
+    if upgrade::config_frozen(state) {
+        hlog!("[UPGRADE] config frozen: REJECTED bot delta '{key}' from {id}\n");
+        return;
+    }
+
     // Change 3b's per-bot key whitelist and value caps are enforced centrally
     // in storage::update_entry (the single choke point shared by this delta
     // path, the config push, the peer sync and config load), so a rejected
@@ -775,6 +796,8 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
             }
         }
         CMD_BOT_PRESENCE => presence::process_bot_presence(state, ci, payload),
+        CMD_UPGRADE_READY => upgrade::bot_report(state, CMD_UPGRADE_READY, payload),
+        CMD_UPGRADE_RESULT => upgrade::bot_report(state, CMD_UPGRADE_RESULT, payload),
         CMD_CONFIG_PUSH => process_bot_config_push(state, ci, payload),
         CMD_CONFIG_PULL => {
             hlog!("[HUB] Config PULL request from {}\n", state.clients[ci].id);
@@ -1060,6 +1083,9 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
     if state.peers[pi].friendly_name.is_empty() && crate::state::name_valid(&peer_name) {
         state.peers[pi].friendly_name = peer_name.clone();
     }
+    // If this process is the product of an upgrade this peer drove, close that
+    // run out now that there is a peer to tell.
+    upgrade::report_pending(state, ci);
     state.clients[ci].id = trunc_string(
         if !state.peers[pi].friendly_name.is_empty() {
             &state.peers[pi].friendly_name
@@ -1188,6 +1214,28 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         CMD_OP_FORWARD_FAILED => opflow::process_forward_op_failed(state, payload),
         CMD_CHAN_FWD_REQUEST => opflow::process_forward_chan_request(state, ci, payload),
         CMD_CHAN_FWD_REPLY => opflow::process_forward_chan_reply(state, ci, payload),
+        // A peer driving a run we are a node of...
+        CMD_UPGRADE_PREPARE => upgrade::peer_prepare(state, ci, payload),
+        CMD_UPGRADE_COMMIT => upgrade::peer_commit(state, ci, payload),
+        CMD_UPGRADE_ABORT => upgrade::peer_abort(state, ci, payload),
+        // ...and a peer answering a run WE drive — for itself, or forwarded on
+        // behalf of one of its own local bots (recorded as a remote node
+        // reached through this peer).
+        CMD_UPGRADE_READY => {
+            // If we are only a hop on someone else's run, pass it further up;
+            // otherwise it answers a run WE drive.  Routed by the peer's own
+            // hub uuid, not its friendly name: that is the key the node table
+            // and every upgrade frame use.
+            if !upgrade::relay_upstream(state, ci, CMD_UPGRADE_READY, payload) {
+                let via = upgrade::peer_uuid_of(state, ci);
+                upgrade::note_ready(state, payload, Some(&via));
+            }
+        }
+        CMD_UPGRADE_RESULT => {
+            if !upgrade::relay_upstream(state, ci, CMD_UPGRADE_RESULT, payload) {
+                upgrade::note_result(state, payload);
+            }
+        }
         // v3: per-bot independent keys.  A peer-forwarded bot rekey would
         // carry a private key, so it is rejected.
         CMD_PEER_REKEY_BOT => hlog!(

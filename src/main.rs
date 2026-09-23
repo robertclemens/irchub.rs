@@ -19,7 +19,7 @@ use irchub::state::{ClientType, HubClient, HubState, MaskRecord, UserRecord, nam
 use irchub::state::{Lane, QueuedMsg};
 use irchub::{
     auth, client, config, crypto, hlog, hlog_error, hlog_status, hlog_warning, logging, mesh, net,
-    presence, queue, ratelimit, storage, tool,
+    presence, queue, ratelimit, storage, tool, upgrade,
 };
 
 const PEER_INFO: &[u8] = b"irchub-peer-session-v1";
@@ -241,6 +241,9 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
         c.promote_buffers();
     }
     hlog!("[PEER] Handshake complete with {}\n", state.clients[ci].ip);
+    // If this process is the product of an upgrade a peer drove, close that
+    // run out now that there is a peer to tell (no-op otherwise).
+    upgrade::report_pending(state, ci);
 
     // Send a full config sync immediately via the BULK queue.  The queue
     // enforces a per-peer byte budget (BULK_SOFT_BUDGET_BPS) so the
@@ -329,6 +332,9 @@ fn maintenance(state: &mut HubState) {
     // Bot presence: gossip our own bots to the peers, expire entries nobody
     // refreshed, and push the tree to bots when it changed.  All volatile.
     presence::presence_tick(state, t);
+
+    // Rolling network upgrade: one step per tick (no-op unless running).
+    upgrade::tick(state, t);
 
     // Mesh-state gossip: every 5 min as a heartbeat, or immediately when the
     // peer topology changes (connect/disconnect sets mesh_state_dirty).
@@ -1072,6 +1078,18 @@ fn main() {
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
+    }
+
+    // The binary an upgrade replaces, and the one <exe>.prev sits beside.
+    // Resolved once, here, because exec() through the upgrade script needs an
+    // absolute path and argv[0] alone may be relative.  A hub that cannot
+    // resolve it still runs; update::commit refuses instead.
+    state.executable_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_default();
+    if state.executable_path.is_empty() {
+        hlog_warning!("Could not resolve my own path; self-upgrade disabled\n");
     }
 
     let Some(pid_file) = lock_pid_file() else {

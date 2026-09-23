@@ -13,7 +13,7 @@ use crate::state::{
     ClientType, HubState, IpAcl, IpAclAdd, MaskRecord, PeerConfig, UserRecord, lww_next_ts,
     name_valid, parse_uint,
 };
-use crate::{auth, client, crypto, hlog, mesh, opflow, presence, ratelimit, storage};
+use crate::{auth, client, crypto, hlog, mesh, opflow, presence, ratelimit, storage, upgrade};
 
 fn resp(state: &mut HubState, ci: usize, msg: &str) -> bool {
     client::send_response(state, ci, msg)
@@ -1509,7 +1509,60 @@ pub fn handle_admin_command(
     raw: &[u8],
     raw_len: usize,
 ) -> bool {
+    // Task 6: an upgrade run holds the config still.  One gate here covers
+    // every mutator rather than a check inside each; queries and the opt-flag
+    // command itself stay available (the latter is how a stuck freeze is
+    // lifted by hand).
+    if upgrade::config_frozen(state) && upgrade::admin_cmd_mutates_config(cmd) {
+        hlog!(
+            "[UPGRADE] Refused admin command 0x{:02x}: config frozen\n",
+            cmd
+        );
+        return resp(state, ci, "ERROR: config frozen (upgrade in progress)");
+    }
+
     match cmd {
+        CMD_ADMIN_UPGRADE_NET => {
+            // Payload: target_ver|variant|kind|min_from|base|hub_ver|hub_base
+            // — everything past the version is optional ("" = let each node
+            // decide).  target_ver/base are the bots' (ircbot-releases);
+            // hub_ver/hub_base are the hubs' own (irchub-releases), and an
+            // empty hub_ver leaves every hub where it is.  A base never
+            // contains '|' (upgrade::start refuses one), so only the last
+            // field is a tail.
+            let f: Vec<&str> = payload.splitn(7, '|').collect();
+            let at = |i: usize| f.get(i).copied().unwrap_or("");
+            let fd = state.clients[ci].fd;
+            let msg = upgrade::start(
+                state,
+                fd,
+                &upgrade::StartArgs {
+                    target_ver: at(0),
+                    variant: at(1),
+                    kind: at(2),
+                    min_from: at(3),
+                    base: at(4),
+                    hub_ver: at(5),
+                    hub_base: at(6),
+                },
+            );
+            resp(state, ci, &msg)
+        }
+
+        CMD_ADMIN_UPGRADE_STATUS => {
+            // A payload of "abort" stops a run in flight and rolls the mesh
+            // back.
+            if payload.eq_ignore_ascii_case("abort") {
+                if !state.upgrade.active {
+                    return resp(state, ci, "ERROR: no upgrade is running");
+                }
+                upgrade::abort(state, "aborted by admin");
+                return resp(state, ci, "OK:upgrade aborted; rolling back");
+            }
+            let out = upgrade::status(state);
+            resp(state, ci, &out)
+        }
+
         CMD_ADMIN_LIST_SUMMARY => {
             let out = storage::get_summary_list(state);
             resp(state, ci, &out)

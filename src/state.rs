@@ -307,6 +307,203 @@ impl Default for PeerConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Network upgrade orchestration
+// ---------------------------------------------------------------------------
+
+/// Where one node stands in a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UpgradeNodeState {
+    /// PREPARE sent, no answer yet.
+    #[default]
+    Pending,
+    /// Answered ready; waiting for its turn.
+    Ready,
+    /// Answered not-ready (`reason` says why).
+    Unable,
+    /// COMMIT sent; waiting for the restart.
+    Committed,
+    /// Back on the target version.
+    Done,
+    /// Said fail, or never came back in time.
+    Failed,
+}
+
+impl UpgradeNodeState {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Unable => "unable",
+            Self::Committed => "committing",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Which kind of node a row describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UpgradeNodeKind {
+    #[default]
+    Bot,
+    PeerHub,
+    /// This hub, which upgrades last.
+    SelfHub,
+}
+
+impl UpgradeNodeKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bot => "bot",
+            Self::PeerHub => "hub",
+            Self::SelfHub => "self",
+        }
+    }
+}
+
+/// The plan a completed run left behind, and the one node being walked up to
+/// it right now.  The plan is persisted in this hub's own `.irchub.cnf` (a
+/// `rollup|` line, hub-local and never replicated — its base may be a test
+/// hook's file:// URL) so a restart does not forget what the network is
+/// supposed to be running; the attempt in flight and the retry ledger stay
+/// volatile.  The roll-up is a convenience, never the record of what the
+/// network runs (that is each node's own presence), and it only ever chases a
+/// target some other bot is demonstrably running (`rollup_target_proven`).
+#[derive(Clone, Debug, Default)]
+pub struct PendingRollup {
+    pub have_plan: bool,
+    pub target: String,
+    pub variant: String,
+    pub kind: String,
+    pub min_from: String,
+    pub base: String,
+    /// The run's hub target, "" = hubs were not moved.
+    pub hub_target: String,
+    pub hub_base: String,
+    pub plan_set: i64,
+
+    /// The attempt in flight, if any.
+    pub active: bool,
+    /// Its own run id, distinct from any real run.
+    pub id: String,
+    /// The node being rolled up.
+    pub uuid: String,
+    pub node_kind: UpgradeNodeKind,
+    /// The version THIS attempt installs.
+    pub step: String,
+    pub started: i64,
+    pub committed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RollupTry {
+    pub uuid: String,
+    pub last_try: i64,
+    pub tries: i32,
+}
+
+/// One downstream node a FOLLOWER relays for.  A run reaches every hub in the
+/// mesh, whatever shape it is wired in: each follower re-broadcasts PREPARE to
+/// its own peers and forwards the answers back toward the driver, so a node
+/// several hops away is still a node of the run.  COMMIT and ABORT travel the
+/// same path in reverse, hop by hop, and this is the hop: "the peer I heard
+/// `uuid` from is where a frame for `uuid` goes next".
+#[derive(Clone, Debug, Default)]
+pub struct UpgradeRoute {
+    /// The node the driver is addressing.
+    pub uuid: String,
+    /// Hub uuid of the peer it was learned from (the next hop).
+    pub via: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UpgradeNode {
+    /// Bot uuid, or a peer hub's OWN hub uuid.
+    pub uuid: String,
+    /// Display label: a peer hub is known to the mesh by its friendly name,
+    /// while every upgrade frame it sends is keyed by its uuid, so the table
+    /// is keyed by uuid and prints this.  Empty for a bot.
+    pub name: String,
+    pub kind: UpgradeNodeKind,
+    /// Peer hub a remote bot is reached through, else empty.
+    pub via: String,
+    /// The connection it was reached on, -1 once gone.
+    pub fd: i32,
+    pub cur_version: String,
+    /// "c" / "rs".
+    pub variant: String,
+    pub arch: String,
+    pub libc: String,
+    pub state: UpgradeNodeState,
+    pub reason: String,
+    pub committed_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum UpgradePhase {
+    #[default]
+    Idle,
+    /// PREPARE fanned out, collecting READY/UNABLE.
+    Prepare,
+    /// Committing nodes wave by wave.
+    Rolling,
+    Done,
+    Failed,
+    Aborted,
+}
+
+impl UpgradePhase {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Prepare => "preparing",
+            Self::Rolling => "rolling",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+        }
+    }
+}
+
+/// `pending_upgrade_t`: the network upgrade this hub is driving, if any.
+///
+/// Modeled on [`PendingOpRequest`]: a run carries its own id, routes its
+/// status back down `origin_fd`, and every node it touches gets a row.
+/// Volatile on purpose — a hub that restarts mid-run has no business
+/// resuming someone else's plan; it comes back with the freeze flag still set
+/// in the replicated opt record, and an admin clears it explicitly.
+#[derive(Clone, Debug, Default)]
+pub struct PendingUpgrade {
+    pub active: bool,
+    /// `opflow::generate_request_id()`.
+    pub id: String,
+    pub target_ver: String,
+    /// "" = keep each node's own variant.
+    pub variant: String,
+    /// "" = let each node pick bin/src.
+    pub kind: String,
+    /// "*" = any.
+    pub min_from: String,
+    /// Release base override, "" = compiled-in.
+    pub base: String,
+    /// The hubs' own target.  ircbot and irchub are separate products with
+    /// separate version lines and separate release trees, so a hub node is
+    /// never checked against `target_ver`/`base` — those are the bots'.  An
+    /// empty `hub_ver` leaves every hub on the build it runs.
+    pub hub_ver: String,
+    /// irchub-releases override, "" = compiled-in.
+    pub hub_base: String,
+    /// Admin connection that started it, or -1.
+    pub origin_fd: i32,
+    pub started: i64,
+    pub phase_started: i64,
+    pub phase: UpgradePhase,
+    pub nodes: Vec<UpgradeNode>,
+    /// Why it ended, shown by CMD_ADMIN_UPGRADE_STATUS.
+    pub summary: String,
+}
+
 /// Track recently processed PURGE messages to prevent feedback loops.
 #[derive(Clone, Debug, Default)]
 pub struct RecentPurge {
@@ -661,6 +858,10 @@ pub struct HubState {
     /// IP this hub advertises itself as in the mesh.
     pub bind_ip: String,
     pub hub_uuid: String,
+    /// `realpath(argv[0])` — the binary an upgrade replaces, and the one
+    /// `<exe>.prev` sits beside.  Empty when it could not be resolved, which
+    /// disables self-upgrade rather than guessing.
+    pub executable_path: String,
     pub hub_friendly_name: String,
     /// The plaintext AES-GCM config-file password, held for the lifetime of
     /// the process (needed on every config write) in an mlock'd buffer.  See
@@ -690,6 +891,36 @@ pub struct HubState {
 
     pub pending_op_requests: Vec<PendingOpRequest>,
     pub pending_chan_requests: Vec<PendingChanRequest>,
+
+    /// The network upgrade this hub is driving, if any (one at a time).
+    pub upgrade: PendingUpgrade,
+
+    /// The upgrade this hub has agreed to take from ANOTHER hub, if any.  The
+    /// mesh is flat, so a hub is a follower and a driver at the same time and
+    /// the two must not share state: `upgrade` above is the run this hub
+    /// drives, these are a run someone else drives.  CMD_UPGRADE_COMMIT
+    /// carries only the id and the version, so the release base the driver
+    /// named at PREPARE time is remembered here.  Volatile — the upgrade
+    /// itself hands over through HUB_UPGRADE_MARKER_FILE.
+    pub follow_id: String,
+    /// uuid of the hub driving the followed run.
+    pub follow_origin: String,
+    /// The bots' target (relayed COMMITs).
+    pub follow_target: String,
+    /// This hub's own target, "" = stay put.
+    pub follow_hub_target: String,
+    pub follow_variant: String,
+    /// irchub-releases base for this hub.
+    pub follow_hub_base: String,
+    /// Whether this hub itself can take the followed run.
+    pub follow_self_ready: bool,
+    pub follow_prepared: i64,
+    /// Nodes below this hub in the followed run's fan-out tree (its own
+    /// peers' subtrees).  Rebuilt for every run; see [`UpgradeRoute`].
+    pub follow_routes: Vec<UpgradeRoute>,
+    /// Offline roll-up; see [`PendingRollup`].
+    pub rollup: PendingRollup,
+    pub rollup_tries: Vec<RollupTry>,
 
     pub ip_limits: Vec<IpRateLimit>,
 
@@ -773,6 +1004,7 @@ impl HubState {
             port: 0,
             bind_ip: String::new(),
             hub_uuid: String::new(),
+            executable_path: String::new(),
             hub_friendly_name: String::new(),
             config_pass: Locked::new(),
             hub_ed25519_priv: Locked::new(),
@@ -790,6 +1022,18 @@ impl HubState {
             pending_head: 0,
             pending_op_requests: vec![PendingOpRequest::default(); MAX_PENDING_OP_REQUESTS],
             pending_chan_requests: vec![PendingChanRequest::default(); MAX_PENDING_CHAN_REQUESTS],
+            upgrade: PendingUpgrade::default(),
+            follow_id: String::new(),
+            follow_origin: String::new(),
+            follow_target: String::new(),
+            follow_variant: String::new(),
+            follow_hub_target: String::new(),
+            follow_hub_base: String::new(),
+            follow_self_ready: false,
+            follow_prepared: 0,
+            follow_routes: Vec::new(),
+            rollup: PendingRollup::default(),
+            rollup_tries: Vec::new(),
             ip_limits: Vec::new(),
             ip_allow: Vec::new(),
             ip_deny: Vec::new(),
