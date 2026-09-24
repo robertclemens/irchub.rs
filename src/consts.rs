@@ -38,6 +38,9 @@ pub const HUB_PID_FILE: &str = ".irchub.pid";
 pub const HUB_PASS_FILE: &str = ".irchub.pass";
 pub const HUB_LOG_FILE: &str = ".irchub.log";
 pub const HUB_LOG_FILE_SIZE: i64 = 10 * 1024 * 1024;
+/// CMD_ADMIN_SET_LOG_SIZE / log_size| bounds (ircbot's L| takes the same).
+pub const HUB_LOG_SIZE_MIN: i64 = 1024;
+pub const HUB_LOG_SIZE_MAX: i64 = 1024 * 1024 * 1024;
 
 // Curve25519 key constants
 pub const ED25519_KEY_LEN: usize = 32;
@@ -69,8 +72,21 @@ pub const CHURN_WINDOW_SEC: i64 = 10;
 pub const CHURN_MAX_CONNS: i32 = 30;
 pub const CHURN_BLOCK_SEC: i64 = 30;
 
-pub const MAX_RECENT_PURGES: usize = 5;
-pub const PURGE_DEDUP_WINDOW: i64 = 60;
+/// PURGE loop suppression.  A purge is flooded to every peer and forwarded
+/// on, so on a big mesh each hub sees many copies, some of them minutes late
+/// when peer queues back up.  An id is random and never reused, so it is
+/// remembered long and in quantity: with 5 ids for 60 s, a late copy or one
+/// pushed out by newer purges was taken as new, re-applied and re-flooded,
+/// and a 10-hub mesh kept a dozen purges circulating for good.  An id-less
+/// purge (a hub that predates the id) can only be told apart by time, so it
+/// keeps the short window — a longer one would swallow a second, deliberate
+/// purge now.
+pub const MAX_RECENT_PURGES: usize = 64;
+/// The full config push to bots is coalesced: however many updates land in a
+/// burst, the bots get one push per this many seconds, with the latest state.
+pub const BOT_CONFIG_PUSH_COALESCE: i64 = 1;
+pub const PURGE_DEDUP_WINDOW: i64 = 3600;
+pub const PURGE_DEDUP_WINDOW_LEGACY: i64 = 60;
 pub const PURGE_ID_HEX: usize = 16;
 
 // OP_FORWARD_REQUEST deduplication — prevents packet storms
@@ -267,6 +283,55 @@ pub const CMD_UPGRADE_ABORT: u8 = 0x62;
 pub const CMD_ADMIN_UPGRADE_NET: u8 = 0x63;
 pub const CMD_ADMIN_UPGRADE_STATUS: u8 = 0x64;
 
+/// Sealed bot-to-bot relay across hubs (mirrors irchub/hub.h).  A
+/// CMD_BOT_RELAY whose target is not connected here is stamped with a request
+/// id and flooded to the peers; each delivers it as CMD_BOT_MSG to its own bot
+/// or passes it on minus the link it came in on.  Loop-suppressed by the
+/// shared seen-forwards ring; the target bot still checks the sealed payload
+/// against the sender's key, so a peer cannot forge a command.  Hub <-> hub
+/// only.  Payload: `id|origin_ts|sender_uuid|target_uuid|<sealed frame>`.
+pub const CMD_BOT_RELAY_FWD: u8 = 0x65;
+/// Seconds a forwarded relay stays deliverable.
+pub const BOT_RELAY_FWD_TTL: i64 = 30;
+
+/// Drop the roll-up plan mesh-wide (mirrors irchub/hub.h).  Every hub that
+/// followed a run keeps that run's plan in its own .irchub.cnf and walks any
+/// bot that comes back behind it up to the target; an admin's
+/// CMD_ADMIN_UPGRADE_STATUS "forget" drops it on the hub it is logged into
+/// and floods this frame so every other hub drops its copy too.
+/// Loop-suppressed by the seen-forwards ring, refused while the config
+/// freeze (a run in flight) is up.  Hub <-> hub only.  Payload: `id|origin_ts`.
+pub const CMD_UPGRADE_FORGET: u8 = 0x66;
+/// Seconds a forwarded forget stays valid.
+pub const UPGRADE_FORGET_TTL: i64 = 60;
+
+/// A config broadcast (mirrors irchub/hub.h): the payload of CMD_PEER_SYNC,
+/// sent by a hub to EVERY peer it is linked to (minus the one it forwards
+/// for).  The receiver may rely on that when it forwards what it accepted: a
+/// peer the sender is linked to right now already has the frame first hand,
+/// so the forwarder skips it (the split horizon in `mesh`).  Point-to-point
+/// syncs (the reply to CMD_SYNC_REQUEST, the sync a new link opens with) stay
+/// CMD_PEER_SYNC.  Sent only to a peer whose roster gossip carries l| lines;
+/// an older peer gets CMD_PEER_SYNC as before.
+pub const CMD_PEER_BCAST: u8 = 0x67;
+
+/// Admin -> Hub: this hub's traffic counters since it started (read-only,
+/// empty payload).  Reply lines, zero rows left out:
+///   stats|up=<s>
+///   cfg|sent=<n>|same=<n>|lost=<n>        full config pushes to bots
+///   sync|frames=<n>|noop=<n>|records=<n>|applied=<n>   PEER_SYNC/BCAST in
+///   op|0x<cc>|rx=<frames>/<bytes>|tx=<frames>/<bytes>
+/// "same" = a push skipped because that bot was already sent the identical
+/// config; "lost" = a queued push dropped on overflow (that bot is re-sent
+/// the next one in full).  rx counts every authenticated frame this hub
+/// decrypted, tx every frame it sent from its outbound queues (the ping/pong
+/// keepalive and direct admin/bot replies are not queued and not counted).
+pub const CMD_ADMIN_STATS: u8 = 0x68;
+/// After a peer link drops, ask the remaining peers for a full sync this many
+/// seconds later: a forwarder may have skipped us on the strength of that
+/// link in the moment before the drop reached its gossip.
+pub const SYNC_RESYNC_AFTER_LINK_LOSS: i64 = 5;
+
 pub const MAX_PENDING_CHAN_REQUESTS: usize = 200;
 pub const CHAN_REQUEST_TIMEOUT: i64 = 45;
 
@@ -298,6 +363,9 @@ pub const ROLLUP_TIMEOUT: i64 = 300;
 pub const MAX_ROLLUP_TRIES: usize = 64;
 /// Stop waiting for READY acks.
 pub const UPGRADE_PREPARE_TIMEOUT: i64 = 45;
+/// PREPARE also stays open this long after the node table last grew: a hub
+/// several hops out is unknown to the driver until its first READY arrives.
+pub const UPGRADE_PREPARE_SETTLE: i64 = 3;
 /// A committed node must be back, upgraded, by now.
 pub const UPGRADE_COMMIT_TIMEOUT: i64 = 420;
 /// Bots go in waves so a channel never loses every bot at once.
@@ -394,7 +462,19 @@ pub const TREE_ROW_MAX: usize = 256;
 pub const MAX_BOT_ROSTER: usize = (MAX_PEERS + 1) * MAX_BOTS;
 /// Tree rows: every hub node, every bot beneath one, plus the disconnected
 /// tail (bounded by the bots the config knows about).
-pub const MAX_TREE_ROWS: usize = MAX_PEERS + 1 + MAX_BOT_ROSTER + MAX_BOTS;
+/// Hubs the tree can know mesh-wide, direct peers or not.  Each hub's roster
+/// gossip is relayed hop by hop (see CMD_BOT_ROSTER), so a chain or a star
+/// still draws every hub; this bounds the per-origin relay bookkeeping.
+pub const MAX_MESH_HUBS: usize = 64;
+/// Hops a relayed roster frame may still travel when its origin sends it.
+pub const ROSTER_RELAY_HOPS: i32 = 16;
+/// Hub rows are hung no deeper than this; the bots render up to depth 32.
+pub const MAX_TREE_DEPTH: i32 = 30;
+/// A forwarder trusts a sender's reported links (for the sync split horizon)
+/// only while the report is this fresh: past one missed gossip round it
+/// forwards to everyone, as a hub that never reported links is.
+pub const SYNC_SPLIT_HORIZON_FRESH: i64 = 2 * BOT_PRESENCE_INTERVAL + 10;
+pub const MAX_TREE_ROWS: usize = MAX_MESH_HUBS + MAX_PEERS + 1 + MAX_BOT_ROSTER + MAX_BOTS;
 pub const MAX_TREE_PAYLOAD: usize = MAX_TREE_ROWS * TREE_ROW_MAX + PAYLOAD_SLACK;
 
 // ---- Mesh transport tuning (see docs/mesh.md) ------------------------------

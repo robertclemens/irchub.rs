@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 
 use crate::consts::*;
 use crate::cstr::now;
-use crate::hlog;
+
 use crate::state::{HubState, IpAcl, IpAclAdd, IpRateLimit};
 
 /// find_or_create_ip_limit(): the index of this IP's entry, or None when the
@@ -55,7 +55,7 @@ pub fn is_ip_allowed(state: &mut HubState, ip: &str) -> bool {
     let t = now();
 
     if state.ip_limits[i].blocked_until > 0 && t < state.ip_limits[i].blocked_until {
-        hlog!(
+        crate::hlog_warning!(
             "[RATE_LIMIT] IP {ip} is blocked until {}\n",
             state.ip_limits[i].blocked_until
         );
@@ -76,7 +76,7 @@ pub fn is_ip_allowed(state: &mut HubState, ip: &str) -> bool {
     state.ip_limits[i].churn_count += 1;
     if state.ip_limits[i].churn_count > CHURN_MAX_CONNS {
         state.ip_limits[i].blocked_until = t + CHURN_BLOCK_SEC;
-        hlog!(
+        crate::hlog_warning!(
             "[RATE_LIMIT] IP {ip} connection churn flood ({} conns/{CHURN_WINDOW_SEC}s) — blocked {CHURN_BLOCK_SEC}s\n",
             state.ip_limits[i].churn_count
         );
@@ -84,7 +84,7 @@ pub fn is_ip_allowed(state: &mut HubState, ip: &str) -> bool {
     }
 
     if state.ip_limits[i].active_connections >= MAX_CONNECTIONS_PER_IP {
-        hlog!(
+        crate::hlog_warning!(
             "[RATE_LIMIT] IP {ip} exceeded connection limit ({}/{MAX_CONNECTIONS_PER_IP})\n",
             state.ip_limits[i].active_connections
         );
@@ -125,14 +125,14 @@ pub fn record_failed_auth(state: &mut HubState, ip: &str) {
     state.ip_limits[i].failed_auth_count += 1;
     state.ip_limits[i].last_failed_auth = t;
 
-    hlog!(
+    crate::hlog_warning!(
         "[AUTH_FAIL] IP {ip} failed auth (attempt {}/{MAX_FAILED_AUTH_ATTEMPTS})\n",
         state.ip_limits[i].failed_auth_count
     );
 
     if state.ip_limits[i].failed_auth_count >= MAX_FAILED_AUTH_ATTEMPTS {
         state.ip_limits[i].blocked_until = t + FAILED_AUTH_BLOCK_DURATION;
-        hlog!(
+        crate::hlog_warning!(
             "[AUTH_BLOCK] IP {ip} blocked for {FAILED_AUTH_BLOCK_DURATION} seconds (too many failed attempts)\n"
         );
     }
@@ -239,7 +239,7 @@ pub fn check_ip_access_lists(state: &HubState, ip: &str) -> bool {
     if verdict == 0 {
         return true;
     }
-    hlog!(
+    crate::hlog_warning!(
         "[ACCESS_CONTROL] IP {ip} denied ({})\n",
         if verdict == 1 {
             "denylist"

@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 use crate::consts::*;
 use crate::cstr::{atoll, now, split_fields, trunc_string};
 use crate::state::{HubState, IpAclAdd, MaskRecord, UserRecord, lww_next_ts, parse_uint};
-use crate::{crypto, hlog, ratelimit, storage};
+use crate::{crypto, ratelimit, storage};
 
 // ---------------------------------------------------------------------------
 // a|/o| user record codec (docs/passwordless.md §3.1)
@@ -154,6 +154,16 @@ pub fn write(state: &mut HubState) {
     // Persist the Lamport seq so it survives a restart and stays monotonic.
     buf.push_str(&format!("lamport_seq|{}\n", state.next_lamport_seq));
 
+    // Log settings set over CMD_ADMIN_SET_LOG_LEVEL / _SIZE: written only
+    // when they differ from the defaults, so an untouched hub's file is
+    // unchanged.
+    if state.log_level != HUB_DEFAULT_LOG_LEVEL {
+        buf.push_str(&format!("log_level|{}\n", state.log_level));
+    }
+    if state.log_max_size > 0 && state.log_max_size != HUB_LOG_FILE_SIZE {
+        buf.push_str(&format!("log_size|{}\n", state.log_max_size));
+    }
+
     if state.purge_days_setting > 0 {
         buf.push_str(&format!("purge_days|{}\n", state.purge_days_setting));
     }
@@ -259,8 +269,8 @@ pub fn write(state: &mut HubState) {
         seen.push((u.typ, u.name.clone()));
         let line = format_user_record(u, false);
         if line.len() >= USER_LINE_MAX {
-            hlog!(
-                "[CONFIG][ERROR] user record for '{}' exceeds its line bound; NOT written (previous file kept)\n",
+            crate::hlog_error!(
+                "[CONFIG] user record for '{}' exceeds its line bound; NOT written (previous file kept)\n",
                 u.name
             );
             return;
@@ -302,8 +312,8 @@ pub fn write(state: &mut HubState) {
     }
 
     if buf.len() >= estimated_size {
-        hlog!(
-            "[CONFIG][ERROR] config exceeds its {estimated_size}-byte bound; NOT written (previous file kept)\n"
+        crate::hlog_error!(
+            "[CONFIG] config exceeds its {estimated_size}-byte bound; NOT written (previous file kept)\n"
         );
         return;
     }
@@ -313,7 +323,7 @@ pub fn write(state: &mut HubState) {
     let mut salt = [0u8; SALT_SIZE];
     let mut iv = [0u8; GCM_IV_LEN];
     if !crypto::random_bytes(&mut salt) || !crypto::random_bytes(&mut iv) {
-        hlog!("RAND_bytes failed; aborting config write\n");
+        crate::hlog_error!("[HUB] RAND_bytes failed; aborting config write\n");
         return;
     }
 
@@ -323,7 +333,7 @@ pub fn write(state: &mut HubState) {
 
     let Some((ct, tag)) = crypto::gcm_encrypt_detached(key.as_ref(), &iv, &[], buf.as_bytes())
     else {
-        hlog!("EVP encryption failed; aborting config write\n");
+        crate::hlog_error!("[HUB] EVP encryption failed; aborting config write\n");
         return;
     };
 
@@ -362,7 +372,7 @@ pub fn write(state: &mut HubState) {
 fn load_ip_acl_line(state: &mut HubState, list: char, v: &str) -> bool {
     let name = if list == 'w' { "allowlist" } else { "denylist" };
     let Some(s_ts) = v.rfind('|') else {
-        hlog!("[CONFIG] Dropping {name} line without a timestamp\n");
+        crate::hlog_warning!("[CONFIG] Dropping {name} line without a timestamp\n");
         return false;
     };
     let ts = atoll(&v[s_ts + 1..]);
@@ -372,7 +382,7 @@ fn load_ip_acl_line(state: &mut HubState, list: char, v: &str) -> bool {
         Some(i) => {
             let op = &head[i + 1..];
             if op != "add" {
-                hlog!(
+                crate::hlog_warning!(
                     "[CONFIG] Dropping {name} entry '{}' (op '{}')\n",
                     trunc_string(&head[..i], 41),
                     trunc_string(op, 9)
@@ -384,7 +394,7 @@ fn load_ip_acl_line(state: &mut HubState, list: char, v: &str) -> bool {
         None => (head, false),
     };
     let Some(mut e) = ratelimit::ip_acl_parse(pattern) else {
-        hlog!(
+        crate::hlog_warning!(
             "[CONFIG] Dropping invalid {name} entry '{}' (not an IPv4 address or CIDR)\n",
             trunc_string(pattern, 41)
         );
@@ -393,7 +403,7 @@ fn load_ip_acl_line(state: &mut HubState, list: char, v: &str) -> bool {
     e.added = ts;
     let r = ratelimit::ip_acl_add(state, list, &e);
     if r == IpAclAdd::Full {
-        hlog!(
+        crate::hlog_warning!(
             "[CONFIG] {name} full ({MAX_IP_ACL_ENTRIES}); dropping {}\n",
             e.pattern()
         );
@@ -495,7 +505,7 @@ fn load_peer_line(state: &mut HubState, v: &str) {
                             p.has_pubkey = true;
                         }
                         other => {
-                            hlog!(
+                            crate::hlog_warning!(
                                 "[PEER] peer {} pubkey wrong length ({}, need {COMBINED_KEY_LEN}) — ignoring; v2 auth disabled for this peer\n",
                                 p.uuid,
                                 other.map_or(0, |d| d.len())
@@ -605,7 +615,7 @@ fn dedup_records(state: &mut HubState) -> bool {
                 if incoming_wins {
                     users[j] = u.clone();
                 }
-                hlog!(
+                crate::hlog_debug!(
                     "[HUB] Dedup: merged duplicate '{}' {} record\n",
                     u.name,
                     u.typ
@@ -623,7 +633,7 @@ fn dedup_records(state: &mut HubState) -> bool {
         }
         // Drop masks whose UUID has no surviving owner.
         if !users.iter().any(|u| u.uuid == m.uuid) {
-            hlog!(
+            crate::hlog_debug!(
                 "[HUB] Dedup: dropped orphaned mask '{}' (UUID {})\n",
                 m.mask,
                 m.uuid
@@ -650,7 +660,7 @@ fn dedup_records(state: &mut HubState) -> bool {
     let changed =
         users.len() != state.user_records.len() || masks.len() != state.mask_records.len();
     if changed {
-        hlog!(
+        crate::hlog_info!(
             "[HUB] Config dedup: users {}->{}, masks {}->{}\n",
             state.user_records.len(),
             users.len(),
@@ -673,20 +683,20 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
     if let Ok(md) = fs::metadata(HUB_CONFIG_FILE) {
         let mode = md.permissions().mode();
         if mode & 0o177 != 0 {
-            hlog!(
-                "[WARN] {HUB_CONFIG_FILE} has insecure permissions {:04o} — should be 0600\n",
+            crate::hlog_warning!(
+                "[HUB] {HUB_CONFIG_FILE} has insecure permissions {:04o} — should be 0600\n",
                 mode & 0o777
             );
         }
     }
 
     let Ok(file) = fs::read(HUB_CONFIG_FILE) else {
-        hlog!("Config file not found\n");
+        crate::hlog_error!("[HUB] Config file not found\n");
         return false;
     };
     let hdr = SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN;
     if file.len() <= hdr {
-        hlog!("Invalid config file size\n");
+        crate::hlog_error!("[HUB] Invalid config file size\n");
         return false;
     }
     let salt = &file[..SALT_SIZE];
@@ -696,7 +706,7 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
 
     let key = crypto::derive_config_key(password.as_bytes(), salt);
     let Some(plain) = crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag) else {
-        hlog!("Config decryption failed (wrong password or corrupted file)\n");
+        crate::hlog_error!("[HUB] Config decryption failed (wrong password or corrupted file)\n");
         return false;
     };
     let text = Zeroizing::new(String::from_utf8_lossy(&plain).into_owned());
@@ -729,6 +739,16 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
             // lose the field on the next save; admins must already exist as
             // a| records.
             "admin" => {}
+            "log_level" => {
+                state.log_level = crate::cstr::atoi(v).clamp(LOG_NONE, LOG_DEBUG);
+            }
+            "log_size" => {
+                state.log_max_size = v
+                    .trim()
+                    .parse::<i64>()
+                    .unwrap_or(0)
+                    .clamp(HUB_LOG_SIZE_MIN, HUB_LOG_SIZE_MAX);
+            }
             "purge_days" => {
                 state.purge_days_setting = crate::cstr::atoi(v).max(0);
             }
@@ -771,7 +791,7 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                     r.have_plan = true;
                 } else {
                     state.rollup = Default::default();
-                    hlog!("[CONFIG] Ignoring a malformed rollup| line\n");
+                    crate::hlog_warning!("[CONFIG] Ignoring a malformed rollup| line\n");
                 }
             }
             "lamport_seq" => {
@@ -791,7 +811,7 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                     crypto::wipe(&mut c);
                     state.hub_keys_loaded = true;
                 }
-                Some(_) => hlog!(
+                Some(_) => crate::hlog_error!(
                     "[HUB] Hub private key in config is not 64 bytes (legacy RSA?). Re-run -setup with a Curve25519 key.\n"
                 ),
                 None => {}
@@ -851,13 +871,13 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
     }
 
     if cfg_legacy_users > 0 {
-        hlog!(
+        crate::hlog_info!(
             "[HUB] Config migrated to passwordless records ({cfg_legacy_users} legacy line(s)); passwords dropped\n"
         );
     }
     for u in &state.user_records {
         if u.is_active && !u.has_pubkey {
-            hlog!(
+            crate::hlog_warning!(
                 "[HUB] {} '{}' has no public key and cannot authenticate until given one (hub_admin: Change user public key)\n",
                 if u.typ == 'a' { "Admin" } else { "Oper" },
                 u.name

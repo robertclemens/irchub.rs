@@ -20,7 +20,7 @@
 use crate::consts::*;
 use crate::cstr::{now, trunc_string};
 use crate::state::{BotAuthState, BotConfig, ClientType, HubState, PendingBot};
-use crate::{crypto, hlog, net, presence, ratelimit, storage};
+use crate::{crypto, net, presence, ratelimit, storage};
 
 /// Load a bot's combined 64-byte public key from the hub config.
 fn load_bot_combined_pub(state: &HubState, uuid: &str) -> Option<[u8; COMBINED_KEY_LEN]> {
@@ -74,6 +74,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         // invalid byte to U+FFFD, which is exactly what the sanitizer is
         // there to show.
         crate::logging::hub_log_with_raw(
+            LOG_DEBUG,
             &format!("[HUB] Bot auth attempt from {ip} with UUID: "),
             data,
             "\n",
@@ -82,6 +83,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         let authorized = state.bots.iter().any(|b| b.uuid == uuid && b.is_active);
         if !authorized {
             crate::logging::hub_log_with_raw(
+                LOG_WARNING,
                 "[HUB] Unauthorized bot UUID: ",
                 data,
                 &format!(" from {ip}\n"),
@@ -93,11 +95,11 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
 
         let mut challenge = [0u8; 32];
         if !crypto::random_bytes(&mut challenge) {
-            hlog!("[HUB][ERROR] Failed to generate challenge\n");
+            crate::hlog_error!("[HUB] Failed to generate challenge\n");
             return false;
         }
         let Some((eph_priv, eph_pub)) = crypto::gen_ephemeral_x25519() else {
-            hlog!("[HUB][ERROR] Ephemeral X25519 keygen failed\n");
+            crate::hlog_error!("[HUB] Ephemeral X25519 keygen failed\n");
             return false;
         };
 
@@ -117,7 +119,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             return false;
         };
         if !net::write_framed(sock, &out_buf) {
-            hlog!("[HUB][ERROR] Failed to send v2 challenge to {uuid}\n");
+            crate::hlog_warning!("[HUB] Failed to send v2 challenge to {uuid}\n");
             return false;
         }
 
@@ -129,7 +131,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         c.bot_auth_state = BotAuthState::ChallengeSent;
         c.last_seen = now();
 
-        hlog!("[HUB] Sent v2 signed Curve25519 challenge to bot {uuid}\n");
+        crate::hlog_debug!("[HUB] Sent v2 signed Curve25519 challenge to bot {uuid}\n");
         return true;
     }
 
@@ -139,15 +141,15 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
     {
         let id = state.clients[ci].id.clone();
         let ip = state.clients[ci].ip.clone();
-        hlog!("[HUB] Received signature from bot {id} ({packet_len} bytes)\n");
+        crate::hlog_debug!("[HUB] Received signature from bot {id} ({packet_len} bytes)\n");
 
         if packet_len != ED25519_SIG_LEN || !state.clients[ci].bot_eph_priv_set {
-            hlog!("[HUB][ERROR] Bad signature size or state from {id}\n");
+            crate::hlog_warning!("[HUB] Bad signature size or state from {id}\n");
             return false;
         }
 
         let Some(bot_combined) = load_bot_combined_pub(state, &id) else {
-            hlog!("[HUB][ERROR] No public key for bot {id}\n");
+            crate::hlog_warning!("[HUB] No public key for bot {id}\n");
             return false;
         };
         let (bot_ed_pub, bot_x_pub) = crypto::pub_halves(&bot_combined);
@@ -158,7 +160,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             &state.clients[ci].challenge,
         );
         if !crypto::ed25519_verify(&bot_ed_pub, &msg, data) {
-            hlog!("[HUB][ERROR] Invalid signature from bot {id}\n");
+            crate::hlog_warning!("[HUB] Invalid signature from bot {id}\n");
             ratelimit::record_failed_auth(state, &ip);
             return false;
         }
@@ -166,7 +168,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         let Some(shared) =
             crypto::x25519_derive(&state.clients[ci].bot_eph_x25519_priv, &bot_x_pub)
         else {
-            hlog!("[HUB][ERROR] X25519 derive failed for {id}\n");
+            crate::hlog_error!("[HUB] X25519 derive failed for {id}\n");
             return false;
         };
 
@@ -184,7 +186,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             c.bot_eph_priv_set = false;
         }
         if !ok {
-            hlog!("[HUB][ERROR] HKDF failed for {id}\n");
+            crate::hlog_error!("[HUB] HKDF failed for {id}\n");
             return false;
         }
         state.clients[ci].session_key = session_key;
@@ -193,7 +195,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         let Some((body, tag)) =
             crypto::aes_gcm_encrypt(&[0x01], state.clients[ci].session_key.as_ref())
         else {
-            hlog!("[HUB][ERROR] ACK encrypt failed for {id}\n");
+            crate::hlog_error!("[HUB] ACK encrypt failed for {id}\n");
             return false;
         };
         let mut ack = body;
@@ -205,7 +207,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
                 return false;
             };
             if !net::write_framed(sock, &ack) {
-                hlog!("[HUB][ERROR] Failed to send v2 ACK to {id}\n");
+                crate::hlog_warning!("[HUB] Failed to send v2 ACK to {id}\n");
                 return false;
             }
             c.typ = ClientType::Bot;
@@ -224,7 +226,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         presence::roster_mark_dirty(state);
         state.last_presence_gossip = 0;
 
-        hlog!("[HUB] Bot {id} authenticated (Curve25519)\n");
+        crate::hlog_info!("[HUB] Bot {id} authenticated (Curve25519)\n");
         return true;
     }
 
@@ -296,7 +298,7 @@ pub fn disconnect_client(state: &mut HubState, ci: usize) {
         let c = &state.clients[ci];
         (c.ip.clone(), c.fd, c.typ, c.authenticated)
     };
-    hlog!("[HUB] Disconnecting client {ip} (FD: {fd})\n");
+    crate::hlog_info!("[HUB] Disconnecting client {ip} (FD: {fd})\n");
 
     ratelimit::decrement_active_connections(state, &ip);
 

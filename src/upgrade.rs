@@ -20,7 +20,7 @@ use crate::state::{
     ClientType, HubState, RollupTry, UpgradeNode, UpgradeNodeKind, UpgradeNodeState, UpgradePhase,
     UpgradeRoute, lww_next_ts,
 };
-use crate::{client, hlog, mesh, opflow, queue, update};
+use crate::{client, mesh, opflow, queue, update};
 
 // ---------------------------------------------------------------------------
 // Config freeze (Task 6)
@@ -45,7 +45,7 @@ fn opt_flag_set(state: &mut HubState, flag: char, on: bool) {
     let sync_pkt = format!("opt|{}|{}\n", state.opt_flags, state.opt_flags_ts);
     mesh::broadcast_sync_to_peers(state, &sync_pkt, -1);
     client::broadcast_full_config_to_all_bots(state);
-    hlog!(
+    crate::hlog_info!(
         "[UPGRADE] opt flags now '{}'\n",
         if state.opt_flags.is_empty() {
             "(none)"
@@ -201,7 +201,7 @@ fn finish(state: &mut HubState, phase: UpgradePhase, summary: &str) {
     state.upgrade.phase = phase;
     state.upgrade.summary = clean(summary, 192);
     opt_flag_set(state, OPT_CONFIG_FROZEN, false);
-    hlog!(
+    crate::hlog_info!(
         "[UPGRADE] Run {} {}: {}\n",
         state.upgrade.id,
         phase.name(),
@@ -258,7 +258,7 @@ pub fn abort(state: &mut HubState, reason: &str) {
             UpgradeNodeKind::SelfHub => {}
         }
     }
-    hlog!(
+    crate::hlog_info!(
         "[UPGRADE] Abort {} sent to {} node(s): {}\n",
         state.upgrade.id,
         told,
@@ -322,7 +322,7 @@ fn commit_node(state: &mut HubState, ni: usize) -> bool {
     }
     node.state = UpgradeNodeState::Committed;
     node.committed_at = now();
-    hlog!(
+    crate::hlog_info!(
         "[UPGRADE] COMMIT {} -> {} ({})\n",
         state.upgrade.id,
         uuid,
@@ -338,7 +338,7 @@ fn commit_self(state: &mut HubState, ni: usize) -> bool {
         node.state = UpgradeNodeState::Committed;
         node.committed_at = now();
     }
-    hlog!(
+    crate::hlog_info!(
         "[UPGRADE] COMMIT {} -> this hub ({})\n",
         state.upgrade.id,
         state.upgrade.hub_ver
@@ -373,7 +373,7 @@ fn commit_self(state: &mut HubState, ni: usize) -> bool {
                 192,
             );
             state.upgrade.phase = UpgradePhase::Failed;
-            hlog!("[UPGRADE] This hub could not take {ver}: {e}\n");
+            crate::hlog_warning!("[UPGRADE] This hub could not take {ver}: {e}\n");
             false
         }
     }
@@ -455,6 +455,8 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         phase_started: now(),
         phase: UpgradePhase::Prepare,
         nodes: Vec::new(),
+        last_added: now(),
+        ready_seq_next: 0,
         summary: String::new(),
     };
 
@@ -528,6 +530,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
                     },
                     ..UpgradeNode::default()
                 });
+                state.upgrade.last_added = now();
                 if delivered {
                     bots += 1;
                 }
@@ -537,7 +540,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
                 // not on the connection.  Its READY ack carries the
                 // authoritative one.
                 if key.is_empty() {
-                    hlog!(
+                    crate::hlog_warning!(
                         "[UPGRADE] Peer {} has no uuid yet — left out of run {}\n",
                         name,
                         state.upgrade.id
@@ -564,6 +567,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
                     },
                     ..UpgradeNode::default()
                 });
+                state.upgrade.last_added = now();
                 if delivered {
                     peers += 1;
                 }
@@ -599,8 +603,9 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         reason: self_reason,
         ..UpgradeNode::default()
     });
+    state.upgrade.last_added = now();
 
-    hlog!(
+    crate::hlog_info!(
         "[UPGRADE] Run {} -> {}: PREPARE to {} bot(s) and {} peer hub(s); this hub is {}\n",
         state.upgrade.id,
         state.upgrade.target_ver,
@@ -623,7 +628,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
 pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) {
     let f: Vec<&str> = payload.splitn(9, '|').collect();
     if f.len() < 7 {
-        hlog!("[UPGRADE] Malformed UPGRADE_READY\n");
+        crate::hlog_warning!("[UPGRADE] Malformed UPGRADE_READY\n");
         return;
     }
     let (id, uuid) = (f[0], f[1]);
@@ -631,7 +636,7 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
         return;
     }
     if !state.upgrade.active || state.upgrade.id != id {
-        hlog!(
+        crate::hlog_debug!(
             "[UPGRADE] READY for unknown run {} from {} — ignoring\n",
             id,
             uuid
@@ -657,11 +662,11 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
             // through the peer so the rolling plan drives it and STATUS
             // accounts for it network-wide.
             let Some(via) = from_peer else {
-                hlog!("[UPGRADE] READY from {} which is not in run {}\n", uuid, id);
+                crate::hlog_warning!("[UPGRADE] READY from {} which is not in run {}\n", uuid, id);
                 return;
             };
             if state.upgrade.nodes.len() >= MAX_UPGRADE_NODES {
-                hlog!("[UPGRADE] No room for remote node {} in run {}\n", uuid, id);
+                crate::hlog_warning!("[UPGRADE] No room for remote node {} in run {}\n", uuid, id);
                 return;
             }
             let kind = if f.get(8).copied().unwrap_or("") == "h" {
@@ -676,10 +681,15 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
                 fd: -1,
                 ..UpgradeNode::default()
             });
+            state.upgrade.last_added = now();
             state.upgrade.nodes.len() - 1
         }
     };
     let reason = clean(f.get(7).copied().unwrap_or(""), 128);
+    if state.upgrade.nodes[ni].ready_seq == 0 {
+        state.upgrade.ready_seq_next += 1;
+        state.upgrade.nodes[ni].ready_seq = state.upgrade.ready_seq_next;
+    }
     let node = &mut state.upgrade.nodes[ni];
     // Explicit truncation: a version longer than the roster field is cut on
     // purpose, exactly as the presence path cuts it for the tree.
@@ -693,7 +703,12 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
     } else {
         UpgradeNodeState::Unable
     };
-    hlog!(
+    if node.kind == UpgradeNodeKind::PeerHub
+        && let Some(rel) = f.get(9).and_then(|v| v.parse::<usize>().ok())
+    {
+        node.relayed = if rel <= MAX_UPGRADE_NODES { rel } else { 0 };
+    }
+    crate::hlog_debug!(
         "[UPGRADE] {} is {} ({} {}/{}){}{}\n",
         uuid,
         node.state.name(),
@@ -731,7 +746,7 @@ pub fn bot_report(state: &mut HubState, cmd: u8, payload: &str) {
 pub fn note_result(state: &mut HubState, payload: &str) {
     let f: Vec<&str> = payload.splitn(5, '|').collect();
     if f.len() < 4 {
-        hlog!("[UPGRADE] Malformed UPGRADE_RESULT\n");
+        crate::hlog_warning!("[UPGRADE] Malformed UPGRADE_RESULT\n");
         return;
     }
     let (id, uuid, status) = (f[0], f[1], f[2]);
@@ -756,7 +771,7 @@ pub fn note_result(state: &mut HubState, payload: &str) {
     if node.state == UpgradeNodeState::Failed && node.reason.is_empty() {
         node.reason = status.to_string();
     }
-    hlog!(
+    crate::hlog_debug!(
         "[UPGRADE] {} reports {} ({}){}{}\n",
         uuid,
         status,
@@ -785,7 +800,7 @@ pub fn note_presence(state: &mut HubState, uuid: &str, version: &str) {
     node.cur_version = trunc_string(version, ROSTER_VERSION_MAX + 1);
     if version == target {
         node.state = UpgradeNodeState::Done;
-        hlog!("[UPGRADE] {} is back on {}\n", uuid, version);
+        crate::hlog_info!("[UPGRADE] {} is back on {}\n", uuid, version);
     }
 }
 
@@ -800,6 +815,85 @@ pub fn note_presence(state: &mut HubState, uuid: &str, version: &str) {
 // a node that cannot take the build is re-committed on every reconnect.  When
 // the node sits below the target's min_from_version the walk is taken one
 // release at a time, reading the steps out of the manifest.
+
+/// Drop the roll-up plan (and any attempt in flight) from memory and from
+/// .irchub.cnf.  Returns true when there was a plan to drop.
+pub fn rollup_forget(state: &mut HubState, why: &str) -> bool {
+    rollup_end(state, why, false);
+    let had = state.rollup.have_plan;
+    if had {
+        crate::hlog_info!(
+            "[ROLLUP] Plan {} (hubs {}) dropped: {}\n",
+            state.rollup.target,
+            if state.rollup.hub_target.is_empty() {
+                "-"
+            } else {
+                &state.rollup.hub_target
+            },
+            why
+        );
+    }
+    state.rollup = crate::state::PendingRollup::default();
+    state.rollup_tries.clear();
+    if had {
+        crate::config::write(state);
+    }
+    had
+}
+
+/// The admin's "forget": drop our plan and flood CMD_UPGRADE_FORGET so every
+/// other hub drops its copy.  Returns the admin reply.
+pub fn admin_forget(state: &mut HubState) -> String {
+    if state.upgrade.active || config_frozen(state) {
+        return "ERROR: an upgrade is running — the plan is kept until it ends (abort it first)"
+            .to_string();
+    }
+    let had = state.rollup.have_plan.then(|| state.rollup.target.clone());
+    rollup_forget(state, "forgotten by admin");
+    let id = opflow::generate_request_id();
+    opflow::forward_seen_check_and_add(state, &id);
+    let fwd = format!("{id}|{}", now());
+    let mut told = 0;
+    for ci in state.peer_clients() {
+        if queue::send_urgent(&mut state.clients[ci], CMD_UPGRADE_FORGET, &fwd) {
+            told += 1;
+        }
+    }
+    match had {
+        Some(t) => format!(
+            "OK:roll-up plan {t} forgotten on this hub; told {told} peer hub(s) to drop theirs"
+        ),
+        None => format!("OK:no roll-up plan on this hub; told {told} peer hub(s) to drop theirs"),
+    }
+}
+
+/// CMD_UPGRADE_FORGET from a peer: drop our plan and pass it on.
+pub fn peer_forget(state: &mut HubState, ci: usize, payload: &str) {
+    let f: Vec<&str> = payload.split('|').collect();
+    if f.len() < 2 || f[0].is_empty() || f[0].len() >= 64 || !plan_field_ok(f[0]) {
+        let ip = state.clients[ci].ip.clone();
+        crate::hlog_warning!("[ROLLUP] Malformed UPGRADE_FORGET from peer {ip}\n");
+        return;
+    }
+    let ts = crate::cstr::atoll(f[1]);
+    let age = now() - ts;
+    if ts <= 0 || !(-UPGRADE_FORGET_TTL..=UPGRADE_FORGET_TTL).contains(&age) {
+        return;
+    }
+    if opflow::forward_seen_check_and_add(state, f[0]) {
+        return;
+    }
+    // A plan is never dropped under a run: the freeze is replicated, so every
+    // hub sees the same answer the admin's own hub gave.
+    if !state.upgrade.active && !config_frozen(state) {
+        rollup_forget(state, "forgotten by an admin on another hub");
+    }
+    for pi in state.peer_clients() {
+        if pi != ci {
+            queue::send_urgent(&mut state.clients[pi], CMD_UPGRADE_FORGET, payload);
+        }
+    }
+}
 
 /// End the attempt in flight and charge it to the node's ledger.
 fn rollup_end(state: &mut HubState, why: &str, charge: bool) {
@@ -824,7 +918,7 @@ fn rollup_end(state: &mut HubState, why: &str, charge: bool) {
             });
         }
     }
-    hlog!(
+    crate::hlog_info!(
         "[ROLLUP] {} -> {}: {}\n",
         state.rollup.uuid,
         state.rollup.step,
@@ -915,7 +1009,7 @@ fn rollup_consider(state: &mut HubState, uuid: &str, node_kind: UpgradeNodeKind,
     let step = match update::next_step(&base, &variant, version, &target) {
         Ok(v) => v,
         Err(why) => {
-            hlog!("[ROLLUP] No step read for {uuid} ({why}); aiming at {target}\n");
+            crate::hlog_info!("[ROLLUP] No step read for {uuid} ({why}); aiming at {target}\n");
             target.clone()
         }
     };
@@ -943,7 +1037,9 @@ fn rollup_consider(state: &mut HubState, uuid: &str, node_kind: UpgradeNodeKind,
         rollup_end(state, "could not deliver PREPARE", true);
         return;
     }
-    hlog!("[ROLLUP] {uuid} is on {version}, the network is on {target}: PREPARE {id} -> {step}\n");
+    crate::hlog_info!(
+        "[ROLLUP] {uuid} is on {version}, the network is on {target}: PREPARE {id} -> {step}\n"
+    );
 }
 
 /// `CMD_UPGRADE_READY` carrying a roll-up id.  Returns true when it was one.
@@ -983,7 +1079,7 @@ fn rollup_note_ready(state: &mut HubState, payload: &str) -> bool {
     }
     state.rollup.committed = true;
     state.rollup.started = now();
-    hlog!("[ROLLUP] COMMIT {id} -> {uuid} ({step})\n");
+    crate::hlog_info!("[ROLLUP] COMMIT {id} -> {uuid} ({step})\n");
     true
 }
 
@@ -1040,6 +1136,24 @@ fn rollup_tick(state: &mut HubState, t_now: i64) {
 // The rolling plan
 // ---------------------------------------------------------------------------
 
+/// Relayed-bot READYs still owed: what the hub nodes said they relayed to,
+/// less the remote bots already in the table.  Bounded by the PREPARE timeout
+/// like every other wait.
+fn relays_owed(u: &crate::state::PendingUpgrade) -> usize {
+    let promised: usize = u
+        .nodes
+        .iter()
+        .filter(|n| n.kind == UpgradeNodeKind::PeerHub)
+        .map(|n| n.relayed)
+        .sum();
+    let seen = u
+        .nodes
+        .iter()
+        .filter(|n| n.kind == UpgradeNodeKind::Bot && !n.via.is_empty())
+        .count();
+    promised.saturating_sub(seen)
+}
+
 /// One step per maintenance tick.  A no-op unless a run is active.
 pub fn tick(state: &mut HubState, now_ts: i64) {
     rollup_tick(state, now_ts);
@@ -1049,7 +1163,11 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
 
     if state.upgrade.phase == UpgradePhase::Prepare {
         let timed_out = now_ts - state.upgrade.phase_started > UPGRADE_PREPARE_TIMEOUT;
-        if count(state, UpgradeNodeState::Pending, None) > 0 && !timed_out {
+        if !timed_out
+            && (count(state, UpgradeNodeState::Pending, None) > 0
+                || relays_owed(&state.upgrade) > 0
+                || now_ts - state.upgrade.last_added < UPGRADE_PREPARE_SETTLE)
+        {
             return;
         }
         for n in &mut state.upgrade.nodes {
@@ -1065,7 +1183,7 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
         }
         state.upgrade.phase = UpgradePhase::Rolling;
         state.upgrade.phase_started = now_ts;
-        hlog!(
+        crate::hlog_info!(
             "[UPGRADE] Run {} rolling: {} node(s) ready\n",
             state.upgrade.id,
             ready
@@ -1128,14 +1246,33 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
 
     // Bots are settled.  Peer hubs go one at a time, and only once nothing is
     // mid-restart, so the mesh never drops below one reachable hub.
+    //
+    // Deepest first: a follower's run state (follow_id, its COMMIT routes) is
+    // volatile, so a hub that restarts can no longer carry a COMMIT to the
+    // hubs it routes for.  The latest READY is always from a hub no other
+    // pending hub routes through (see `UpgradeNode::ready_seq`).  This hub
+    // goes after every peer hub: it restarts last and its run table goes
+    // with it.
     if in_flight > 0 {
         return;
     }
+    let ready =
+        |n: &UpgradeNode, k: UpgradeNodeKind| n.state == UpgradeNodeState::Ready && n.kind == k;
     let next_hub = state
         .upgrade
         .nodes
         .iter()
-        .position(|n| n.state == UpgradeNodeState::Ready && n.kind != UpgradeNodeKind::Bot);
+        .enumerate()
+        .filter(|(_, n)| ready(n, UpgradeNodeKind::PeerHub))
+        .max_by_key(|(_, n)| n.ready_seq)
+        .map(|(i, _)| i)
+        .or_else(|| {
+            state
+                .upgrade
+                .nodes
+                .iter()
+                .position(|n| ready(n, UpgradeNodeKind::SelfHub))
+        });
     if let Some(ni) = next_hub {
         commit_node(state, ni);
         return;
@@ -1178,7 +1315,7 @@ fn route_note(state: &mut HubState, uuid: &str, via: &str) {
         return;
     }
     if state.follow_routes.len() >= MAX_UPGRADE_ROUTES {
-        hlog!("[UPGRADE] No room to route {uuid} — it stays out of the run\n");
+        crate::hlog_warning!("[UPGRADE] No room to route {uuid} — it stays out of the run\n");
         return;
     }
     state.follow_routes.push(UpgradeRoute {
@@ -1196,17 +1333,26 @@ fn route_via(state: &HubState, uuid: &str) -> Option<String> {
         .map(|r| r.via.clone())
 }
 
-/// `id|uuid|cur_ver|variant|arch|libc|ready|reason|kind`
-fn answer_ready(state: &mut HubState, ci: usize, id: &str, ready: bool, reason: &str) {
+/// `id|uuid|cur_ver|variant|arch|libc|ready|reason|kind|relayed`
+fn answer_ready(
+    state: &mut HubState,
+    ci: usize,
+    id: &str,
+    ready: bool,
+    reason: &str,
+    relayed: usize,
+) {
     let clean_reason = clean(reason, 192);
     // The trailing "h" is the node KIND.  A bot's READY stops at the reason,
     // so an absent field still means "bot" and ircbot is untouched; a hub
     // several hops from the driver has no other way to say what it is, and the
     // driver has to know to route its COMMIT back through the peer that
     // forwarded this.  clean() has already turned any '|' in the reason into
-    // '/', so the field after it is unambiguous.
+    // '/', so the field after it is unambiguous.  After the kind: how many
+    // local bots this hub relayed the PREPARE to, so the driver waits for
+    // their answers.
     let payload = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|h",
+        "{}|{}|{}|{}|{}|{}|{}|{}|h|{}",
         id,
         state.hub_uuid,
         HUB_VERSION,
@@ -1214,10 +1360,11 @@ fn answer_ready(state: &mut HubState, ci: usize, id: &str, ready: bool, reason: 
         update::host_arch(),
         update::host_libc(),
         if ready { 1 } else { 0 },
-        clean_reason
+        clean_reason,
+        relayed
     );
     queue::send_urgent(&mut state.clients[ci], CMD_UPGRADE_READY, &payload);
-    hlog!(
+    crate::hlog_info!(
         "[UPGRADE] {} upgrade {id}{}{}\n",
         if ready { "Ready for" } else { "Cannot take" },
         if clean_reason.is_empty() { "" } else { ": " },
@@ -1259,7 +1406,7 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
     // fields, then the hubs' own target and base (see start).
     let f: Vec<&str> = payload.splitn(8, '|').collect();
     if f.len() < 2 || f[0].is_empty() || f[1].is_empty() || f[0].len() > 63 || f[1].len() > 63 {
-        hlog!(
+        crate::hlog_warning!(
             "[UPGRADE] Malformed UPGRADE_PREPARE from peer {}\n",
             state.clients[ci].ip
         );
@@ -1275,7 +1422,7 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
     // in a download path, so a peer's PREPARE is held to the same shape the
     // driver enforced on its admin: nothing that could split a line.
     if !f.iter().all(|x| plan_field_ok(x)) {
-        hlog!(
+        crate::hlog_warning!(
             "[UPGRADE] Malformed UPGRADE_PREPARE from peer {}\n",
             state.clients[ci].ip
         );
@@ -1300,7 +1447,7 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
     // circulate forever.  The driver seeds the ring with its own id at start,
     // so its PREPARE coming back around a cycle is dropped here too.
     if opflow::forward_seen_check_and_add(state, &id) {
-        hlog!("[UPGRADE] PREPARE {id} already seen — not relaying it again\n");
+        crate::hlog_debug!("[UPGRADE] PREPARE {id} already seen — not relaying it again\n");
         return;
     }
 
@@ -1313,6 +1460,7 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
             &id,
             false,
             "already driving an upgrade of its own",
+            0,
         );
         return;
     }
@@ -1389,7 +1537,7 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
         }
     }
     if relayed > 0 {
-        hlog!(
+        crate::hlog_info!(
             "[UPGRADE] Relayed PREPARE {} to {} local bot(s)\n",
             id,
             relayed
@@ -1415,10 +1563,10 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
         }
     }
     if fanned > 0 {
-        hlog!("[UPGRADE] Re-broadcast PREPARE {id} to {fanned} peer hub(s)\n");
+        crate::hlog_info!("[UPGRADE] Re-broadcast PREPARE {id} to {fanned} peer hub(s)\n");
     }
 
-    answer_ready(state, ci, &id, ready, &why);
+    answer_ready(state, ci, &id, ready, &why, relayed);
 }
 
 /// A frame this hub is only relaying: an answer from somewhere below it in the
@@ -1446,7 +1594,9 @@ pub fn relay_upstream(state: &mut HubState, ci: usize, cmd: u8, payload: &str) -
 
     let origin = state.follow_origin.clone();
     let Some(oi) = find_client_hub(state, &origin) else {
-        hlog!("[UPGRADE] Driver of {id} is gone — dropping a relayed answer for {uuid}\n");
+        crate::hlog_debug!(
+            "[UPGRADE] Driver of {id} is gone — dropping a relayed answer for {uuid}\n"
+        );
         return true;
     };
     queue::send_urgent(&mut state.clients[oi], cmd, payload);
@@ -1458,7 +1608,7 @@ pub fn relay_upstream(state: &mut HubState, ci: usize, cmd: u8, payload: &str) -
 pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
     let f: Vec<&str> = payload.splitn(4, '|').collect();
     if f.len() < 2 || f[0].is_empty() || f[1].is_empty() || f[0].len() > 63 || f[1].len() > 63 {
-        hlog!(
+        crate::hlog_warning!(
             "[UPGRADE] Malformed UPGRADE_COMMIT from peer {}\n",
             state.clients[ci].ip
         );
@@ -1555,7 +1705,7 @@ pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
     // report_pending() reports in after the restart.
     if let Err(e) = update::commit(state, &id, &ver, &variant, &base) {
         // Nothing was changed on disk; stay on this build and say why.
-        hlog!("[UPGRADE] Commit {id} refused: {e}\n");
+        crate::hlog_warning!("[UPGRADE] Commit {id} refused: {e}\n");
         answer_result(state, ci, &id, "fail", &e);
         state.follow_id.clear();
     }
@@ -1573,7 +1723,7 @@ pub fn peer_abort(state: &mut HubState, ci: usize, payload: &str) {
     } else {
         clean(raw_reason, 192)
     };
-    hlog!(
+    crate::hlog_info!(
         "[UPGRADE] Abort {id} from peer {}{}{}: {reason}\n",
         state.clients[ci].ip,
         if uuid.is_empty() { "" } else { " for bot " },
@@ -1622,7 +1772,7 @@ pub fn report_pending(state: &mut HubState, ci: usize) {
         return;
     };
     let ok = update::version_cmp(HUB_VERSION, &want) == std::cmp::Ordering::Equal;
-    hlog!("[UPGRADE] Restarted after {id}: running {HUB_VERSION} (wanted {want})\n");
+    crate::hlog_warning!("[UPGRADE] Restarted after {id}: running {HUB_VERSION} (wanted {want})\n");
     let status = if ok { "ok" } else { "version-mismatch" };
     answer_result(state, ci, &id, status, if ok { "" } else { &want });
 }
@@ -1630,8 +1780,30 @@ pub fn report_pending(state: &mut HubState, ci: usize) {
 /// `CMD_ADMIN_UPGRADE_STATUS`: one line per node, for hub_admin to print.
 pub fn status(state: &HubState) -> String {
     let u = &state.upgrade;
+    // The roll-up plan this hub holds, if any: what a bot that comes back is
+    // walked up to, until an admin's "forget" drops it.
+    let r = &state.rollup;
+    let plan = if r.have_plan {
+        format!(
+            "roll-up plan: bots -> {}{}{} (set {} s ago; \"forget\" drops it)\n",
+            r.target,
+            if r.hub_target.is_empty() {
+                ""
+            } else {
+                ", hubs -> "
+            },
+            r.hub_target,
+            now() - r.plan_set
+        )
+    } else {
+        String::new()
+    };
     if u.id.is_empty() {
         let mut out = "No upgrade has run on this hub.".to_string();
+        if !plan.is_empty() {
+            out.push('\n');
+            out.push_str(&plan);
+        }
         if config_frozen(state) {
             out.push_str("\nWARNING: config is frozen — clear opt flag 'F' to lift it.");
         }
@@ -1649,6 +1821,7 @@ pub fn status(state: &HubState) -> String {
     if !u.hub_ver.is_empty() {
         out.push_str(&format!("hubs -> {}\n", u.hub_ver));
     }
+    out.push_str(&plan);
     for n in &u.nodes {
         out.push_str(&format!(
             "{:<4} {:<36} {:<10} {:<8} {}{}{}\n",

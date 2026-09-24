@@ -41,6 +41,7 @@ pub mod queue;
 pub mod ratelimit;
 pub mod secret;
 pub mod state;
+pub mod stats;
 pub mod storage;
 pub mod tool;
 pub mod update;

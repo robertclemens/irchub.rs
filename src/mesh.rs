@@ -14,7 +14,7 @@ use crate::state::{
     ClientType, ConfigEntry, HubState, Lane, MaskRecord, QueuedMsg, UserRecord,
     global_value_active, lww_accepts, opt_accepts,
 };
-use crate::{client, config, crypto, hlog, queue, storage};
+use crate::{client, config, crypto, queue, storage};
 
 // ---------------------------------------------------------------------------
 // PURGE deduplication
@@ -28,10 +28,15 @@ use crate::{client, config, crypto, hlog, queue, storage};
 
 fn is_purge_recent(state: &HubState, cutoff: i64, id: &str) -> bool {
     let t = now();
+    let window = if id.is_empty() {
+        PURGE_DEDUP_WINDOW_LEGACY
+    } else {
+        PURGE_DEDUP_WINDOW
+    };
     state
         .recent_purges
         .iter()
-        .any(|p| p.cutoff == cutoff && p.id == id && t - p.received_at < PURGE_DEDUP_WINDOW)
+        .any(|p| p.cutoff == cutoff && p.id == id && t - p.received_at < window)
 }
 
 fn record_recent_purge(state: &mut HubState, cutoff: i64, id: &str) {
@@ -97,7 +102,7 @@ fn parse_purge_line(line: &str) -> Option<(i64, String)> {
 /// drawn.
 pub fn broadcast_purge(state: &mut HubState, cutoff: i64) -> bool {
     let Some(id) = crypto::random_hex(PURGE_ID_HEX / 2) else {
-        hlog!("[PURGE][ERROR] no random bytes for a purge id; purge not broadcast\n");
+        crate::hlog_error!("[PURGE] no random bytes for a purge id; purge not broadcast\n");
         return false;
     };
     record_recent_purge(state, cutoff, &id);
@@ -292,7 +297,7 @@ pub fn process_mesh_state(state: &mut HubState, ci: usize, payload: &str) {
         && state.peers[pi].friendly_name != remote_name
     {
         state.peers[pi].friendly_name = remote_name.clone();
-        hlog!("[MESH] Updated peer friendly_name to: {remote_name}\n");
+        crate::hlog_debug!("[MESH] Updated peer friendly_name to: {remote_name}\n");
         config_updated = true;
     }
 
@@ -302,7 +307,7 @@ pub fn process_mesh_state(state: &mut HubState, ci: usize, payload: &str) {
         && (state.peers[pi].uuid.is_empty() || state.peers[pi].uuid != remote_uuid)
     {
         state.peers[pi].uuid = remote_uuid.clone();
-        hlog!("[MESH] Updated peer UUID to: {remote_uuid}\n");
+        crate::hlog_debug!("[MESH] Updated peer UUID to: {remote_uuid}\n");
         config_updated = true;
     }
 
@@ -315,36 +320,114 @@ pub fn process_mesh_state(state: &mut HubState, ci: usize, payload: &str) {
 // Sync fan-out
 // ---------------------------------------------------------------------------
 
-/// hub_broadcast_sync_to_peers().
-///
-/// Lane heuristic: a single-line CMD_PEER_SYNC payload originating from a
-/// delta forward is short (< 1 KB) and time-sensitive, so it rides DELTA and
-/// is not throttled by the BULK budget.  Larger, multi-line payloads (an
-/// anti-entropy full sync) ride BULK.
-pub fn broadcast_sync_to_peers(state: &mut HubState, payload: &str, exclude_fd: i32) {
+/// The opcode a config broadcast goes to peer `ci` under: CMD_PEER_BCAST
+/// when its gossip shows it knows the opcode (it sends l| lines), else the
+/// CMD_PEER_SYNC every hub understands.
+fn sync_bcast_opcode(state: &HubState, ci: usize) -> u8 {
+    let cu = crate::upgrade::peer_uuid_of(state, ci);
+    let knows = !cu.is_empty() && state.mesh_hubs.iter().any(|h| h.uuid == cu && h.have_links);
+    if knows { CMD_PEER_BCAST } else { CMD_PEER_SYNC }
+}
+
+/// One config payload to every authenticated peer except `exclude_fd`.
+/// `split`: the payload is a forward of a CMD_PEER_BCAST the peer on
+/// `exclude_fd` sent us, so the split horizon may apply (see CMD_PEER_BCAST).
+/// `coalesce`: queue coalescing (key, seq) for a single-key delta.
+pub fn sync_send_to_peers(
+    state: &mut HubState,
+    payload: &str,
+    exclude_fd: i32,
+    split: bool,
+    lane: Lane,
+    coalesce: Option<(&str, u64)>,
+) {
     // Change 5: a full-state anti-entropy sync can exceed MAX_BUFFER; bound
     // by the sync-payload ceiling so it is never silently dropped here.
     if payload.len() > MAX_SYNC_PAYLOAD - 10 {
         return;
     }
-    let lane = if payload.len() > 1024 {
-        Lane::Bulk
+    // The sender's links, if we may trust them: its report is fresh (sent the
+    // moment a link changes, refreshed every BOT_PRESENCE_INTERVAL).  A peer
+    // it is linked to right now got this frame from it directly.  A copy lost
+    // to a link that dropped in the moment before its gossip said so is what
+    // the resync after a link loss and the periodic anti-entropy repair.
+    let now_ts = now();
+    let sender_links: Option<Vec<String>> = if split {
+        state
+            .peer_clients()
+            .into_iter()
+            .find(|&ci| state.clients[ci].fd == exclude_fd)
+            .map(|ci| crate::upgrade::peer_uuid_of(state, ci))
+            .filter(|u| !u.is_empty())
+            .and_then(|u| {
+                state.mesh_hubs.iter().find(|h| {
+                    h.uuid == u
+                        && h.have_links
+                        && now_ts - h.reported_at <= SYNC_SPLIT_HORIZON_FRESH
+                })
+            })
+            .map(|h| {
+                h.links
+                    .iter()
+                    .filter(|l| l.online)
+                    .map(|l| l.uuid.clone())
+                    .collect()
+            })
     } else {
-        Lane::Delta
+        None
     };
+    let hub_uuid = state.hub_uuid.clone();
+    let mut skipped = 0;
     for ci in state.peer_clients() {
         if state.clients[ci].fd == exclude_fd {
             continue;
         }
-        let Some(m) = QueuedMsg::new(CMD_PEER_SYNC, lane, payload.as_bytes()) else {
+        if let Some(links) = &sender_links {
+            let cu = crate::upgrade::peer_uuid_of(state, ci);
+            if !cu.is_empty() && links.contains(&cu) {
+                skipped += 1;
+                continue;
+            }
+        }
+        let op = sync_bcast_opcode(state, ci);
+        let Some(mut m) = QueuedMsg::new(op, lane, payload.as_bytes()) else {
             continue;
         };
+        if let Some((key, seq)) = coalesce {
+            m.set_coalesce(&hub_uuid, seq, key);
+        }
         if !queue::enqueue(&mut state.clients[ci], m) {
             // Only URGENT can fail here; PEER_SYNC is DELTA/BULK so this is
             // effectively unreachable, but be safe.
-            hlog!("[MESH] enqueue failed for peer {}\n", state.clients[ci].ip);
+            crate::hlog_warning!("[MESH] enqueue failed for peer {}\n", state.clients[ci].ip);
         }
     }
+    if skipped > 0 {
+        crate::hlog_debug!("[MESH] Forward skipped {skipped} peer(s) the sender reaches itself\n");
+    }
+}
+
+/// Lane heuristic: a single-line payload originating from a delta forward is
+/// short (< 1 KB) and time-sensitive, so it rides DELTA and is not throttled
+/// by the BULK budget.  Larger, multi-line payloads (an anti-entropy full
+/// sync) ride BULK.
+fn sync_lane(payload: &str) -> Lane {
+    if payload.len() > 1024 {
+        Lane::Bulk
+    } else {
+        Lane::Delta
+    }
+}
+
+/// hub_broadcast_sync_to_peers().
+pub fn broadcast_sync_to_peers(state: &mut HubState, payload: &str, exclude_fd: i32) {
+    sync_send_to_peers(state, payload, exclude_fd, false, sync_lane(payload), None);
+}
+
+/// A forward of what we accepted from a peer's frame.  `bcast`: that frame
+/// was a CMD_PEER_BCAST, so the split horizon applies.
+fn sync_forward_to_peers(state: &mut HubState, payload: &str, origin_fd: i32, bcast: bool) {
+    sync_send_to_peers(state, payload, origin_fd, bcast, sync_lane(payload), None);
 }
 
 /// hub_request_sync_from_peers(): ask every peer for its full state now.
@@ -364,7 +447,7 @@ pub fn request_sync_from_peers(state: &mut HubState) {
         i += 1;
     }
     if sent > 0 {
-        hlog!("[MESH] Sent sync request to {sent} peer(s)\n");
+        crate::hlog_debug!("[MESH] Sent sync request to {sent} peer(s)\n");
     }
 }
 
@@ -588,7 +671,7 @@ fn sync_user_record(state: &mut HubState, key: char, vstart: &str, cnt: &mut Syn
                     && incoming.timestamp == ex.timestamp
                     && incoming.uuid < ex.uuid);
             if incoming_wins {
-                hlog!(
+                crate::hlog_info!(
                     "[MESH] Dedup: '{}' ({key}) UUID collision resolved, adopting {}\n",
                     incoming.name,
                     incoming.uuid
@@ -784,40 +867,44 @@ fn sync_bot_entry(state: &mut HubState, ptr: &str, cnt: &mut SyncCounters) {
 
 /// process_peer_sync(): apply one CMD_PEER_SYNC payload and re-forward what
 /// it actually changed.
-pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32) {
+pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bcast: bool) {
     let mut cnt = SyncCounters {
         updates: 0,
         bot_push_updates: 0,
         forward: String::new(),
     };
+    crate::stats::sync_frame();
 
     for line in trunc_string(payload, MAX_SYNC_PAYLOAD).split('\n') {
         if line.is_empty() {
             continue;
         }
+        crate::stats::sync_record();
 
         if line.starts_with("PURGE|") {
             match parse_purge_line(line) {
-                None => hlog!("[MESH] Dropped malformed PURGE line from peer\n"),
+                None => crate::hlog_warning!("[MESH] Dropped malformed PURGE line from peer\n"),
                 Some((cutoff, purge_id)) => {
                     let shown = if purge_id.is_empty() { "-" } else { &purge_id };
-                    hlog!("[MESH] Received PURGE from peer: cutoff={cutoff} id={shown}\n");
+                    crate::hlog_info!(
+                        "[MESH] Received PURGE from peer: cutoff={cutoff} id={shown}\n"
+                    );
                     if is_purge_recent(state, cutoff, &purge_id) {
-                        hlog!(
+                        crate::hlog_debug!(
                             "[MESH] PURGE cutoff={cutoff} id={shown} already processed recently, skipping to prevent loop\n"
                         );
                     } else {
                         record_recent_purge(state, cutoff, &purge_id);
                         let purged = execute_purge(state, cutoff).0;
                         if purged > 0 {
-                            hlog!("[MESH] Purged {purged} entries from peer sync\n");
+                            crate::hlog_info!("[MESH] Purged {purged} entries from peer sync\n");
                             cnt.updates += purged as u32;
                         }
                         // Forward to all other peers (excluding the sender to
                         // prevent an immediate echo; with the dedup above
                         // that closes the feedback loop).
                         if origin_fd != -1 {
-                            broadcast_sync_to_peers(state, line, origin_fd);
+                            sync_forward_to_peers(state, line, origin_fd, bcast);
                         }
                     }
                 }
@@ -831,7 +918,9 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32) {
             if f.len() == 2 && !f[0].is_empty() && !f[1].is_empty() {
                 let (inv_nick, inv_chan) = (f[0], f[1].split_whitespace().next().unwrap_or(""));
                 if !inv_chan.is_empty() {
-                    hlog!("[MESH] Forwarded INVITE_REQUEST: invite {inv_nick} into {inv_chan}\n");
+                    crate::hlog_info!(
+                        "[MESH] Forwarded INVITE_REQUEST: invite {inv_nick} into {inv_chan}\n"
+                    );
                     let inv_payload = format!("{inv_nick}|{inv_chan}");
                     for ci in state.bot_clients() {
                         client::send_cmd_to_bot(
@@ -928,15 +1017,16 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32) {
         sync_bot_entry(state, ptr, &mut cnt);
     }
 
+    crate::stats::sync_done(u64::from(cnt.updates));
     if cnt.updates > 0 {
         state.config_dirty = true;
-        hlog!(
+        crate::hlog_debug!(
             "[MESH] Synced {} entries from Peer ({} bot-relevant).\n",
             cnt.updates,
             cnt.bot_push_updates
         );
         if !cnt.forward.is_empty() {
-            broadcast_sync_to_peers(state, &cnt.forward, origin_fd);
+            sync_forward_to_peers(state, &cnt.forward, origin_fd, bcast);
         }
         if cnt.bot_push_updates > 0 {
             client::broadcast_full_config_to_all_bots(state);
@@ -1040,14 +1130,14 @@ pub fn execute_purge(state: &mut HubState, cutoff: i64) -> (i32, String) {
     client::broadcast_config_to_bots(state, &purge_msg);
     for ci in state.bot_clients() {
         let Some(m) = QueuedMsg::new(CMD_CONFIG_DATA, Lane::Bulk, purge_msg.as_bytes()) else {
-            hlog!(
+            crate::hlog_error!(
                 "[PURGE] OOM queueing PURGE for bot {}\n",
                 state.clients[ci].id
             );
             continue;
         };
         if !queue::enqueue(&mut state.clients[ci], m) {
-            hlog!(
+            crate::hlog_warning!(
                 "[PURGE] could not queue PURGE for bot {}\n",
                 state.clients[ci].id
             );
@@ -1060,6 +1150,75 @@ pub fn execute_purge(state: &mut HubState, cutoff: i64) -> (i32, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hub with authenticated peer links s (fd 10), x (fd 11), y (fd 12).
+    fn three_peers() -> (HubState, Vec<std::net::TcpListener>) {
+        let mut s = HubState::new();
+        let mut keep = Vec::new();
+        for (fd, uuid) in [(10, "s"), (11, "x"), (12, "y")] {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let sock = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            keep.push(l);
+            let mut c = crate::state::HubClient::new(sock, fd, "127.0.0.1", MAX_BUFFER);
+            c.typ = crate::state::ClientType::Hub;
+            c.authenticated = true;
+            s.clients.push(c);
+            s.peers.push(crate::state::PeerConfig {
+                uuid: uuid.into(),
+                connected: true,
+                fd,
+                ..Default::default()
+            });
+        }
+        (s, keep)
+    }
+
+    fn queued(s: &HubState, fd: i32) -> Vec<u8> {
+        let c = s.clients.iter().find(|c| c.fd == fd).unwrap();
+        c.out_lanes
+            .iter()
+            .flat_map(|l| l.msgs.iter().map(|m| m.cmd))
+            .collect()
+    }
+
+    #[test]
+    fn a_bcast_forward_skips_the_peers_the_sender_reaches_itself() {
+        let (mut s, _keep) = three_peers();
+        // s says it is linked to x; x knows CMD_PEER_BCAST, y is an old hub.
+        s.mesh_hubs.push(crate::state::MeshHub {
+            uuid: "s".into(),
+            have_links: true,
+            reported_at: now(),
+            links: vec![crate::state::MeshLink {
+                uuid: "x".into(),
+                name: String::new(),
+                online: true,
+            }],
+            ..Default::default()
+        });
+        s.mesh_hubs.push(crate::state::MeshHub {
+            uuid: "x".into(),
+            have_links: true,
+            reported_at: now(),
+            ..Default::default()
+        });
+        sync_forward_to_peers(&mut s, "b|bot|n|nick|5\n", 10, true);
+        assert!(queued(&s, 10).is_empty(), "never back to the sender");
+        assert!(queued(&s, 11).is_empty(), "x had it from s");
+        assert_eq!(
+            queued(&s, 12),
+            vec![CMD_PEER_SYNC],
+            "y: old hub, old opcode"
+        );
+        // A forward of a point-to-point sync reaches every other peer, under
+        // the opcode each one understands.
+        sync_forward_to_peers(&mut s, "b|bot|n|nick|6\n", 10, false);
+        assert_eq!(queued(&s, 11), vec![CMD_PEER_BCAST]);
+        // So does a bcast forward once the sender's link report goes stale.
+        s.mesh_hubs[0].reported_at = now() - SYNC_SPLIT_HORIZON_FRESH - 1;
+        sync_forward_to_peers(&mut s, "b|bot|n|nick|7\n", 10, true);
+        assert_eq!(queued(&s, 11).len(), 2);
+    }
 
     #[test]
     fn purge_line_shapes() {
@@ -1201,7 +1360,7 @@ mod tests {
              b|bot-1|h|rob!u@h|40\n\
              opt|h|50\n"
         );
-        process_peer_sync(&mut s, &payload, -1);
+        process_peer_sync(&mut s, &payload, -1, false);
         assert_eq!(s.user_records.len(), 1);
         assert!(s.user_records[0].has_pubkey);
         assert_eq!(s.mask_records.len(), 1);
@@ -1213,6 +1372,7 @@ mod tests {
             &mut s,
             "m|99999999-2222-3333-4444-555555555555|x!*@*|add|0|99\n",
             -1,
+            false,
         );
         assert_eq!(s.mask_records.len(), 1);
     }
@@ -1234,7 +1394,7 @@ mod tests {
         });
 
         let legacy = format!("a|11111111-2222-3333-4444-555555555555|rob|hunter2|add|10|20|{k}\n");
-        process_peer_sync(&mut s, &legacy, -1);
+        process_peer_sync(&mut s, &legacy, -1, false);
 
         let u = &s.user_records[0];
         assert_eq!(u.name, "rob");
@@ -1260,7 +1420,7 @@ mod tests {
         let mut s = HubState::new();
         // A channel arrives on the per-bot wire shape; `c` is a global key,
         // so the storage layer routes it to the global table.
-        process_peer_sync(&mut s, "b|bot-1|c|#chan|key|0|del|500\n", -1);
+        process_peer_sync(&mut s, "b|bot-1|c|#chan|key|0|del|500\n", -1, false);
         let e = s.global_entries.iter().find(|e| e.key == "c").unwrap();
         // All four fields survived the split, so the op is still read as the
         // last one and the delete stayed a delete.
@@ -1275,10 +1435,10 @@ mod tests {
     #[test]
     fn peer_sync_drops_retired_shapes() {
         let mut s = HubState::new();
-        process_peer_sync(&mut s, "p|sharedpassword|100\n", -1);
+        process_peer_sync(&mut s, "p|sharedpassword|100\n", -1, false);
         assert!(s.global_entries.is_empty());
         // The pre-UUID a|<password>|<ts> row has no UUID in field 1.
-        process_peer_sync(&mut s, "a|hunter2|100\n", -1);
+        process_peer_sync(&mut s, "a|hunter2|100\n", -1, false);
         assert!(s.user_records.is_empty());
         assert!(s.global_entries.is_empty());
     }

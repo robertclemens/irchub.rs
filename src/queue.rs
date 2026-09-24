@@ -8,10 +8,10 @@
 //! full sync).
 
 use crate::consts::*;
+use crate::crypto;
 use crate::cstr::now;
 use crate::net::{self, SendOutcome};
 use crate::state::{DeltaSeen, HubClient, HubState, Lane, QueuedMsg};
-use crate::{crypto, hlog};
 
 /// peer_enqueue(): put `m` on the client's lane, coalescing when its key
 /// matches one already queued.
@@ -61,10 +61,11 @@ pub fn enqueue(client: &mut HubClient, m: QueuedMsg) -> bool {
         if let Some(old) = lane.msgs.pop_front() {
             lane.bytes -= old.len();
             client.out_total_bytes -= old.len();
-            hlog!(
+            crate::hlog_warning!(
                 "[MESH] queue {} lane full — dropping oldest (peer fd={fd})\n",
                 m.lane.name()
             );
+            cfg_push_lost(client, &old);
         }
     }
 
@@ -73,6 +74,15 @@ pub fn enqueue(client: &mut HubClient, m: QueuedMsg) -> bool {
     client.out_lanes[li].bytes += n;
     client.out_total_bytes += n;
     true
+}
+
+/// A config push that never reaches its bot must not stand as "sent", or the
+/// next identical broadcast would be skipped and the bot left behind.
+fn cfg_push_lost(client: &mut HubClient, m: &QueuedMsg) {
+    if m.cmd == CMD_CONFIG_DATA {
+        client.cfg_sent_hash = None;
+        crate::stats::cfg_lost();
+    }
 }
 
 /// Encrypt `m` with the client's session key into `writing_buf`.  Returns the
@@ -136,7 +146,7 @@ fn push_in_flight(client: &mut HubClient) -> bool {
                 // A hard send error: the caller cannot disconnect from here
                 // (it is iterating the client list), so the in-flight buffer
                 // is cleared and the recv side reaps the socket on EOF.
-                hlog!(
+                crate::hlog_warning!(
                     "[MESH] send error to {} (fd={}): {e}\n",
                     client.ip,
                     client.fd
@@ -190,11 +200,13 @@ pub fn drain_writable(client: &mut HubClient) {
             client.out_total_bytes -= m.len();
 
             let wire_len = encrypt_into_writing(client, &m);
-            drop(m);
             if wire_len == 0 {
-                hlog!("[MESH] encrypt failed for peer {} lane {li}\n", client.ip);
+                crate::hlog_error!("[MESH] encrypt failed for peer {} lane {li}\n", client.ip);
+                cfg_push_lost(client, &m);
                 continue; // drop and move on
             }
+            crate::stats::tx(m.cmd, wire_len);
+            drop(m);
             client.writing_offset = 0;
 
             // Try to send immediately.
@@ -212,7 +224,7 @@ pub fn send_urgent(client: &mut HubClient, cmd: u8, payload: &str) -> bool {
         return false;
     };
     if !enqueue(client, m) {
-        hlog!(
+        crate::hlog_warning!(
             "[URGENT] Queue full for peer {} — disconnecting\n",
             client.ip
         );

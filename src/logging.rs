@@ -164,7 +164,21 @@ pub fn hub_log(msg: &str) {
 /// with U+FFFD — which is valid UTF-8, so the sanitizer passes it through and
 /// the log no longer shows what was actually received.  This takes the bytes
 /// as they arrived, so a lone `0xFF` still reads `\xFF` in the log.
-pub fn hub_log_with_raw(prefix: &str, raw: &[u8], suffix: &str) {
+///
+/// `level` is the LOG_* level the line belongs to: it is filtered and tagged
+/// exactly as the `hlog_*!` macros do it (the C call sites are
+/// `hub_log_debug`/`hub_log_warning` with a `%s` for the raw bytes).
+pub fn hub_log_with_raw(level: i32, prefix: &str, raw: &[u8], suffix: &str) {
+    let tag = match level {
+        LOG_ERROR => "[ERROR] ",
+        LOG_WARNING => "[WARNING] ",
+        LOG_INFO => "[INFO] ",
+        _ => "[DEBUG] ",
+    };
+    if self::level() < level {
+        return;
+    }
+    let prefix = format!("{tag}{prefix}");
     let mut line = Vec::with_capacity(prefix.len() + raw.len() + suffix.len());
     line.extend_from_slice(prefix.as_bytes());
     line.extend_from_slice(raw);
@@ -207,10 +221,12 @@ pub fn hub_log_bytes(msg: &[u8]) {
             && md.len() as i64 >= max_size
         {
             l.file = open_log(true);
-            if let Some(f) = &mut l.file {
-                let _ = writeln!(f, "[{time_buf}] Log file truncated (size limit reached)");
-                let _ = f.flush();
-            }
+            let Some(f) = &mut l.file else { return };
+            let _ = writeln!(f, "[{time_buf}] Log file truncated (size limit reached)");
+            let _ = f.flush();
+            // The line that tripped the cap is kept, after the notice.
+            let _ = write!(f, "[{time_buf}] {}", sanitize(msg));
+            let _ = f.flush();
             return;
         }
 

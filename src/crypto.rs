@@ -283,6 +283,33 @@ pub fn b64_decode(s: &str) -> Option<Zeroizing<Vec<u8>>> {
     Some(v)
 }
 
+/// Strict decode of an Ed25519 release-signing key: only the canonical,
+/// padded 44-character base64 of exactly 32 bytes, as the C updater's
+/// OpenSSL decode requires.  The lenient `b64_decode` would also take the
+/// unpadded 43-character spelling, so the two daemons would disagree about
+/// which keys are well formed.
+pub fn update_pubkey_b64_decode(b64: &str) -> Option<[u8; 32]> {
+    let b = b64.as_bytes();
+    if b.len() != 44 || b[43] != b'=' {
+        return None;
+    }
+    if !b[..43]
+        .iter()
+        .all(|&c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/')
+    {
+        return None;
+    }
+    let v = b64_decode(b64)?;
+    // A non-canonical final character (stray low bits) decodes the same 32
+    // bytes; re-encoding pins the one spelling.
+    if v.len() != 32 || STANDARD.encode(&v[..]) != b64 {
+        return None;
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&v);
+    Some(k)
+}
+
 /// hub_crypto_pubkey_b64_decode: strict decode of an 88-char combined public
 /// key — only the canonical base64 of exactly 64 bytes (one key, one
 /// spelling: uniqueness checks and record matching compare strings), neither
@@ -402,6 +429,18 @@ pub fn wipe(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn update_key_takes_only_the_padded_spelling() {
+        let k = "qkXMh/F8TC+cnKuIwrP5TJIynfrLBD+MDUwvkyh9lBU=";
+        assert!(update_pubkey_b64_decode(k).is_some());
+        // The unpadded spelling the C updater refuses...
+        assert!(update_pubkey_b64_decode(k.trim_end_matches('=')).is_none());
+        // ...a non-canonical last character (stray low bits)...
+        assert!(update_pubkey_b64_decode("qkXMh/F8TC+cnKuIwrP5TJIynfrLBD+MDUwvkyh9lBV=").is_none());
+        // ...and anything not 32 bytes.
+        assert!(update_pubkey_b64_decode("AAAA").is_none());
+    }
     use super::*;
 
     #[test]

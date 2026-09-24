@@ -13,7 +13,7 @@ use crate::state::{
     ClientType, HubState, IpAcl, IpAclAdd, MaskRecord, PeerConfig, UserRecord, lww_next_ts,
     name_valid, parse_uint,
 };
-use crate::{auth, client, crypto, hlog, mesh, opflow, presence, ratelimit, storage, upgrade};
+use crate::{auth, client, crypto, mesh, opflow, presence, ratelimit, storage, upgrade};
 
 fn resp(state: &mut HubState, ci: usize, msg: &str) -> bool {
     client::send_response(state, ci, msg)
@@ -105,7 +105,7 @@ fn ip_acl_change(state: &mut HubState, ci: usize, list: char, add: bool, payload
         .count();
     state.ip_acl_changed = true;
     state.config_dirty = true;
-    hlog!(
+    crate::hlog_info!(
         "[ACCESS_CONTROL] {} {} {name} by {}\n",
         e.pattern(),
         if add { "added to" } else { "removed from" },
@@ -786,9 +786,8 @@ fn add_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
         trunc_string(s.split_whitespace().next().unwrap_or(""), 128)
     });
 
-    if state.peers.len() >= MAX_PEERS {
-        return resp(state, ci, "ERROR: Max peers reached.");
-    }
+    // A duplicate is named as such even on a full table: "max peers" would
+    // send the admin looking for a slot the add never needed.
     if !uuid.is_empty()
         && state
             .peers
@@ -796,6 +795,9 @@ fn add_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
             .any(|p| !p.uuid.is_empty() && p.uuid == uuid)
     {
         return resp(state, ci, "ERROR: Peer with this UUID already exists.");
+    }
+    if state.peers.len() >= MAX_PEERS {
+        return resp(state, ci, "ERROR: Max peers reached.");
     }
 
     let mut np = PeerConfig {
@@ -913,7 +915,7 @@ fn set_peer_pubkey(state: &mut HubState, ci: usize, payload: &str) -> bool {
         }
     }
     state.config_dirty = true;
-    hlog!("[HUB] Peer {uuid} pubkey set — next connection will use v2 Ed25519 auth.\n");
+    crate::hlog_info!("[HUB] Peer {uuid} pubkey set — next connection will use v2 Ed25519 auth.\n");
     resp(
         state,
         ci,
@@ -1096,7 +1098,7 @@ fn del_user_record(state: &mut HubState, ci: usize, payload: &str, is_admin: boo
 
     client::broadcast_config_to_bots(state, &uline); // logs the user line only
     mesh::broadcast_sync_to_peers(state, &sync, -1);
-    hlog!(
+    crate::hlog_info!(
         "[ADMIN] {} {target_name} removed with {masks_dropped} usermask(s)\n",
         if is_admin { "Admin" } else { "Oper" }
     );
@@ -1566,7 +1568,7 @@ pub fn handle_admin_command(
     // command itself stay available (the latter is how a stuck freeze is
     // lifted by hand).
     if upgrade::config_frozen(state) && upgrade::admin_cmd_mutates_config(cmd) {
-        hlog!(
+        crate::hlog_warning!(
             "[UPGRADE] Refused admin command 0x{:02x}: config frozen\n",
             cmd
         );
@@ -1610,6 +1612,12 @@ pub fn handle_admin_command(
                 }
                 upgrade::abort(state, "aborted by admin");
                 return resp(state, ci, "OK:upgrade aborted; rolling back");
+            }
+            // "forget" drops the roll-up plan a finished run left behind, here
+            // and (flooded) on every other hub.
+            if payload.eq_ignore_ascii_case("forget") {
+                let out = upgrade::admin_forget(state);
+                return resp(state, ci, &out);
             }
             let out = upgrade::status(state);
             resp(state, ci, &out)
@@ -1660,7 +1668,7 @@ pub fn handle_admin_command(
                 .position(|c| c.typ == ClientType::Bot && c.id == payload);
             match found {
                 Some(bi) => {
-                    hlog!("[ADMIN] Disconnecting bot {payload}\n");
+                    crate::hlog_warning!("[ADMIN] Disconnecting bot {payload}\n");
                     auth::disconnect_client(state, bi);
                     let Some(ci) = state.client_by_fd(admin_fd) else {
                         return false;
@@ -1681,7 +1689,7 @@ pub fn handle_admin_command(
                 .iter()
                 .position(|c| c.typ == ClientType::Bot && c.id == payload)
             {
-                hlog!("[ADMIN] Disconnecting deleted bot {payload}\n");
+                crate::hlog_warning!("[ADMIN] Disconnecting deleted bot {payload}\n");
                 auth::disconnect_client(state, bi);
             }
             // Peers store the same tombstone (same stamp); every bot gets a
@@ -2000,6 +2008,7 @@ pub fn handle_admin_command(
             }
             let level = i32::from(raw[0]).clamp(LOG_NONE, LOG_DEBUG);
             state.log_level = level;
+            state.config_dirty = true; // log_level| survives a restart
             crate::logging::set_level(level);
             let msg = format!("OK:log_level set to {level}");
             resp(state, ci, &msg)
@@ -2010,11 +2019,24 @@ pub fn handle_admin_command(
             if raw_len != 4 {
                 return resp(state, ci, "ERR:invalid payload");
             }
-            let size = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])
-                .clamp(1024, 1024 * 1024 * 1024);
-            state.log_max_size = i64::from(size);
+            let size = i64::from(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+                .clamp(HUB_LOG_SIZE_MIN, HUB_LOG_SIZE_MAX);
+            state.log_max_size = size;
+            state.config_dirty = true; // log_size| survives a restart
             crate::logging::set_max_size(state.log_max_size);
             let msg = format!("OK:log_size set to {}", state.log_max_size);
+            resp(state, ci, &msg)
+        }
+
+        CMD_ADMIN_STATS => {
+            // Read-only snapshot of the traffic counters; see
+            // consts::CMD_ADMIN_STATS.
+            let up = if state.hub_started > 0 {
+                now() - state.hub_started
+            } else {
+                0
+            };
+            let msg = crate::stats::report(up, MAX_BUFFER - 64);
             resp(state, ci, &msg)
         }
 

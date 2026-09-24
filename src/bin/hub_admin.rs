@@ -1080,6 +1080,7 @@ fn menu_manage_peer_config(a: &mut Admin) {
                 "Export Public Key",
                 "Set Log Level",
                 "Set Log Size Limit",
+                "Show Traffic Stats",
                 "Back to Main Menu",
             ],
         ) {
@@ -1094,7 +1095,16 @@ fn menu_manage_peer_config(a: &mut Admin) {
             9 => export_public_key(a),
             10 => set_log_level(a),
             11 => set_log_size(a),
-            12 => return,
+            12 => {
+                let r = a.ask(CMD_ADMIN_STATS, "");
+                println!(
+                    "\nTraffic since this hub started (cfg: full config pushes to bots,\n\
+                     same = skipped as identical; sync: peer sync frames/records in;\n\
+                     op: frames/bytes by opcode):\n{r}"
+                );
+                a.pause();
+            }
+            13 => return,
             _ => println!("Invalid choice."),
         }
     }
@@ -1240,6 +1250,26 @@ fn upgrade_abort(a: &mut Admin) {
     a.pause();
 }
 
+/// Drop the roll-up plan the last finished run left behind, on every hub:
+/// until then, any bot that comes back on an older build is walked up to the
+/// plan's target by its hub.
+fn upgrade_forget(a: &mut Admin) {
+    println!("\n{RULE_H}");
+    println!("               FORGET ROLL-UP PLAN");
+    println!("{RULE_H}\n");
+    println!("  Every hub stops walking returning bots up to the last");
+    println!("  run's target.  Nothing already upgraded is touched.");
+    println!("  Type 'yes' to confirm.\n");
+    if a.input("Confirm: ") != "yes" {
+        println!("[*] Cancelled.");
+        a.pause();
+        return;
+    }
+    let r = a.ask(CMD_ADMIN_UPGRADE_STATUS, "forget");
+    println!("\nHub: {r}");
+    a.pause();
+}
+
 fn menu_upgrade_network(a: &mut Admin) {
     loop {
         match menu(
@@ -1249,13 +1279,15 @@ fn menu_upgrade_network(a: &mut Admin) {
                 "Upgrade network to a version",
                 "Upgrade status",
                 "Abort the running upgrade",
+                "Forget the roll-up plan",
                 "Back to Main Menu",
             ],
         ) {
             1 => upgrade_network(a),
             2 => upgrade_status(a),
             3 => upgrade_abort(a),
-            4 => return,
+            4 => upgrade_forget(a),
+            5 => return,
             _ => println!("Invalid choice."),
         }
     }

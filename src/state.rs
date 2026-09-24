@@ -442,6 +442,16 @@ pub struct UpgradeNode {
     pub state: UpgradeNodeState,
     pub reason: String,
     pub committed_at: i64,
+    /// A hub node's READY says how many of ITS local bots it relayed PREPARE
+    /// to; the driver holds PREPARE open until that many relayed READYs are
+    /// in, so a peer's bots are never missed for answering a moment after it.
+    pub relayed: usize,
+    /// Order its READY reached the driver in (1, 2, ...; 0 = none yet).  A
+    /// follower answers before it relays anything from below it, and every
+    /// answer travels the same FIFO peer links up, so a hub's READY always
+    /// lands ahead of any hub it routes for: descending `ready_seq` is
+    /// deepest-first along the COMMIT routes (see `upgrade::tick`).
+    pub ready_seq: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -504,6 +514,10 @@ pub struct PendingUpgrade {
     pub phase_started: i64,
     pub phase: UpgradePhase,
     pub nodes: Vec<UpgradeNode>,
+    /// When the node table last grew.
+    pub last_added: i64,
+    /// Last `UpgradeNode::ready_seq` handed out.
+    pub ready_seq_next: usize,
     /// Why it ended, shown by CMD_ADMIN_UPGRADE_STATUS.
     pub summary: String,
 }
@@ -522,6 +536,38 @@ pub struct RecentPurge {
 pub struct SeenForward {
     pub request_id: String,
     pub seen_at: i64,
+}
+
+/// One peer link a hub reports in its roster gossip (an l| line): a peer it is
+/// configured with and whether that link is up right now.
+#[derive(Clone, Debug, Default)]
+pub struct MeshLink {
+    pub uuid: String,
+    pub name: String,
+    pub online: bool,
+}
+
+/// What this hub knows about another hub anywhere in the mesh, from that
+/// hub's own roster gossip — direct or relayed.  Volatile like the roster:
+/// dropped once nothing refreshed it within BOT_ROSTER_TTL.  `round` and
+/// `chunks_seen` suppress relay loops: a hub applies and passes on a given
+/// frame (origin, generation, chunk) exactly once.
+#[derive(Clone, Debug, Default)]
+pub struct MeshHub {
+    pub uuid: String,
+    pub name: String,
+    pub started: i64,
+    pub version: String,
+    pub variant: String,
+    pub links: Vec<MeshLink>,
+    /// It has sent an l| list (a hub that relays).
+    pub have_links: bool,
+    /// Newest gossip generation (round) seen from it.
+    pub round: i64,
+    /// Chunks of `gen` already applied (bit n).
+    pub chunks_seen: u64,
+    /// Local clock: drives the TTL.
+    pub reported_at: i64,
 }
 
 /// One bot's live presence, as reported by the hub it is connected to.
@@ -732,6 +778,12 @@ pub struct HubClient {
     pub bot_variant: String,
     /// The bot's own start time, 0 = unreported.
     pub bot_started: i64,
+    /// SHA-256 of the last full config queued to this bot (CMD_CONFIG_DATA),
+    /// so a broadcast push that would repeat it is skipped.  Only set while
+    /// that push is known to be on its way: cleared when a queued config is
+    /// dropped on overflow and whenever the bot sends a config push of its
+    /// own.
+    pub cfg_sent_hash: Option<[u8; 32]>,
 }
 
 impl HubClient {
@@ -774,6 +826,7 @@ impl HubClient {
             bot_server: String::new(),
             bot_variant: String::new(),
             bot_started: 0,
+            cfg_sent_hash: None,
         }
     }
 
@@ -972,6 +1025,10 @@ pub struct HubState {
     /// CONFIG_WRITE_DEBOUNCE_S seconds.  This prevents N PBKDF2(100k) calls
     /// when N peer syncs arrive in a burst.
     pub config_dirty: bool,
+    /// A full config push to every local bot is owed
+    /// (`client::flush_bot_config`, at most once per BOT_CONFIG_PUSH_COALESCE).
+    pub bot_config_pending: bool,
+    pub last_bot_config_push: i64,
     pub last_config_write: i64,
     /// Set on peer connect/disconnect; clears after gossip.
     pub mesh_state_dirty: bool,
@@ -996,6 +1053,14 @@ pub struct HubState {
     pub last_tree_push: i64,
     /// Roster changed: push to bots on the next tick.
     pub tree_dirty: bool,
+    /// Every hub heard from, any hop (see `MeshHub`).
+    pub mesh_hubs: Vec<MeshHub>,
+    /// Last generation this hub gossiped.
+    pub roster_gen: i64,
+    /// Peers linked at the last gossip (bit p).
+    pub gossip_link_mask: u32,
+    /// Ask peers for a sync then (0 = none).
+    pub resync_due_at: i64,
 
     pub timers: MaintTimers,
 }
@@ -1060,6 +1125,8 @@ impl HubState {
             opt_flags: String::new(),
             opt_flags_ts: 0,
             config_dirty: false,
+            bot_config_pending: false,
+            last_bot_config_push: 0,
             last_config_write: 0,
             mesh_state_dirty: false,
             anti_entropy_due: false,
@@ -1070,6 +1137,10 @@ impl HubState {
             last_presence_gossip: 0,
             last_tree_push: 0,
             tree_dirty: false,
+            mesh_hubs: Vec::new(),
+            roster_gen: 0,
+            gossip_link_mask: 0,
+            resync_due_at: 0,
             timers: MaintTimers::default(),
         }
     }

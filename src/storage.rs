@@ -11,7 +11,7 @@
 use crate::consts::*;
 use crate::cstr::trunc_string;
 use crate::state::{BotConfig, ConfigEntry, HubState, global_value_active, lww_accepts};
-use crate::{config, crypto, hlog};
+use crate::{config, crypto};
 
 /// hub_storage_init(): nothing to do; the tables live in [`HubState::new`].
 pub fn init() {}
@@ -119,7 +119,7 @@ pub fn update_global_entry(
             stored_ts,
             global_value_active(&state.global_entries[i].value),
         ) {
-            hlog!(
+            crate::hlog_debug!(
                 "[STORAGE] Global {key}={value}: incoming_ts={ts} {} stored_ts={stored_ts} -> UPDATED\n",
                 if ts > stored_ts {
                     ">"
@@ -131,14 +131,14 @@ pub fn update_global_entry(
             state.global_entries[i].timestamp = ts;
             return true;
         }
-        hlog!(
+        crate::hlog_debug!(
             "[STORAGE] Global {key}={value}: incoming_ts={ts} <= stored_ts={stored_ts} -> REJECTED\n"
         );
         return false;
     }
 
     if state.global_entries.len() < MAX_BOT_ENTRIES {
-        hlog!("[STORAGE] Global {key}={value}: NEW entry ts={ts}\n");
+        crate::hlog_debug!("[STORAGE] Global {key}={value}: NEW entry ts={ts}\n");
         state.global_entries.push(ConfigEntry {
             key: trunc_string(key, 32),
             value: combined,
@@ -146,7 +146,7 @@ pub fn update_global_entry(
         });
         return true;
     }
-    hlog!("[STORAGE] Global {key}={value}: REJECTED (max entries reached)\n");
+    crate::hlog_warning!("[STORAGE] Global {key}={value}: REJECTED (max entries reached)\n");
     false
 }
 
@@ -164,7 +164,7 @@ pub fn update_entry(
     // password 'p' and the legacy global admin password 'a' are never stored
     // again, whichever path (delta, push, sync, load) offers them.
     if key == "p" || key == "a" {
-        hlog!("[STORAGE] REJECTED retired key '{key}' (passwordless)\n");
+        crate::hlog_warning!("[STORAGE] REJECTED retired key '{key}' (passwordless)\n");
         return false;
     }
 
@@ -175,7 +175,9 @@ pub fn update_entry(
 
     // Reject bot-specific key names being used as a UUID.
     if matches!(uuid, "n" | "h" | "seen" | "pub" | "d" | "t") {
-        hlog!("[STORAGE] REJECTED: Invalid UUID '{uuid}' (bot-specific key used as UUID)\n");
+        crate::hlog_warning!(
+            "[STORAGE] REJECTED: Invalid UUID '{uuid}' (bot-specific key used as UUID)\n"
+        );
         return false;
     }
 
@@ -196,7 +198,9 @@ pub fn update_entry(
     // still leaves an (empty) bot record, exactly as in the C hub, so the two
     // trees converge on the same config from the same input.
     if !matches!(key, "t" | "n" | "h" | "pub" | "seen" | "d") {
-        hlog!("[STORAGE] REJECTED per-bot key '{key}' for {uuid} (not in whitelist)\n");
+        crate::hlog_warning!(
+            "[STORAGE] REJECTED per-bot key '{key}' for {uuid} (not in whitelist)\n"
+        );
         return false;
     }
     {
@@ -208,7 +212,7 @@ pub fn update_entry(
         };
         let vlen = value.len();
         if vlen > cap {
-            hlog!(
+            crate::hlog_warning!(
                 "[STORAGE] REJECTED per-bot '{key}' for {uuid}: value too long ({vlen} > {cap})\n"
             );
             return false;
@@ -289,7 +293,7 @@ pub fn update_entry(
         return true;
     }
 
-    hlog!("Warning: Bot {uuid} has reached MAX_BOT_ENTRIES\n");
+    crate::hlog_warning!("[STORAGE] Bot {uuid} has reached MAX_BOT_ENTRIES\n");
     false
 }
 

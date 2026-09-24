@@ -18,8 +18,8 @@ use irchub::cstr::{now, trunc_string};
 use irchub::state::{ClientType, HubClient, HubState, MaskRecord, UserRecord, name_valid};
 use irchub::state::{Lane, QueuedMsg};
 use irchub::{
-    auth, client, config, crypto, hlog, hlog_error, hlog_status, hlog_warning, logging, mesh, net,
-    presence, queue, ratelimit, storage, tool, upgrade,
+    auth, client, config, crypto, hlog_debug, hlog_error, hlog_info, hlog_status, hlog_warning,
+    logging, mesh, net, presence, queue, ratelimit, storage, tool, upgrade,
 };
 
 const PEER_INFO: &[u8] = b"irchub-peer-session-v1";
@@ -172,12 +172,12 @@ fn passfile_create(path: &str, password: &str) -> bool {
 /// key for every frame afterwards.
 fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
     if !state.hub_keys_loaded {
-        hlog!("[PEER] No Curve25519 keys loaded; cannot handshake\n");
+        hlog_error!("[PEER] No Curve25519 keys loaded; cannot handshake\n");
         auth::disconnect_client(state, ci);
         return;
     }
     if !state.peers[pi].has_pubkey {
-        hlog!(
+        hlog_warning!(
             "[PEER] Peer has no registered pubkey — refusing to connect. Re-add this peer with its Curve25519 pubkey (HUBv3 auth needs it).\n"
         );
         auth::disconnect_client(state, ci);
@@ -190,7 +190,7 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
         state.hub_uuid, state.port, state.hub_friendly_name, state.bind_ip
     );
     if transcript.len() >= 512 {
-        hlog!("[PEER] v3 transcript too long\n");
+        hlog_error!("[PEER] v3 transcript too long\n");
         auth::disconnect_client(state, ci);
         return;
     }
@@ -208,7 +208,7 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
         crypto::b64_encode(&sig)
     );
     if pack.len() >= 1024 {
-        hlog!("[PEER] v3 packet too long\n");
+        hlog_error!("[PEER] v3 packet too long\n");
         auth::disconnect_client(state, ci);
         return;
     }
@@ -218,7 +218,7 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
 
     let target = state.peers[pi].x25519_pub;
     let Some((enc, session_key)) = crypto::seal_send(&target, &plain, PEER_INFO) else {
-        hlog!("[PEER] Sealed-box encryption failed\n");
+        hlog_error!("[PEER] Sealed-box encryption failed\n");
         auth::disconnect_client(state, ci);
         return;
     };
@@ -230,7 +230,7 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
             return;
         };
         if !net::write_framed(sock, &enc) {
-            hlog!("[PEER] Handshake write failed\n");
+            hlog_warning!("[PEER] Handshake write failed\n");
             auth::disconnect_client(state, ci);
             return;
         }
@@ -240,7 +240,7 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
         // full sync below rides these.
         c.promote_buffers();
     }
-    hlog!("[PEER] Handshake complete with {}\n", state.clients[ci].ip);
+    hlog_info!("[PEER] Handshake complete with {}\n", state.clients[ci].ip);
     // If this process is the product of an upgrade a peer drove, close that
     // run out now that there is a peer to tell (no-op otherwise).
     upgrade::report_pending(state, ci);
@@ -262,7 +262,7 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
     let hub_uuid = state.hub_uuid.clone();
     m.set_coalesce(&hub_uuid, seq, "handshake_sync");
     if !queue::enqueue(&mut state.clients[ci], m) {
-        hlog!(
+        hlog_warning!(
             "[PEER] Could not queue initial sync to {}\n",
             state.clients[ci].ip
         );
@@ -282,13 +282,13 @@ fn check_peers(state: &mut HubState) {
             continue;
         }
         let (ip, port) = (state.peers[pi].ip.clone(), state.peers[pi].port);
-        hlog!("[PEER] Attempting to connect to {ip}:{port}...\n");
+        hlog_debug!("[PEER] Attempting to connect to {ip}:{port}...\n");
         let Ok(sock) = net::connect_peer(&ip, port) else {
-            hlog!("[PEER] Failed to connect to {ip}:{port}\n");
+            hlog_warning!("[PEER] Failed to connect to {ip}:{port}\n");
             continue;
         };
         if state.clients.len() >= MAX_CLIENTS {
-            hlog!("[PEER] Client limit reached.\n");
+            hlog_warning!("[PEER] Client limit reached.\n");
             continue;
         }
         let fd = {
@@ -336,6 +336,9 @@ fn maintenance(state: &mut HubState) {
     // Rolling network upgrade: one step per tick (no-op unless running).
     upgrade::tick(state, t);
 
+    // The full config push owed to the bots, coalesced across a burst.
+    client::flush_bot_config(state, t);
+
     // Mesh-state gossip: every 5 min as a heartbeat, or immediately when the
     // peer topology changes (connect/disconnect sets mesh_state_dirty).
     if state.mesh_state_dirty || t - state.timers.last_mesh_gossip > 300 {
@@ -357,7 +360,7 @@ fn maintenance(state: &mut HubState) {
         state.timers.last_anti_entropy = t;
         state.anti_entropy_due = false;
         if !state.peers.is_empty() {
-            hlog!(
+            hlog_debug!(
                 "[MESH] Running {}anti-entropy sync...\n",
                 if forced_ae { "forced " } else { "periodic " }
             );
@@ -383,7 +386,7 @@ fn maintenance(state: &mut HubState) {
         while i < state.clients.len() {
             let c = &state.clients[i];
             if c.inbound && !ratelimit::ip_acl_permits(state, &c.ip) {
-                hlog!(
+                hlog_warning!(
                     "[ACCESS_CONTROL] Closing {}: no longer permitted by the allow/deny lists\n",
                     c.ip
                 );
@@ -408,18 +411,18 @@ fn maintenance(state: &mut HubState) {
         if t - state.timers.last_purge > 86400 {
             state.timers.last_purge = t;
             if mesh::should_initiate_scheduled_purge(state) {
-                hlog!(
+                hlog_info!(
                     "[HUB] Running scheduled purge (older than {} days)\n",
                     state.purge_days_setting
                 );
                 let cutoff = t - i64::from(state.purge_days_setting) * 86400;
                 let (purged, _) = mesh::execute_purge(state, cutoff);
                 if purged > 0 {
-                    hlog!("[HUB] Scheduled purge removed {purged} tombstones\n");
+                    hlog_info!("[HUB] Scheduled purge removed {purged} tombstones\n");
                 }
                 mesh::broadcast_purge(state, cutoff);
             } else {
-                hlog!("[HUB] Scheduled purge skipped (not elected leader in mesh)\n");
+                hlog_info!("[HUB] Scheduled purge skipped (not elected leader in mesh)\n");
             }
         }
     }
@@ -433,7 +436,7 @@ fn maintenance(state: &mut HubState) {
         while i < state.clients.len() {
             let c = &state.clients[i];
             if t - c.last_seen > CLIENT_TIMEOUT {
-                hlog!("[HUB] Client {} timed out.\n", c.ip);
+                hlog_warning!("[HUB] Client {} timed out.\n", c.ip);
                 auth::disconnect_client(state, i);
                 continue;
             }
@@ -452,7 +455,7 @@ fn maintenance(state: &mut HubState) {
                 PREAUTH_TIMEOUT_SEC
             };
             if !c.authenticated && c.typ != ClientType::Hub && t - c.connected_at > preauth_window {
-                hlog!(
+                hlog_warning!(
                     "[HUB] Pre-auth timeout for {} ({}s, no handshake{}) — dropping\n",
                     c.ip,
                     t - c.connected_at,
@@ -770,11 +773,11 @@ fn accept_one(state: &mut HubState) {
     let incoming_ip = net::peer_ip(&addr);
 
     if !ratelimit::check_ip_access_lists(state, &incoming_ip) {
-        hlog!("[HUB] Connection from {incoming_ip} rejected (access control)\n");
+        hlog_warning!("[HUB] Connection from {incoming_ip} rejected (access control)\n");
         return;
     }
     if !ratelimit::is_ip_allowed(state, &incoming_ip) {
-        hlog!("[HUB] Connection from {incoming_ip} rejected (rate limit)\n");
+        hlog_warning!("[HUB] Connection from {incoming_ip} rejected (rate limit)\n");
         return;
     }
     if state.clients.len() >= MAX_CLIENTS {
@@ -791,7 +794,7 @@ fn accept_one(state: &mut HubState) {
     c.last_pong_sent = 0;
     state.clients.push(c);
     ratelimit::increment_active_connections(state, &incoming_ip);
-    hlog!("[HUB] Incoming connect: {incoming_ip}\n");
+    hlog_info!("[HUB] Incoming connect: {incoming_ip}\n");
 }
 
 /// One readable client: fill its buffer, then hand whole frames to the pump.
@@ -822,7 +825,7 @@ fn read_one(state: &mut HubState, fd: i32) {
     } else if !state.clients[ci].has_buffered_frame() {
         // A full buffer with no whole frame in it cannot happen with a valid
         // length prefix, so the stream is bad.
-        hlog!("[HUB] Buffer overflow {}\n", state.clients[ci].ip);
+        hlog_warning!("[HUB] Buffer overflow {}\n", state.clients[ci].ip);
         auth::disconnect_client(state, ci);
         return;
     }
@@ -841,7 +844,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     if !config::load(&mut state, &password) {
         state.config_pass.wipe();
         println!("Config load failed. Run -setup.");
-        hlog!("Config load failed.\n");
+        hlog_error!("[HUB] Config load failed.\n");
         let _ = fs::remove_file(HUB_PID_FILE);
         return 1;
     }
@@ -870,12 +873,12 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     // own pubkey via hub_admin.
     let peerless = state.peers.iter().filter(|p| !p.has_pubkey).count();
     if peerless > 0 {
-        hlog!(
-            "[HUB] WARNING: {peerless} peer(s) lack a Curve25519 pubkey and will be refused on connect. Re-add them with their hub_public.b64 via hub_admin (Add Peer / Set Peer Pubkey).\n"
+        hlog_warning!(
+            "[HUB] {peerless} peer(s) lack a Curve25519 pubkey and will be refused on connect. Re-add them with their hub_public.b64 via hub_admin (Add Peer / Set Peer Pubkey).\n"
         );
     }
 
-    hlog!(
+    hlog_info!(
         "[HUB] Started on port {} (PID: {})\n",
         state.port,
         std::process::id()
@@ -884,9 +887,9 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     let addr: SocketAddr = match net::bind_addr(&state.bind_ip, state.port) {
         Ok(a) => {
             if a.ip().is_unspecified() {
-                hlog!("[HUB] Binding to 0.0.0.0:{} (all interfaces)\n", state.port);
+                hlog_info!("[HUB] Binding to 0.0.0.0:{} (all interfaces)\n", state.port);
             } else {
-                hlog!("[HUB] Binding to {}:{}\n", state.bind_ip, state.port);
+                hlog_info!("[HUB] Binding to {}:{}\n", state.bind_ip, state.port);
             }
             a
         }
@@ -980,7 +983,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     // unlinked while still locked, then the lock is released.  Dropping it
     // first let an immediate restart find the port still bound.
     let sig = if stop.load(Ordering::Relaxed) { 1 } else { 0 };
-    hlog!("[HUB] Shutting down (signal {sig}).\n");
+    hlog_info!("[HUB] Shutting down (signal {sig}).\n");
     state.listener = None;
     while !state.clients.is_empty() {
         let last = state.clients.len() - 1;
@@ -1014,6 +1017,13 @@ fn main() {
     // there is nothing to tune.
 
     let args: Vec<String> = std::env::args().collect();
+    // -checkupdate [variant]: verify the release channel and exit; needs no
+    // config, no password and no PID lock.
+    if let Some(i) = args.iter().skip(1).position(|a| a == "-checkupdate") {
+        std::process::exit(irchub::update::check_cli(
+            args.get(i + 2).map(String::as_str),
+        ));
+    }
     let setup_mode = args.iter().skip(1).any(|a| a == "-setup");
     let passfile_mode = args.iter().skip(1).any(|a| a == "-p");
 

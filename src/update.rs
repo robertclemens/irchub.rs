@@ -22,7 +22,7 @@ use std::sync::RwLock;
 
 use crate::consts::*;
 use crate::state::HubState;
-use crate::{config, crypto, hlog};
+use crate::{config, crypto};
 
 // ---------------------------------------------------------------------------
 // Host capability probe (answered in CMD_UPGRADE_READY)
@@ -159,6 +159,49 @@ fn env_base() -> Option<String> {
     std::env::var("IRCHUB_UPDATE_BASE")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+/// `irchub -checkupdate [variant]`: fetch the irchub release manifest and its
+/// signature exactly as a hub self-upgrade does — `<root>/<variant>`, the
+/// compiled-in root and pinned key unless IRCHUB_UPDATE_BASE says otherwise —
+/// verify one against the other, and report.  Nothing past the manifest is
+/// downloaded and nothing is installed, so an operator (or the testnet) can
+/// prove a host reaches and trusts the real release channel — TLS, CA store,
+/// pinned key — without upgrading anything.  Returns the exit code: 0 =
+/// verified.
+pub fn check_cli(variant: Option<&str>) -> i32 {
+    let want = variant.filter(|v| !v.is_empty()).unwrap_or(host_variant());
+    if want.len() > 7 || want.contains(['/', ';', '|', '&', '`', '$', ' ', '\t', '\r', '\n']) {
+        println!("checkupdate: FAIL malformed variant");
+        return 1;
+    }
+    let tree = format!("{}/{want}", effective_root(""));
+    let manifest = match fetch_verified_manifest(&tree) {
+        Ok(m) => m,
+        Err(e) => {
+            println!("checkupdate: FAIL {e} ({tree})");
+            return 1;
+        }
+    };
+    let mut rows = 0;
+    let mut newest = String::new();
+    for line in manifest.lines() {
+        let Some(version) = line.split_whitespace().next() else {
+            continue;
+        };
+        if line.starts_with('#') {
+            continue;
+        }
+        rows += 1;
+        if newest.is_empty() || version_cmp(version, &newest) == std::cmp::Ordering::Greater {
+            newest = version.to_string();
+        }
+    }
+    println!(
+        "checkupdate: OK {want} manifest verified: {rows} release row(s), newest {}, running {HUB_VERSION}",
+        if newest.is_empty() { "-" } else { &newest }
+    );
+    0
 }
 
 /// The base a run works against: what the driver named, else the operator's
@@ -304,11 +347,8 @@ fn fetch_verified_manifest(base: &str) -> Result<String, String> {
     if pubkey_b64.is_empty() {
         return Err("hub updater disabled (no signing key configured)".to_string());
     }
-    let pub_key = crypto::b64_decode(&pubkey_b64)
-        .filter(|p| p.len() == 32)
+    let pk = crypto::update_pubkey_b64_decode(&pubkey_b64)
         .ok_or("configured update public key is malformed")?;
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&pub_key);
 
     let man = fetch(&format!("{base}/releases.txt"), HUB_UPDATE_MAX_MANIFEST)
         .ok_or("failed to download release manifest")?;
@@ -550,19 +590,19 @@ pub fn rollback(state: &mut HubState, reason: &str) -> bool {
     let prev_exe = format!("{exe}{HUB_UPGRADE_PREV_SUFFIX}");
     let prev_cfg = format!("{HUB_CONFIG_FILE}{HUB_UPGRADE_PREV_SUFFIX}");
     if !std::path::Path::new(&prev_exe).exists() {
-        hlog!("[UPGRADE] Rollback requested ({reason}) but no retained binary\n");
+        crate::hlog_error!("[UPGRADE] Rollback requested ({reason}) but no retained binary\n");
         return false;
     }
-    hlog!("[UPGRADE] Rolling back to the retained build: {reason}\n");
+    crate::hlog_warning!("[UPGRADE] Rolling back to the retained build: {reason}\n");
     // Config first: if the restart races us, the old binary must not come up
     // against a config only the newer build understands.
     if std::path::Path::new(&prev_cfg).exists()
         && std::fs::rename(&prev_cfg, HUB_CONFIG_FILE).is_err()
     {
-        hlog!("[UPGRADE] Could not restore {prev_cfg}; keeping the current one\n");
+        crate::hlog_error!("[UPGRADE] Could not restore {prev_cfg}; keeping the current one\n");
     }
     if std::fs::rename(&prev_exe, &exe).is_err() {
-        hlog!("[UPGRADE] Could not restore {prev_exe}\n");
+        crate::hlog_error!("[UPGRADE] Could not restore {prev_exe}\n");
         return false;
     }
     let _ = std::fs::remove_file(HUB_UPGRADE_MARKER_FILE);
@@ -677,7 +717,7 @@ pub fn commit(
     }
     let tree = format!("{root}/{want_variant}");
 
-    hlog!(
+    crate::hlog_info!(
         "[UPGRADE] Commit {upgrade_id}: {} -> {target_ver} (variant {want_variant})\n",
         HUB_VERSION
     );
@@ -702,7 +742,7 @@ pub fn commit(
         return Err("manifest artifact is not a irchub release".to_string());
     }
 
-    hlog!("[UPGRADE] Fetching {} artifact {archive}\n", row.kind);
+    crate::hlog_info!("[UPGRADE] Fetching {} artifact {archive}\n", row.kind);
     if !download(&row.url, &archive) {
         return Err("artifact download failed".to_string());
     }
@@ -751,7 +791,7 @@ pub fn commit(
         return Err("could not stage the upgrade script".to_string());
     }
 
-    hlog!("[UPGRADE] Installing {target_ver} and restarting\n");
+    crate::hlog_info!("[UPGRADE] Installing {target_ver} and restarting\n");
     state.pid_file = None;
     std::thread::sleep(std::time::Duration::from_secs(1));
     let err = Command::new(format!("./{HUB_UPGRADE_SCRIPT}")).exec();

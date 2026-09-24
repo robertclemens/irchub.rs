@@ -13,8 +13,11 @@
 use crate::consts::*;
 use crate::cstr::{atoll, now, trunc_string};
 use crate::queue;
-use crate::state::{BotRoster, ClientType, HubState, Lane, QueuedMsg, UpgradeNodeKind};
-use crate::{hlog, storage, upgrade};
+use crate::state::{
+    BotRoster, ClientType, HubState, Lane, MeshHub, MeshLink, PeerConfig, QueuedMsg,
+    UpgradeNodeKind,
+};
+use crate::{storage, upgrade};
 
 /// Sanitize one field arriving from a bot or a peer before it is stored or
 /// echoed into a tree row.  Presence text is attacker-controlled: it reaches
@@ -39,7 +42,7 @@ pub fn roster_expire(state: &mut HubState, now_ts: i64) {
     while i < state.roster.len() {
         if now_ts - state.roster[i].reported_at > BOT_ROSTER_TTL {
             let e = &state.roster[i];
-            hlog!(
+            crate::hlog_info!(
                 "[PRESENCE] {} on hub {} aged out of the roster\n",
                 if e.nick.is_empty() {
                     &e.bot_uuid
@@ -54,6 +57,55 @@ pub fn roster_expire(state: &mut HubState, now_ts: i64) {
         }
         i += 1;
     }
+    let before = state.mesh_hubs.len();
+    state.mesh_hubs.retain(|h| {
+        let keep = now_ts - h.reported_at <= BOT_ROSTER_TTL;
+        if !keep {
+            crate::hlog_info!(
+                "[PRESENCE] Hub {} aged out of the mesh map\n",
+                if h.name.is_empty() { &h.uuid } else { &h.name }
+            );
+        }
+        keep
+    });
+    if state.mesh_hubs.len() != before {
+        state.tree_dirty = true;
+    }
+}
+
+/// The mesh-map record for hub `uuid`, or None.
+fn mesh_hub_find(state: &HubState, uuid: &str) -> Option<usize> {
+    state.mesh_hubs.iter().position(|h| h.uuid == uuid)
+}
+
+/// ...created on first sight.  None when the map is full: that hub's frames
+/// are then applied as before but not relayed, so a map overflow degrades to
+/// the one-hop tree instead of a relay loop.
+fn mesh_hub_get(state: &mut HubState, uuid: &str) -> Option<usize> {
+    if let Some(i) = mesh_hub_find(state, uuid) {
+        return Some(i);
+    }
+    if state.mesh_hubs.len() >= MAX_MESH_HUBS {
+        crate::hlog_warning!(
+            "[PRESENCE] Mesh map full ({MAX_MESH_HUBS}) — {uuid} is not relayed\n"
+        );
+        return None;
+    }
+    state.mesh_hubs.push(MeshHub {
+        uuid: uuid.to_string(),
+        round: -1,
+        ..MeshHub::default()
+    });
+    Some(state.mesh_hubs.len() - 1)
+}
+
+/// True when our link to configured peer `p` is up right now.
+fn peer_is_linked(state: &HubState, p: &PeerConfig) -> bool {
+    p.fd > 0
+        && state
+            .clients
+            .iter()
+            .any(|c| c.typ == ClientType::Hub && c.authenticated && c.fd == p.fd)
 }
 
 /// Upsert one reported bot.  Keyed on (reporting hub, bot) so the same bot
@@ -80,7 +132,7 @@ fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
         return;
     }
     if state.roster.len() >= MAX_BOT_ROSTER {
-        hlog!(
+        crate::hlog_warning!(
             "[PRESENCE] Roster full ({MAX_BOT_ROSTER}) — dropping report for {}\n",
             incoming.bot_uuid
         );
@@ -145,7 +197,7 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
 
     if changed {
         let id = c.id.clone();
-        hlog!(
+        crate::hlog_info!(
             "[PRESENCE] Bot {id}: version {} ({}) on {}\n",
             if version.is_empty() { "?" } else { &version },
             if variant.is_empty() { "?" } else { &variant },
@@ -188,18 +240,38 @@ fn bot_nick_from_config(state: &HubState, uuid: &str) -> String {
     }
 }
 
-/// One roster frame to every authenticated peer.  Deliberately NOT
-/// coalesced: a large roster is chunked into several frames and coalescing on
-/// one key would collapse them into whichever arrived last.  Best-effort on
-/// the BULK lane — a dropped frame just means those bots refresh on the next
-/// tick.
-fn roster_send_to_peers(state: &mut HubState, frame: &str) {
+/// One roster frame to every authenticated peer except `skip`.  Deliberately
+/// NOT coalesced: a large roster is chunked into several frames and
+/// coalescing on one key would collapse them into whichever arrived last.
+/// Best-effort on the BULK lane — a dropped frame just means those bots
+/// refresh on the next tick.
+///
+/// Split horizon for a relayed frame (`origin` set): a peer that IS the
+/// origin, or that the origin says it is linked to right now, already has it
+/// first hand.  On a full mesh this leaves nothing to relay at all.
+fn roster_send_to_peers(
+    state: &mut HubState,
+    frame: &str,
+    skip: Option<usize>,
+    origin: Option<usize>,
+) {
     for ci in state.peer_clients() {
+        if Some(ci) == skip {
+            continue;
+        }
+        if let Some(oi) = origin {
+            let cu = upgrade::peer_uuid_of(state, ci);
+            let o = &state.mesh_hubs[oi];
+            if !cu.is_empty() && (cu == o.uuid || o.links.iter().any(|l| l.online && l.uuid == cu))
+            {
+                continue;
+            }
+        }
         let Some(m) = QueuedMsg::new(CMD_BOT_ROSTER, Lane::Bulk, frame.as_bytes()) else {
             continue;
         };
         if !queue::enqueue(&mut state.clients[ci], m) {
-            hlog!(
+            crate::hlog_warning!(
                 "[PRESENCE] roster enqueue failed for peer {}\n",
                 state.clients[ci].ip
             );
@@ -207,29 +279,11 @@ fn roster_send_to_peers(state: &mut HubState, frame: &str) {
     }
 }
 
-/// Gossip the bots connected to THIS hub out to the peers.  Chunked to a byte
-/// budget: each frame repeats the h| header and carries whole rows only, so a
-/// receiver can apply any frame on its own without waiting for the rest.
-///
-/// Frame shape:
-/// ```text
-/// h|<hub_uuid>|<name>|<started>|<hub_version>
-/// v|<hub_variant>                          (this hub's code base: c / rs)
-/// b|<bot_uuid>|<nick>|<version>|<server>|<started>|<variant>
-/// ```
-/// The hub's variant is a line of its own, not a sixth h| field: a hub that
-/// predates it reads everything after the version's '|' into the version
-/// (roster_clean drops the '|'), which would read as "2.4.0c" and stall any
-/// upgrade run waiting on "2.4.0".  Older hubs skip an unknown line.  The b|
-/// variant can ride last because older hubs split five fields and atoll() the
-/// start time, which stops at the '|'.
-fn gossip_bot_roster(state: &mut HubState) {
-    if state.peers.is_empty() {
-        return;
-    }
-    let now_ts = now();
-    let header = format!(
-        "h|{}|{}|{}|{HUB_VERSION}\nv|{HUB_UPDATE_VARIANT}\n",
+/// Start one gossip frame: the header lines every frame repeats, the relay
+/// line, and — on the first chunk only — this hub's peer links.
+fn roster_frame_begin(state: &HubState, round: i64, chunk: u32) -> String {
+    let mut f = format!(
+        "h|{}|{}|{}|{HUB_VERSION}\nv|{HUB_UPDATE_VARIANT}\ng|{round}|{chunk}|{ROSTER_RELAY_HOPS}\n",
         if state.hub_uuid.is_empty() {
             "-"
         } else {
@@ -242,11 +296,67 @@ fn gossip_bot_roster(state: &mut HubState) {
         },
         state.hub_started
     );
-    if header.len() >= ROSTER_FRAME_BUDGET {
+    if chunk != 0 {
+        return f;
+    }
+    for peer in state.peers.iter().filter(|p| !p.uuid.is_empty()) {
+        let pname = roster_clean(
+            if peer.friendly_name.is_empty() {
+                &peer.ip
+            } else {
+                &peer.friendly_name
+            },
+            64,
+        );
+        f.push_str(&format!(
+            "l|{}|{}|{}\n",
+            peer.uuid,
+            if pname.is_empty() { "-" } else { &pname },
+            i32::from(peer_is_linked(state, peer))
+        ));
+    }
+    f
+}
+
+/// Gossip the bots connected to THIS hub out to the peers.  Chunked to a byte
+/// budget: each frame repeats the h| header and carries whole rows only, so a
+/// receiver can apply any frame on its own without waiting for the rest.
+///
+/// Frame shape:
+/// ```text
+/// h|<hub_uuid>|<name>|<started>|<hub_version>
+/// v|<hub_variant>                          (this hub's code base: c / rs)
+/// g|<round>|<chunk>|<ttl>                    (relay control, see below)
+/// l|<peer_uuid>|<peer_name>|<online>       (first chunk only, per peer)
+/// b|<bot_uuid>|<nick>|<version>|<server>|<started>|<variant>
+/// ```
+/// The hub's variant is a line of its own, not a sixth h| field: a hub that
+/// predates it reads everything after the version's '|' into the version
+/// (roster_clean drops the '|'), which would read as "2.4.0c" and stall any
+/// upgrade run waiting on "2.4.0".  Older hubs skip an unknown line, which is
+/// also why g| and l| are lines of their own.  The b| variant can ride last
+/// because older hubs split five fields and atoll() the start time, which
+/// stops at the '|'.
+///
+/// g| makes the gossip multi-hop: a hub that receives a frame it has not seen
+/// (origin, round, chunk) passes it on with ttl-1, so every hub hears every
+/// other hub however the peers are wired.  l| is what lets a receiver draw
+/// the mesh deeper than its own peers.
+fn gossip_bot_roster(state: &mut HubState) {
+    if state.peers.is_empty() {
         return;
     }
+    let now_ts = now();
+    // Generations only ever grow, across restarts too (wall-clock based), so
+    // a receiver can tell a new round from a late copy of an old one.
+    let round = (now_ts * 1000).max(state.roster_gen + 1);
+    state.roster_gen = round;
 
-    let mut frame = header.clone();
+    let mut chunk = 0u32;
+    let mut frame = roster_frame_begin(state, round, chunk);
+    if frame.len() >= ROSTER_FRAME_BUDGET {
+        return;
+    }
     let mut rows = 0;
     let mut frames = 0;
 
@@ -278,10 +388,12 @@ fn gossip_bot_roster(state: &mut HubState) {
         if row.len() >= TREE_ROW_MAX {
             continue; // an unrepresentable row
         }
-        if frame.len() + row.len() >= ROSTER_FRAME_BUDGET {
-            // Full: flush and restart.
-            let f = std::mem::replace(&mut frame, header.clone());
-            roster_send_to_peers(state, &f);
+        if frame.len() + row.len() >= ROSTER_FRAME_BUDGET && rows > 0 {
+            // Full: flush and start the next chunk.
+            chunk += 1;
+            let next = roster_frame_begin(state, round, chunk);
+            let f = std::mem::replace(&mut frame, next);
+            roster_send_to_peers(state, &f, None, None);
             frames += 1;
             rows = 0;
         }
@@ -296,16 +408,101 @@ fn gossip_bot_roster(state: &mut HubState) {
     // this hub's liveness and uptime beacon, which is what lets a peer show
     // an empty hub in the tree with a real uptime instead of a blank.
     if rows > 0 || frames == 0 {
-        roster_send_to_peers(state, &frame);
+        roster_send_to_peers(state, &frame, None, None);
     }
     state.last_presence_gossip = now_ts;
 }
 
-/// process_bot_roster(): a peer told us which bots are on it.
-pub fn process_bot_roster(state: &mut HubState, payload: &str) {
+/// The relay control of a roster frame: origin uuid and start time from its
+/// h| line, and `(round, chunk, ttl)` from its g| line if it has one.
+fn roster_frame_peek(payload: &str) -> (String, i64, Option<(i64, u32, i32)>) {
+    let mut origin = String::new();
+    let mut started = 0;
+    let mut g = None;
+    for line in payload.split('\n') {
+        if let Some(body) = line.strip_prefix("h|") {
+            if origin.is_empty() {
+                let f: Vec<&str> = body.split('|').collect();
+                origin = roster_clean(f[0], 64);
+                started = f.get(2).map_or(0, |v| atoll(v));
+            }
+        } else if let Some(body) = line.strip_prefix("g|")
+            && g.is_none()
+        {
+            let f: Vec<&str> = body.split('|').collect();
+            if f.len() >= 3 && !f[0].is_empty() {
+                g = Some((
+                    atoll(f[0]),
+                    atoll(f[1]).clamp(0, u32::MAX as i64) as u32,
+                    atoll(f[2]).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                ));
+            }
+        }
+    }
+    (origin, started, g)
+}
+
+/// The same frame with its g| ttl replaced, for the next hop.
+fn roster_frame_rettl(payload: &str, round: i64, chunk: u32, ttl: i32) -> String {
+    let mut out = String::with_capacity(payload.len() + 8);
+    for line in payload.split('\n').filter(|l| !l.is_empty()) {
+        if line.starts_with("g|") {
+            out.push_str(&format!("g|{round}|{chunk}|{ttl}\n"));
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// process_bot_roster(): a hub told us which bots are on it — a peer about
+/// itself, or any hub further out, relayed.  `from` is the peer link it
+/// arrived on.
+pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
     let mut hub_uuid = String::new();
     let mut hub_name = String::new();
     let now_ts = now();
+
+    // Relay bookkeeping first, on the untouched frame.
+    let (origin, o_started, g) = roster_frame_peek(payload);
+    if origin.is_empty() || origin == "-" {
+        return;
+    }
+    if !state.hub_uuid.is_empty() && origin == state.hub_uuid {
+        return; // our own gossip, back around a cycle
+    }
+    let mh = mesh_hub_get(state, &origin);
+    if let (Some((round, chunk, _)), Some(mi)) = (g, mh) {
+        let h = &mut state.mesh_hubs[mi];
+        // A restarted origin starts its generations over from its clock, so a
+        // new start time resets the window rather than reading as stale.
+        if o_started > 0 && h.started > 0 && o_started != h.started {
+            h.round = -1;
+            h.chunks_seen = 0;
+        }
+        if round < h.round {
+            return; // a late copy of an older round
+        }
+        let bit = if chunk < 64 { 1u64 << chunk } else { 0 };
+        if round == h.round && (bit == 0 || h.chunks_seen & bit != 0) {
+            return;
+        }
+        if round > h.round {
+            h.round = round;
+            h.chunks_seen = 0;
+        }
+        h.chunks_seen |= bit;
+    }
+    let relay = match (g, mh) {
+        (Some((round, chunk, ttl)), Some(_)) if ttl > 1 && ttl <= ROSTER_RELAY_HOPS => {
+            let r = roster_frame_rettl(payload, round, chunk, ttl - 1);
+            (r.len() <= ROSTER_FRAME_BUDGET + 64).then_some(r)
+        }
+        _ => None,
+    };
+    let first_chunk = matches!(g, Some((_, 0, _)));
+    let mut links_reset = false;
 
     for line in payload.split('\n') {
         if let Some(body) = line.strip_prefix("h|") {
@@ -323,18 +520,38 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
             }
             hub_uuid = roster_clean(f[0], 64);
             hub_name = roster_clean(f[1], 64);
+            if hub_uuid.is_empty() {
+                continue;
+            }
+            let sane_start = started > 0 && started <= now_ts;
 
             // The header doubles as the remote hub's uptime and version
             // beacon.  Clamp rather than trust: a peer's clock skew would
             // render as a negative uptime.
-            if !hub_uuid.is_empty()
-                && let Some(p) = state
-                    .peers
-                    .iter_mut()
-                    .find(|p| !p.uuid.is_empty() && p.uuid == hub_uuid)
+            if let Some(mi) = mh
+                && state.mesh_hubs[mi].uuid == hub_uuid
+            {
+                let h = &mut state.mesh_hubs[mi];
+                if h.name != hub_name
+                    || h.version != hub_ver
+                    || (sane_start && h.started != started)
+                {
+                    state.tree_dirty = true;
+                }
+                h.name = hub_name.clone();
+                h.version = hub_ver.clone();
+                if sane_start {
+                    h.started = started;
+                }
+                h.reported_at = now_ts;
+            }
+            if let Some(p) = state
+                .peers
+                .iter_mut()
+                .find(|p| !p.uuid.is_empty() && p.uuid == hub_uuid)
             {
                 let mut dirty = false;
-                if started > 0 && started <= now_ts && p.remote_started != started {
+                if sane_start && p.remote_started != started {
                     p.remote_started = started;
                     dirty = true;
                 }
@@ -345,20 +562,20 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
                 if dirty {
                     state.tree_dirty = true;
                 }
-                // Same authoritative signal the bots give through their
-                // presence: a hub node of a run we drive is done when it
-                // reappears in the gossip on the target version.  Its
-                // CMD_UPGRADE_RESULT can be lost — several hops more of it,
-                // now that a run reaches the whole mesh — but this gossip
-                // cannot, or the hub is not on the mesh at all.
-                upgrade::note_presence(state, &hub_uuid, &hub_ver);
-                // No roll-up here: a peer hub is never rolled up by a PREPARE
-                // from its neighbour.  A peer cannot tell a single-node
-                // roll-up PREPARE from a run's, so it would fan the frame out
-                // to the whole mesh — and every hub holding the plan would do
-                // the same to every other, which is the storm a hub-and-bot
-                // net produced.
             }
+            // Same authoritative signal the bots give through their presence:
+            // a hub node of a run we drive is done when it reappears in the
+            // gossip on the target version.  Its CMD_UPGRADE_RESULT can be
+            // lost — several hops more of it, now that a run reaches the whole
+            // mesh — but this gossip cannot, or the hub is not on the mesh at
+            // all.  Relayed gossip counts too: that is how a hub several hops
+            // out reports in.
+            // No roll-up here: a peer hub is never rolled up by a PREPARE from
+            // its neighbour.  A peer cannot tell a single-node roll-up PREPARE
+            // from a run's, so it would fan the frame out to the whole mesh —
+            // and every hub holding the plan would do the same to every other,
+            // which is the storm a hub-and-bot net produced.
+            upgrade::note_presence(state, &hub_uuid, &hub_ver);
             continue;
         }
         if let Some(v) = line.strip_prefix("v|") {
@@ -367,6 +584,13 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
                 continue;
             }
             let hv = roster_clean(v, ROSTER_VARIANT_MAX + 1);
+            if let Some(mi) = mh
+                && state.mesh_hubs[mi].uuid == hub_uuid
+                && state.mesh_hubs[mi].variant != hv
+            {
+                state.mesh_hubs[mi].variant = hv.clone();
+                state.tree_dirty = true;
+            }
             if let Some(p) = state
                 .peers
                 .iter_mut()
@@ -376,6 +600,35 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
                 p.remote_variant = hv;
                 state.tree_dirty = true;
             }
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("l|") {
+            // The origin's peer links, first chunk of a round only: the list
+            // replaces what we had, so a link it dropped disappears.
+            let Some(mi) = mh else { continue };
+            if !first_chunk || state.mesh_hubs[mi].uuid != hub_uuid {
+                continue;
+            }
+            let h = &mut state.mesh_hubs[mi];
+            if !links_reset {
+                h.links.clear();
+                h.have_links = true;
+                links_reset = true;
+                state.tree_dirty = true; // cheap: pushes are coalesced per bot
+            }
+            let f: Vec<&str> = body.split('|').collect();
+            if f.len() < 3 || h.links.len() >= MAX_PEERS {
+                continue;
+            }
+            let uuid = roster_clean(f[0], 64);
+            if uuid.is_empty() {
+                continue;
+            }
+            h.links.push(MeshLink {
+                uuid,
+                name: roster_clean(f[1], 64),
+                online: f[2].starts_with('1'),
+            });
             continue;
         }
         let Some(body) = line.strip_prefix("b|") else {
@@ -443,6 +696,12 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
         };
         roster_upsert(state, e);
     }
+
+    // Pass it on after applying it, so the split horizon uses the links this
+    // very frame just reported.
+    if let Some(r) = relay {
+        roster_send_to_peers(state, &r, Some(from), mh);
+    }
 }
 
 /// hub_build_tree(): the tree for the bots on THIS hub, in DFS pre-order.
@@ -464,7 +723,8 @@ pub fn process_bot_roster(state: &mut HubState, payload: &str) {
 /// can change without a hub deploy.
 ///
 /// Rooted at this hub because that is the vantage point the asking bot has:
-/// its own hub first, peer hubs beneath it.  The mesh is flat, so the same
+/// its own hub first, its peer hubs beneath it, and every hub further out
+/// beneath the hub that links to it (from the relayed gossip).  The same
 /// network legitimately renders differently depending on which bot you ask.
 pub fn build_tree(state: &HubState) -> String {
     let max_len = MAX_TREE_PAYLOAD;
@@ -525,80 +785,164 @@ pub fn build_tree(state: &HubState) -> String {
         ));
     }
 
-    // Peer hubs at depth 1, each followed by its bots at depth 2.  A peer we
-    // have no roster for still gets its node — "linked, nothing reported yet"
-    // is more useful than silently omitting a hub that is plainly there.
-    for peer in &state.peers {
+    // Every other hub, breadth-first from here: our configured peers at
+    // depth 1 (linked or not — "configured, down" is worth showing), then
+    // whatever each linked hub reports it is linked to, one level further
+    // out.  A hub is placed once, at the first (so the shortest) path found;
+    // a hub only reported through a DOWN link is hung, unlinked, under the
+    // first hub that reports it once the live mesh has been walked.  Emitted
+    // depth-first below, since pre-order plus depth is what the renderer
+    // reads.
+    struct TreeHub {
+        uuid: String,
+        name: String,
+        online: bool,
+        depth: i32,
+        parent: Option<usize>,
+    }
+    let cap = MAX_MESH_HUBS + MAX_PEERS + 1;
+    let mut th: Vec<TreeHub> = state
+        .peers
+        .iter()
+        .take(cap)
+        .map(|peer| TreeHub {
+            uuid: if peer.uuid.is_empty() {
+                "-".to_string()
+            } else {
+                peer.uuid.clone()
+            },
+            name: roster_clean(
+                if peer.friendly_name.is_empty() {
+                    &peer.ip
+                } else {
+                    &peer.friendly_name
+                },
+                64,
+            ),
+            online: peer_is_linked(state, peer),
+            depth: 1,
+            parent: None,
+        })
+        .collect();
+    let placed = |th: &[TreeHub], u: &str| u == state.hub_uuid || th.iter().any(|t| t.uuid == u);
+    for pass in 0..2 {
+        // pass 0 walks live links only; pass 1 hangs what is left, unlinked.
+        let mut i = 0;
+        while i < th.len() && th.len() < cap {
+            if th[i].online
+                && th[i].depth < MAX_TREE_DEPTH
+                && let Some(mi) = mesh_hub_find(state, &th[i].uuid)
+            {
+                for l in &state.mesh_hubs[mi].links {
+                    if th.len() >= cap {
+                        break;
+                    }
+                    if l.online != (pass == 0) || placed(&th, &l.uuid) {
+                        continue;
+                    }
+                    let name = match mesh_hub_find(state, &l.uuid) {
+                        Some(li) if !state.mesh_hubs[li].name.is_empty() => {
+                            roster_clean(&state.mesh_hubs[li].name, 64)
+                        }
+                        _ => roster_clean(&l.name, 64),
+                    };
+                    let depth = th[i].depth + 1;
+                    th.push(TreeHub {
+                        uuid: l.uuid.clone(),
+                        name,
+                        online: l.online,
+                        depth,
+                        parent: Some(i),
+                    });
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Depth-first emission: a hub, its bots, then its child hubs.
+    let mut stack: Vec<usize> = (0..th.len())
+        .rev()
+        .filter(|&i| th[i].parent.is_none())
+        .collect();
+    while let Some(i) = stack.pop() {
         if max_len - out.len() <= TREE_ROW_MAX {
             break;
         }
-        let online = peer.fd > 0
-            && state
-                .clients
-                .iter()
-                .any(|c| c.typ == ClientType::Hub && c.authenticated && c.fd == peer.fd);
-        let pname = roster_clean(
-            if peer.friendly_name.is_empty() {
-                &peer.ip
-            } else {
-                &peer.friendly_name
-            },
-            64,
-        );
-        out.push_str(&format!(
-            "H|1|{}|{}|{}|{}|{}|{}\n",
-            if pname.is_empty() { "peer" } else { &pname },
-            if peer.uuid.is_empty() {
-                "-"
-            } else {
-                &peer.uuid
-            },
-            i32::from(online),
-            if peer.remote_started != 0 {
-                now_ts - peer.remote_started
-            } else {
-                0
-            },
-            if peer.remote_version.is_empty() {
-                "-"
-            } else {
-                &peer.remote_version
-            },
-            if peer.remote_variant.is_empty() {
-                "-"
-            } else {
-                &peer.remote_variant
+        let t = &th[i];
+        let puuid = if t.uuid == "-" { "" } else { t.uuid.as_str() };
+        // Uptime / version / code base: from our own peer record for a direct
+        // peer, else from the hub's own (relayed) gossip.
+        let (mut started, mut ver, mut var) = (0i64, "", "");
+        if let Some(p) = state
+            .peers
+            .iter()
+            .find(|p| !puuid.is_empty() && p.uuid == puuid)
+        {
+            started = p.remote_started;
+            ver = &p.remote_version;
+            var = &p.remote_variant;
+        }
+        if let Some(mi) = if puuid.is_empty() {
+            None
+        } else {
+            mesh_hub_find(state, puuid)
+        } {
+            let h = &state.mesh_hubs[mi];
+            if started == 0 {
+                started = h.started;
             }
+            if ver.is_empty() {
+                ver = &h.version;
+            }
+            if var.is_empty() {
+                var = &h.variant;
+            }
+        }
+        out.push_str(&format!(
+            "H|{}|{}|{}|{}|{}|{}|{}\n",
+            t.depth,
+            if t.name.is_empty() { "peer" } else { &t.name },
+            if puuid.is_empty() { "-" } else { puuid },
+            i32::from(t.online),
+            if started != 0 { now_ts - started } else { 0 },
+            if ver.is_empty() { "-" } else { ver },
+            if var.is_empty() { "-" } else { var }
         ));
 
-        if peer.uuid.is_empty() {
-            continue;
-        }
-        for e in state.roster.iter().filter(|e| e.hub_uuid == peer.uuid) {
-            if max_len - out.len() <= TREE_ROW_MAX {
-                break;
-            }
-            out.push_str(&format!(
-                "B|2|{}|{}|{}|{}|{}|{}\n",
-                if e.nick.is_empty() { "-" } else { &e.nick },
-                e.bot_uuid,
-                if e.version.is_empty() {
-                    "-"
-                } else {
-                    &e.version
-                },
-                if e.server.is_empty() { "-" } else { &e.server },
-                if e.connected_at != 0 {
-                    now_ts - e.connected_at
-                } else {
-                    0
-                },
-                if e.variant.is_empty() {
-                    "-"
-                } else {
-                    &e.variant
+        if !puuid.is_empty() {
+            for e in state.roster.iter().filter(|e| e.hub_uuid == puuid) {
+                if max_len - out.len() <= TREE_ROW_MAX {
+                    break;
                 }
-            ));
+                out.push_str(&format!(
+                    "B|{}|{}|{}|{}|{}|{}|{}\n",
+                    t.depth + 1,
+                    if e.nick.is_empty() { "-" } else { &e.nick },
+                    e.bot_uuid,
+                    if e.version.is_empty() {
+                        "-"
+                    } else {
+                        &e.version
+                    },
+                    if e.server.is_empty() { "-" } else { &e.server },
+                    if e.connected_at != 0 {
+                        now_ts - e.connected_at
+                    } else {
+                        0
+                    },
+                    if e.variant.is_empty() {
+                        "-"
+                    } else {
+                        &e.variant
+                    }
+                ));
+            }
+        }
+        for k in ((i + 1)..th.len()).rev() {
+            if th[k].parent == Some(i) {
+                stack.push(k);
+            }
         }
     }
 
@@ -673,6 +1017,29 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
 
     roster_expire(state, now_ts);
 
+    // A peer link that came up or went down is news for everyone's tree and
+    // for every forwarder's split horizon (`mesh::sync_send_to_peers`):
+    // gossip it now rather than on the next interval.
+    let mut mask = 0u32;
+    for (p, peer) in state.peers.iter().enumerate().take(32) {
+        if peer_is_linked(state, peer) {
+            mask |= 1 << p;
+        }
+    }
+    if mask != state.gossip_link_mask {
+        // A link went down: see SYNC_RESYNC_AFTER_LINK_LOSS.
+        if state.gossip_link_mask & !mask != 0 {
+            state.resync_due_at = now_ts + SYNC_RESYNC_AFTER_LINK_LOSS;
+        }
+        state.gossip_link_mask = mask;
+        state.last_presence_gossip = 0;
+        state.tree_dirty = true;
+    }
+    if state.resync_due_at != 0 && now_ts >= state.resync_due_at {
+        state.resync_due_at = 0;
+        crate::mesh::request_sync_from_peers(state);
+    }
+
     if now_ts - state.last_presence_gossip >= BOT_PRESENCE_INTERVAL {
         gossip_bot_roster(state);
     }
@@ -739,6 +1106,109 @@ pub fn note_seen(state: &mut HubState, uuid: &str, ts: i64) {
 mod tests {
     use super::*;
 
+    /// A frame that arrived on no client link (unit tests have none).
+    const NO_LINK: usize = usize::MAX;
+
+    #[test]
+    fn relayed_roster_is_applied_once_per_round_and_chunk() {
+        let mut s = HubState::new();
+        s.hub_uuid = "me".into();
+        let f = "h|far|Far|0|2.4.1\nv|c\ng|5000|0|16\nl|mid|Mid|1\nb|bot-9|nine|2.4.1|srv|0|c\n";
+        process_bot_roster(&mut s, NO_LINK, f);
+        assert_eq!(s.roster.len(), 1);
+        let h = &s.mesh_hubs[mesh_hub_find(&s, "far").unwrap()];
+        assert_eq!((h.round, h.chunks_seen, h.links.len()), (5000, 1, 1));
+        assert!(h.links[0].online && h.links[0].uuid == "mid");
+        // The same frame around a cycle is dropped; so is an older round.
+        s.roster.clear();
+        process_bot_roster(&mut s, NO_LINK, f);
+        process_bot_roster(&mut s, NO_LINK, &f.replace("g|5000|", "g|4000|"));
+        assert!(s.roster.is_empty());
+        // Our own gossip coming back is never applied.
+        process_bot_roster(&mut s, NO_LINK, &f.replace("h|far|", "h|me|"));
+        assert!(s.roster.is_empty());
+        // The next round is; a frame without l| lines keeps the links it had.
+        process_bot_roster(&mut s, NO_LINK, &f.replace("g|5000|0|", "g|6000|1|"));
+        assert_eq!(s.roster.len(), 1);
+        assert_eq!(s.mesh_hubs[0].links.len(), 1);
+    }
+
+    #[test]
+    fn relay_rewrites_only_the_ttl() {
+        let f = "h|far|Far|0|2.4.1\ng|7|0|16\nb|x|-|-|-|0\n";
+        assert_eq!(
+            roster_frame_rettl(f, 7, 0, 15),
+            "h|far|Far|0|2.4.1\ng|7|0|15\nb|x|-|-|-|0\n"
+        );
+    }
+
+    #[test]
+    fn tree_hangs_hubs_beyond_the_peers_at_their_hop_distance() {
+        // me - mid (direct peer, linked) - far (mid's peer) - gone (far's
+        // peer, link down).
+        let mut s = HubState::new();
+        s.hub_uuid = "me".into();
+        s.hub_friendly_name = "Me".into();
+        s.peers.push(crate::state::PeerConfig {
+            uuid: "mid".into(),
+            friendly_name: "Mid".into(),
+            ..Default::default()
+        });
+        s.mesh_hubs.push(MeshHub {
+            uuid: "mid".into(),
+            name: "Mid".into(),
+            links: vec![
+                MeshLink {
+                    uuid: "me".into(),
+                    name: "Me".into(),
+                    online: true,
+                },
+                MeshLink {
+                    uuid: "far".into(),
+                    name: "Far".into(),
+                    online: true,
+                },
+            ],
+            ..MeshHub::default()
+        });
+        s.mesh_hubs.push(MeshHub {
+            uuid: "far".into(),
+            name: "Far".into(),
+            links: vec![MeshLink {
+                uuid: "gone".into(),
+                name: "Gone".into(),
+                online: false,
+            }],
+            ..MeshHub::default()
+        });
+        s.roster.push(BotRoster {
+            hub_uuid: "far".into(),
+            bot_uuid: "b1".into(),
+            nick: "farbot".into(),
+            ..Default::default()
+        });
+        // Without a live link to mid nothing past it is walked...
+        let tree = build_tree(&s);
+        assert!(tree.contains("H|1|Mid|mid|0|"));
+        assert!(!tree.contains("|far|"));
+        // ...but a hub reached through a linked peer is placed under it, one
+        // level deeper, with its bots one deeper still.  A hub reported only
+        // through a down link is hung under its reporter, unlinked.
+        s.peers[0].fd = 7;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sock = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let mut c = crate::state::HubClient::new(sock, 7, "127.0.0.1", MAX_BUFFER);
+        c.typ = ClientType::Hub;
+        c.authenticated = true;
+        s.clients.push(c);
+        let tree = build_tree(&s);
+        let rows: Vec<&str> = tree.lines().collect();
+        assert!(rows[1].starts_with("H|1|Mid|mid|1|"), "{tree}");
+        assert!(rows[2].starts_with("H|2|Far|far|1|"), "{tree}");
+        assert!(rows[3].starts_with("B|3|farbot|b1|"), "{tree}");
+        assert!(rows[4].starts_with("H|3|Gone|gone|0|"), "{tree}");
+    }
+
     #[test]
     fn roster_clean_drops_separators_and_controls() {
         assert_eq!(roster_clean("ok", 32), "ok");
@@ -776,13 +1246,17 @@ mod tests {
         let mut s = HubState::new();
         s.hub_uuid = "me".into();
         // A row with no header has no hub to hang off.
-        process_bot_roster(&mut s, "b|bot-1|n|v|srv|0\n");
+        process_bot_roster(&mut s, NO_LINK, "b|bot-1|n|v|srv|0\n");
         assert!(s.roster.is_empty());
         // A peer claiming our own bots is refused.
-        process_bot_roster(&mut s, "h|me|Me|0|2.0\nb|bot-1|n|v|srv|0\n");
+        process_bot_roster(&mut s, NO_LINK, "h|me|Me|0|2.0\nb|bot-1|n|v|srv|0\n");
         assert!(s.roster.is_empty());
         // A real peer's rows land.
-        process_bot_roster(&mut s, "h|them|Them|0|2.0\nb|bot-1|nick|2.3.0|irc:6667|0\n");
+        process_bot_roster(
+            &mut s,
+            NO_LINK,
+            "h|them|Them|0|2.0\nb|bot-1|nick|2.3.0|irc:6667|0\n",
+        );
         assert_eq!(s.roster.len(), 1);
         assert_eq!(s.roster[0].hub_name, "Them");
         assert_eq!(s.roster[0].nick, "nick");
@@ -799,6 +1273,7 @@ mod tests {
         // A new hub: v| line for itself, a sixth b| field per bot.
         process_bot_roster(
             &mut s,
+            NO_LINK,
             "h|them|Them|0|2.4.0\nv|rs\nb|bot-1|n|2.4.0|srv|0|c\n",
         );
         assert_eq!(s.peers[0].remote_version, "2.4.0");
@@ -807,7 +1282,11 @@ mod tests {
         assert_eq!(s.roster[0].variant, "c");
         assert_eq!(bot_version_label(&s, "bot-1"), "2.4.0 (c)");
         // A pre-variant hub: five fields, no v| line.
-        process_bot_roster(&mut s, "h|them|Them|0|2.3.0\nb|bot-2|n|2.3.0|srv|0\n");
+        process_bot_roster(
+            &mut s,
+            NO_LINK,
+            "h|them|Them|0|2.3.0\nb|bot-2|n|2.3.0|srv|0\n",
+        );
         assert_eq!(s.roster[1].variant, "");
         assert_eq!(bot_version_label(&s, "bot-2"), "2.3.0");
         assert_eq!(bot_version_label(&s, "nobody"), "-");
@@ -819,6 +1298,7 @@ mod tests {
         let future = now() + 86400;
         process_bot_roster(
             &mut s,
+            NO_LINK,
             &format!("h|them|Them|{future}|2.0\nb|bot-1|-|-|-|{future}\n"),
         );
         assert_eq!(s.roster[0].connected_at, 0);
