@@ -223,7 +223,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
 
         // A new bot joins the tree: gossip and push on the next tick instead
         // of leaving it invisible to the mesh until the periodic refresh.
-        presence::roster_mark_dirty(state);
+        presence::roster_mark_dirty(state, true);
         state.last_presence_gossip = 0;
 
         crate::hlog_info!("[HUB] Bot {id} authenticated (Curve25519)\n");
@@ -316,12 +316,12 @@ pub fn disconnect_client(state: &mut HubState, ci: usize) {
     }
     if peer_went_away {
         state.mesh_state_dirty = true;
-        presence::roster_mark_dirty(state); // a whole branch just went away
+        presence::roster_mark_dirty(state, false); // a whole branch just went away
     }
     // A bot leaving changes the tree; gossip it on the next tick rather than
     // waiting for its roster entry to time out on the peers.
     if typ == ClientType::Bot && authed {
-        presence::roster_mark_dirty(state);
+        presence::roster_mark_dirty(state, true);
         state.last_presence_gossip = 0;
     }
 

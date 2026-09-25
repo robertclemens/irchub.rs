@@ -329,6 +329,32 @@ fn sync_bcast_opcode(state: &HubState, ci: usize) -> u8 {
     if knows { CMD_PEER_BCAST } else { CMD_PEER_SYNC }
 }
 
+/// split_horizon_sender(): the peers the peer on `from_fd` is linked to right
+/// now, if its link report is fresh enough to trust for a split horizon (sent
+/// the moment a link changes, refreshed every BOT_PRESENCE_INTERVAL).  It
+/// sent its flood to each of them directly.
+pub fn split_horizon_links(state: &HubState, from_fd: i32) -> Option<Vec<String>> {
+    let now_ts = now();
+    state
+        .peer_clients()
+        .into_iter()
+        .find(|&ci| state.clients[ci].fd == from_fd)
+        .map(|ci| crate::upgrade::peer_uuid_of(state, ci))
+        .filter(|u| !u.is_empty())
+        .and_then(|u| {
+            state.mesh_hubs.iter().find(|h| {
+                h.uuid == u && h.have_links && now_ts - h.reported_at <= SYNC_SPLIT_HORIZON_FRESH
+            })
+        })
+        .map(|h| {
+            h.links
+                .iter()
+                .filter(|l| l.online)
+                .map(|l| l.uuid.clone())
+                .collect()
+        })
+}
+
 /// One config payload to every authenticated peer except `exclude_fd`.
 /// `split`: the payload is a forward of a CMD_PEER_BCAST the peer on
 /// `exclude_fd` sent us, so the split horizon may apply (see CMD_PEER_BCAST).
@@ -351,28 +377,8 @@ pub fn sync_send_to_peers(
     // it is linked to right now got this frame from it directly.  A copy lost
     // to a link that dropped in the moment before its gossip said so is what
     // the resync after a link loss and the periodic anti-entropy repair.
-    let now_ts = now();
-    let sender_links: Option<Vec<String>> = if split {
-        state
-            .peer_clients()
-            .into_iter()
-            .find(|&ci| state.clients[ci].fd == exclude_fd)
-            .map(|ci| crate::upgrade::peer_uuid_of(state, ci))
-            .filter(|u| !u.is_empty())
-            .and_then(|u| {
-                state.mesh_hubs.iter().find(|h| {
-                    h.uuid == u
-                        && h.have_links
-                        && now_ts - h.reported_at <= SYNC_SPLIT_HORIZON_FRESH
-                })
-            })
-            .map(|h| {
-                h.links
-                    .iter()
-                    .filter(|l| l.online)
-                    .map(|l| l.uuid.clone())
-                    .collect()
-            })
+    let sender_links = if split {
+        split_horizon_links(state, exclude_fd)
     } else {
         None
     };

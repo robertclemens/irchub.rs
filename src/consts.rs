@@ -476,6 +476,13 @@ pub const MAX_BULK_PAYLOAD: usize = if MAX_CONFIG_PAYLOAD > MAX_SYNC_PAYLOAD {
 // automatically.  None of this touches the config store.
 pub const BOT_PRESENCE_INTERVAL: i64 = 60;
 pub const BOT_TREE_REFRESH: i64 = 300;
+/// Change pushes are coalesced: news from the mesh (peer gossip, links, TTL
+/// expiry) reaches bots at most once per BOT_TREE_COALESCE — it is already up
+/// to a gossip interval old — while a change to this hub's own bots goes out
+/// within BOT_TREE_COALESCE_LOCAL.  A quiet mesh pushes at once (leading
+/// edge); the flag is held until the push, so the latest tree always lands.
+pub const BOT_TREE_COALESCE: i64 = 30;
+pub const BOT_TREE_COALESCE_LOCAL: i64 = 2;
 pub const BOT_ROSTER_TTL: i64 = 240;
 pub const ROSTER_VERSION_MAX: usize = 15;
 /// Code base: "c" / "rs".

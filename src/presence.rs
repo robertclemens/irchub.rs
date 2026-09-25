@@ -31,9 +31,11 @@ pub fn roster_clean(src: &str, cap: usize) -> String {
     trunc_string(&filtered, cap)
 }
 
-/// hub_roster_mark_dirty(): ask for a tree push on the next tick.
-pub fn roster_mark_dirty(state: &mut HubState) {
+/// hub_roster_mark_dirty(): ask for a tree push (`local`: one of our own bots
+/// changed, pushed within BOT_TREE_COALESCE_LOCAL).
+pub fn roster_mark_dirty(state: &mut HubState, local: bool) {
     state.tree_dirty = true;
+    state.tree_dirty_local |= local;
 }
 
 /// hub_roster_expire(): drop entries nobody refreshed within the TTL.
@@ -207,7 +209,7 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
                 &server
             }
         );
-        state.tree_dirty = true;
+        roster_mark_dirty(state, true);
         state.last_presence_gossip = 0; // gossip the change on the next tick
     }
 
@@ -1062,10 +1064,20 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
 
     // Push on change (only to bots whose tree it changes), with an
     // unconditional refresh.  Only the refresh restarts the refresh clock: a
-    // change push may reach no bot at all.
+    // change push may reach no bot at all.  Changes are coalesced (see
+    // BOT_TREE_COALESCE): under churn every peer's gossip round re-rendered
+    // the tree for every bot, O(hubs x bots) 10 KB frames a minute.
     let refresh = now_ts - state.last_tree_push >= BOT_TREE_REFRESH;
-    if state.tree_dirty || refresh {
+    let gap = if state.tree_dirty_local {
+        BOT_TREE_COALESCE_LOCAL
+    } else {
+        BOT_TREE_COALESCE
+    };
+    let due = state.tree_dirty && now_ts - state.last_tree_change_push >= gap;
+    if due || refresh {
         state.tree_dirty = false;
+        state.tree_dirty_local = false;
+        state.last_tree_change_push = now_ts;
         if refresh {
             state.last_tree_push = now_ts;
         }
@@ -1130,6 +1142,32 @@ mod tests {
 
     /// A frame that arrived on no client link (unit tests have none).
     const NO_LINK: usize = usize::MAX;
+
+    #[test]
+    fn tree_change_pushes_are_coalesced() {
+        let mut s = HubState::new();
+        s.hub_uuid = "me".into();
+        let now_ts = now();
+        s.hub_started = now_ts;
+        s.last_tree_push = now_ts; // no forced refresh due
+        s.last_presence_gossip = now_ts;
+        // Mesh news inside the gap waits; the flag is held, not dropped.
+        s.last_tree_change_push = now_ts - 5;
+        roster_mark_dirty(&mut s, false);
+        presence_tick(&mut s, now_ts);
+        assert!(s.tree_dirty, "mesh news inside BOT_TREE_COALESCE waits");
+        // A change to one of our own bots goes out on the short gap, and
+        // carries the held mesh news with it.
+        roster_mark_dirty(&mut s, true);
+        presence_tick(&mut s, now_ts);
+        assert!(!s.tree_dirty && !s.tree_dirty_local);
+        assert_eq!(s.last_tree_change_push, now_ts);
+        // Past the gap, mesh news is pushed at once (leading edge).
+        s.last_tree_change_push = now_ts - BOT_TREE_COALESCE;
+        roster_mark_dirty(&mut s, false);
+        presence_tick(&mut s, now_ts);
+        assert!(!s.tree_dirty);
+    }
 
     #[test]
     fn relayed_roster_is_applied_once_per_round_and_chunk() {

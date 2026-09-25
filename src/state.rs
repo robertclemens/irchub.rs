@@ -1056,6 +1056,10 @@ pub struct HubState {
     pub last_tree_push: i64,
     /// Roster changed: push to bots on the next tick.
     pub tree_dirty: bool,
+    /// ...by one of our own bots (short gap).
+    pub tree_dirty_local: bool,
+    /// Coalescing clock (BOT_TREE_COALESCE).
+    pub last_tree_change_push: i64,
     /// Every hub heard from, any hop (see `MeshHub`).
     pub mesh_hubs: Vec<MeshHub>,
     /// Last generation this hub gossiped.
@@ -1139,6 +1143,8 @@ impl HubState {
             last_presence_gossip: 0,
             last_tree_push: 0,
             tree_dirty: false,
+            tree_dirty_local: false,
+            last_tree_change_push: 0,
             mesh_hubs: Vec::new(),
             roster_gen: 0,
             gossip_link_mask: 0,

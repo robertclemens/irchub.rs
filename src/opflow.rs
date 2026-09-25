@@ -85,12 +85,14 @@ fn remove_pending_op_request(state: &mut HubState, request_id: &str) {
 
 /// forward_op_request_to_peers().
 ///
-/// Payload (6 fields):
-///   `request_id|requester_uuid|target_uuid|channel|requester_hostmask|origin_ts`
-/// The trailing origin_ts is newer than the rest; an old hub peer parses a
-/// fixed field count and simply ignores it — wire-backwards-compatible.
+/// Payload (7 fields):
+///   `request_id|requester_uuid|target_uuid|channel|requester_hostmask|origin_ts|how`
+/// `how` is newest: "F" = flooded to every peer the sender is linked to (a
+/// receiver may apply the split horizon), "D" = sent to one peer only.  Old
+/// hubs read a fixed field count and ignore it; a frame without it is treated
+/// as "D" (no split horizon) — the old behaviour.
 // The argument list is the wire record, field for field; bundling it into a
-// struct would only rename the same six values.
+// struct would only rename the same values.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_op_request_to_peers(
     state: &mut HubState,
@@ -101,19 +103,63 @@ pub fn forward_op_request_to_peers(
     requester_hostmask: &str,
     exclude_fd: i32,
     origin_ts: i64,
+    split: bool,
 ) {
     let ts = if origin_ts > 0 { origin_ts } else { now() };
+    let route = if target_uuid == "ANY" {
+        None
+    } else {
+        op_route_peer(state, target_uuid, exclude_fd)
+    };
+    let how = if route.is_some() { "D" } else { "F" };
     let payload = trunc_string(
-        &format!("{request_id}|{requester_uuid}|{target_uuid}|{channel}|{requester_hostmask}|{ts}"),
+        &format!(
+            "{request_id}|{requester_uuid}|{target_uuid}|{channel}|{requester_hostmask}|{ts}|{how}"
+        ),
         680,
     );
 
+    if let Some(ri) = route {
+        // Directed: the roster says which hub holds the target and it is one
+        // of ours.  Flooding put ~hubs^2 copies on the mesh for one grant.  If
+        // the roster was stale, that hub routes it on the same way (it
+        // excludes us), so the request is still delivered, one hop later.
+        let fd = state.clients[ri].fd;
+        if !queue::send_urgent(&mut state.clients[ri], CMD_OP_FORWARD_REQUEST, &payload) {
+            crate::hlog_warning!(
+                "[HUB] URGENT queue full forwarding OP_REQUEST to peer fd={fd} — disconnecting\n"
+            );
+            auth::disconnect_client(state, ri);
+            return;
+        }
+        crate::hlog_debug!(
+            "[HUB] Routed OP_FORWARD_REQUEST (id:{request_id}) to peer fd={fd}, the hub of {target_uuid}\n"
+        );
+        return;
+    }
+
+    // Flood, with the split horizon when the sender flooded too: a peer the
+    // sender is linked to got its copy straight from the sender.
+    let sender_links = if split {
+        crate::mesh::split_horizon_links(state, exclude_fd)
+    } else {
+        None
+    };
     let mut queued = 0;
+    let mut skipped = 0;
     let mut i = 0;
     while i < state.clients.len() {
         let c = &state.clients[i];
         if c.typ == ClientType::Hub && c.authenticated && c.fd != exclude_fd {
-            let fd = c.fd;
+            if let Some(links) = &sender_links {
+                let cu = crate::upgrade::peer_uuid_of(state, i);
+                if !cu.is_empty() && links.contains(&cu) {
+                    skipped += 1;
+                    i += 1;
+                    continue;
+                }
+            }
+            let fd = state.clients[i].fd;
             if !queue::send_urgent(&mut state.clients[i], CMD_OP_FORWARD_REQUEST, &payload) {
                 crate::hlog_warning!(
                     "[HUB] URGENT queue full forwarding OP_REQUEST to peer fd={fd} — disconnecting\n"
@@ -128,11 +174,29 @@ pub fn forward_op_request_to_peers(
         }
         i += 1;
     }
-    if queued > 0 {
+    if queued > 0 || skipped > 0 {
         crate::hlog_debug!(
-            "[HUB] Forwarded OP_FORWARD_REQUEST (id:{request_id}) to {queued} peer(s)\n"
+            "[HUB] Forwarded OP_FORWARD_REQUEST (id:{request_id}) to {queued} peer(s), {skipped} skipped (split horizon)\n"
         );
     }
+}
+
+/// op_route_peer(): the peer link to the hub the roster places bot
+/// `target_uuid` on, or None (flood) when it is on no direct peer, on more
+/// than one hub (mid-move), or unknown.  Never the peer on `exclude_fd`: that
+/// is where it came from.
+fn op_route_peer(state: &HubState, target_uuid: &str, exclude_fd: i32) -> Option<usize> {
+    let mut home: Option<&str> = None;
+    for r in state.roster.iter().filter(|r| r.bot_uuid == target_uuid) {
+        match home {
+            Some(h) if h != r.hub_uuid => return None,
+            _ => home = Some(&r.hub_uuid),
+        }
+    }
+    let home = home?;
+    state.peer_clients().into_iter().find(|&ci| {
+        state.clients[ci].fd != exclude_fd && crate::upgrade::peer_uuid_of(state, ci) == home
+    })
 }
 
 /// Send CMD_OP_GRANT to every authenticated local bot.  They ignore it when
@@ -203,6 +267,7 @@ pub fn process_op_request(state: &mut HubState, ci: usize, payload: &str) {
                         &req_hostmask,
                         -1,
                         op_origin_ts,
+                        false,
                     );
                     crate::hlog_info!(
                         "[HUB] Forwarded OP_REQUEST (id:{request_id}) to {peer_count} peer hub(s)\n"
@@ -279,6 +344,9 @@ pub fn process_forward_op_request(state: &mut HubState, ci: usize, payload: &str
     let channel = conv[3].s().to_string();
     let carried_hostmask = conv.get(4).map_or("", |c| c.s()).to_string();
     let origin_ts = conv.get(5).map_or(0, |c: &Conv| c.i());
+    // The trailing "F": the sender flooded it (see forward_op_request_to_peers).
+    // Read from the end: an empty hostmask field stops the sscanf above early.
+    let flooded = payload.rsplit('|').next() == Some("F");
 
     // 1. TTL: drop requests too old to be worth servicing.
     if origin_ts > 0 {
@@ -327,6 +395,7 @@ pub fn process_forward_op_request(state: &mut HubState, ci: usize, payload: &str
                 "",
                 fd,
                 origin_ts,
+                flooded,
             );
             crate::hlog_info!(
                 "[HUB] Admin OP_REQUEST delivered to {sent} local bot(s), forwarding to peers\n"
@@ -350,6 +419,7 @@ pub fn process_forward_op_request(state: &mut HubState, ci: usize, payload: &str
             &carried_hostmask,
             fd,
             origin_ts,
+            flooded,
         );
         return;
     };
@@ -890,6 +960,7 @@ pub fn admin_op_user(state: &mut HubState, nick: &str, channel: &str) -> usize {
         "",
         -1,
         admin_origin_ts,
+        false,
     );
     sent
 }
@@ -911,6 +982,29 @@ mod tests {
         assert_eq!(a.as_bytes()[8], b'-');
         assert_eq!(a.as_bytes()[13], b'-');
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn op_route_floods_unless_one_direct_hub_holds_the_target() {
+        let mut s = HubState::new();
+        assert_eq!(op_route_peer(&s, "bot-1", -1), None, "unknown: flood");
+        let row = |hub: &str| crate::state::BotRoster {
+            hub_uuid: hub.into(),
+            bot_uuid: "bot-1".into(),
+            ..Default::default()
+        };
+        s.roster.push(row("hub-a"));
+        assert_eq!(
+            op_route_peer(&s, "bot-1", -1),
+            None,
+            "hub-a is no direct peer: flood"
+        );
+        s.roster.push(row("hub-b"));
+        assert_eq!(
+            op_route_peer(&s, "bot-1", -1),
+            None,
+            "two hubs (mid-move): flood"
+        );
     }
 
     #[test]
