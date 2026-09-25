@@ -12,7 +12,7 @@
 //! | `hub_config.c`    | `config`                                          |
 //! | `hub_main.c`      | `main.rs`, `logging`, `net`                       |
 //! | `hub_logic.c`     | `queue`, `ratelimit`, `auth`, `presence`, `mesh`, |
-//! |                   | `opflow`, `admin`, `client`                       |
+//! |                   | `opflow`, `admin`, `client`, `activity`           |
 //! | `hub_tool.h`      | `tool`                                            |
 //! | `hub_admin.c`     | `bin/hub_admin.rs`                                |
 //! | `keygen.c`        | `bin/keygen.rs`                                   |
@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod activity;
 pub mod admin;
 pub mod auth;
 pub mod client;

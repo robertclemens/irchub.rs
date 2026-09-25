@@ -355,15 +355,10 @@ fn maintenance(state: &mut HubState) {
         let jitter = i64::from(30 + crypto::random_below(61));
         state.timers.last_anti_entropy = t - (MESH_ANTI_ENTROPY_INTERVAL - jitter);
     }
-    let forced_ae = state.anti_entropy_due;
-    if forced_ae || t - state.timers.last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL {
+    if t - state.timers.last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL {
         state.timers.last_anti_entropy = t;
-        state.anti_entropy_due = false;
         if !state.peers.is_empty() {
-            hlog_debug!(
-                "[MESH] Running {}anti-entropy sync...\n",
-                if forced_ae { "forced " } else { "periodic " }
-            );
+            hlog_debug!("[MESH] Running periodic anti-entropy sync...\n");
             let full_sync = mesh::generate_sync_packet(state);
             mesh::broadcast_sync_to_peers(state, &full_sync, -1);
         }

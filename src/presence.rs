@@ -503,6 +503,9 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
     };
     let first_chunk = matches!(g, Some((_, 0, _)));
     let mut links_reset = false;
+    // The link list this frame replaces: re-rendering every bot's tree is
+    // only worth it when the list really changed, not on every gossip round.
+    let mut old_links: Option<Vec<MeshLink>> = None;
 
     for line in payload.split('\n') {
         if let Some(body) = line.strip_prefix("h|") {
@@ -611,10 +614,10 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
             }
             let h = &mut state.mesh_hubs[mi];
             if !links_reset {
+                old_links = h.have_links.then(|| std::mem::take(&mut h.links));
                 h.links.clear();
                 h.have_links = true;
                 links_reset = true;
-                state.tree_dirty = true; // cheap: pushes are coalesced per bot
             }
             let f: Vec<&str> = body.split('|').collect();
             if f.len() < 3 || h.links.len() >= MAX_PEERS {
@@ -697,6 +700,12 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
         roster_upsert(state, e);
     }
 
+    if let Some(mi) = mh.filter(|_| links_reset)
+        && old_links.as_ref() != Some(&state.mesh_hubs[mi].links)
+    {
+        state.tree_dirty = true;
+    }
+
     // Pass it on after applying it, so the split horizon uses the links this
     // very frame just reported.
     if let Some(r) = relay {
@@ -728,9 +737,14 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
 /// network legitimately renders differently depending on which bot you ask.
 pub fn build_tree(state: &HubState) -> String {
     let max_len = MAX_TREE_PAYLOAD;
-    let now_ts = now();
+    // <variant> is the code base (c / rs); after it comes <started>, the
+    // node's absolute start time (0 = unknown), from which the bot works out
+    // the uptime itself.  A bot that predates a field splits a fixed field
+    // count and never looks past it.  The old uptime field is always 0: a
+    // tree that says the same thing is then the same bytes, and an unchanged
+    // tree is not pushed again (push_tree_to_bots).
     let mut out = format!(
-        "H|0|{}|{}|1|{}|{HUB_VERSION}|{HUB_UPDATE_VARIANT}\n",
+        "H|0|{}|{}|1|0|{HUB_VERSION}|{HUB_UPDATE_VARIANT}|{}\n",
         if state.hub_friendly_name.is_empty() {
             "hub"
         } else {
@@ -741,11 +755,7 @@ pub fn build_tree(state: &HubState) -> String {
         } else {
             &state.hub_uuid
         },
-        if state.hub_started != 0 {
-            now_ts - state.hub_started
-        } else {
-            0
-        }
+        state.hub_started
     );
     if out.len() >= max_len {
         return String::new();
@@ -759,7 +769,7 @@ pub fn build_tree(state: &HubState) -> String {
         let c = &state.clients[ci];
         let nick = bot_nick_from_config(state, &c.id);
         out.push_str(&format!(
-            "B|1|{}|{}|{}|{}|{}|{}\n",
+            "B|1|{}|{}|{}|{}|0|{}|{}\n",
             if nick.is_empty() { "-" } else { &nick },
             c.id,
             if c.bot_version.is_empty() {
@@ -772,16 +782,12 @@ pub fn build_tree(state: &HubState) -> String {
             } else {
                 &c.bot_server
             },
-            if c.bot_started != 0 {
-                now_ts - c.bot_started
-            } else {
-                0
-            },
             if c.bot_variant.is_empty() {
                 "-"
             } else {
                 &c.bot_variant
-            }
+            },
+            c.bot_started
         ));
     }
 
@@ -900,14 +906,14 @@ pub fn build_tree(state: &HubState) -> String {
             }
         }
         out.push_str(&format!(
-            "H|{}|{}|{}|{}|{}|{}|{}\n",
+            "H|{}|{}|{}|{}|0|{}|{}|{}\n",
             t.depth,
             if t.name.is_empty() { "peer" } else { &t.name },
             if puuid.is_empty() { "-" } else { puuid },
             i32::from(t.online),
-            if started != 0 { now_ts - started } else { 0 },
             if ver.is_empty() { "-" } else { ver },
-            if var.is_empty() { "-" } else { var }
+            if var.is_empty() { "-" } else { var },
+            started
         ));
 
         if !puuid.is_empty() {
@@ -916,7 +922,7 @@ pub fn build_tree(state: &HubState) -> String {
                     break;
                 }
                 out.push_str(&format!(
-                    "B|{}|{}|{}|{}|{}|{}|{}\n",
+                    "B|{}|{}|{}|{}|{}|0|{}|{}\n",
                     t.depth + 1,
                     if e.nick.is_empty() { "-" } else { &e.nick },
                     e.bot_uuid,
@@ -926,16 +932,12 @@ pub fn build_tree(state: &HubState) -> String {
                         &e.version
                     },
                     if e.server.is_empty() { "-" } else { &e.server },
-                    if e.connected_at != 0 {
-                        now_ts - e.connected_at
-                    } else {
-                        0
-                    },
                     if e.variant.is_empty() {
                         "-"
                     } else {
                         &e.variant
-                    }
+                    },
+                    e.connected_at
                 ));
             }
         }
@@ -984,7 +986,10 @@ pub fn build_tree(state: &HubState) -> String {
 
 /// Push the assembled tree to every connected bot.  Coalesced per bot so a
 /// burst of roster changes collapses to one send per drain cycle.
-fn push_tree_to_bots(state: &mut HubState) {
+/// `force` false (a change) skips a bot that was already sent this exact
+/// tree; the BOT_TREE_REFRESH push is forced, which is what keeps a bot's
+/// tree from looking stale (BOT_TREE_STALE_AFTER) on a quiet mesh.
+fn push_tree_to_bots(state: &mut HubState, force: bool) {
     let bots = state.bot_clients();
     if bots.is_empty() {
         return;
@@ -993,7 +998,14 @@ fn push_tree_to_bots(state: &mut HubState) {
     if payload.is_empty() {
         return;
     }
+    let hash: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(payload.as_bytes()).into()
+    };
     for ci in bots {
+        if !force && state.clients[ci].tree_sent_hash == Some(hash) {
+            continue;
+        }
         let Some(mut m) = QueuedMsg::new(CMD_BOT_TREE, Lane::Bulk, payload.as_bytes()) else {
             continue;
         };
@@ -1001,7 +1013,11 @@ fn push_tree_to_bots(state: &mut HubState) {
         let seq = state.next_lamport_seq();
         let hub_uuid = state.hub_uuid.clone();
         m.set_coalesce(&hub_uuid, seq, &coalesce);
-        queue::enqueue(&mut state.clients[ci], m);
+        let c = &mut state.clients[ci];
+        c.tree_sent_hash = Some(hash);
+        if !queue::enqueue(c, m) {
+            c.tree_sent_hash = None;
+        }
     }
 }
 
@@ -1044,10 +1060,16 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
         gossip_bot_roster(state);
     }
 
-    if state.tree_dirty || now_ts - state.last_tree_push >= BOT_TREE_REFRESH {
+    // Push on change (only to bots whose tree it changes), with an
+    // unconditional refresh.  Only the refresh restarts the refresh clock: a
+    // change push may reach no bot at all.
+    let refresh = now_ts - state.last_tree_push >= BOT_TREE_REFRESH;
+    if state.tree_dirty || refresh {
         state.tree_dirty = false;
-        state.last_tree_push = now_ts;
-        push_tree_to_bots(state);
+        if refresh {
+            state.last_tree_push = now_ts;
+        }
+        push_tree_to_bots(state, refresh);
     }
 }
 
@@ -1131,6 +1153,24 @@ mod tests {
         process_bot_roster(&mut s, NO_LINK, &f.replace("g|5000|0|", "g|6000|1|"));
         assert_eq!(s.roster.len(), 1);
         assert_eq!(s.mesh_hubs[0].links.len(), 1);
+    }
+
+    #[test]
+    fn only_a_changed_link_list_dirties_the_tree() {
+        let mut s = HubState::new();
+        s.hub_uuid = "me".into();
+        let f = |round: u32, online: u8| {
+            format!(
+                "h|far|Far|0|2.4.1\nv|c\ng|{round}|0|16\nl|mid|Mid|{online}\nb|bot-9|nine|2.4.1|srv|0|c\n"
+            )
+        };
+        process_bot_roster(&mut s, NO_LINK, &f(5000, 1));
+        assert!(s.tree_dirty, "a first report is news");
+        s.tree_dirty = false;
+        process_bot_roster(&mut s, NO_LINK, &f(6000, 1));
+        assert!(!s.tree_dirty, "the same links next round are not");
+        process_bot_roster(&mut s, NO_LINK, &f(7000, 0));
+        assert!(s.tree_dirty, "a link that went down is");
     }
 
     #[test]
@@ -1309,14 +1349,16 @@ mod tests {
         let mut s = HubState::new();
         s.hub_uuid = "me".into();
         s.hub_friendly_name = "Me".into();
-        s.hub_started = now() - 60;
+        s.hub_started = 1_700_000_000;
         storage::update_entry(&mut s, "bot-1", "n", "offbot", "", "", 100);
         storage::update_entry(&mut s, "bot-1", "seen", "", "", "", 4242);
         let tree = build_tree(&s);
         let lines: Vec<&str> = tree.lines().collect();
+        // The start time is absolute and the old uptime field 0: the same
+        // tree built later is the same bytes.
         assert_eq!(
             lines[0],
-            format!("H|0|Me|me|1|60|{HUB_VERSION}|{HUB_UPDATE_VARIANT}")
+            format!("H|0|Me|me|1|0|{HUB_VERSION}|{HUB_UPDATE_VARIANT}|1700000000")
         );
         assert_eq!(lines[1], "D|offbot|bot-1|4242");
     }

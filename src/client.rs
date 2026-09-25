@@ -534,6 +534,8 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 };
                 let cur = &state.mask_records[mi];
                 if !crate::state::lww_accepts(ts, is_active, cur.timestamp, cur.is_active) {
+                    // Activity repair, outside LWW: not an update.
+                    crate::activity::raise(state, crate::activity::Slot::Mask(mi), last_used);
                     continue;
                 }
                 let m = &mut state.mask_records[mi];
@@ -580,6 +582,12 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                     cur.timestamp,
                     cur.is_active,
                 ) {
+                    // Activity repair, outside LWW: not an update.
+                    crate::activity::raise(
+                        state,
+                        crate::activity::Slot::User(ui),
+                        incoming.last_seen,
+                    );
                     continue;
                 }
                 {
@@ -966,6 +974,8 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
             }
         }
         CMD_BOT_PRESENCE => presence::process_bot_presence(state, ci, payload),
+        CMD_ACTIVITY => crate::activity::process(state, ci, payload),
+        CMD_ACTIVITY_QUERY => crate::activity::process_query(state, ci, payload),
         CMD_UPGRADE_READY => upgrade::bot_report(state, CMD_UPGRADE_READY, payload),
         CMD_UPGRADE_RESULT => upgrade::bot_report(state, CMD_UPGRADE_RESULT, payload),
         CMD_CONFIG_PUSH => process_bot_config_push(state, ci, payload),
@@ -1145,10 +1155,11 @@ fn handle_admin2(state: &mut HubState, ci: usize, payload: &str, eph_pub: &[u8])
         }
     }
 
+    // Activity, not a config change: no peer sync, no bot push.  The first
+    // login in a clock hour is flooded to the peers.
     if let Some(ui) = admin_ui {
-        state.user_records[ui].last_seen = now();
+        crate::activity::stamp_user(state, ui, now());
     }
-    state.config_dirty = true;
     crate::hlog_info!(
         "[HUB] Admin Login (key {}): {ip} as '{auth_name}'\n",
         crypto::key_fingerprint(&admin_pub)
@@ -1159,9 +1170,6 @@ fn handle_admin2(state: &mut HubState, ci: usize, payload: &str, eph_pub: &[u8])
         return false; // send_response already disconnected
     }
 
-    state.anti_entropy_due = true;
-    mesh::request_sync_from_peers(state);
-    broadcast_full_config_to_all_bots(state);
     true
 }
 
@@ -1390,6 +1398,7 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         CMD_OP_FORWARD_GRANT => opflow::process_forward_op_grant(state, payload),
         CMD_OP_FORWARD_FAILED => opflow::process_forward_op_failed(state, payload),
         CMD_BOT_RELAY_FWD => process_peer_bot_relay(state, ci, payload),
+        CMD_ACTIVITY => crate::activity::process(state, ci, payload),
         CMD_UPGRADE_FORGET => upgrade::peer_forget(state, ci, payload),
         CMD_CHAN_FWD_REQUEST => opflow::process_forward_chan_request(state, ci, payload),
         CMD_CHAN_FWD_REPLY => opflow::process_forward_chan_reply(state, ci, payload),

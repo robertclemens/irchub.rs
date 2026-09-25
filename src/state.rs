@@ -540,7 +540,7 @@ pub struct SeenForward {
 
 /// One peer link a hub reports in its roster gossip (an l| line): a peer it is
 /// configured with and whether that link is up right now.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MeshLink {
     pub uuid: String,
     pub name: String,
@@ -784,6 +784,10 @@ pub struct HubClient {
     /// dropped on overflow and whenever the bot sends a config push of its
     /// own.
     pub cfg_sent_hash: Option<[u8; 32]>,
+    /// SHA-256 of the last bot tree queued to this bot (CMD_BOT_TREE): a
+    /// change push that would repeat it is skipped (the BOT_TREE_REFRESH one
+    /// never is).  Cleared when a queued tree is dropped on overflow.
+    pub tree_sent_hash: Option<[u8; 32]>,
 }
 
 impl HubClient {
@@ -827,6 +831,7 @@ impl HubClient {
             bot_variant: String::new(),
             bot_started: 0,
             cfg_sent_hash: None,
+            tree_sent_hash: None,
         }
     }
 
@@ -1032,8 +1037,6 @@ pub struct HubState {
     pub last_config_write: i64,
     /// Set on peer connect/disconnect; clears after gossip.
     pub mesh_state_dirty: bool,
-    /// Set to force anti-entropy on the next maintenance tick.
-    pub anti_entropy_due: bool,
 
     /// Mesh transport: monotonic Lamport sequence stamped onto outgoing
     /// deltas.  On load from disk this is bumped past any plausibly recent
@@ -1129,7 +1132,6 @@ impl HubState {
             last_bot_config_push: 0,
             last_config_write: 0,
             mesh_state_dirty: false,
-            anti_entropy_due: false,
             next_lamport_seq: 0,
             delta_seen: Vec::new(),
             roster: Vec::new(),

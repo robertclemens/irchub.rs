@@ -79,6 +79,9 @@ pub fn enqueue(client: &mut HubClient, m: QueuedMsg) -> bool {
 /// A config push that never reaches its bot must not stand as "sent", or the
 /// next identical broadcast would be skipped and the bot left behind.
 fn cfg_push_lost(client: &mut HubClient, m: &QueuedMsg) {
+    if m.cmd == CMD_BOT_TREE {
+        client.tree_sent_hash = None; // same for a tree
+    }
     if m.cmd == CMD_CONFIG_DATA {
         client.cfg_sent_hash = None;
         crate::stats::cfg_lost();

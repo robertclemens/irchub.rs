@@ -711,6 +711,8 @@ fn sync_user_record(state: &mut HubState, key: char, vstart: &str, cnt: &mut Syn
         cur.timestamp,
         cur.is_active,
     ) {
+        // Activity repair, outside LWW: not an update.
+        crate::activity::raise(state, crate::activity::Slot::User(ui), incoming.last_seen);
         return;
     }
     let u = &mut state.user_records[ui];
@@ -773,6 +775,8 @@ fn sync_mask_record(state: &mut HubState, vstart: &str, line: &str, cnt: &mut Sy
     };
     let cur = &state.mask_records[mi];
     if !lww_accepts(ts, is_active, cur.timestamp, cur.is_active) {
+        // Activity repair, outside LWW: not an update.
+        crate::activity::raise(state, crate::activity::Slot::Mask(mi), last_used);
         return;
     }
     let m = &mut state.mask_records[mi];

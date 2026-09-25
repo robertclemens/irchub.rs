@@ -327,6 +327,33 @@ pub const CMD_PEER_BCAST: u8 = 0x67;
 /// decrypted, tx every frame it sent from its outbound queues (the ping/pong
 /// keepalive and direct admin/bot replies are not queued and not counted).
 pub const CMD_ADMIN_STATS: u8 = 0x68;
+
+/// Activity (last seen / last used), mirrors irchub/hub.h.  An admin/oper's
+/// last_seen and a usermask's last_used are max-merged values OUTSIDE the LWW
+/// config: they only ever rise, a rise is never a config change (no record
+/// forward, no bot push), and every hub converges on the latest time any node
+/// saw.  A node reports a record only on its first use within an
+/// ACTIVITY_BUCKET (a clock hour), with that use's exact time.  A hub keeps
+/// max(stored, ts) and forwards to its other peers only the lines that raised
+/// its value.  PEER_SYNC / CONFIG_PUSH max-merge the same fields as repair.
+///
+///   CMD_ACTIVITY        bot -> hub, hub <-> hub.  Lines:
+///                         a|<user_uuid>|<ts>          (admin or oper)
+///                         m|<user_uuid>|<mask>|<ts>
+///   CMD_ACTIVITY_QUERY  bot -> hub: <req_id>|users   or
+///                                   <req_id>|masks|<user_uuid or *>
+///                       ("masks" answers that user's a| line too)
+///   CMD_ACTIVITY_REPLY  hub -> bot: first line <req_id>|<more>, then a|/m|
+///                       lines; chunked under MAX_BUFFER, more=0 on the last.
+pub const CMD_ACTIVITY: u8 = 0x69;
+pub const CMD_ACTIVITY_QUERY: u8 = 0x6A;
+pub const CMD_ACTIVITY_REPLY: u8 = 0x6B;
+/// Report the first use per this many seconds.
+pub const ACTIVITY_BUCKET: i64 = 3600;
+/// A reported time this far ahead of our clock is refused: activity only
+/// rises, so one bogus future stamp would stick for good.
+pub const ACTIVITY_MAX_FUTURE: i64 = 300;
+pub const ACTIVITY_REQ_ID_MAX: usize = 32;
 /// After a peer link drops, ask the remaining peers for a full sync this many
 /// seconds later: a forwarder may have skipped us on the strength of that
 /// link in the moment before the drop reached its gossip.
