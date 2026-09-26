@@ -171,6 +171,225 @@ fn clean(src: &str, cap: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Selective runs
+// ---------------------------------------------------------------------------
+// An admin may move a handful of nodes instead of the whole network, each
+// optionally onto the other build ("optiplex=c").  Names are resolved here,
+// once, against everything this hub knows a node by — the stored bot records
+// (so an offline bot can still be named and ends "no answer to PREPARE"), the
+// live roster, and every hub heard from — and the run itself only ever
+// carries uuids.
+
+/// One node a selection token may name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cand {
+    pub uuid: String,
+    pub name: String,
+    pub kind: UpgradeNodeKind,
+}
+
+fn cand_add(c: &mut Vec<Cand>, uuid: &str, name: &str, kind: UpgradeNodeKind) {
+    if uuid.is_empty() || uuid == "-" {
+        return;
+    }
+    if let Some(e) = c.iter_mut().find(|e| e.uuid == uuid) {
+        if e.name.is_empty() && !name.is_empty() {
+            e.name = name.to_string();
+        }
+        return;
+    }
+    c.push(Cand {
+        uuid: uuid.to_string(),
+        name: name.to_string(),
+        kind,
+    });
+}
+
+/// Every node this hub could name.
+fn candidates(state: &HubState) -> Vec<Cand> {
+    let mut c = Vec::new();
+    cand_add(
+        &mut c,
+        &state.hub_uuid,
+        &state.hub_friendly_name,
+        UpgradeNodeKind::SelfHub,
+    );
+    for p in &state.peers {
+        cand_add(&mut c, &p.uuid, &p.friendly_name, UpgradeNodeKind::PeerHub);
+    }
+    for m in &state.mesh_hubs {
+        cand_add(&mut c, &m.uuid, &m.name, UpgradeNodeKind::PeerHub);
+    }
+    for cl in &state.clients {
+        if cl.typ == ClientType::Bot && cl.authenticated {
+            let nick = state.bot_entry(&cl.id, "n").unwrap_or("");
+            cand_add(&mut c, &cl.id, nick, UpgradeNodeKind::Bot);
+        }
+    }
+    for e in &state.roster {
+        cand_add(&mut c, &e.bot_uuid, &e.nick, UpgradeNodeKind::Bot);
+    }
+    for b in state.bots.iter().filter(|b| b.is_active) {
+        let nick = state.bot_entry(&b.uuid, "n").unwrap_or("");
+        cand_add(&mut c, &b.uuid, nick, UpgradeNodeKind::Bot);
+    }
+    c
+}
+
+/// One token: a full uuid, else an exact name (case-insensitive), else a uuid
+/// prefix of at least 4 characters.  Anything matching two different nodes is
+/// refused rather than guessed.
+pub fn resolve<'a>(c: &'a [Cand], tok: &str) -> Result<&'a Cand, String> {
+    if let Some(e) = c.iter().find(|e| e.uuid.eq_ignore_ascii_case(tok)) {
+        return Ok(e);
+    }
+    let mut hit: Option<&Cand> = None;
+    for e in c
+        .iter()
+        .filter(|e| !e.name.is_empty() && e.name.eq_ignore_ascii_case(tok))
+    {
+        if let Some(h) = hit {
+            return Err(format!(
+                "'{tok}' names more than one node ({}, {}) — use a uuid",
+                h.uuid, e.uuid
+            ));
+        }
+        hit = Some(e);
+    }
+    if let Some(h) = hit {
+        return Ok(h);
+    }
+    if tok.len() >= 4 {
+        let t = tok.to_ascii_lowercase();
+        for e in c
+            .iter()
+            .filter(|e| e.uuid.to_ascii_lowercase().starts_with(&t))
+        {
+            if let Some(h) = hit {
+                return Err(format!(
+                    "uuid prefix '{tok}' is ambiguous ({}, {})",
+                    h.uuid, e.uuid
+                ));
+            }
+            hit = Some(e);
+        }
+        if let Some(h) = hit {
+            return Ok(h);
+        }
+    }
+    Err(format!("no node known as '{tok}'"))
+}
+
+/// Is `uuid` in this run's selection?  `Some(variant)` ("" = the run's) when
+/// it is — always, for a whole-network run.
+fn selected<'a>(u: &'a crate::state::PendingUpgrade, uuid: &str) -> Option<&'a str> {
+    if u.select.is_empty() {
+        return Some("");
+    }
+    u.select
+        .iter()
+        .find(|(id, _)| id == uuid)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Look `uuid` up in a peer PREPARE's resolved selection ("uuid[=v],...").
+/// `Some(variant)` ("" when none given) when it is listed.
+pub fn sel_lookup(sel: &str, uuid: &str) -> Option<String> {
+    if uuid.is_empty() {
+        return None;
+    }
+    sel.split(',').find_map(|e| {
+        let (id, v) = e.split_once('=').unwrap_or((e, ""));
+        (id == uuid).then(|| v.to_string())
+    })
+}
+
+/// The variant a node is being moved onto: its own override in a selective
+/// run, else the run's ("" = keep its own).
+fn node_variant(u: &crate::state::PendingUpgrade, ni: usize) -> &str {
+    let n = &u.nodes[ni];
+    if n.want_variant.is_empty() {
+        &u.variant
+    } else {
+        &n.want_variant
+    }
+}
+
+/// Every hub a selective run could cross must understand the `sel` field of a
+/// peer PREPARE (see UPGRADE_SELECT_MIN_HUB).  Names the first one that does
+/// not.
+fn old_hub(state: &HubState) -> Option<String> {
+    let old = |v: &str| update::version_cmp(v, UPGRADE_SELECT_MIN_HUB) == std::cmp::Ordering::Less;
+    for p in state.peers.iter().filter(|p| p.connected) {
+        if p.remote_version.is_empty() || old(&p.remote_version) {
+            return Some(format!(
+                "{} ({})",
+                if p.friendly_name.is_empty() {
+                    &p.uuid
+                } else {
+                    &p.friendly_name
+                },
+                if p.remote_version.is_empty() {
+                    "version unknown"
+                } else {
+                    &p.remote_version
+                }
+            ));
+        }
+    }
+    state
+        .mesh_hubs
+        .iter()
+        .find(|m| m.uuid != state.hub_uuid && !m.version.is_empty() && old(&m.version))
+        .map(|m| {
+            format!(
+                "{} ({})",
+                if m.name.is_empty() { &m.uuid } else { &m.name },
+                m.version
+            )
+        })
+}
+
+/// Is the peer connection `ci` known to run a hub new enough for `sel`?
+fn peer_takes_sel(state: &HubState, ci: usize) -> bool {
+    let fd = state.clients[ci].fd;
+    state
+        .peers
+        .iter()
+        .find(|p| p.connected && p.fd == fd)
+        .is_some_and(|p| {
+            !p.remote_version.is_empty()
+                && update::version_cmp(&p.remote_version, UPGRADE_SELECT_MIN_HUB)
+                    != std::cmp::Ordering::Less
+        })
+}
+
+/// "rs->c" when the node is being moved onto the other build.
+fn variant_label(n: &UpgradeNode, want: &str) -> String {
+    if !want.is_empty() && want != n.variant {
+        format!(
+            "{}->{want}",
+            if n.variant.is_empty() {
+                "?"
+            } else {
+                &n.variant
+            }
+        )
+    } else {
+        n.variant.clone()
+    }
+}
+
+/// A manifest's "v2.4.4" spelled the way nodes announce it ("2.4.4"), so a
+/// run's target compares with strcmp against what nodes say.
+fn strip_version_v(v: &str) -> &str {
+    match v.strip_prefix('v') {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
+        _ => v,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Run lifecycle
 // ---------------------------------------------------------------------------
 
@@ -180,8 +399,20 @@ fn finish(state: &mut HubState, phase: UpgradePhase, summary: &str) {
     // Keep the plan of a run that actually got somewhere: a node that was down
     // or homed elsewhere while it went through is walked up to this target
     // when it comes back (see the roll-up below).  An aborted run left the
-    // mesh where it was, so there is nothing to catch up to.
-    if phase == UpgradePhase::Done {
+    // mesh where it was, so there is nothing to catch up to.  A selective run
+    // leaves the plan alone either way: moving three named bots says nothing
+    // about what every other bot should run.
+    //
+    // A run where nothing actually moved must not replace a good plan either.
+    if !state.upgrade.select.is_empty() {
+        // no roll-up plan change
+    } else if phase == UpgradePhase::Done
+        && (count(state, UpgradeNodeState::Done, None) > 0
+            // commit_self finishes the run just before this hub execs.
+            || state.upgrade.nodes.iter().any(|n| {
+                n.kind == UpgradeNodeKind::SelfHub && n.state == UpgradeNodeState::Committed
+            }))
+    {
         state.rollup.have_plan = true;
         state.rollup.target = state.upgrade.target_ver.clone();
         state.rollup.variant = state.upgrade.variant.clone();
@@ -283,12 +514,33 @@ fn node_target(u: &crate::state::PendingUpgrade, ni: usize) -> &str {
 /// when it reconnects.
 fn commit_node(state: &mut HubState, ni: usize) -> bool {
     let ver = node_target(&state.upgrade, ni).to_string();
-    let payload = format!("{}|{}|{}", state.upgrade.id, ver, state.upgrade.variant);
+    let variant = node_variant(&state.upgrade, ni).to_string();
+    let payload = format!("{}|{}|{}", state.upgrade.id, ver, variant);
     let (uuid, kind, via) = (
         state.upgrade.nodes[ni].uuid.clone(),
         state.upgrade.nodes[ni].kind,
         state.upgrade.nodes[ni].via.clone(),
     );
+    // Never through a hub that has already restarted: its run state
+    // (follow_id and the COMMIT routes) went with the old process, so the
+    // frame could only come back as a failure — and one a pre-2.4.3 follower
+    // files under its own uuid.  Hubs go after bots, so this only catches a
+    // straggler; it stays out of the run, unharmed.
+    if !via.is_empty()
+        && kind != UpgradeNodeKind::SelfHub
+        && find_node(state, &via).is_some_and(|h| {
+            matches!(
+                state.upgrade.nodes[h].state,
+                UpgradeNodeState::Committed | UpgradeNodeState::Done | UpgradeNodeState::Failed
+            )
+        })
+    {
+        let node = &mut state.upgrade.nodes[ni];
+        node.state = UpgradeNodeState::Unable;
+        node.reason = "its hub restarted before it could be committed".to_string();
+        crate::hlog_warning!("[UPGRADE] Not committing {uuid}: hub {via} already restarted\n");
+        return false;
+    }
     let sent = match kind {
         // A node somewhere below a peer hub — a bot homed on it, or a hub
         // further out in the mesh.  Route COMMIT through that peer, naming
@@ -353,7 +605,7 @@ fn commit_self(state: &mut HubState, ni: usize) -> bool {
     let (id, ver, variant, base) = (
         state.upgrade.id.clone(),
         state.upgrade.hub_ver.clone(),
-        state.upgrade.variant.clone(),
+        node_variant(&state.upgrade, ni).to_string(),
         state.upgrade.hub_base.clone(),
     );
     match update::commit(state, &id, &ver, &variant, &base) {
@@ -379,9 +631,6 @@ fn commit_self(state: &mut HubState, ni: usize) -> bool {
     }
 }
 
-/// hub_admin asked for a network upgrade.  Freeze the config, enumerate the
-/// nodes and fan PREPARE out; the rolling plan itself runs on the maintenance
-/// tick.  The returned string is what the admin console prints.
 /// What `CMD_ADMIN_UPGRADE_NET` asked for, field by field.
 pub struct StartArgs<'a> {
     pub target_ver: &'a str,
@@ -391,8 +640,63 @@ pub struct StartArgs<'a> {
     pub base: &'a str,
     pub hub_ver: &'a str,
     pub hub_base: &'a str,
+    /// The admin's selection ("" = whole network): comma-separated
+    /// name-or-uuid tokens, each optionally "=c" / "=rs".
+    pub sel: &'a str,
 }
 
+/// Resolve a selection into `(uuid, variant, kind)` picks.  Done before
+/// anything is frozen or sent, so a typo refuses the run instead of quietly
+/// moving nothing.
+fn resolve_selection(
+    state: &HubState,
+    sel: &str,
+    hub_ver: &str,
+) -> Result<Vec<(String, String, UpgradeNodeKind)>, String> {
+    let cands = candidates(state);
+    let mut picks: Vec<(String, String, UpgradeNodeKind)> = Vec::new();
+    for tok in sel.split([',', ' ']).filter(|t| !t.is_empty()) {
+        let (name, want) = match tok.split_once('=') {
+            Some((n, w)) => {
+                if w != "c" && w != "rs" {
+                    return Err(format!("ERROR: '{n}={w}': the build must be c or rs"));
+                }
+                (n, w)
+            }
+            None => (tok, ""),
+        };
+        let c = resolve(&cands, name).map_err(|e| format!("ERROR: {e}"))?;
+        if picks.iter().any(|(u, _, _)| *u == c.uuid) {
+            continue;
+        }
+        if picks.len() >= MAX_UPGRADE_SELECT {
+            return Err(format!(
+                "ERROR: at most {MAX_UPGRADE_SELECT} nodes per selective run — run the whole \
+                 network instead"
+            ));
+        }
+        if c.kind != UpgradeNodeKind::Bot && hub_ver.is_empty() {
+            return Err(format!(
+                "ERROR: '{name}' is a hub, and this run has no hub target"
+            ));
+        }
+        picks.push((c.uuid.clone(), want.to_string(), c.kind));
+    }
+    if picks.is_empty() {
+        return Err("ERROR: the selection names no node".to_string());
+    }
+    if let Some(who) = old_hub(state) {
+        return Err(format!(
+            "ERROR: hub {who} is older than {UPGRADE_SELECT_MIN_HUB} and cannot take a \
+             selective run — upgrade the hubs first with a whole-network run"
+        ));
+    }
+    Ok(picks)
+}
+
+/// hub_admin asked for a network upgrade.  Freeze the config, enumerate the
+/// nodes and fan PREPARE out; the rolling plan itself runs on the maintenance
+/// tick.  The returned string is what the admin console prints.
 pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
     let StartArgs {
         target_ver,
@@ -402,6 +706,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         base,
         hub_ver,
         hub_base,
+        sel,
     } = *a;
     if state.upgrade.active {
         return format!(
@@ -410,8 +715,25 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
             state.upgrade.phase.name()
         );
     }
-    if target_ver.is_empty() || target_ver.len() >= 64 {
+    // The freeze replicates, so it is how this hub knows a run driven from
+    // anywhere else in the mesh is still in flight.  Two plans moving the same
+    // nodes is what the one-run-at-a-time rule exists to prevent.
+    if config_frozen(state) {
+        return "ERROR: config is frozen — an upgrade is already in flight somewhere in the mesh \
+                (if none is, clear opt flag 'F')"
+            .to_string();
+    }
+    if target_ver.is_empty() || !plan_field_ok(target_ver) || target_ver.len() >= 64 {
         return "ERROR: bad target version".to_string();
+    }
+    if !variant.is_empty() && variant != "c" && variant != "rs" {
+        return "ERROR: variant must be c or rs".to_string();
+    }
+    if !kind.is_empty() && kind != "bin" && kind != "src" {
+        return "ERROR: kind must be bin or src".to_string();
+    }
+    if !min_from.is_empty() && (!plan_field_ok(min_from) || min_from.len() >= 64) {
+        return "ERROR: bad min_from version".to_string();
     }
     // The base travels to every node and ends up in a shell-free download
     // path there, but reject the obvious shapes here rather than at each node.
@@ -430,11 +752,36 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
     {
         return "ERROR: bad hub manifest base".to_string();
     }
+    // Resolve the selection first: an error must leave the last run's table
+    // (and its status) untouched.
+    let picks = if sel.is_empty() {
+        Vec::new()
+    } else {
+        match resolve_selection(state, sel, hub_ver) {
+            Ok(p) => p,
+            Err(e) => return e,
+        }
+    };
+    // One spelling of a version everywhere a run compares it with strcmp —
+    // what nodes announce ("2.4.4"), not what manifests write ("v2.4.4").
+    let target_ver = strip_version_v(target_ver);
+    let hub_ver = strip_version_v(hub_ver);
 
     // Seed the PREPARE seen-ring: our own PREPARE coming back to us around a
     // cycle of peers is then dropped silently instead of being answered.
     let run_id = opflow::generate_request_id();
     opflow::forward_seen_check_and_add(state, &run_id);
+    let sel_wire = picks
+        .iter()
+        .map(|(u, v, _)| {
+            if v.is_empty() {
+                u.clone()
+            } else {
+                format!("{u}={v}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let u = &mut state.upgrade;
     *u = crate::state::PendingUpgrade {
         active: true,
@@ -458,29 +805,35 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         last_added: now(),
         ready_seq_next: 0,
         summary: String::new(),
+        select: picks
+            .iter()
+            .map(|(u, v, _)| (u.clone(), v.clone()))
+            .collect(),
+        sel_wire,
     };
 
     // Freeze first: a config change that lands between PREPARE and the last
     // COMMIT would reach half the mesh on one build and half on another.
     opt_flag_set(state, OPT_CONFIG_FROZEN, true);
 
-    let prepare = format!(
-        "{}|{}|{}|{}|{}|{}",
-        state.upgrade.id,
-        state.upgrade.target_ver,
-        state.upgrade.variant,
-        state.upgrade.kind,
-        state.upgrade.min_from,
-        state.upgrade.base
-    );
     // Two shapes of the same PREPARE.  A bot gets the six fields it has
     // always read; a peer hub also needs the hubs' own target and base,
     // appended so the bot prefix stays byte-identical and a follower can
-    // relay it on.
-    let prepare_peer = format!(
-        "{prepare}|{}|{}",
-        state.upgrade.hub_ver, state.upgrade.hub_base
-    );
+    // relay it on, and — in a selective run — the resolved selection, which
+    // tells it which of its own bots to ask and whether it is itself part of
+    // the run.
+    let prepare_peer = {
+        let u = &state.upgrade;
+        let mut p = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            u.id, u.target_ver, u.variant, u.kind, u.min_from, u.base, u.hub_ver, u.hub_base
+        );
+        if !u.sel_wire.is_empty() {
+            p.push('|');
+            p.push_str(&u.sel_wire);
+        }
+        p
+    };
 
     let roster: Vec<(usize, String, ClientType, String)> = state
         .clients
@@ -510,6 +863,21 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         }
         match typ {
             ClientType::Bot => {
+                let Some(want) = selected(&state.upgrade, &key).map(str::to_string) else {
+                    continue;
+                };
+                // The variant this bot is asked about is ITS target build, so
+                // a bot told "=c" checks the C manifest at PREPARE, not its own.
+                let u = &state.upgrade;
+                let prepare = format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    u.id,
+                    u.target_ver,
+                    if want.is_empty() { &u.variant } else { &want },
+                    u.kind,
+                    u.min_from,
+                    u.base
+                );
                 let fd = state.clients[ci].fd;
                 let delivered =
                     client::send_cmd_to_bot(&mut state.clients[ci], CMD_UPGRADE_PREPARE, &prepare);
@@ -518,6 +886,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
                     kind: UpgradeNodeKind::Bot,
                     fd,
                     cur_version: ver,
+                    want_variant: want,
                     state: if delivered {
                         UpgradeNodeState::Pending
                     } else {
@@ -547,6 +916,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
                     );
                     continue;
                 }
+                let want = selected(&state.upgrade, &key).unwrap_or("").to_string();
                 let fd = state.clients[ci].fd;
                 let delivered =
                     queue::send_urgent(&mut state.clients[ci], CMD_UPGRADE_PREPARE, &prepare_peer);
@@ -555,6 +925,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
                     name,
                     kind: UpgradeNodeKind::PeerHub,
                     fd,
+                    want_variant: want,
                     state: if delivered {
                         UpgradeNodeState::Pending
                     } else {
@@ -576,14 +947,24 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         }
     }
     // This hub goes last, and answers its own PREPARE without a round trip.
-    let (self_state, self_reason) = if state.upgrade.hub_ver.is_empty() {
+    let self_pick = selected(&state.upgrade, &state.hub_uuid).map(str::to_string);
+    let self_want = self_pick.clone().unwrap_or_default();
+    let (self_state, self_reason) = if self_pick.is_none() {
+        (UpgradeNodeState::Unable, "not selected".to_string())
+    } else if state.upgrade.hub_ver.is_empty() {
         (
             UpgradeNodeState::Unable,
             "no hub target in this run".to_string(),
         )
     } else {
+        let want = if self_want.is_empty() {
+            state.upgrade.variant.clone()
+        } else {
+            self_want.clone()
+        };
         match update::can_take(
             &state.upgrade.hub_ver,
+            &want,
             &state.upgrade.min_from,
             &state.upgrade.hub_base,
         ) {
@@ -593,10 +974,13 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
     };
     state.upgrade.nodes.push(UpgradeNode {
         uuid: state.hub_uuid.clone(),
+        name: state.hub_friendly_name.clone(),
         kind: UpgradeNodeKind::SelfHub,
         fd: -1,
         cur_version: HUB_VERSION.to_string(),
         variant: update::host_variant().to_string(),
+        want_variant: self_want,
+        not_selected: self_pick.is_none(),
         arch: update::host_arch(),
         libc: update::host_libc(),
         state: self_state,
@@ -604,29 +988,77 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         ..UpgradeNode::default()
     });
     state.upgrade.last_added = now();
+    // A selected node this hub did not just ask directly is somewhere below a
+    // peer (or offline).  Seed it as pending: its READY fills it in, and one
+    // that never answers ends "no answer to PREPARE" instead of vanishing from
+    // the status an admin is watching.
+    for (uuid, want, kind) in &picks {
+        if find_node(state, uuid).is_some() || state.upgrade.nodes.len() >= MAX_UPGRADE_NODES {
+            continue;
+        }
+        state.upgrade.nodes.push(UpgradeNode {
+            uuid: uuid.clone(),
+            kind: if *kind == UpgradeNodeKind::Bot {
+                UpgradeNodeKind::Bot
+            } else {
+                UpgradeNodeKind::PeerHub
+            },
+            fd: -1,
+            want_variant: want.clone(),
+            ..UpgradeNode::default()
+        });
+        state.upgrade.last_added = now();
+    }
 
+    let u = &state.upgrade;
     crate::hlog_info!(
-        "[UPGRADE] Run {} -> {}: PREPARE to {} bot(s) and {} peer hub(s); this hub is {}\n",
-        state.upgrade.id,
-        state.upgrade.target_ver,
+        "[UPGRADE] Run {} -> {}: PREPARE to {} bot(s) and {} peer hub(s){}{}; this hub is {}\n",
+        u.id,
+        u.target_ver,
         bots,
         peers,
+        if u.select.is_empty() {
+            ""
+        } else {
+            "; selection "
+        },
+        u.sel_wire,
         self_state.name()
     );
-    format!(
-        "OK:upgrade {} started for {} — {} bot(s) and {} peer hub(s) asked to prepare, this hub \
-         last; config frozen until it finishes",
-        state.upgrade.id, state.upgrade.target_ver, bots, peers
-    )
+    if !u.select.is_empty() {
+        format!(
+            "OK:upgrade {} started for {} selected node(s) -> {}{}{}; config frozen until it \
+             finishes",
+            u.id,
+            u.select.len(),
+            u.target_ver,
+            if u.hub_ver.is_empty() {
+                ""
+            } else {
+                ", hubs -> "
+            },
+            u.hub_ver
+        )
+    } else {
+        format!(
+            "OK:upgrade {} started for {} — {} bot(s) and {} peer hub(s) asked to prepare, this \
+             hub last; config frozen until it finishes",
+            u.id, u.target_ver, bots, peers
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Inbound frames
 // ---------------------------------------------------------------------------
 
-/// `CMD_UPGRADE_READY`: `id|uuid|cur_ver|variant|arch|libc|ready|reason`
+/// `CMD_UPGRADE_READY`: `id|uuid|cur_ver|variant|arch|libc|ready|reason`,
+/// then — from a hub — `|kind|relayed`.  All ten fields are split out: with
+/// `splitn(9)` the kind read as "h|5", a hub further out was filed as a bot
+/// and a peer's relayed-bot count was never read, so PREPARE closed before
+/// its bots answered (run 83aac614).
 pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) {
-    let f: Vec<&str> = payload.splitn(9, '|').collect();
+    let f: Vec<&str> = payload.splitn(10, '|').collect();
     if f.len() < 7 {
         crate::hlog_warning!("[UPGRADE] Malformed UPGRADE_READY\n");
         return;
@@ -685,11 +1117,24 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
             state.upgrade.nodes.len() - 1
         }
     };
+    // A READY answers PREPARE, once.  A second copy (a relay loop, a bot that
+    // reconnected and was re-asked by a follower) must not move a node that
+    // is already committed or finished back to "ready" — that re-commits it.
+    if state.upgrade.nodes[ni].state != UpgradeNodeState::Pending {
+        crate::hlog_debug!(
+            "[UPGRADE] Duplicate READY from {} ({}) — ignored\n",
+            uuid,
+            state.upgrade.nodes[ni].state.name()
+        );
+        return;
+    }
     let reason = clean(f.get(7).copied().unwrap_or(""), 128);
     if state.upgrade.nodes[ni].ready_seq == 0 {
         state.upgrade.ready_seq_next += 1;
         state.upgrade.nodes[ni].ready_seq = state.upgrade.ready_seq_next;
     }
+    let plan_fixed = state.upgrade.phase != UpgradePhase::Prepare;
+    let is_selected = selected(&state.upgrade, uuid).is_some();
     let node = &mut state.upgrade.nodes[ni];
     // Explicit truncation: a version longer than the roster field is cut on
     // purpose, exactly as the presence path cuts it for the tree.
@@ -703,6 +1148,22 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
     } else {
         UpgradeNodeState::Unable
     };
+    // The plan is fixed when PREPARE closes.  An answer that arrives later —
+    // a bot a follower relayed to, whose READY lost the race — is recorded
+    // but never committed: by then the hub it sits behind may already be
+    // restarting, and a COMMIT sent through it would come back as a failure
+    // that aborts a healthy run (run 83aac614).
+    if node.state == UpgradeNodeState::Ready && plan_fixed {
+        node.state = UpgradeNodeState::Unable;
+        node.reason = "answered after the plan was fixed — run again to include it".to_string();
+    }
+    // A whole-network follower (or an older one) asks every bot it has; a
+    // selective run only moves what the admin named.
+    if !is_selected {
+        node.state = UpgradeNodeState::Unable;
+        node.not_selected = true;
+        node.reason = "not selected".to_string();
+    }
     if node.kind == UpgradeNodeKind::PeerHub
         && let Some(rel) = f.get(9).and_then(|v| v.parse::<usize>().ok())
     {
@@ -760,18 +1221,54 @@ pub fn note_result(state: &mut HubState, payload: &str) {
         return;
     };
     let detail = clean(f.get(4).copied().unwrap_or(""), 128);
+    // A RESULT answers a COMMIT.  Anything for a node that is not committed —
+    // a duplicate, a late reply from a hub that restarted, the answer to our
+    // own ABORT — is logged and dropped: a finished node must never be turned
+    // back into a failure by noise (run 83aac614's eb04).
+    if state.upgrade.nodes[ni].state != UpgradeNodeState::Committed {
+        crate::hlog_info!(
+            "[UPGRADE] {} reports {} ({}) while {} — ignored{}{}\n",
+            uuid,
+            status,
+            f[3],
+            state.upgrade.nodes[ni].state.name(),
+            if detail.is_empty() { "" } else { ": " },
+            detail
+        );
+        return;
+    }
     let node = &mut state.upgrade.nodes[ni];
     node.cur_version = trunc_string(f[3], ROSTER_VERSION_MAX + 1);
+    // A follower saw this bot back on the target; its own "ok" follows once
+    // it is back in its channels with ops.  Stays committed (Addendum A1).
+    if status == "back" {
+        if node.back_at == 0 {
+            node.back_at = now();
+        }
+        crate::hlog_info!(
+            "[UPGRADE] {} is back on {}; waiting for its ready report\n",
+            uuid,
+            node.cur_version
+        );
+        return;
+    }
     node.reason = detail;
     node.state = match status {
         "ok" => UpgradeNodeState::Done,
-        // "aborted" is the answer to our own ABORT; the run is already over.
+        // Nothing on that node changed and it is healthy on its current
+        // build: it leaves the run, the run goes on.  Abort is for harm, not
+        // noise.
+        "skip" => UpgradeNodeState::Unable,
         _ => UpgradeNodeState::Failed,
     };
-    if node.state == UpgradeNodeState::Failed && node.reason.is_empty() {
-        node.reason = status.to_string();
+    if node.reason.is_empty() && node.state != UpgradeNodeState::Done {
+        node.reason = if node.state == UpgradeNodeState::Unable {
+            "skipped".to_string()
+        } else {
+            status.to_string()
+        };
     }
-    crate::hlog_debug!(
+    crate::hlog_info!(
         "[UPGRADE] {} reports {} ({}){}{}\n",
         uuid,
         status,
@@ -785,23 +1282,64 @@ pub fn note_result(state: &mut HubState, payload: &str) {
 /// on the new build — that, not the RESULT frame, is the authoritative signal
 /// (the RESULT can be lost, the presence cannot: without it the bot is not on
 /// the mesh at all).
-pub fn note_presence(state: &mut HubState, uuid: &str, version: &str) {
+pub fn note_presence(state: &mut HubState, uuid: &str, version: &str, variant: &str) {
     if !state.upgrade.active || state.upgrade.phase != UpgradePhase::Rolling {
         return;
     }
     let Some(ni) = find_node(state, uuid) else {
         return;
     };
-    if state.upgrade.nodes[ni].state != UpgradeNodeState::Committed {
+    let target = node_target(&state.upgrade, ni).to_string();
+    let want = node_variant(&state.upgrade, ni).to_string();
+    let on_target = update::version_cmp(version, &target) == std::cmp::Ordering::Equal;
+    let node = &mut state.upgrade.nodes[ni];
+
+    // A node that reported done and then shows up on another build fell back:
+    // its upgrade script's watchdog put the old binary back because the new
+    // one would not stay up.  That is the one signal a bad build gives.  Bots
+    // only: their presence comes straight off their own connection, while a
+    // hub's header may be a relayed copy older than its restart.
+    if node.state == UpgradeNodeState::Done {
+        if !on_target && node.kind == UpgradeNodeKind::Bot {
+            node.state = UpgradeNodeState::Failed;
+            node.reason = format!(
+                "came back on {} after reporting done",
+                trunc_string(version, 41)
+            );
+            crate::hlog_warning!("[UPGRADE] {uuid} fell back to {version} after reporting done\n");
+        }
         return;
     }
-    let target = node_target(&state.upgrade, ni).to_string();
-    let node = &mut state.upgrade.nodes[ni];
-    node.cur_version = trunc_string(version, ROSTER_VERSION_MAX + 1);
-    if version == target {
-        node.state = UpgradeNodeState::Done;
-        crate::hlog_info!("[UPGRADE] {} is back on {}\n", uuid, version);
+    if node.state != UpgradeNodeState::Committed {
+        return;
     }
+    node.cur_version = trunc_string(version, ROSTER_VERSION_MAX + 1);
+    if !on_target {
+        return;
+    }
+    // A build switch at the same version is only proven by the variant: the
+    // old process announced this very version before it restarted.  Without a
+    // variant to compare (a hub's header line), wait for the RESULT.
+    if !want.is_empty() && want != node.variant && variant != want {
+        return;
+    }
+    // A bot new enough to hold its "ok" until it is back in its channels with
+    // ops is not done yet — the next wave waits for that (Addendum A1).
+    if node.kind == UpgradeNodeKind::Bot
+        && update::version_cmp(&target, UPGRADE_OPS_GATE_MIN_BOT) != std::cmp::Ordering::Less
+    {
+        if node.back_at == 0 {
+            node.back_at = now();
+            crate::hlog_info!(
+                "[UPGRADE] {} is back on {}; waiting for its ready report\n",
+                uuid,
+                version
+            );
+        }
+        return;
+    }
+    node.state = UpgradeNodeState::Done;
+    crate::hlog_info!("[UPGRADE] {} is back on {}\n", uuid, version);
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,7 +1544,22 @@ fn rollup_consider(state: &mut HubState, uuid: &str, node_kind: UpgradeNodeKind,
         state.rollup.variant.clone(),
         state.rollup.target.clone(),
     );
-    let step = match update::next_step(&base, &variant, version, &target) {
+    // Read the BOT's release tree for its own build: the hub's tree and the
+    // hub's variant say nothing about which ircbot releases exist.
+    let step_root = if base.is_empty() {
+        HUB_BOT_RELEASE_BASE.to_string()
+    } else {
+        base.clone()
+    };
+    let step_variant = if !variant.is_empty() {
+        variant.clone()
+    } else {
+        find_client(state, uuid, ClientType::Bot)
+            .map(|ci| state.clients[ci].bot_variant.clone())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "c".to_string())
+    };
+    let step = match update::next_step(&step_root, &step_variant, version, &target) {
         Ok(v) => v,
         Err(why) => {
             crate::hlog_info!("[ROLLUP] No step read for {uuid} ({why}); aiming at {target}\n");
@@ -1154,6 +1707,22 @@ fn relays_owed(u: &crate::state::PendingUpgrade) -> usize {
     promised.saturating_sub(seen)
 }
 
+/// A bot seen back on the target whose "ok" never came (lost, or it could not
+/// get its ops back) is done once UPGRADE_OPS_GRACE has passed: it is
+/// running the new build, which is what the run is about (Addendum A1).
+fn ops_grace(state: &mut HubState, now_ts: i64) {
+    for n in state.upgrade.nodes.iter_mut() {
+        if n.state == UpgradeNodeState::Committed
+            && n.back_at > 0
+            && now_ts - n.back_at > UPGRADE_OPS_GRACE
+        {
+            n.state = UpgradeNodeState::Done;
+            n.reason = "back on target; no ready report".to_string();
+            crate::hlog_info!("[UPGRADE] {} back on target; no ready report\n", n.uuid);
+        }
+    }
+}
+
 /// One step per maintenance tick.  A no-op unless a run is active.
 pub fn tick(state: &mut HubState, now_ts: i64) {
     rollup_tick(state, now_ts);
@@ -1195,10 +1764,15 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
         return;
     }
 
+    ops_grace(state, now_ts);
+
     // A committed node that never came back fails the whole run: the rest of
-    // the mesh must not keep marching onto a build that does not come up.
+    // the mesh must not keep marching onto a build that does not come up.  A
+    // node already seen back is governed by the grace above instead.
     let stalled = state.upgrade.nodes.iter().position(|n| {
-        n.state == UpgradeNodeState::Committed && now_ts - n.committed_at > UPGRADE_COMMIT_TIMEOUT
+        n.state == UpgradeNodeState::Committed
+            && n.back_at == 0
+            && now_ts - n.committed_at > UPGRADE_COMMIT_TIMEOUT
     });
     if let Some(ni) = stalled {
         let target = node_target(&state.upgrade, ni).to_string();
@@ -1278,11 +1852,16 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
         return;
     }
 
+    let unable = state
+        .upgrade
+        .nodes
+        .iter()
+        .filter(|n| n.state == UpgradeNodeState::Unable && !n.not_selected)
+        .count();
     let done_msg = format!(
-        "{} node(s) now on {}, {} could not take it",
+        "{} node(s) now on the target, {} could not take it",
         count(state, UpgradeNodeState::Done, None),
-        state.upgrade.target_ver,
-        count(state, UpgradeNodeState::Unable, None)
+        unable
     );
     finish(state, UpgradePhase::Done, &done_msg);
 }
@@ -1402,9 +1981,10 @@ fn answer_result(state: &mut HubState, ci: usize, id: &str, status: &str, detail
 /// `CMD_UPGRADE_PREPARE` from a peer: a capability question.  Nothing is
 /// downloaded and nothing on disk is touched until COMMIT.
 pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
-    // id|ver|variant|kind|min_from|base|hub_ver|hub_base — the bots' six
-    // fields, then the hubs' own target and base (see start).
-    let f: Vec<&str> = payload.splitn(8, '|').collect();
+    // id|ver|variant|kind|min_from|base|hub_ver|hub_base[|sel] — the bots'
+    // six fields, the hubs' own target and base, then (2.4.3+) a selective
+    // run's resolved selection, uuid[=v],... (see start).
+    let f: Vec<&str> = payload.splitn(9, '|').collect();
     if f.len() < 2 || f[0].is_empty() || f[1].is_empty() || f[0].len() > 63 || f[1].len() > 63 {
         crate::hlog_warning!(
             "[UPGRADE] Malformed UPGRADE_PREPARE from peer {}\n",
@@ -1418,6 +1998,18 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
     let base = f.get(5).copied().unwrap_or("").to_string();
     let hub_ver = f.get(6).copied().unwrap_or("").to_string();
     let hub_base = f.get(7).copied().unwrap_or("").to_string();
+    let sel = f.get(8).copied().unwrap_or("").to_string();
+    if !sel
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '=' || c == ',')
+    {
+        crate::hlog_warning!(
+            "[UPGRADE] Malformed selection in PREPARE from peer {}\n",
+            state.clients[ci].ip
+        );
+        return;
+    }
+    let selective = !sel.is_empty();
     // Every field lands in this hub's config (the persisted roll-up plan) and
     // in a download path, so a peer's PREPARE is held to the same shape the
     // driver enforced on its admin: nothing that could split a line.
@@ -1470,27 +2062,35 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
     // that cannot upgrade must still relay the run to its own local bots and
     // carry their COMMITs, so `follow_*` is set unconditionally and
     // `follow_self_ready` records only whether the hub itself may commit.
-    let (ready, why) = if hub_ver.is_empty() {
+    let self_pick = if selective {
+        sel_lookup(&sel, &state.hub_uuid)
+    } else {
+        Some(String::new())
+    };
+    let self_variant = match &self_pick {
+        Some(v) if !v.is_empty() => v.clone(),
+        _ => variant.clone(),
+    };
+    let (ready, why) = if self_pick.is_none() {
+        (false, "not selected".to_string())
+    } else if hub_ver.is_empty() {
         (false, "no hub target in this run".to_string())
     } else {
-        match update::can_take(&hub_ver, &min_from, &hub_base) {
+        match update::can_take(&hub_ver, &self_variant, &min_from, &hub_base) {
             Ok(()) => (true, String::new()),
             Err(why) => (false, why),
         }
     };
-    // Bots get the six fields they read, not the hubs' two on the end.
-    let bot_prepare = format!(
-        "{id}|{ver}|{variant}|{}|{min_from}|{base}",
-        f.get(3).copied().unwrap_or("")
-    );
     let origin = peer_uuid_of(state, ci);
     state.follow_id = id.clone();
     state.follow_origin = origin;
-    state.follow_target = ver;
-    state.follow_variant = if variant.is_empty() {
+    state.follow_target = ver.clone();
+    state.follow_bot_variant = variant.clone();
+    state.follow_sel = sel.clone();
+    state.follow_variant = if self_variant.is_empty() {
         update::host_variant().to_string()
     } else {
-        variant
+        self_variant
     };
     state.follow_hub_target = hub_ver;
     state.follow_hub_base = hub_base;
@@ -1502,36 +2102,55 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
     // down while the run went through reconnects to whichever hub it likes, so
     // every hub has to know what the network is supposed to be running; the
     // replicated config freeze is what keeps any of them from acting on it
-    // before the run is over (see rollup_may_try).
-    state.rollup.have_plan = true;
-    state.rollup.target = state.follow_target.clone();
-    state.rollup.variant = variant_field;
-    state.rollup.kind = kind_field;
-    state.rollup.min_from = if min_from.is_empty() {
-        "*".to_string()
-    } else {
-        min_from.clone()
-    };
-    state.rollup.base = base;
-    state.rollup.hub_target = state.follow_hub_target.clone();
-    state.rollup.hub_base = state.follow_hub_base.clone();
-    state.rollup.plan_set = now();
-    state.rollup_tries.clear();
-    crate::config::write(state); // the plan survives a restart (Task 13)
+    // before the run is over (see rollup_may_try).  Not for a selective run:
+    // a few named nodes moving is no statement about the rest.
+    if !selective {
+        state.rollup.have_plan = true;
+        state.rollup.target = state.follow_target.clone();
+        state.rollup.variant = variant_field;
+        state.rollup.kind = kind_field.clone();
+        state.rollup.min_from = if min_from.is_empty() {
+            "*".to_string()
+        } else {
+            min_from.clone()
+        };
+        state.rollup.base = base.clone();
+        state.rollup.hub_target = state.follow_hub_target.clone();
+        state.rollup.hub_base = state.follow_hub_base.clone();
+        state.rollup.plan_set = now();
+        state.rollup_tries.clear();
+        crate::config::write(state); // the plan survives a restart (Task 13)
+    }
 
     // Fan PREPARE out to this hub's own local bots.  Each answers READY to us
     // (its hub); we forward that up to the origin, which records it as a
     // remote node reached through this hub.  That is what makes one run reach
     // a bot no matter which hub it is homed on.
-    let bots: Vec<usize> = state
+    // Bots get the six fields they read, not the hubs' on the end — and in a
+    // selective run only the bots it names, each asked about its own build.
+    let bots: Vec<(usize, String)> = state
         .clients
         .iter()
         .enumerate()
         .filter(|(_, c)| c.typ == ClientType::Bot && c.authenticated)
-        .map(|(i, _)| i)
+        .filter_map(|(i, c)| {
+            if selective {
+                sel_lookup(&sel, &c.id).map(|v| (i, v))
+            } else {
+                Some((i, String::new()))
+            }
+        })
         .collect();
     let mut relayed = 0;
-    for bi in bots {
+    for (bi, bot_variant) in bots {
+        let bot_prepare = format!(
+            "{id}|{ver}|{}|{kind_field}|{min_from}|{base}",
+            if bot_variant.is_empty() {
+                &variant
+            } else {
+                &bot_variant
+            }
+        );
         if client::send_cmd_to_bot(&mut state.clients[bi], CMD_UPGRADE_PREPARE, &bot_prepare) {
             relayed += 1;
         }
@@ -1558,6 +2177,18 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
         .collect();
     let mut fanned = 0;
     for pi in peers {
+        // A hub too old to read the selection would ask all of its bots and
+        // adopt the target as its roll-up plan; the driver refuses a
+        // selective run it can see such a hub in, and this catches one it
+        // could not.
+        if selective && !peer_takes_sel(state, pi) {
+            crate::hlog_warning!(
+                "[UPGRADE] Not relaying selective run {id} to {}: it is older than {}\n",
+                state.clients[pi].id,
+                UPGRADE_SELECT_MIN_HUB
+            );
+            continue;
+        }
         if queue::send_urgent(&mut state.clients[pi], CMD_UPGRADE_PREPARE, payload) {
             fanned += 1;
         }
@@ -1617,9 +2248,37 @@ pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
     let (id, ver) = (f[0].to_string(), f[1].to_string());
     let variant = f.get(2).copied().unwrap_or("").to_string();
     let target_uuid = f.get(3).copied().unwrap_or("").to_string();
+    let for_self = target_uuid.is_empty() || target_uuid == state.hub_uuid;
+    // Every refusal below touched nothing, so it is answered "skip" — the
+    // node stays healthy where it is and leaves the run — and always under
+    // the uuid of the node the driver addressed.  Answering a relayed bot's
+    // COMMIT under this hub's own uuid is what turned a done hub into a
+    // failed one and aborted run 83aac614.
+    let who = if for_self {
+        state.hub_uuid.clone()
+    } else {
+        target_uuid.clone()
+    };
 
     if state.follow_id.is_empty() || state.follow_id != id {
-        answer_result(state, ci, &id, "fail", "no matching UPGRADE_PREPARE");
+        // No run state: this hub restarted (or never saw the PREPARE).  If it
+        // is itself the target and already on that build, the COMMIT's work
+        // is done — say so rather than fail a node that succeeded.
+        let there = for_self
+            && update::version_cmp(HUB_VERSION, &ver) == std::cmp::Ordering::Equal
+            && (variant.is_empty() || variant == update::host_variant());
+        if there {
+            answer_result_uuid(state, ci, &id, &who, "ok", "");
+        } else {
+            answer_result_uuid(
+                state,
+                ci,
+                &id,
+                &who,
+                "skip",
+                "this hub holds no such run (restarted since PREPARE?)",
+            );
+        }
         return;
     }
     // The version must be one this run named: the bots' target for a frame
@@ -1627,18 +2286,19 @@ pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
     if state.follow_target != ver
         && (state.follow_hub_target.is_empty() || state.follow_hub_target != ver)
     {
-        answer_result(
+        answer_result_uuid(
             state,
             ci,
             &id,
-            "fail",
+            &who,
+            "skip",
             "commit version differs from prepare",
         );
         return;
     }
     if now() - state.follow_prepared > UPGRADE_PREPARE_TTL {
         state.follow_id.clear();
-        answer_result(state, ci, &id, "fail", "prepare expired");
+        answer_result_uuid(state, ci, &id, &who, "skip", "prepare expired");
         return;
     }
 
@@ -1646,7 +2306,7 @@ pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
     // things, in order: this hub, one of its local bots, or something further
     // out that this hub relayed an answer for at PREPARE time — in which case
     // the frame goes on, unchanged, along the route it learned.
-    if !target_uuid.is_empty() && target_uuid != state.hub_uuid {
+    if !for_self {
         if let Some(bi) = find_client(state, &target_uuid, ClientType::Bot) {
             let relay = format!("{id}|{ver}|{variant}");
             if !client::send_cmd_to_bot(&mut state.clients[bi], CMD_UPGRADE_COMMIT, &relay) {
@@ -1655,7 +2315,7 @@ pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
                     ci,
                     &id,
                     &target_uuid,
-                    "fail",
+                    "skip",
                     "bot not reachable through this hub",
                 );
             }
@@ -1672,7 +2332,7 @@ pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
                 ci,
                 &id,
                 &target_uuid,
-                "fail",
+                "skip",
                 "no route to that node from this hub",
             );
         }
@@ -1681,7 +2341,7 @@ pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
 
     // No target uuid: this hub is the node being committed.
     if !state.follow_self_ready {
-        answer_result(state, ci, &id, "fail", "this hub cannot take the upgrade");
+        answer_result(state, ci, &id, "skip", "this hub cannot take the upgrade");
         return;
     }
     if state.follow_hub_target != ver {
@@ -1689,7 +2349,7 @@ pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
             state,
             ci,
             &id,
-            "fail",
+            "skip",
             "commit version differs from prepare",
         );
         return;
@@ -1706,9 +2366,31 @@ pub fn peer_commit(state: &mut HubState, ci: usize, payload: &str) {
     if let Err(e) = update::commit(state, &id, &ver, &variant, &base) {
         // Nothing was changed on disk; stay on this build and say why.
         crate::hlog_warning!("[UPGRADE] Commit {id} refused: {e}\n");
-        answer_result(state, ci, &id, "fail", &e);
+        // Nothing was touched either way, but a tampered or corrupt release
+        // must still abort the run rather than be retried on every node.
+        let status = if commit_err_is_integrity(&e) {
+            "fail"
+        } else {
+            "skip"
+        };
+        answer_result(state, ci, &id, status, &e);
         state.follow_id.clear();
     }
+}
+
+/// Is a COMMIT refusal an artifact-integrity failure?  Those answer "fail",
+/// not "skip": every other node would read the same bad release, so the run
+/// must stop instead of walking it through the mesh in waves.
+pub fn commit_err_is_integrity(e: &str) -> bool {
+    [
+        "SHA-256 mismatch",
+        "signature INVALID",
+        "is not a irchub release",
+        "is not a ircbot release",
+        "untrusted artifact URL",
+    ]
+    .iter()
+    .any(|m| e.contains(m))
 }
 
 /// `CMD_UPGRADE_ABORT` from a peer: put the retained build back.
@@ -1768,13 +2450,175 @@ pub fn peer_abort(state: &mut HubState, ci: usize, payload: &str) {
 /// run was aiming at.  The driver also infers success from the roster gossip,
 /// so a lost RESULT costs nothing.
 pub fn report_pending(state: &mut HubState, ci: usize) {
-    let Some((id, want)) = update::take_pending() else {
+    let Some((id, want, want_variant)) = update::take_pending() else {
         return;
     };
-    let ok = update::version_cmp(HUB_VERSION, &want) == std::cmp::Ordering::Equal;
-    crate::hlog_warning!("[UPGRADE] Restarted after {id}: running {HUB_VERSION} (wanted {want})\n");
+    let host = update::host_variant();
+    let ok = update::version_cmp(HUB_VERSION, &want) == std::cmp::Ordering::Equal
+        && (want_variant.is_empty() || want_variant == host);
+    let wanted = if want_variant.is_empty() {
+        want.clone()
+    } else {
+        format!("{want}/{want_variant}")
+    };
+    crate::hlog_warning!(
+        "[UPGRADE] Restarted after {id}: running {HUB_VERSION}/{host} (wanted {wanted})\n"
+    );
     let status = if ok { "ok" } else { "version-mismatch" };
-    answer_result(state, ci, &id, status, if ok { "" } else { &want });
+    let detail = if ok {
+        String::new()
+    } else {
+        format!("wanted {wanted}")
+    };
+    answer_result(state, ci, &id, status, &detail);
+}
+
+/// `CMD_ADMIN_UPGRADE_STATUS` "releases[|bot_base|hub_base]": everything
+/// hub_admin needs to offer choices instead of free text.  Lines:
+///   bot|<version>|<date>|<variants>     newest first, per product
+///   hub|<version>|<date>|<variants>
+///   err|<product>/<variant>|<reason>    a tree that could not be read
+///   node|<b|h|s>|<uuid>|<name>|<version>|<variant>
+/// Manifests are signature-verified exactly as an upgrade would read them;
+/// an unverifiable tree lists nothing.  The output is capped at MAX_BUFFER
+/// like the C twin's response buffer: a line that would not fit ends it.
+pub fn releases(state: &HubState, payload: &str) -> String {
+    let f: Vec<&str> = payload.split('|').collect();
+    let bot_base = f.get(1).copied().unwrap_or("");
+    let hub_base = f.get(2).copied().unwrap_or("");
+    if (!bot_base.is_empty() && !plan_field_ok(bot_base))
+        || (!hub_base.is_empty() && !plan_field_ok(hub_base))
+    {
+        return "ERROR: bad release base".to_string();
+    }
+    let cap = MAX_BUFFER - 1;
+    let mut out = String::from("OK:releases\n");
+    let push = |out: &mut String, line: String| -> bool {
+        if out.len() + line.len() > cap {
+            return false;
+        }
+        out.push_str(&line);
+        true
+    };
+    for (pname, root) in [
+        (
+            "bot",
+            if bot_base.is_empty() {
+                HUB_BOT_RELEASE_BASE
+            } else {
+                bot_base
+            },
+        ),
+        ("hub", hub_base), // "" = this hub's own root
+    ] {
+        let mut merged: Vec<(update::Release, String)> = Vec::new();
+        for v in ["c", "rs"] {
+            match update::list_releases(root, v, MAX_UPGRADE_RELEASES) {
+                Err(e) => {
+                    push(&mut out, format!("err|{pname}/{v}|{e}\n"));
+                }
+                Ok(list) => {
+                    for r in list {
+                        if let Some((_, have)) = merged.iter_mut().find(|(m, _)| {
+                            update::version_cmp(&m.version, &r.version) == std::cmp::Ordering::Equal
+                        }) {
+                            have.push(',');
+                            have.push_str(v);
+                        } else if merged.len() < MAX_UPGRADE_RELEASES {
+                            merged.push((r, v.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        // Newest first across both trees.
+        merged.sort_by(|a, b| update::version_cmp(&b.0.version, &a.0.version));
+        for (r, have) in merged {
+            if !push(
+                &mut out,
+                format!("{pname}|{}|{}|{have}\n", r.version, r.date),
+            ) {
+                return out;
+            }
+        }
+    }
+
+    // The nodes a selective run could name, as this hub sees them now.
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "-".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    if !push(
+        &mut out,
+        format!(
+            "node|s|{}|{}|{}|{}\n",
+            state.hub_uuid,
+            state.hub_friendly_name,
+            HUB_VERSION,
+            update::host_variant()
+        ),
+    ) {
+        return out;
+    }
+    for m in &state.mesh_hubs {
+        if m.uuid.is_empty() || m.uuid == state.hub_uuid {
+            continue;
+        }
+        if !push(
+            &mut out,
+            format!(
+                "node|h|{}|{}|{}|{}\n",
+                m.uuid,
+                m.name,
+                dash(&m.version),
+                dash(&m.variant)
+            ),
+        ) {
+            return out;
+        }
+    }
+    for c in &state.clients {
+        if c.typ != ClientType::Bot || !c.authenticated {
+            continue;
+        }
+        let nick = state.bot_entry(&c.id, "n").unwrap_or("");
+        if !push(
+            &mut out,
+            format!(
+                "node|b|{}|{}|{}|{}\n",
+                c.id,
+                nick,
+                dash(&c.bot_version),
+                dash(&c.bot_variant)
+            ),
+        ) {
+            return out;
+        }
+    }
+    for (i, e) in state.roster.iter().enumerate() {
+        if e.hub_uuid == state.hub_uuid
+            || find_client(state, &e.bot_uuid, ClientType::Bot).is_some()
+            || state.roster[..i].iter().any(|p| p.bot_uuid == e.bot_uuid)
+        {
+            continue;
+        }
+        if !push(
+            &mut out,
+            format!(
+                "node|b|{}|{}|{}|{}\n",
+                e.bot_uuid,
+                e.nick,
+                dash(&e.version),
+                dash(&e.variant)
+            ),
+        ) {
+            return out;
+        }
+    }
+    out
 }
 
 /// `CMD_ADMIN_UPGRADE_STATUS`: one line per node, for hub_admin to print.
@@ -1818,11 +2662,14 @@ pub fn status(state: &HubState) -> String {
         if u.summary.is_empty() { "" } else { "; " },
         u.summary
     );
+    if !u.select.is_empty() {
+        out.push_str(&format!("selective: {} node(s) named\n", u.select.len()));
+    }
     if !u.hub_ver.is_empty() {
         out.push_str(&format!("hubs -> {}\n", u.hub_ver));
     }
     out.push_str(&plan);
-    for n in &u.nodes {
+    for (ni, n) in u.nodes.iter().enumerate() {
         out.push_str(&format!(
             "{:<4} {:<36} {:<10} {:<8} {}{}{}\n",
             n.kind.name(),
@@ -1833,7 +2680,7 @@ pub fn status(state: &HubState) -> String {
             } else {
                 &n.cur_version
             },
-            n.variant,
+            variant_label(n, node_variant(u, ni)),
             if n.reason.is_empty() { "" } else { " " },
             n.reason
         ));
@@ -1843,7 +2690,271 @@ pub fn status(state: &HubState) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::plan_field_ok;
+    use super::*;
+
+    /// A driver mid-PREPARE for run "r1".
+    fn driver() -> HubState {
+        let mut s = HubState::new();
+        s.hub_uuid = "self-uuid".to_string();
+        s.upgrade.active = true;
+        s.upgrade.id = "r1".to_string();
+        s.upgrade.target_ver = "2.4.5".to_string();
+        s.upgrade.hub_ver = "2.4.3".to_string();
+        s.upgrade.phase = UpgradePhase::Prepare;
+        s
+    }
+
+    fn node<'a>(s: &'a HubState, uuid: &str) -> &'a UpgradeNode {
+        &s.upgrade.nodes[find_node(s, uuid).expect("node")]
+    }
+
+    /// Run 83aac614: a hub's READY carries ten fields.  The kind and the
+    /// relayed-bot count must both be read, or PREPARE closes before the
+    /// peer's bots have answered.
+    #[test]
+    fn ready_parses_all_ten_fields() {
+        let mut s = driver();
+        note_ready(
+            &mut s,
+            "r1|far-hub|2.4.2|rs|x86_64|musl|1|some reason|h|5",
+            Some("peer-a"),
+        );
+        let n = node(&s, "far-hub");
+        assert_eq!(n.kind, UpgradeNodeKind::PeerHub);
+        assert_eq!(n.relayed, 5);
+        assert_eq!(n.state, UpgradeNodeState::Ready);
+        assert_eq!(n.via, "peer-a");
+        assert_eq!(relays_owed(&s.upgrade), 5);
+        // A bot's READY stops at the reason: kind defaults to bot.
+        note_ready(&mut s, "r1|bot-1|2.4.4|c|x86_64|musl|1|", Some("peer-a"));
+        assert_eq!(node(&s, "bot-1").kind, UpgradeNodeKind::Bot);
+        assert_eq!(relays_owed(&s.upgrade), 4);
+    }
+
+    #[test]
+    fn ready_moves_only_a_pending_node() {
+        let mut s = driver();
+        note_ready(&mut s, "r1|bot-1|2.4.4|c|x86_64|musl|1|", Some("peer-a"));
+        let ni = find_node(&s, "bot-1").unwrap();
+        s.upgrade.nodes[ni].state = UpgradeNodeState::Committed;
+        note_ready(&mut s, "r1|bot-1|2.4.4|c|x86_64|musl|1|", Some("peer-a"));
+        assert_eq!(node(&s, "bot-1").state, UpgradeNodeState::Committed);
+    }
+
+    #[test]
+    fn late_ready_is_never_committed() {
+        let mut s = driver();
+        s.upgrade.phase = UpgradePhase::Rolling;
+        note_ready(&mut s, "r1|bot-7209|2.4.3|rs|x86_64|musl|1|", Some("eb04"));
+        let n = node(&s, "bot-7209");
+        assert_eq!(n.state, UpgradeNodeState::Unable);
+        assert!(n.reason.starts_with("answered after the plan was fixed"));
+    }
+
+    #[test]
+    fn unselected_ready_is_not_selected() {
+        let mut s = driver();
+        s.upgrade.select = vec![("bot-a".to_string(), "c".to_string())];
+        note_ready(&mut s, "r1|bot-b|2.4.3|rs|x86_64|musl|1|", Some("peer"));
+        let n = node(&s, "bot-b");
+        assert_eq!(n.state, UpgradeNodeState::Unable);
+        assert!(n.not_selected);
+        assert_eq!(n.reason, "not selected");
+    }
+
+    /// Run 83aac614's eb04: a done node must never be turned back into a
+    /// failure by a late RESULT.
+    #[test]
+    fn result_moves_only_a_committed_node() {
+        let mut s = driver();
+        s.upgrade.phase = UpgradePhase::Rolling;
+        for id in ["done", "c1", "c2", "c3"] {
+            s.upgrade.nodes.push(UpgradeNode {
+                uuid: id.to_string(),
+                kind: UpgradeNodeKind::PeerHub,
+                state: if id == "done" {
+                    UpgradeNodeState::Done
+                } else {
+                    UpgradeNodeState::Committed
+                },
+                ..UpgradeNode::default()
+            });
+        }
+        note_result(&mut s, "r1|done|fail|2.4.3|no matching UPGRADE_PREPARE");
+        assert_eq!(node(&s, "done").state, UpgradeNodeState::Done);
+        note_result(&mut s, "r1|c1|skip|2.4.2|prepare expired");
+        assert_eq!(node(&s, "c1").state, UpgradeNodeState::Unable);
+        assert_eq!(node(&s, "c1").reason, "prepare expired");
+        note_result(&mut s, "r1|c2|version-mismatch|2.4.2|wanted 2.4.3");
+        assert_eq!(node(&s, "c2").state, UpgradeNodeState::Failed);
+        note_result(&mut s, "r1|c3|ok|2.4.3|");
+        assert_eq!(node(&s, "c3").state, UpgradeNodeState::Done);
+    }
+
+    #[test]
+    fn integrity_failures_abort() {
+        assert!(commit_err_is_integrity("artifact SHA-256 mismatch"));
+        assert!(commit_err_is_integrity(
+            "release manifest signature INVALID — possible tampering"
+        ));
+        assert!(commit_err_is_integrity(
+            "manifest artifact is not a irchub release"
+        ));
+        assert!(commit_err_is_integrity(
+            "manifest artifact is not a ircbot release"
+        ));
+        assert!(commit_err_is_integrity(
+            "untrusted artifact URL in manifest"
+        ));
+        assert!(!commit_err_is_integrity("artifact download failed"));
+        assert!(!commit_err_is_integrity(
+            "failed to download release manifest"
+        ));
+        assert!(!commit_err_is_integrity(
+            "already running the target version"
+        ));
+    }
+
+    #[test]
+    fn sel_lookup_matches_whole_uuids() {
+        let sel = "aaaa-1=c,bbbb-2,cccc-3=rs";
+        assert_eq!(sel_lookup(sel, "aaaa-1").as_deref(), Some("c"));
+        assert_eq!(sel_lookup(sel, "bbbb-2").as_deref(), Some(""));
+        assert_eq!(sel_lookup(sel, "cccc-3").as_deref(), Some("rs"));
+        assert_eq!(sel_lookup(sel, "aaaa"), None);
+        assert_eq!(sel_lookup(sel, "bbbb-2x"), None);
+        assert_eq!(sel_lookup("", "aaaa-1"), None);
+        assert_eq!(sel_lookup(sel, ""), None);
+    }
+
+    #[test]
+    fn tokens_resolve_or_refuse() {
+        let c = |u: &str, n: &str| Cand {
+            uuid: u.to_string(),
+            name: n.to_string(),
+            kind: UpgradeNodeKind::Bot,
+        };
+        let cands = vec![
+            c("c68c4ce0-a933-4a8a-bfdf-c481a37273ef", "optiplex"),
+            c("c68c9999-0000-0000-0000-000000000000", "fusoya"),
+            c("7209ad7f-705b-45ae-b93a-b261b6cb0a99", "trojan"),
+            c("37b8f85c-d90c-4926-bc2a-689f206f18c0", "trojan"),
+        ];
+        // Exact uuid, any case.
+        assert_eq!(
+            resolve(&cands, "C68C4CE0-A933-4A8A-BFDF-C481A37273EF")
+                .unwrap()
+                .name,
+            "optiplex"
+        );
+        // Exact name, any case.
+        assert_eq!(
+            resolve(&cands, "OPTIPLEX").unwrap().uuid,
+            "c68c4ce0-a933-4a8a-bfdf-c481a37273ef"
+        );
+        // Two nodes by the same name.
+        assert!(
+            resolve(&cands, "trojan")
+                .unwrap_err()
+                .contains("more than one")
+        );
+        // Unique prefix, ambiguous prefix, too-short prefix, unknown.
+        assert_eq!(resolve(&cands, "7209").unwrap().name, "trojan");
+        assert!(resolve(&cands, "c68c").unwrap_err().contains("ambiguous"));
+        assert!(resolve(&cands, "720").is_err());
+        assert!(
+            resolve(&cands, "nosuch")
+                .unwrap_err()
+                .contains("no node known")
+        );
+    }
+
+    #[test]
+    fn done_bot_falling_back_fails_the_run() {
+        let mut s = driver();
+        s.upgrade.phase = UpgradePhase::Rolling;
+        s.upgrade.nodes.push(UpgradeNode {
+            uuid: "b".to_string(),
+            kind: UpgradeNodeKind::Bot,
+            variant: "rs".to_string(),
+            state: UpgradeNodeState::Done,
+            ..UpgradeNode::default()
+        });
+        note_presence(&mut s, "b", "2.4.4", "rs");
+        assert_eq!(node(&s, "b").state, UpgradeNodeState::Failed);
+    }
+
+    #[test]
+    fn variant_switch_needs_the_new_variant() {
+        let mut s = driver();
+        s.upgrade.phase = UpgradePhase::Rolling;
+        s.upgrade.nodes.push(UpgradeNode {
+            uuid: "b".to_string(),
+            kind: UpgradeNodeKind::Bot,
+            variant: "rs".to_string(),
+            want_variant: "c".to_string(),
+            state: UpgradeNodeState::Committed,
+            ..UpgradeNode::default()
+        });
+        note_presence(&mut s, "b", "2.4.5", "rs");
+        assert_eq!(node(&s, "b").state, UpgradeNodeState::Committed);
+        assert_eq!(node(&s, "b").back_at, 0);
+        // The right build: back, but a 2.4.5 bot is done only on its "ok".
+        note_presence(&mut s, "b", "2.4.5", "c");
+        assert_eq!(node(&s, "b").state, UpgradeNodeState::Committed);
+        assert!(node(&s, "b").back_at > 0);
+    }
+
+    /// Addendum A1: a gated bot's presence on the target stamps back_at and
+    /// keeps it committing; its "ok" is what makes it done.  A pre-gate
+    /// target keeps the old presence-marks-done behaviour.
+    #[test]
+    fn gated_bot_is_done_on_its_ok_not_its_presence() {
+        let mut s = driver();
+        s.upgrade.phase = UpgradePhase::Rolling;
+        for id in ["b", "old"] {
+            s.upgrade.nodes.push(UpgradeNode {
+                uuid: id.to_string(),
+                kind: UpgradeNodeKind::Bot,
+                variant: "c".to_string(),
+                state: UpgradeNodeState::Committed,
+                ..UpgradeNode::default()
+            });
+        }
+        note_presence(&mut s, "b", "2.4.5", "c");
+        assert_eq!(node(&s, "b").state, UpgradeNodeState::Committed);
+        assert!(node(&s, "b").back_at > 0);
+        note_result(&mut s, "r1|b|ok|2.4.5|");
+        assert_eq!(node(&s, "b").state, UpgradeNodeState::Done);
+
+        s.upgrade.target_ver = "2.4.4".to_string();
+        note_presence(&mut s, "old", "2.4.4", "c");
+        assert_eq!(node(&s, "old").state, UpgradeNodeState::Done);
+    }
+
+    /// A follower's "back" stamps back_at and never finishes or fails the
+    /// node; past UPGRADE_OPS_GRACE with no "ok" the bot is done anyway.
+    #[test]
+    fn back_then_grace() {
+        let mut s = driver();
+        s.upgrade.phase = UpgradePhase::Rolling;
+        s.upgrade.nodes.push(UpgradeNode {
+            uuid: "b".to_string(),
+            kind: UpgradeNodeKind::Bot,
+            via: "peer".to_string(),
+            state: UpgradeNodeState::Committed,
+            ..UpgradeNode::default()
+        });
+        note_result(&mut s, "r1|b|back|2.4.5|");
+        assert_eq!(node(&s, "b").state, UpgradeNodeState::Committed);
+        let back = node(&s, "b").back_at;
+        assert!(back > 0);
+        ops_grace(&mut s, back + UPGRADE_OPS_GRACE);
+        assert_eq!(node(&s, "b").state, UpgradeNodeState::Committed);
+        ops_grace(&mut s, back + UPGRADE_OPS_GRACE + 1);
+        assert_eq!(node(&s, "b").state, UpgradeNodeState::Done);
+        assert_eq!(node(&s, "b").reason, "back on target; no ready report");
+    }
 
     #[test]
     fn plan_fields_cannot_split_a_config_line() {

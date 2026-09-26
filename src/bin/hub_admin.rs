@@ -1180,45 +1180,302 @@ fn menu_manage_channels(a: &mut Admin) {
 // Network upgrade (hub-orchestrated rolling upgrade)
 // ---------------------------------------------------------------------------
 
-/// Start a run.  Everything past the version is optional: an empty variant
-/// keeps each node on the one it is already running, an empty kind lets each
-/// node pick a prebuilt binary or a source build, and an empty base uses the
-/// release URL compiled into the daemons.  Bots and hubs are separate
-/// products on separate version lines, so the hubs get their own target and
-/// base; a blank hub target leaves every hub on the build it runs.  The hub
-/// freezes the config for the
-/// duration and drives the rolling plan itself, so this is fire-and-poll: the
-/// status screen is where the run is watched.
+// ---- Upgrade network: pick, don't type ----------------------------------
+// The hub reads and signature-verifies both products' release manifests and
+// lists the nodes it knows ("releases" query), so the admin picks versions and
+// nodes from numbered lists.  No URLs, no artifact kinds, no min_from: each
+// node answers those questions itself from the verified manifest.
+// IRCBOT_UPDATE_BASE / IRCHUB_UPDATE_BASE in this tool's environment still
+// point a run at another release tree (the testnet's local one).
+
+const UPG_MAX_LIST: usize = 64;
+const UPG_MAX_NODES: usize = 256;
+const UPG_MAX_SEL: usize = 16 * 80;
+
+struct UpgRelease {
+    version: String,
+    date: String,
+    variants: String,
+}
+
+struct UpgNode {
+    kind: char,
+    uuid: String,
+    name: String,
+    version: String,
+    variant: String,
+}
+
+fn upg_env(name: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|v| {
+            !v.is_empty()
+                && v.len() < 500
+                && !v.contains(['|', ';', '&', '`', '$', ' ', '\t', '\r', '\n'])
+        })
+        .unwrap_or_default()
+}
+
+/// Pick from a numbered list: Enter = `dflt` (1-based).  `Some(0)` is "none"
+/// (only when `allow_none`), `None` cancels.
+fn upg_pick(
+    a: &mut Admin,
+    prompt: &str,
+    count: usize,
+    dflt: usize,
+    allow_none: bool,
+) -> Option<usize> {
+    loop {
+        let buf = a.input(prompt);
+        let buf = buf.trim();
+        if buf.is_empty() {
+            return Some(dflt);
+        }
+        if buf.starts_with(['q', 'Q']) {
+            return None;
+        }
+        if let Ok(v) = buf.parse::<usize>() {
+            if v == 0 && allow_none {
+                return Some(0);
+            }
+            if (1..=count).contains(&v) {
+                return Some(v);
+            }
+        }
+        println!(
+            "  Enter a number from the list{}, or q to cancel.",
+            if allow_none { " (0 = none)" } else { "" }
+        );
+    }
+}
+
+/// "v2.4.4" as manifests write it → "2.4.4" as nodes announce it.
+fn upg_strip_v(v: &str) -> &str {
+    match v.strip_prefix('v') {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
+        _ => v,
+    }
+}
+
 fn upgrade_network(a: &mut Admin) {
     println!("\n{RULE_H}");
     println!("                 UPGRADE NETWORK");
     println!("{RULE_H}\n");
-    println!("  Bots are upgraded in waves, peer hubs afterwards one at a");
-    println!("  time, this hub last.  The config is frozen until the run");
-    println!("  finishes, and any failure rolls the whole mesh back.\n");
+    println!("  Bots go in waves, then peer hubs one at a time, this hub");
+    println!("  last.  The config is frozen until the run finishes.  A node");
+    println!("  that cannot take the build is left where it is; a node that");
+    println!("  takes it and does not come back up aborts the run.\n");
+    println!("[*] Reading the release manifests...");
 
-    let version = a.input("Bot target version (e.g. 2.4.0, blank to cancel): ");
-    if version.is_empty() {
+    let bot_base = upg_env("IRCBOT_UPDATE_BASE");
+    let hub_base = upg_env("IRCHUB_UPDATE_BASE");
+    let query = if bot_base.is_empty() && hub_base.is_empty() {
+        "releases".to_string()
+    } else {
+        format!("releases|{bot_base}|{hub_base}")
+    };
+    let response = a.ask(CMD_ADMIN_UPGRADE_STATUS, &query);
+    if !response.starts_with("OK:releases") {
+        println!("\nHub: {response}");
+        println!("[!] This hub cannot list releases (older than 2.4.3?).");
+        a.pause();
+        return;
+    }
+
+    let (mut bots, mut hubs, mut nodes) = (Vec::new(), Vec::new(), Vec::new());
+    for line in response.split('\n').filter(|l| !l.is_empty()) {
+        let f: Vec<&str> = line.splitn(7, '|').collect();
+        match f[0] {
+            "bot" | "hub" if f.len() >= 4 => {
+                let list: &mut Vec<UpgRelease> = if f[0] == "bot" { &mut bots } else { &mut hubs };
+                if list.len() < UPG_MAX_LIST {
+                    list.push(UpgRelease {
+                        version: upg_strip_v(f[1]).to_string(),
+                        date: f[2].to_string(),
+                        variants: f[3].to_string(),
+                    });
+                }
+            }
+            "err" if f.len() >= 3 => println!("[!] Could not read {}: {}", f[1], f[2]),
+            "node" if f.len() >= 6 && nodes.len() < UPG_MAX_NODES => nodes.push(UpgNode {
+                kind: f[1].chars().next().unwrap_or('b'),
+                uuid: f[2].to_string(),
+                name: f[3].to_string(),
+                version: f[4].to_string(),
+                variant: f[5].to_string(),
+            }),
+            _ => {}
+        }
+    }
+    if bots.is_empty() {
+        println!("[!] No bot releases could be read — nothing to upgrade to.");
+        a.pause();
+        return;
+    }
+
+    // What the network runs now, so "newest" is read against something.
+    println!("\n  Nodes:");
+    for (i, n) in nodes.iter().enumerate() {
+        let name: String = if n.name.is_empty() {
+            "-".to_string()
+        } else {
+            n.name.chars().take(20).collect()
+        };
+        println!(
+            "   {:>3}. {:<4} {:<20} {:<8} {:<3} {}",
+            i + 1,
+            match n.kind {
+                'b' => "bot",
+                'h' => "hub",
+                _ => "self",
+            },
+            name,
+            n.version,
+            n.variant,
+            n.uuid
+        );
+    }
+
+    println!("\n  Bot releases:");
+    for (i, r) in bots.iter().enumerate() {
+        println!(
+            "   {:>3}. {:<10} {:<10} {}{}",
+            i + 1,
+            r.version,
+            r.date,
+            r.variants,
+            if i == 0 { "   (newest)" } else { "" }
+        );
+    }
+    let Some(bi) = upg_pick(
+        a,
+        "Bot version [Enter = newest, q = cancel]: ",
+        bots.len(),
+        1,
+        false,
+    ) else {
+        println!("[*] Cancelled.");
+        a.pause();
+        return;
+    };
+
+    let mut hi = 0;
+    if !hubs.is_empty() {
+        println!("\n  Hub releases:");
+        for (i, r) in hubs.iter().enumerate() {
+            println!(
+                "   {:>3}. {:<10} {:<10} {}{}",
+                i + 1,
+                r.version,
+                r.date,
+                r.variants,
+                if i == 0 { "   (newest)" } else { "" }
+            );
+        }
+        match upg_pick(
+            a,
+            "Hub version [Enter = newest, 0 = leave hubs, q = cancel]: ",
+            hubs.len(),
+            1,
+            true,
+        ) {
+            Some(v) => hi = v,
+            None => {
+                println!("[*] Cancelled.");
+                a.pause();
+                return;
+            }
+        }
+    } else {
+        println!("\n[!] No hub releases could be read; hubs stay on their build.");
+    }
+
+    println!("\n  Which nodes?  Enter = the whole network.  Or list them by");
+    println!("  number or name, comma-separated; add =c or =rs to move a node");
+    println!("  onto that build (e.g.  3,optiplex=c).");
+    let scope = a.input("Nodes: ");
+    let mut sel = String::new();
+    for tok in scope.split([',', ' ']).filter(|t| !t.is_empty()) {
+        let (name, suffix) = match tok.find('=') {
+            Some(i) => (&tok[..i], tok[i..].chars().take(7).collect::<String>()),
+            None => (tok, String::new()),
+        };
+        // A bare number picks from the node list above; anything else is
+        // passed on for the hub to resolve (name, uuid or uuid prefix).
+        let tokname = match name.parse::<usize>() {
+            Ok(v) if (1..=nodes.len()).contains(&v) => nodes[v - 1].uuid.as_str(),
+            _ => name,
+        };
+        if tokname.contains(['|', ';', '&', '`', '$', '\t', '\r', '\n'])
+            || suffix.contains(['|', ';', '&', '`', '$', '\t', '\r', '\n'])
+        {
+            println!("[!] Bad node token '{tok}'.");
+            a.pause();
+            return;
+        }
+        let piece = format!("{}{tokname}{suffix}", if sel.is_empty() { "" } else { "," });
+        if sel.len() + piece.len() >= UPG_MAX_SEL {
+            println!("[!] Too many nodes named.");
+            a.pause();
+            return;
+        }
+        sel.push_str(&piece);
+    }
+
+    let bot_ver = bots[bi - 1].version.clone();
+    let hub_ver = if hi > 0 {
+        hubs[hi - 1].version.clone()
+    } else {
+        String::new()
+    };
+    println!("\n  Summary");
+    println!("   bots  -> {bot_ver}");
+    println!(
+        "   hubs  -> {}",
+        if hi > 0 {
+            hub_ver.as_str()
+        } else {
+            "(stay on their build)"
+        }
+    );
+    println!(
+        "   nodes : {}",
+        if sel.is_empty() {
+            "whole network"
+        } else {
+            &sel
+        }
+    );
+    if !bot_base.is_empty() || !hub_base.is_empty() {
+        println!(
+            "   bases : {} | {} (from the environment)",
+            if bot_base.is_empty() {
+                "built-in"
+            } else {
+                &bot_base
+            },
+            if hub_base.is_empty() {
+                "built-in"
+            } else {
+                &hub_base
+            }
+        );
+    }
+    if a.input("\nType 'yes' to start: ") != "yes" {
         println!("[*] Cancelled.");
         a.pause();
         return;
     }
-    let variant = a.input("Variant c/rs (blank = keep each node's own): ");
-    let kind = a.input("Artifact bin/src (blank = let each node choose): ");
-    let min_from = a.input("Minimum version to upgrade from (blank = any): ");
-    let base = a.input("Bot release base URL override (blank = built-in): ");
-    let hub_version = a.input("Hub target version (blank = hubs stay on their build): ");
-    let hub_base = if hub_version.is_empty() {
-        String::new()
-    } else {
-        a.input("Hub release base URL override (blank = built-in): ")
-    };
 
-    println!("\n[*] Asking the hub to upgrade the network to {version}...");
-    let r = a.ask(
-        CMD_ADMIN_UPGRADE_NET,
-        &format!("{version}|{variant}|{kind}|{min_from}|{base}|{hub_version}|{hub_base}"),
+    // ver|variant|kind|min_from|base|hub_ver|hub_base|sel — variant, kind and
+    // min_from are left to each node.
+    let payload = format!(
+        "{bot_ver}||||{bot_base}|{hub_ver}|{}|{sel}",
+        if hi > 0 { hub_base.as_str() } else { "" }
     );
+    println!("\n[*] Starting the upgrade...");
+    let r = a.ask(CMD_ADMIN_UPGRADE_NET, &payload);
     println!("\nHub: {r}");
     println!("\n[*] Watch it with \"Upgrade status\"; the run continues whether");
     println!("    or not this console stays connected.");

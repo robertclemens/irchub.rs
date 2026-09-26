@@ -217,20 +217,62 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
     // success signal for a rolling upgrade — CMD_UPGRADE_RESULT can be lost,
     // but without this frame the bot is not on the mesh at all.
     let uuid = state.clients[ci].id.clone();
-    upgrade::note_presence(state, &uuid, &version);
+    upgrade::note_presence(state, &uuid, &version, &variant);
     upgrade::rollup_note_presence(state, &uuid, UpgradeNodeKind::Bot, &version);
 
     // If this hub is following a run another hub drives, a local bot
     // reappearing on the followed target is that bot's authoritative success:
     // synthesize a RESULT up to the driver so a lost bot RESULT does not stall
     // the run.
-    if !state.follow_id.is_empty() && !version.is_empty() && state.follow_target == version {
+    if let Some(p) = follower_presence_ok(state, &uuid, &version, &variant) {
         let origin = state.follow_origin.clone();
         if let Some(oi) = crate::upgrade::find_client_hub(state, &origin) {
-            let p = format!("{}|{}|ok|{}|", state.follow_id, uuid, version);
             crate::queue::send_urgent(&mut state.clients[oi], CMD_UPGRADE_RESULT, &p);
         }
     }
+}
+
+/// The RESULT a follower synthesizes for a local bot seen on the followed
+/// target, or `None`.  Only on the right build: for a C<->Rust switch at the
+/// same version the old process announced this very version, so the variant
+/// the bot was told to take (its own `=v` in the selection, else the run's)
+/// must match too.  It is `back`, not `ok`, for a bot that holds its own
+/// "ok" until it is back in its channels with ops — when the driver is new
+/// enough to read `back` (an older one takes any unknown status as fail).
+fn follower_presence_ok(
+    state: &HubState,
+    uuid: &str,
+    version: &str,
+    variant: &str,
+) -> Option<String> {
+    if state.follow_id.is_empty()
+        || version.is_empty()
+        || crate::update::version_cmp(version, &state.follow_target) != std::cmp::Ordering::Equal
+    {
+        return None;
+    }
+    let want = crate::upgrade::sel_lookup(&state.follow_sel, uuid)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| state.follow_bot_variant.clone());
+    if !want.is_empty() && variant != want {
+        return None;
+    }
+    let gated = crate::update::version_cmp(&state.follow_target, UPGRADE_OPS_GATE_MIN_BOT)
+        != std::cmp::Ordering::Less;
+    let driver_new = state
+        .peers
+        .iter()
+        .find(|p| p.uuid == state.follow_origin)
+        .is_some_and(|p| {
+            !p.remote_version.is_empty()
+                && crate::update::version_cmp(&p.remote_version, UPGRADE_SELECT_MIN_HUB)
+                    != std::cmp::Ordering::Less
+        });
+    let status = if gated && driver_new { "back" } else { "ok" };
+    Some(format!(
+        "{}|{}|{status}|{}|",
+        state.follow_id, uuid, version
+    ))
 }
 
 /// The nick the config knows this bot by (the persisted 'n' key); empty if
@@ -580,7 +622,9 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
             // from a run's, so it would fan the frame out to the whole mesh —
             // and every hub holding the plan would do the same to every other,
             // which is the storm a hub-and-bot net produced.
-            upgrade::note_presence(state, &hub_uuid, &hub_ver);
+            // No variant here: it follows on the v| line, so a hub asked to
+            // switch build at the same version is proven by its RESULT alone.
+            upgrade::note_presence(state, &hub_uuid, &hub_ver, "");
             continue;
         }
         if let Some(v) = line.strip_prefix("v|") {
@@ -1138,6 +1182,42 @@ pub fn note_seen(state: &mut HubState, uuid: &str, ts: i64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn follower_ok_needs_the_right_build() {
+        let mut s = HubState::new();
+        assert_eq!(follower_presence_ok(&s, "b", "2.4.5", "rs"), None);
+        s.follow_id = "r1".to_string();
+        s.follow_target = "2.4.5".to_string();
+        assert!(follower_presence_ok(&s, "b", "2.4.5", "rs").is_some());
+        assert_eq!(follower_presence_ok(&s, "b", "2.4.4", "rs"), None);
+        // The run's bot variant.
+        s.follow_bot_variant = "c".to_string();
+        assert_eq!(follower_presence_ok(&s, "b", "2.4.5", "rs"), None);
+        assert!(follower_presence_ok(&s, "b", "2.4.5", "c").is_some());
+        // A per-bot "=v" in the selection wins over the run's.
+        s.follow_sel = "b=rs,x=c".to_string();
+        assert!(follower_presence_ok(&s, "b", "2.4.5", "rs").is_some());
+        assert_eq!(follower_presence_ok(&s, "b", "2.4.5", "c"), None);
+        // Listed without a variant: the run's applies.
+        s.follow_sel = "b".to_string();
+        assert!(follower_presence_ok(&s, "b", "2.4.5", "c").is_some());
+        // Addendum A1: a gated bot's report is "back" — but only to a driver
+        // new enough to read it; an older one gets the old "ok".
+        let p = follower_presence_ok(&s, "b", "2.4.5", "c").unwrap();
+        assert_eq!(p, "r1|b|ok|2.4.5|");
+        s.follow_origin = "drv".to_string();
+        s.peers.push(crate::state::PeerConfig {
+            uuid: "drv".to_string(),
+            remote_version: "2.4.3".to_string(),
+            ..Default::default()
+        });
+        let p = follower_presence_ok(&s, "b", "2.4.5", "c").unwrap();
+        assert_eq!(p, "r1|b|back|2.4.5|");
+        s.follow_target = "2.4.4".to_string();
+        let p = follower_presence_ok(&s, "b", "2.4.4", "c").unwrap();
+        assert_eq!(p, "r1|b|ok|2.4.4|");
+    }
+
     use super::*;
 
     /// A frame that arrived on no client link (unit tests have none).

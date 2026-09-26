@@ -437,6 +437,11 @@ pub struct UpgradeNode {
     pub cur_version: String,
     /// "c" / "rs".
     pub variant: String,
+    /// The variant a selective run asked for THIS node ("name=c"), "" = the
+    /// run's own.  Sent in its PREPARE and COMMIT.
+    pub want_variant: String,
+    /// A selective run left it out: not a failure.
+    pub not_selected: bool,
     pub arch: String,
     pub libc: String,
     pub state: UpgradeNodeState,
@@ -452,6 +457,11 @@ pub struct UpgradeNode {
     /// lands ahead of any hub it routes for: descending `ready_seq` is
     /// deepest-first along the COMMIT routes (see `upgrade::tick`).
     pub ready_seq: usize,
+    /// A committed bot seen back on the target (its presence, or a
+    /// follower's "back"), still waiting for its own "ok" — sent once it is
+    /// back in its channels with ops.  0 = not seen yet.  Past
+    /// UPGRADE_OPS_GRACE it is done anyway (Addendum A1).
+    pub back_at: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -520,6 +530,11 @@ pub struct PendingUpgrade {
     pub ready_seq_next: usize,
     /// Why it ended, shown by CMD_ADMIN_UPGRADE_STATUS.
     pub summary: String,
+    /// Selective run: only these (uuid, variant) nodes move; every other node
+    /// answers into "not selected".  Empty = the whole network.
+    pub select: Vec<(String, String)>,
+    /// `uuid[=v],...` — the selection as a peer PREPARE carries it.
+    pub sel_wire: String,
 }
 
 /// Track recently processed PURGE messages to prevent feedback loops.
@@ -977,6 +992,10 @@ pub struct HubState {
     /// This hub's own target, "" = stay put.
     pub follow_hub_target: String,
     pub follow_variant: String,
+    /// The run's bot variant from the PREPARE ("" = each bot keeps its own).
+    pub follow_bot_variant: String,
+    /// A selective run's resolved selection from the PREPARE, uuid[=v],...
+    pub follow_sel: String,
     /// irchub-releases base for this hub.
     pub follow_hub_base: String,
     /// Whether this hub itself can take the followed run.
@@ -1108,6 +1127,8 @@ impl HubState {
             follow_origin: String::new(),
             follow_target: String::new(),
             follow_variant: String::new(),
+            follow_bot_variant: String::new(),
+            follow_sel: String::new(),
             follow_hub_target: String::new(),
             follow_hub_base: String::new(),
             follow_self_ready: false,

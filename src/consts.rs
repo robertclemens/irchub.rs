@@ -104,7 +104,7 @@ pub const HIDEPINGPONG: bool = true;
 /// the bots tree and the one every upgrade comparison is made against.
 pub const HUB_VERSION: &str = match option_env!("IRCHUB_VERSION") {
     Some(v) => v,
-    None => "2.4.2",
+    None => "2.4.3",
 };
 
 /// Signed-release channel for the hub (irchub-releases).  Same Ed25519 key
@@ -138,6 +138,17 @@ pub const HUB_UPGRADE_SCRIPT: &str = "hub_upgrade.sh";
 pub const HUB_UPDATE_MAX_MANIFEST: u64 = 1024 * 1024;
 pub const HUB_UPDATE_MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 pub const HUB_UPDATE_FETCH_TIMEOUT: u64 = 300;
+/// Per-transfer budget for manifest reads made from the event loop (PREPARE
+/// answers, the hub_admin release list): the hub serves nothing meanwhile.
+pub const HUB_UPDATE_QUICK_TIMEOUT: u64 = 8;
+/// The upgrade script's startup watchdog: how long the new build's daemon has
+/// to be up and alive before the script keeps it.
+pub const UPGRADE_WATCH_SECS: u32 = 20;
+/// The bots' release tree ROOT (ircbot-releases), for the hub_admin release
+/// list and for walking a bot up via the roll-up.  Mirrors
+/// HUB_BOT_RELEASE_BASE in hub.h.
+pub const HUB_BOT_RELEASE_BASE: &str =
+    "https://raw.githubusercontent.com/robertclemens/ircbot-releases/main/ircbot";
 
 // Timeouts (seconds)
 pub const PING_INTERVAL: i64 = 60;
@@ -370,6 +381,26 @@ pub const MAX_UPGRADE_NODES: usize = MAX_CLIENTS + 1;
 /// Downstream routes a follower remembers for a run it is only relaying: one
 /// per node it forwarded an answer for.  See `state::UpgradeRoute`.
 pub const MAX_UPGRADE_ROUTES: usize = MAX_UPGRADE_NODES;
+/// A selective run (CMD_ADMIN_UPGRADE_NET's 8th field) names at most this many
+/// nodes; an empty selection is the whole network.
+pub const MAX_UPGRADE_SELECT: usize = 16;
+/// Selective runs need every hub they cross to understand the peer PREPARE's
+/// `sel` field: an older follower would PREPARE all its bots and adopt the
+/// run's target as its roll-up plan, walking bots nobody selected up to it.
+pub const UPGRADE_SELECT_MIN_HUB: &str = "2.4.3";
+/// Bots from this version on hold their upgrade "ok" until they are back in
+/// their channels with ops; for them presence on the target only stamps
+/// `back_at` (hub.h UPGRADE_OPS_GATE_MIN_BOT).
+pub const UPGRADE_OPS_GATE_MIN_BOT: &str = "2.4.5";
+/// How long after a committed bot was seen back on the target its "ok" may
+/// take before the driver counts it done anyway (seconds).
+pub const UPGRADE_OPS_GRACE: i64 = 240;
+/// The first hub version with `-selftest` (an older build would not know the
+/// flag and would start a second daemon) and the staged run's timeout.
+pub const SELFTEST_MIN_HUB: &str = "2.4.3";
+pub const SELFTEST_TIMEOUT: u64 = 15;
+/// Releases listed by the hub_admin "releases" query, per product.
+pub const MAX_UPGRADE_RELEASES: usize = 24;
 
 // ---- Offline roll-up (upgrade plan, Task 7) -------------------------------
 // A node that was down, or homed elsewhere, when a run went through comes back

@@ -133,7 +133,14 @@ pub fn format_user_record(u: &UserRecord, legacy_v1: bool) -> String {
 
 /// hub_config_write().  A config that does not fit its bound is NOT written
 /// (the old file is kept) — never a truncated one.
+/// Set by `-selftest`: nothing may write the config the running build owns,
+/// whatever migration or dedup load() would otherwise do.
+pub static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn write(state: &mut HubState) {
+    if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let estimated_size = HUB_CONFIG_FIXED_MAX + state.bots.len() * HUB_CONFIG_PER_BOT_MAX;
     let mut buf = Zeroizing::new(String::with_capacity(8192));
 

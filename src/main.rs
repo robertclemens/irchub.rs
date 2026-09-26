@@ -999,6 +999,43 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     0
 }
 
+/// `irchub -selftest`: prints `selftest: OK irchub <version> <variant>` and
+/// returns 0, or `selftest: FAIL <reason>` and 1.  Never writes the config
+/// (config::READ_ONLY): the running build still owns it.
+fn selftest() -> i32 {
+    let fail = |why: &str| {
+        println!("selftest: FAIL {why}");
+        1
+    };
+    if let Some(f) = irchub::update::tls_cpu_missing() {
+        return fail(&format!(
+            "this CPU lacks {f}, which the Rust build's TLS needs — use the C build"
+        ));
+    }
+    if fs::metadata(HUB_CONFIG_FILE).is_err() {
+        return fail(&format!("no {HUB_CONFIG_FILE}"));
+    }
+    let password = match passfile_load(HUB_PASS_FILE) {
+        Some(p) if !p.is_empty() => p,
+        _ => return fail(&format!("{HUB_PASS_FILE} missing or unreadable")),
+    };
+    let mut state = HubState::new();
+    state.log_level = HUB_DEFAULT_LOG_LEVEL;
+    state.log_max_size = HUB_LOG_FILE_SIZE;
+    config::READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+    state.set_config_pass(&password);
+    let ok = config::load(&mut state, &password);
+    state.config_pass.wipe();
+    if !ok {
+        return fail("the config did not load (see the log)");
+    }
+    println!(
+        "selftest: OK irchub {HUB_VERSION} {}",
+        irchub::update::host_variant()
+    );
+    0
+}
+
 fn main() {
     tool::harden_process();
     logging::install_panic_hook();
@@ -1018,6 +1055,12 @@ fn main() {
         std::process::exit(irchub::update::check_cli(
             args.get(i + 2).map(String::as_str),
         ));
+    }
+    // -selftest: could this build run here?  Loads the config exactly as a
+    // start would, then exits — no daemon, no PID lock, no network.  A hub-
+    // driven upgrade runs the staged new build with it before swapping.
+    if args.iter().skip(1).any(|a| a == "-selftest") {
+        std::process::exit(selftest());
     }
     let setup_mode = args.iter().skip(1).any(|a| a == "-setup");
     let passfile_mode = args.iter().skip(1).any(|a| a == "-p");

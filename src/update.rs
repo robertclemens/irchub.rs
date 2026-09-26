@@ -17,7 +17,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::RwLock;
 
 use crate::consts::*;
@@ -241,30 +241,115 @@ fn sanitize_filename(input: &str) -> Option<String> {
 // Fetch
 // ---------------------------------------------------------------------------
 
+/// The first CPU feature graviola needs that this machine lacks, or `None`.
+///
+/// graviola 0.4.1 *asserts* on its required features, and it does so lazily —
+/// on the first crypto call, deep inside a TLS handshake — not when the
+/// provider is built.  A `catch_unwind` around provider construction therefore
+/// guarded nothing (run 96e79880: an Ivy Bridge bot died mid-download).  The
+/// features are checked here, in graviola's own order, so the name reported
+/// matches its panic text.
+pub fn tls_cpu_missing() -> Option<&'static str> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !std::arch::is_x86_feature_detected!("aes") {
+            return Some("aes");
+        }
+        if !std::arch::is_x86_feature_detected!("pclmulqdq") {
+            return Some("pclmulqdq");
+        }
+        if !std::arch::is_x86_feature_detected!("bmi1") {
+            return Some("bmi1");
+        }
+        if !std::arch::is_x86_feature_detected!("adx") {
+            return Some("adx");
+        }
+        if !std::arch::is_x86_feature_detected!("avx") {
+            return Some("avx");
+        }
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return Some("avx2");
+        }
+        None
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return Some("neon");
+        }
+        if !std::arch::is_aarch64_feature_detected!("aes") {
+            return Some("aes");
+        }
+        if !std::arch::is_aarch64_feature_detected!("pmull") {
+            return Some("pmull");
+        }
+        if !std::arch::is_aarch64_feature_detected!("sha2") {
+            return Some("sha2");
+        }
+        None
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        Some("a supported architecture (x86_64/aarch64)")
+    }
+}
+
+/// Why HTTPS cannot be used on this machine, in the words an admin reads in
+/// the upgrade status, or `None` when it can.
+fn tls_refusal() -> Option<String> {
+    tls_cpu_missing()
+        .map(|f| format!("this CPU lacks {f}, which the Rust build's TLS needs — use the C build"))
+}
+
 /// Install the rustls provider once, and say whether HTTPS is usable at all.
 ///
 /// The C hub gets TLS from libcurl and runs anywhere.  Here it comes from
-/// graviola, which is x86_64/aarch64 only and *asserts* on the CPU features it
-/// needs — so the construction is wrapped: on a CPU it does not support the
-/// hub keeps running and only the updater is unavailable, instead of the
-/// daemon dying on a feature nobody asked for yet.
+/// graviola, which is x86_64/aarch64 only and asserts on the CPU features it
+/// needs: the features are checked first (see [`tls_cpu_missing`]), so on a
+/// CPU it does not support the provider is never built, graviola is never
+/// entered and only the updater is unavailable.
 fn tls_ready() -> bool {
     use std::sync::OnceLock;
     static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(|| {
-        std::panic::catch_unwind(|| {
-            let _ = rustls_graviola::default_provider().install_default();
-        })
-        .is_ok()
+        tls_cpu_missing().is_none()
+            && std::panic::catch_unwind(|| {
+                let _ = rustls_graviola::default_provider().install_default();
+            })
+            .is_ok()
     })
 }
 
+/// Manifest reads made from the event loop (a PREPARE answer, the hub_admin
+/// release list) run on a short budget: the hub serves nothing while a fetch
+/// blocks, and a peer link that misses its pings is a worse outcome than a
+/// node answering "unable: manifest fetch failed".  0 = the full budget, for
+/// COMMIT, which is about to restart the process anyway.
+static FETCH_QUICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Run `f` with the quick fetch budget in force.
+fn quick<T>(f: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering::Relaxed;
+    FETCH_QUICK.store(HUB_UPDATE_QUICK_TIMEOUT, Relaxed);
+    let out = f();
+    FETCH_QUICK.store(0, Relaxed);
+    out
+}
+
 fn agent() -> ureq::Agent {
+    let q = FETCH_QUICK.load(std::sync::atomic::Ordering::Relaxed);
     ureq::Agent::config_builder()
         .user_agent("irchub-updater/1.0")
-        .timeout_global(Some(std::time::Duration::from_secs(
-            HUB_UPDATE_FETCH_TIMEOUT,
-        )))
+        .timeout_connect(Some(std::time::Duration::from_secs(if q > 0 {
+            5
+        } else {
+            30
+        })))
+        .timeout_global(Some(std::time::Duration::from_secs(if q > 0 {
+            q
+        } else {
+            HUB_UPDATE_FETCH_TIMEOUT
+        })))
         .build()
         .into()
 }
@@ -349,6 +434,11 @@ fn fetch_verified_manifest(base: &str) -> Result<String, String> {
     }
     let pk = crypto::update_pubkey_b64_decode(&pubkey_b64)
         .ok_or("configured update public key is malformed")?;
+    if file_url_path(base).is_none()
+        && let Some(why) = tls_refusal()
+    {
+        return Err(why);
+    }
 
     let man = fetch(&format!("{base}/releases.txt"), HUB_UPDATE_MAX_MANIFEST)
         .ok_or("failed to download release manifest")?;
@@ -373,6 +463,8 @@ struct ManifestRow {
     arch: String,
     libc: String,
     min_from: String,
+    /// Column 10: the CPU features this artifact needs ("-" = none).
+    cpu: String,
 }
 
 impl ManifestRow {
@@ -387,7 +479,7 @@ fn parse_row(line: &str) -> Option<(String, ManifestRow)> {
     if f.len() < 5 {
         return None;
     }
-    let caps = [63, 63, 511, 127, 255, 7, 31, 15, 63];
+    let caps = [63, 63, 511, 127, 255, 7, 31, 15, 63, 255];
     if f.iter().zip(caps).any(|(s, c)| s.len() > c) {
         return None;
     }
@@ -401,6 +493,7 @@ fn parse_row(line: &str) -> Option<(String, ManifestRow)> {
             arch: at(6, "any"),
             libc: at(7, "any"),
             min_from: at(8, "*"),
+            cpu: at(9, "-"),
         },
     ))
 }
@@ -411,7 +504,7 @@ fn parse_row(line: &str) -> Option<(String, ManifestRow)> {
 /// Build dependencies are NOT checked as the bot's updater does: the hub has
 /// no dependency prober, and a source build that cannot compile fails in the
 /// upgrade script, which restores the retained binary.
-fn manifest_select(manifest: &str, version: &str) -> Result<ManifestRow, String> {
+fn manifest_select(manifest: &str, version: &str, variant: &str) -> Result<ManifestRow, String> {
     let mut why = "requested version is not in the manifest".to_string();
     let mut pick: Option<ManifestRow> = None;
 
@@ -431,6 +524,10 @@ fn manifest_select(manifest: &str, version: &str) -> Result<ManifestRow, String>
         }
         if !row.fits_host() {
             why = "no artifact for this host arch/libc".to_string();
+            continue;
+        }
+        if let Some(f) = cpu_missing(&row.cpu, &host_arch(), host_cpu_features()) {
+            why = format!("this CPU lacks {f}, which the {variant} build needs");
             continue;
         }
         if row.min_from != "*"
@@ -520,18 +617,23 @@ fn next_step_in(manifest: &str, cur_ver: &str, target_ver: &str) -> Option<Strin
     best
 }
 
-pub fn can_take(target_ver: &str, min_from: &str, _base: &str) -> Result<(), String> {
+/// The checks that need no network: version order, variant, min_from and the
+/// unattended-restart password file.  Same version is only "already running"
+/// when the variant matches too — a different variant is a switch between the
+/// C and Rust builds, which is exactly what an admin's "name=c" asks.
+fn can_take_local(target_ver: &str, want_variant: &str, min_from: &str) -> Result<(), String> {
     if target_ver.is_empty() {
         return Err("no target version".to_string());
     }
+    let same_variant = want_variant == host_variant();
     match version_cmp(target_ver, HUB_VERSION) {
-        std::cmp::Ordering::Equal => {
+        std::cmp::Ordering::Equal if same_variant => {
             return Err("already running the target version".to_string());
         }
         std::cmp::Ordering::Less => {
             return Err("target is older than the running version".to_string());
         }
-        std::cmp::Ordering::Greater => {}
+        _ => {}
     }
     if !min_from.is_empty()
         && min_from != "*"
@@ -547,6 +649,133 @@ pub fn can_take(target_ver: &str, min_from: &str, _base: &str) -> Result<(), Str
     Ok(())
 }
 
+fn bad_url_chars(s: &str) -> bool {
+    s.contains([';', '|', '&', '`', '$', ' ', '\t', '\r', '\n'])
+}
+
+fn bad_variant(v: &str) -> bool {
+    v.is_empty() || v.len() > 7 || v.contains(['/', ';', '|', '&', '`', '$', ' ', '\t', '\r', '\n'])
+}
+
+/// Is `target_ver` a version this hub could move to?  Answered at PREPARE
+/// time, and it answers everything COMMIT will need short of the download
+/// itself: the signed manifest for the wanted variant must verify and list an
+/// artifact that fits this host.  A node that says "ready" here and then
+/// cannot fetch its artifact at COMMIT is what turns a routine run into an
+/// abort, so the question is asked in full up front.  `min_from` is what the
+/// driving hub sent; empty or "*" means the manifest decides.  `Err` is the
+/// reason.
+pub fn can_take(target_ver: &str, variant: &str, min_from: &str, base: &str) -> Result<(), String> {
+    let want_variant = if variant.is_empty() {
+        host_variant()
+    } else {
+        variant
+    };
+    can_take_local(target_ver, want_variant, min_from)?;
+    let root = effective_root(base);
+    if root.len() >= 512 || bad_url_chars(&root) || bad_variant(want_variant) {
+        return Err("rejected malformed manifest base or variant".to_string());
+    }
+    // A run's base travels the way the operator's override does, so artifact
+    // URLs under it validate here exactly as they will at COMMIT.
+    if !base.is_empty() && !set_driver_base(base) {
+        return Err("could not record the driver's manifest base".to_string());
+    }
+    let manifest = quick(|| fetch_verified_manifest(&format!("{root}/{want_variant}")))?;
+    let row = match manifest_select(&manifest, target_ver, want_variant) {
+        Ok(row) => row,
+        // This CPU cannot run the wanted build: say so, and when the OTHER
+        // build of the same version fits, say that too.  Never switches.
+        Err(why) if why.starts_with("this CPU lacks ") => {
+            let other = if want_variant == "c" { "rs" } else { "c" };
+            let fits = quick(|| fetch_verified_manifest(&format!("{root}/{other}")))
+                .is_ok_and(|m| manifest_select(&m, target_ver, other).is_ok());
+            return Err(if fits {
+                format!("{why} — the {other} build fits: select this node with ={other}")
+            } else {
+                why
+            });
+        }
+        Err(why) => return Err(why),
+    };
+    let name = row.url.rsplit('/').next().unwrap_or(&row.url);
+    if !name.starts_with("irchub-") {
+        return Err("manifest artifact is not a irchub release".to_string());
+    }
+    Ok(())
+}
+
+/// One release a manifest lists: its version and date.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Release {
+    pub version: String,
+    pub date: String,
+}
+
+/// The distinct versions in a manifest, newest first, at most `max` (the
+/// newest kept) — the row scan behind [`list_releases`].
+fn releases_in(manifest: &str, max: usize) -> Vec<Release> {
+    let mut out: Vec<Release> = Vec::new();
+    for line in manifest.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut t = line.split_whitespace();
+        let (Some(version), Some(date)) = (t.next(), t.next()) else {
+            continue;
+        };
+        if version.len() > 63 || version.contains(['|', ';', '&', '`', '$']) {
+            continue;
+        }
+        let date: String = date.chars().take(15).collect();
+        if out
+            .iter()
+            .any(|r| version_cmp(&r.version, version) == std::cmp::Ordering::Equal)
+        {
+            continue;
+        }
+        if out.len() >= max {
+            // Full: keep the newest `max` — replace the oldest if this is newer.
+            let Some(oldest) =
+                (0..out.len()).min_by(|&a, &b| version_cmp(&out[a].version, &out[b].version))
+            else {
+                continue;
+            };
+            if version_cmp(version, &out[oldest].version) != std::cmp::Ordering::Greater {
+                continue;
+            }
+            out[oldest] = Release {
+                version: version.to_string(),
+                date,
+            };
+            continue;
+        }
+        out.push(Release {
+            version: version.to_string(),
+            date,
+        });
+    }
+    out.sort_by(|a, b| version_cmp(&b.version, &a.version));
+    out
+}
+
+/// List the distinct versions a release tree offers, newest first — what
+/// hub_admin shows so an admin picks a version instead of typing one.  The
+/// manifest is signature-verified like any other read of it; an unverifiable
+/// one lists nothing.  An empty `root` is this hub's own release root.
+pub fn list_releases(root: &str, variant: &str, max: usize) -> Result<Vec<Release>, String> {
+    let root = if root.is_empty() {
+        effective_root("")
+    } else {
+        root.to_string()
+    };
+    if root.len() >= 512 || bad_url_chars(&root) || bad_variant(variant) {
+        return Err("malformed release base".to_string());
+    }
+    let manifest = quick(|| fetch_verified_manifest(&format!("{root}/{variant}")))?;
+    Ok(releases_in(&manifest, max))
+}
+
 // ---------------------------------------------------------------------------
 // Marker and rollback
 // ---------------------------------------------------------------------------
@@ -555,27 +784,39 @@ pub fn can_take(target_ver: &str, min_from: &str, _base: &str) -> Result<(), Str
 /// the version we were aiming at are left in a file for the new binary to
 /// find.  Read exactly once, on the first authenticated peer link after the
 /// restart, and removed there.
-pub fn marker_write(upgrade_id: &str, target_ver: &str) -> bool {
+///
+/// `id|version|variant`.  The variant is what makes a C<->Rust switch at the
+/// same version checkable: without it the old build, restored by the script's
+/// watchdog, would read the marker and report "ok".
+pub fn marker_write(upgrade_id: &str, target_ver: &str, variant: &str) -> bool {
     OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(HUB_UPGRADE_MARKER_FILE)
-        .and_then(|mut f| f.write_all(format!("{upgrade_id}|{target_ver}\n").as_bytes()))
+        .and_then(|mut f| f.write_all(format!("{upgrade_id}|{target_ver}|{variant}\n").as_bytes()))
         .is_ok()
 }
 
+/// Parse a marker line: `(id, version, variant)`.  A two-field marker (an older
+/// build wrote it) has no variant: "".
+fn parse_marker(line: &str) -> Option<(String, String, String)> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let mut f = line.splitn(3, '|');
+    let id = f.next().filter(|s| !s.is_empty() && s.len() <= 63)?;
+    let ver = f.next().filter(|s| !s.is_empty() && s.len() <= 63)?;
+    let variant: String = f.next().unwrap_or("").chars().take(15).collect();
+    Some((id.to_string(), ver.to_string(), variant))
+}
+
 /// Read and consume the marker.  `None` for every ordinary start.
-pub fn take_pending() -> Option<(String, String)> {
+pub fn take_pending() -> Option<(String, String, String)> {
     let body = std::fs::read_to_string(HUB_UPGRADE_MARKER_FILE).ok();
     // Consumed whatever it said: a marker we cannot parse must not be retried
     // on every reconnect for the rest of this process's life.
     let _ = std::fs::remove_file(HUB_UPGRADE_MARKER_FILE);
-    let line = body?;
-    let line = line.trim_end_matches(['\r', '\n']);
-    let (id, ver) = line.split_once('|')?;
-    (!id.is_empty() && !ver.is_empty()).then(|| (id.to_string(), ver.to_string()))
+    parse_marker(&body?)
 }
 
 /// Put back the binary and config an upgrade retained, then restart onto them.
@@ -624,7 +865,24 @@ pub fn rollback(state: &mut HubState, reason: &str) -> bool {
 /// unpacked and moved into place, a source tarball is compiled first.  Either
 /// way the previous binary stays at `<exe>.prev` — the driving hub, not the
 /// script, decides whether to keep it.
-fn upgrade_script(pid: u32, kind: &str, archive: &str, prev: &str, exe: &str) -> String {
+///
+/// It ends in a startup watchdog.  The new build daemonizes, so the script
+/// outlives it: start it, give it UPGRADE_WATCH_SECS, and if its daemon is not
+/// alive by then put the retained build (and config) back and start that
+/// instead.  A build that cannot even come up — a CPU it cannot run on, a
+/// config it cannot read — then costs one restart, not a dead node only an
+/// admin can revive.  The marker is kept (by the rollback path too), so the
+/// old build reports "version-mismatch" on its first peer link and the driver
+/// learns of it at once.  The hub execs this script, so OLD_PID is usually
+/// the script itself; waiting on it would only burn 30 s of every restart.
+fn upgrade_script(
+    pid: u32,
+    kind: &str,
+    archive: &str,
+    prev: &str,
+    exe: &str,
+    selftest: bool,
+) -> String {
     let build = if kind.eq_ignore_ascii_case("bin") {
         // Prebuilt: the tarball holds the binary itself, no toolchain needed.
         // No "run it once" probe — irchub has no --version flag and starting a
@@ -649,12 +907,20 @@ cd ..
 NEW_BIN="$UPGRADE_DIR/$BUILT"
 [ -f "$NEW_BIN" ] || rollback "build failed (see $UPGRADE_DIR)""#
             .to_string()
+            // A source build is only testable once built: its -selftest runs
+            // here, before the mv, for a target that knows the flag.
+            + if selftest {
+                "\n\"$NEW_BIN\" -selftest </dev/null >/dev/null 2>&1 || rollback \"new build failed its selftest\""
+            } else {
+                ""
+            }
     };
     format!(
         r#"#!/bin/bash
 set -u
 OLD_PID={pid}
 for i in $(seq 1 30); do
+  [ "$OLD_PID" = "$$" ] && break
   kill -0 $OLD_PID 2>/dev/null || break
   sleep 1
 done
@@ -664,7 +930,7 @@ mkdir "$UPGRADE_DIR" || exit 1
 rollback() {{
   echo "[UPGRADE] FAILED: $1 — restoring previous build"
   mv -f "{prev}" "{exe}" 2>/dev/null
-  rm -f "{HUB_PID_FILE}" "{HUB_UPGRADE_MARKER_FILE}"
+  rm -f "{HUB_PID_FILE}"
   rm -rf "$UPGRADE_DIR" "{archive}"
   exec "{exe}"
 }}
@@ -673,8 +939,20 @@ tar -xzf "{archive}" --strip-components=1 -C "$UPGRADE_DIR" 2>/dev/null || rollb
 mv -f "$NEW_BIN" "{exe}" || rollback "could not install new binary"
 chmod 700 "{exe}"
 rm -f "{HUB_PID_FILE}"
-(sleep 5; rm -rf "$UPGRADE_DIR" "{archive}" "./{HUB_UPGRADE_SCRIPT}" 2>/dev/null) &
-exec "{exe}"
+rm -rf "$UPGRADE_DIR" "{archive}" 2>/dev/null
+"{exe}" </dev/null >/dev/null 2>&1
+sleep {UPGRADE_WATCH_SECS}
+P=$(cat "{HUB_PID_FILE}" 2>/dev/null | tr -dc 0-9)
+if [ -z "$P" ] || ! kill -0 "$P" 2>/dev/null; then
+  echo "[UPGRADE] new build did not stay up — restoring previous build"
+  mv -f "{exe}" "{exe}.failed" 2>/dev/null
+  mv -f "{prev}" "{exe}" || exit 1
+  [ -f "{HUB_CONFIG_FILE}{HUB_UPGRADE_PREV_SUFFIX}" ] && cp -f "{HUB_CONFIG_FILE}{HUB_UPGRADE_PREV_SUFFIX}" "{HUB_CONFIG_FILE}"
+  rm -f "{HUB_PID_FILE}" "./{HUB_UPGRADE_SCRIPT}"
+  exec "{exe}"
+fi
+rm -f "./{HUB_UPGRADE_SCRIPT}"
+exit 0
 "#
     )
 }
@@ -693,18 +971,15 @@ pub fn commit(
     if state.executable_path.is_empty() {
         return Err("this hub does not know its own executable path".to_string());
     }
-    can_take(target_ver, "", base)?;
-
     let want_variant = if variant.is_empty() {
         host_variant()
     } else {
         variant
     };
-    if want_variant.len() > 7
-        || want_variant.contains(['/', ';', '|', '&', '`', '$', ' ', '\t', '\r', '\n'])
-    {
+    if bad_variant(want_variant) {
         return Err("rejected malformed variant".to_string());
     }
+    can_take_local(target_ver, want_variant, "")?;
     // The driving hub names the release tree ROOT; the variant picks the
     // subtree.  That is what lets one run leave each node on its own kind of
     // build — and lets an admin move a hub from the Rust build to the C one.
@@ -723,7 +998,7 @@ pub fn commit(
     );
 
     let manifest = fetch_verified_manifest(&tree)?;
-    let row = manifest_select(&manifest, target_ver)?;
+    let row = manifest_select(&manifest, target_ver, want_variant)?;
 
     let url_name = row
         .url
@@ -750,6 +1025,18 @@ pub fn commit(
         let _ = std::fs::remove_file(&archive);
         return Err("artifact SHA-256 mismatch".to_string());
     }
+    // Run the new build's own -selftest BEFORE anything is renamed: a build
+    // that cannot run here is refused with nothing touched.  Only a build new
+    // enough to know the flag is asked — an older one would start a second
+    // daemon instead.
+    let selftest = version_cmp(target_ver, SELFTEST_MIN_HUB) != std::cmp::Ordering::Less;
+    if row.kind.eq_ignore_ascii_case("bin") && selftest {
+        crate::hlog_info!("[UPGRADE] Running the new build's selftest\n");
+        if let Err(e) = staged_selftest(&archive) {
+            let _ = std::fs::remove_file(&archive);
+            return Err(format!("new build failed its selftest: {e}"));
+        }
+    }
 
     // Flush the live config, then snapshot the pair we may have to restore.
     // The config is copied (this hub still needs it); the binary is renamed,
@@ -770,8 +1057,15 @@ pub fn commit(
 
     // From here a failure is the script's to handle: it restores <exe>.prev
     // and restarts the old build rather than leaving this hub with no binary.
-    let script = upgrade_script(std::process::id(), &row.kind, &archive, &prev_exe, &exe);
-    let staged = marker_write(upgrade_id, target_ver)
+    let script = upgrade_script(
+        std::process::id(),
+        &row.kind,
+        &archive,
+        &prev_exe,
+        &exe,
+        selftest,
+    );
+    let staged = marker_write(upgrade_id, target_ver, want_variant)
         && OpenOptions::new()
             .write(true)
             .create(true)
@@ -800,6 +1094,120 @@ pub fn commit(
     let _ = std::fs::remove_file(HUB_UPGRADE_MARKER_FILE);
     eprintln!("exec of the upgrade script failed: {err}");
     std::process::exit(1);
+}
+
+/// The feature names this host's CPU reports (/proc/cpuinfo `flags` on
+/// x86_64, `Features` on aarch64).  Read once.
+fn host_cpu_features() -> &'static std::collections::HashSet<String> {
+    use std::sync::OnceLock;
+    static SET: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    SET.get_or_init(|| {
+        let text = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        cpuinfo_features(&text)
+    })
+}
+
+fn cpuinfo_features(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| matches!(k.trim(), "flags" | "Features"))
+        .flat_map(|(_, v)| v.split_whitespace().map(str::to_string))
+        .collect()
+}
+
+/// The first feature a manifest `cpu` column (column 10) needs that `have`
+/// lacks on `arch`, or `None`.  "-" or empty = no requirement; an entry may
+/// be arch-qualified ("x86_64:avx2") and then applies only on that arch;
+/// "neon" is accepted for aarch64's "asimd".
+fn cpu_missing<'a>(
+    spec: &'a str,
+    arch: &str,
+    have: &std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    if spec.is_empty() || spec == "-" {
+        return None;
+    }
+    spec.split(',').filter(|e| !e.is_empty()).find_map(|entry| {
+        let feat = match entry.split_once(':') {
+            Some((a, f)) if a == arch => f,
+            Some(_) => return None,
+            None => entry,
+        };
+        let ok = have.contains(feat) || (feat == "neon" && have.contains("asimd"));
+        (!ok).then_some(feat)
+    })
+}
+
+/// Unpack `archive` into a staging directory and run the binary in it with
+/// `-selftest` from the working directory (so it reads this node's config and
+/// pass file), killed after SELFTEST_TIMEOUT.  The staging directory is
+/// always removed.  `Err` carries the first line of what the build printed.
+fn staged_selftest(archive: &str) -> Result<(), String> {
+    let dir = "./irchub_selftest_tmp";
+    let _ = std::fs::remove_dir_all(dir);
+    let out = (|| {
+        std::fs::create_dir(dir)
+            .map_err(|_| "could not create the staging directory".to_string())?;
+        let ok = Command::new("tar")
+            .args(["-xzf", archive, "--strip-components=1", "-C", dir])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return Err("could not extract artifact".to_string());
+        }
+        run_selftest(&format!("{dir}/irchub"))
+    })();
+    let _ = std::fs::remove_dir_all(dir);
+    out
+}
+
+/// Run `bin -selftest`, polling for its exit and killing it at the timeout.
+fn run_selftest(bin: &str) -> Result<(), String> {
+    use std::io::Read;
+    let mut child = Command::new(bin)
+        .arg("-selftest")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run it ({e})"))?;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(SELFTEST_TIMEOUT);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() < end => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {SELFTEST_TIMEOUT} s"));
+            }
+        }
+    };
+    let mut text = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut text);
+    }
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut text);
+    }
+    if status.success() {
+        return Ok(());
+    }
+    let first = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    Err(if first.is_empty() {
+        format!("exited with {status}")
+    } else {
+        first.chars().take(160).collect()
+    })
 }
 
 #[cfg(test)]
@@ -834,12 +1242,12 @@ mod tests {
             "v9.0 2026-09-21 https://github.com/x/y/v9-sparc.tar.gz cc none bin sparc64 gnu *";
 
         let m = format!("# comment\n{src}\n{bin}\n");
-        assert_eq!(manifest_select(&m, "9.0").unwrap().kind, "bin");
+        assert_eq!(manifest_select(&m, "9.0", "c").unwrap().kind, "bin");
         let m = format!("{other}\n{src}\n");
-        assert_eq!(manifest_select(&m, "v9.0").unwrap().kind, "src");
+        assert_eq!(manifest_select(&m, "v9.0", "c").unwrap().kind, "src");
         let m = format!("{other}\n");
-        assert!(manifest_select(&m, "v9.0").is_err());
-        assert!(manifest_select(&m, "v1.0").is_err());
+        assert!(manifest_select(&m, "v9.0", "c").is_err());
+        assert!(manifest_select(&m, "v1.0", "c").is_err());
     }
 
     /// min_from is a floor on the version we may upgrade FROM: a row that
@@ -848,9 +1256,9 @@ mod tests {
     #[test]
     fn manifest_honors_min_from() {
         let row = "v9.0 2026-09-21 https://github.com/x/y/v9.tar.gz aa none src any any 99.0";
-        assert!(manifest_select(row, "9.0").is_err());
+        assert!(manifest_select(row, "9.0", "c").is_err());
         let row = "v9.0 2026-09-21 https://github.com/x/y/v9.tar.gz aa none src any any 1.0";
-        assert!(manifest_select(row, "9.0").is_ok());
+        assert!(manifest_select(row, "9.0", "c").is_ok());
     }
 
     #[test]
@@ -911,9 +1319,97 @@ v3.0.0 2026-03-01 https://github.com/x/c.tar.gz cc none bin any any v2.0.0
     /// fetched, and so is one below its own min_from.
     #[test]
     fn can_take_refuses_non_upgrades() {
-        assert!(can_take(HUB_VERSION, "", "").is_err());
-        assert!(can_take("0.1", "", "").is_err());
-        assert!(can_take("", "", "").is_err());
-        assert!(can_take("99.0", "98.0", "").is_err());
+        assert!(can_take(HUB_VERSION, "", "", "").is_err());
+        assert!(can_take("0.1", "", "", "").is_err());
+        assert!(can_take("", "", "", "").is_err());
+        assert!(can_take("99.0", "", "98.0", "").is_err());
+        // Same version on the other build is a switch, not "already running"
+        // (it then fails later on the password file / manifest, not here).
+        assert_eq!(
+            can_take_local(HUB_VERSION, host_variant(), "").unwrap_err(),
+            "already running the target version"
+        );
+        assert_ne!(
+            can_take_local(HUB_VERSION, "c", "").err().as_deref(),
+            Some("already running the target version")
+        );
+    }
+
+    #[test]
+    fn marker_carries_the_variant() {
+        assert_eq!(
+            parse_marker("abc|2.4.3|c\n"),
+            Some(("abc".into(), "2.4.3".into(), "c".into()))
+        );
+        // A marker an older build wrote has no variant.
+        assert_eq!(
+            parse_marker("abc|2.4.3\n"),
+            Some(("abc".into(), "2.4.3".into(), String::new()))
+        );
+        assert_eq!(parse_marker("|2.4.3"), None);
+        assert_eq!(parse_marker("abc"), None);
+    }
+
+    #[test]
+    fn releases_are_distinct_and_newest_first() {
+        let m = "# c\nv2.4.1 2026-09-23 u h none bin x any *\nv2.4.1 2026-09-23 u2 h none src any any *\nv2.4.10 2026-09-26 u h none bin x any *\nv2.4.2 2026-09-24 u h none bin x any *\n";
+        let r = releases_in(m, 24);
+        let v: Vec<&str> = r.iter().map(|x| x.version.as_str()).collect();
+        assert_eq!(v, ["v2.4.10", "v2.4.2", "v2.4.1"]);
+        assert_eq!(r[0].date, "2026-09-26");
+        let r = releases_in(m, 2);
+        let v: Vec<&str> = r.iter().map(|x| x.version.as_str()).collect();
+        assert_eq!(v, ["v2.4.10", "v2.4.2"]);
+    }
+
+    #[test]
+    fn watchdog_script_shape() {
+        let s = upgrade_script(42, "bin", "a.tar.gz", "/x/irchub.prev", "/x/irchub", true);
+        assert!(!s.contains("-selftest"));
+        let src = upgrade_script(42, "src", "a.tar.gz", "/x/irchub.prev", "/x/irchub", true);
+        assert!(src.contains(r#""$NEW_BIN" -selftest"#));
+        assert!(s.contains(r#"[ "$OLD_PID" = "$$" ] && break"#));
+        assert!(s.contains(&format!("sleep {UPGRADE_WATCH_SECS}")));
+        assert!(s.contains(r#"mv -f "/x/irchub" "/x/irchub.failed""#));
+        // Neither rollback path removes the marker.
+        assert!(!s.contains(HUB_UPGRADE_MARKER_FILE));
+    }
+
+    #[test]
+    fn cpu_column() {
+        let have = cpuinfo_features(
+            "processor\t: 0\nflags\t\t: fpu aes pclmulqdq avx\n\nprocessor\t: 1\nflags\t\t: fpu aes\n",
+        );
+        assert_eq!(cpu_missing("-", "x86_64", &have), None);
+        assert_eq!(cpu_missing("", "x86_64", &have), None);
+        assert_eq!(cpu_missing("aes,pclmulqdq,avx", "x86_64", &have), None);
+        assert_eq!(cpu_missing("aes,avx2,bmi1", "x86_64", &have), Some("avx2"));
+        assert_eq!(
+            cpu_missing("aarch64:sha2,x86_64:avx", "x86_64", &have),
+            None
+        );
+        assert_eq!(
+            cpu_missing("aarch64:sha2,x86_64:adx", "x86_64", &have),
+            Some("adx")
+        );
+        let arm = cpuinfo_features("Features\t: fp asimd aes pmull sha2\n");
+        assert_eq!(cpu_missing("neon,aes,pmull,sha2", "aarch64", &arm), None);
+        assert_eq!(
+            cpu_missing("x86_64:avx2,aarch64:neon", "aarch64", &arm),
+            None
+        );
+    }
+
+    #[test]
+    fn cpu_column_missing_is_none() {
+        let (_, row) =
+            parse_row("v9.0 2026-09-20 https://github.com/x/y/v9.tar.gz aa none src any any *")
+                .unwrap();
+        assert_eq!(row.cpu, "-");
+        let (_, row) = parse_row(
+            "v9.0 2026-09-20 https://github.com/x/y/v9.tar.gz aa none bin x86_64 any * aes,avx2",
+        )
+        .unwrap();
+        assert_eq!(row.cpu, "aes,avx2");
     }
 }

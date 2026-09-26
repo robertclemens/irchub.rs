@@ -1584,7 +1584,9 @@ pub fn handle_admin_command(
             // empty hub_ver leaves every hub where it is.  A base never
             // contains '|' (upgrade::start refuses one), so only the last
             // field is a tail.
-            let f: Vec<&str> = payload.splitn(7, '|').collect();
+            // 8th field: the selection ("" = whole network), comma-separated
+            // name-or-uuid[=c|rs] tokens.  Only it may be the tail now.
+            let f: Vec<&str> = payload.splitn(8, '|').collect();
             let at = |i: usize| f.get(i).copied().unwrap_or("");
             let fd = state.clients[ci].fd;
             let msg = upgrade::start(
@@ -1598,12 +1600,24 @@ pub fn handle_admin_command(
                     base: at(4),
                     hub_ver: at(5),
                     hub_base: at(6),
+                    sel: at(7),
                 },
             );
             resp(state, ci, &msg)
         }
 
         CMD_ADMIN_UPGRADE_STATUS => {
+            // "releases[|bot_base|hub_base]": what hub_admin offers to pick
+            // from — the verified release manifests of both products and the
+            // nodes a selective run could name.  Read-only; allowed during a
+            // run.
+            let lower = payload.get(..8).map(str::to_ascii_lowercase);
+            if lower.as_deref() == Some("releases")
+                && (payload.len() == 8 || payload.as_bytes()[8] == b'|')
+            {
+                let out = upgrade::releases(state, payload);
+                return resp(state, ci, &out);
+            }
             // A payload of "abort" stops a run in flight and rolls the mesh
             // back.
             if payload.eq_ignore_ascii_case("abort") {
