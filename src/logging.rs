@@ -8,9 +8,15 @@
 //! never start a line that looks like a fresh "[timestamp]" entry.  Only the
 //! message's final newline is kept as is.
 //!
-//! The C hub read the level off the global `g_state`; here the same two
-//! fields live in the logger and are pushed to it whenever the config load or
-//! an admin command changes them, so every call site stays a plain macro.
+//! A line has two sinks, each with its own level: the log file (`log_level`)
+//! and the SSH consoles' in-memory ring (`console_log_level`).  A line is
+//! formatted when either wants it; `hub_log_at` then writes it to each sink
+//! whose level is at least the line's.  A bare `hub_log` counts as LOG_ERROR:
+//! written at every level but LOG_NONE.
+//!
+//! The C hub read the levels off the global `g_state`; here the same fields
+//! live in the logger and are pushed to it whenever the config load or an
+//! admin command changes them, so every call site stays a plain macro.
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
@@ -24,7 +30,10 @@ struct LogState {
     /// NULL, which makes the level macros no-ops but still lets a bare
     /// hub_log() through.
     attached: bool,
+    /// The file's level.
     level: i32,
+    /// The console log ring's level.
+    console_level: i32,
     max_size: i64,
     file: Option<File>,
 }
@@ -34,6 +43,7 @@ thread_local! {
         RefCell::new(LogState {
             attached: false,
             level: HUB_DEFAULT_LOG_LEVEL,
+            console_level: HUB_DEFAULT_CONSOLE_LOG_LEVEL,
             max_size: HUB_LOG_FILE_SIZE,
             file: None,
         })
@@ -41,25 +51,37 @@ thread_local! {
 }
 
 /// Mark the hub state as live (g_state = &state) with its initial settings.
-pub fn attach(level: i32, max_size: i64) {
+pub fn attach(level: i32, console_level: i32, max_size: i64) {
     LOG.with_borrow_mut(|l| {
         l.attached = true;
         l.level = level;
+        l.console_level = console_level;
         l.max_size = max_size;
     });
 }
 
-pub fn set_level(level: i32) {
-    LOG.with_borrow_mut(|l| l.level = level);
+/// The file's and the console log ring's level.
+pub fn set_levels(level: i32, console_level: i32) {
+    LOG.with_borrow_mut(|l| {
+        l.level = level;
+        l.console_level = console_level;
+    });
 }
 
 pub fn set_max_size(max_size: i64) {
     LOG.with_borrow_mut(|l| l.max_size = max_size);
 }
 
-/// The level a `hub_log_*` macro tests, or LOG_NONE while g_state is NULL.
+/// The level a `hub_log_*` macro tests — the higher of the two sinks' —
+/// or LOG_NONE while g_state is NULL.
 pub fn level() -> i32 {
-    LOG.with_borrow(|l| if l.attached { l.level } else { LOG_NONE })
+    LOG.with_borrow(|l| {
+        if l.attached {
+            l.level.max(l.console_level)
+        } else {
+            LOG_NONE
+        }
+    })
 }
 
 /// Close the log file (shutdown).
@@ -151,9 +173,15 @@ fn sanitize(p: &[u8]) -> String {
 }
 
 /// hub_log(): one already-formatted message (its trailing newline included,
-/// as in the C call sites).
+/// as in the C call sites), at LOG_ERROR.
 pub fn hub_log(msg: &str) {
-    hub_log_bytes(msg.as_bytes());
+    hub_log_bytes_at(LOG_ERROR, msg.as_bytes());
+}
+
+/// hub_log_at(): a message the `hlog_*!` macros have already filtered and
+/// tagged; `level` only picks the sinks.
+pub fn hub_log_at(level: i32, msg: &str) {
+    hub_log_bytes_at(level, msg.as_bytes());
 }
 
 /// hub_log() for a line that carries raw, attacker-controlled bytes.
@@ -183,17 +211,43 @@ pub fn hub_log_with_raw(level: i32, prefix: &str, raw: &[u8], suffix: &str) {
     line.extend_from_slice(prefix.as_bytes());
     line.extend_from_slice(raw);
     line.extend_from_slice(suffix.as_bytes());
-    hub_log_bytes(&line);
+    hub_log_bytes_at(level, &line);
 }
 
-/// The byte-level writer both of the above funnel into.
-pub fn hub_log_bytes(msg: &[u8]) {
-    LOG.with_borrow_mut(|l| {
-        if l.attached && l.level == LOG_NONE {
-            return;
-        }
-        let time_buf = local_time_str();
+/// The byte-level writer all of the above funnel into.
+pub fn hub_log_bytes_at(level: i32, msg: &[u8]) {
+    // Which sinks take a line at this level.  Before attach() (early
+    // startup) only the file does, as it always did.
+    let (to_file, to_ring) = LOG.with_borrow(|l| {
+        (
+            !l.attached || l.level >= level,
+            l.attached && l.console_level >= level,
+        )
+    });
+    if !to_file && !to_ring {
+        return;
+    }
+    let time_buf = local_time_str();
+    if to_file {
+        file_write(&time_buf, msg);
+    }
+    if to_ring {
+        // The SSH consoles' log view reads the same lines from memory; the
+        // ring is fed whether or not the file could be written.
+        let mut line = Vec::with_capacity(msg.len() + 24);
+        line.push(b'[');
+        line.extend_from_slice(time_buf.as_bytes());
+        line.extend_from_slice(b"] ");
+        line.extend_from_slice(msg);
+        crate::console::log_append(level, &line);
+        crate::crypto::wipe(&mut line); // log args can hold key material
+    }
+}
 
+/// The file sink: the size-capped, inode-checked HUB_LOG_FILE.  Returns
+/// without writing when the file cannot be opened.
+fn file_write(time_buf: &str, msg: &[u8]) {
+    LOG.with_borrow_mut(|l| {
         // Does the path still point at the same inode as the open handle?  A
         // plain existence check misses a file that was deleted and recreated:
         // the old handle would go on writing to the unlinked inode while the
@@ -249,7 +303,10 @@ macro_rules! hlog {
 macro_rules! hlog_error {
     ($($arg:tt)*) => {
         if $crate::logging::level() >= $crate::consts::LOG_ERROR {
-            $crate::logging::hub_log(&format!("[ERROR] {}", format!($($arg)*)));
+            $crate::logging::hub_log_at(
+                $crate::consts::LOG_ERROR,
+                &format!("[ERROR] {}", format!($($arg)*)),
+            );
         }
     };
 }
@@ -258,7 +315,10 @@ macro_rules! hlog_error {
 macro_rules! hlog_warning {
     ($($arg:tt)*) => {
         if $crate::logging::level() >= $crate::consts::LOG_WARNING {
-            $crate::logging::hub_log(&format!("[WARNING] {}", format!($($arg)*)));
+            $crate::logging::hub_log_at(
+                $crate::consts::LOG_WARNING,
+                &format!("[WARNING] {}", format!($($arg)*)),
+            );
         }
     };
 }
@@ -267,7 +327,10 @@ macro_rules! hlog_warning {
 macro_rules! hlog_info {
     ($($arg:tt)*) => {
         if $crate::logging::level() >= $crate::consts::LOG_INFO {
-            $crate::logging::hub_log(&format!("[INFO] {}", format!($($arg)*)));
+            $crate::logging::hub_log_at(
+                $crate::consts::LOG_INFO,
+                &format!("[INFO] {}", format!($($arg)*)),
+            );
         }
     };
 }
@@ -276,7 +339,10 @@ macro_rules! hlog_info {
 macro_rules! hlog_debug {
     ($($arg:tt)*) => {
         if $crate::logging::level() >= $crate::consts::LOG_DEBUG {
-            $crate::logging::hub_log(&format!("[DEBUG] {}", format!($($arg)*)));
+            $crate::logging::hub_log_at(
+                $crate::consts::LOG_DEBUG,
+                &format!("[DEBUG] {}", format!($($arg)*)),
+            );
         }
     };
 }
@@ -287,7 +353,10 @@ macro_rules! hlog_debug {
 macro_rules! hlog_status {
     ($($arg:tt)*) => {
         if $crate::logging::level() >= $crate::consts::LOG_INFO {
-            $crate::logging::hub_log(&format!("[STATUS] {}", format!($($arg)*)));
+            $crate::logging::hub_log_at(
+                $crate::consts::LOG_INFO,
+                &format!("[STATUS] {}", format!($($arg)*)),
+            );
         }
     };
 }

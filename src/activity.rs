@@ -66,7 +66,7 @@ fn flood(state: &mut HubState, lines: &str, exclude_fd: i32) {
     }
 }
 
-/// hub_admin login: stamp the admin's exact time; the first login in an
+/// Admin console login: stamp the admin's exact time; the first login in an
 /// ACTIVITY_BUCKET is flooded to the peers.  Never a config change.
 pub fn stamp_user(state: &mut HubState, ui: usize, t: i64) {
     let prev = state.user_records[ui].last_seen;

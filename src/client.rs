@@ -3,8 +3,9 @@
 //! Wire format, every frame: `len(4, BE) || AES-256-GCM(iv(12) || ct || tag)`,
 //! where the plaintext is `cmd(1) || inner_len(4) || payload`.  Before a
 //! connection has authenticated the frame is plaintext instead — a bot's
-//! UUID, its challenge signature, `ADMIN-HELLO`, or a sealed box carrying an
-//! `ADMIN2` / `HUBv3` login.
+//! UUID, its challenge signature, or a sealed box carrying a `HUBv3` login.
+//! An SSH console's internal connection (docs/console.md) speaks plaintext
+//! `op(1) || payload` frames instead, from the console thread.
 //!
 //! `handle_client_data` returns false when it disconnected the client, which
 //! is the signal the main loop uses to re-examine the index that was just
@@ -17,7 +18,6 @@ use crate::cstr::{Fmt, Tok, atoll, now, sscanf, trunc_string};
 use crate::state::{BotAuthState, ClientType, HubClient, HubState, Lane, QueuedMsg};
 use crate::{admin, auth, crypto, mesh, net, opflow, presence, queue, ratelimit, storage, upgrade};
 
-const ADMIN_INFO: &[u8] = b"irchub-admin-session-v2";
 const PEER_INFO: &[u8] = b"irchub-peer-session-v1";
 
 // ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ pub fn send_cmd_to_bot(client: &mut HubClient, cmd: u8, payload: &str) -> bool {
     net::write_framed(sock, &wire)
 }
 
-/// The largest reply hub_admin will accept: its frame check refuses anything
+/// The largest reply the old hub_admin client accepted: its frame check refused anything
 /// past a 65536-byte plaintext plus IV and tag.  The C hub built each reply in
 /// a fixed buffer (8 KB for the user listings, 16 KB for most, 64 KB for the
 /// bot list and the mesh matrix) and stopped adding rows at the end of it;
@@ -54,10 +54,26 @@ pub fn send_cmd_to_bot(client: &mut HubClient, cmd: u8, payload: &str) -> bool {
 /// grow past what the console can read.
 const MAX_ADMIN_RESPONSE: usize = 65536;
 
-/// send_response(): an encrypted reply to hub_admin.  The connection is
-/// dropped on any failure, and false says so.
+/// send_response(): the reply to an admin command.  The connection is
+/// dropped on any failure, and false says so.  An SSH console gets it queued
+/// as plaintext, never as a partial write.
 pub fn send_response(state: &mut HubState, ci: usize, msg: &str) -> bool {
     let msg = crate::cstr::trunc(msg, MAX_ADMIN_RESPONSE + 1);
+    if state.clients[ci].internal {
+        let ok = state.clients[ci]
+            .console
+            .as_mut()
+            .is_some_and(|l| l.send(CONSOLE_REPLY, msg.as_bytes()));
+        if ok {
+            return true;
+        }
+        crate::hlog_warning!(
+            "[CONSOLE] {}'s console is not reading — closing it\n",
+            state.clients[ci].id
+        );
+        auth::disconnect_client(state, ci);
+        return false;
+    }
     let ok = {
         let c = &mut state.clients[ci];
         match crypto::aes_gcm_encrypt(msg.as_bytes(), c.session_key.as_ref()) {
@@ -474,7 +490,7 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
         // active.
         if hub_only_mutations && matches!(typ, 'a' | 'o' | 'm' | 'c') {
             crate::hlog_warning!(
-                "[HUB] opt 'h' active: REJECTED bot-pushed '{typ}' record from {id} (hub-authoritative — mutation must originate from hub_admin)\n"
+                "[HUB] opt 'h' active: REJECTED bot-pushed '{typ}' record from {id} (hub-authoritative — mutation must originate from the admin console)\n"
             );
             continue;
         }
@@ -997,182 +1013,6 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
 // Authentication frames
 // ---------------------------------------------------------------------------
 
-/// The ADMIN-HELLO discovery probe.  Answers with
-/// `HUB-PUBKEY2|<hub_x_pub_b64>|<hub_uuid>|<nonce32_b64>` (plaintext,
-/// length-prefixed) and stays unauthenticated.  The nonce is this
-/// connection's one-time login challenge, which hub_admin must sign — with
-/// the hub key, hub UUID and its ephemeral key — in ADMIN2.  One HELLO per
-/// connection; a second one is refused.
-fn handle_admin_hello(state: &mut HubState, ci: usize) -> bool {
-    if state.clients[ci].admin_hello_seen {
-        let ip = state.clients[ci].ip.clone();
-        crate::hlog_warning!("[HUB] Repeated ADMIN-HELLO from {ip} — disconnecting\n");
-        ratelimit::record_failed_auth(state, &ip);
-        auth::disconnect_client(state, ci);
-        return false;
-    }
-    // D4b: an interactive admin client may take a moment before its
-    // sealed-box ADMIN2 arrives.  Grant it the longer pre-auth window;
-    // bots, peers and slowloris connections are unaffected.
-    state.clients[ci].admin_hello_seen = true;
-
-    if state.hub_keys_loaded {
-        let mut nonce = [0u8; 32];
-        if crypto::random_bytes(&mut nonce) {
-            state.clients[ci].admin_nonce = nonce;
-            state.clients[ci].admin_nonce_set = true;
-            let reply = format!(
-                "HUB-PUBKEY2|{}|{}|{}",
-                crypto::b64_encode(&state.hub_x25519_pub),
-                state.hub_uuid,
-                crypto::b64_encode(&nonce)
-            );
-            if reply.len() < 256
-                && let Some(sock) = &mut state.clients[ci].sock
-            {
-                net::write_framed(sock, reply.as_bytes());
-            }
-        }
-    }
-    true
-}
-
-/// ADMIN login v2 (docs/passwordless.md §6): no name, no password.
-///
-/// ```text
-/// "ADMIN2|<admin_pub_b64>|<sig_b64>|<ip>:<port>"
-/// sig = Ed25519(admin_ed_priv, "irchub-admin-auth-v2\0" || hub_uuid || "\0"
-///       || hub_x_pub(32) || nonce(32) || eph_pub(32) || admin_pub(64))
-/// ```
-///
-/// `eph_pub` is the first 32 bytes of the sealed frame — hub_admin's fresh
-/// ephemeral key, which keyed this box; `nonce` is the challenge this
-/// connection received in HUB-PUBKEY2.  The signature proves possession of
-/// the admin's private key, is useless on any other connection or hub (nonce,
-/// hub key and UUID are all bound), and the ephemeral key gives the session
-/// forward secrecy.  The legacy "ADMIN|name|password|..." login is gone.
-fn handle_admin2(state: &mut HubState, ci: usize, payload: &str, eph_pub: &[u8]) -> bool {
-    let nonce_ok = state.clients[ci].admin_nonce_set;
-    let nonce = state.clients[ci].admin_nonce;
-    // Single use, success or not.
-    crypto::wipe(&mut state.clients[ci].admin_nonce);
-    state.clients[ci].admin_nonce_set = false;
-    let ip = state.clients[ci].ip.clone();
-
-    let body = &payload[7..];
-    let f = crate::cstr::split_fields(body, 3);
-    let shape_ok = f.len() == 3 && f[0].len() == COMBINED_KEY_B64 && f[1].len() == 88;
-    let (pub_b64, sig_b64, client_addr) = if shape_ok {
-        (f[0], f[1], trunc_string(f[2], 96))
-    } else {
-        ("", "", String::new())
-    };
-
-    let mut why = "malformed ADMIN2 payload";
-    let mut pass_ok = false;
-    let mut admin_ui: Option<usize> = None;
-    let mut admin_pub = [0u8; COMBINED_KEY_LEN];
-
-    if !nonce_ok {
-        why = "no login challenge on this connection (ADMIN-HELLO first)";
-    } else if shape_ok && let Some(p) = crypto::pubkey_b64_decode(pub_b64) {
-        admin_pub = p;
-        let matches: Vec<usize> = state
-            .user_records
-            .iter()
-            .enumerate()
-            .filter(|(_, u)| u.typ == 'a' && u.is_active && u.has_pubkey && u.pubkey_b64 == pub_b64)
-            .map(|(i, _)| i)
-            .collect();
-        if matches.is_empty() {
-            why = "no active admin record holds this key";
-        } else if matches.len() > 1 {
-            why = "key is on more than one admin record — refusing";
-        } else {
-            admin_ui = Some(matches[0]);
-            if state.hub_uuid.len() < 64 {
-                let mut msg = Vec::with_capacity(256);
-                msg.extend_from_slice(b"irchub-admin-auth-v2\0"); // incl. NUL
-                msg.extend_from_slice(state.hub_uuid.as_bytes());
-                msg.push(0);
-                msg.extend_from_slice(&state.hub_x25519_pub);
-                msg.extend_from_slice(&nonce);
-                msg.extend_from_slice(&eph_pub[..32]);
-                msg.extend_from_slice(&admin_pub);
-                let sig = crypto::b64_decode(sig_b64);
-                pass_ok = sig.as_ref().is_some_and(|s| {
-                    s.len() == ED25519_SIG_LEN
-                        && crypto::ed25519_verify(&crypto::pub_halves(&admin_pub).0, &msg, s)
-                });
-            }
-            if !pass_ok {
-                why = "signature invalid";
-                admin_ui = None;
-            }
-        }
-    }
-
-    let auth_name =
-        admin_ui.map_or_else(|| "?".to_string(), |i| state.user_records[i].name.clone());
-
-    if !pass_ok {
-        crate::hlog_warning!("[HUB] Failed admin auth from {ip}: {why}\n");
-        ratelimit::record_failed_auth(state, &ip);
-        auth::disconnect_client(state, ci);
-        return false;
-    }
-
-    // client.id is the admin's identity for storage lookups and logging.
-    // "ADMIN:" plus a 63-char name does not fit in id[64], and two long names
-    // sharing a prefix would collapse to the same id.  Fail closed rather
-    // than authenticate under a truncated identity.
-    if auth_name.len() + "ADMIN:".len() + 1 > 64 {
-        crate::hlog_warning!(
-            "[HUB] Admin auth from {ip}: name '{auth_name}' too long for client id — refusing\n"
-        );
-        auth::disconnect_client(state, ci);
-        return false;
-    }
-
-    {
-        let c = &mut state.clients[ci];
-        c.typ = ClientType::Admin;
-        c.authenticated = true;
-        // D2: grow the buffers now that the admin is authenticated.
-        c.promote_buffers();
-        c.id = format!("ADMIN:{auth_name}");
-
-        // Capture the admin's reported ip:port (informational).
-        match client_addr.find(':') {
-            Some(colon) if !client_addr.is_empty() => {
-                c.admin_connect_ip = trunc_string(&client_addr[..colon], 64);
-                c.admin_connect_port = crate::cstr::atoi(&client_addr[colon + 1..]);
-            }
-            _ => {
-                c.admin_connect_ip.clear();
-                c.admin_connect_port = 0;
-            }
-        }
-    }
-
-    // Activity, not a config change: no peer sync, no bot push.  The first
-    // login in a clock hour is flooded to the peers.
-    if let Some(ui) = admin_ui {
-        crate::activity::stamp_user(state, ui, now());
-    }
-    crate::hlog_info!(
-        "[HUB] Admin Login (key {}): {ip} as '{auth_name}'\n",
-        crypto::key_fingerprint(&admin_pub)
-    );
-
-    // Tell hub_admin who it is logged in as (encrypted).
-    if !send_response(state, ci, &format!("AUTH-OK|{auth_name}")) {
-        return false; // send_response already disconnected
-    }
-
-    true
-}
-
 /// v3 hub peer authentication (Ed25519 signature, no password).
 /// Format: `HUBv3|<uuid>|<port>|<name>|<bind_ip>|<ts>|<sig_b64>`.
 fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
@@ -1305,13 +1145,6 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
 fn handle_unauthenticated(state: &mut HubState, ci: usize, data: &[u8]) -> bool {
     let packet_len = data.len();
 
-    if packet_len == 11
-        && data == b"ADMIN-HELLO"
-        && state.clients[ci].bot_auth_state == BotAuthState::Idle
-    {
-        return handle_admin_hello(state, ci);
-    }
-
     // Detect the packet type: a bot UUID (plaintext, 36 chars, hex+hyphens)
     // or a mid-handshake bot packet (the 64-byte signature).
     let looks_like_uuid =
@@ -1325,24 +1158,13 @@ fn handle_unauthenticated(state: &mut HubState, ci: usize, data: &[u8]) -> bool 
         return true;
     }
 
-    // Sealed-box decrypt for ADMIN and HUB peer auth.  Frame layout:
+    // Sealed-box decrypt for HUB peer auth.  Frame layout:
     //   eph_pub(32) || IV(GCM_IV_LEN) || ct(N) || tag(GCM_TAG_LEN)
     if (32 + GCM_IV_LEN + GCM_TAG_LEN..=MAX_BUFFER).contains(&packet_len) {
         let mut x_priv = [0u8; 32];
         x_priv.copy_from_slice(state.hub_x25519_priv.get());
 
-        let admin_try = crypto::seal_open(&x_priv, data, ADMIN_INFO);
-        let tried_admin = admin_try
-            .as_ref()
-            .is_some_and(|(pt, _)| pt.len() >= 5 && &pt[..5] == b"ADMIN");
-
-        let opened = if tried_admin {
-            admin_try
-        } else {
-            // Retry under PEER_INFO; if that fails too there is nothing here
-            // for the sealed-box path.
-            crypto::seal_open(&x_priv, data, PEER_INFO)
-        };
+        let opened = crypto::seal_open(&x_priv, data, PEER_INFO);
         crypto::wipe(&mut x_priv);
 
         let Some((plain, session_key)) = opened else {
@@ -1356,9 +1178,6 @@ fn handle_unauthenticated(state: &mut HubState, ci: usize, data: &[u8]) -> bool 
         state.clients[ci].session_key = session_key;
         let payload = String::from_utf8_lossy(crate::cstr::until_nul_bytes(&plain)).into_owned();
 
-        if payload.starts_with("ADMIN2|") {
-            return handle_admin2(state, ci, &payload, &data[..32]);
-        }
         // HUBv2 is a pre-passwordless peer.  It would send a|/o| records with
         // passwords and read ours as passwords, so mixed versions must never
         // exchange state (docs/passwordless.md §3.4): refuse it by name.
@@ -1453,6 +1272,30 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
     }
 }
 
+/// One plaintext `op || payload` frame from an SSH console (docs/console.md),
+/// which authenticated the admin before this connection existed.  False
+/// means the client was disconnected.
+fn handle_console_frame(state: &mut HubState, ci: usize, data: &[u8]) -> bool {
+    let Some((&op, body)) = data.split_first() else {
+        auth::disconnect_client(state, ci);
+        return false;
+    };
+    let payload = String::from_utf8_lossy(crate::cstr::until_nul_bytes(body)).into_owned();
+    if op == CMD_CONSOLE {
+        if !crate::console::frame(state, ci, &payload) {
+            auth::disconnect_client(state, ci);
+            return false;
+        }
+        return true;
+    }
+    // Both return false only after they closed this client.
+    if admin::console_admin_op(op) {
+        admin::handle_admin_command(state, ci, op, &payload, body, body.len())
+    } else {
+        send_response(state, ci, "ERROR: not an admin command")
+    }
+}
+
 /// hub_handle_client_data(): drain whole frames out of a client's receive
 /// buffer.  At most 8 per call so the event loop stays fair across
 /// connections — one backlogged peer must not starve bot auth.  False means
@@ -1503,7 +1346,11 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
         }
         let data: Vec<u8> = c.recv_buf[4..4 + packet_len].to_vec();
 
-        if !state.clients[ci].authenticated {
+        if state.clients[ci].internal {
+            if !handle_console_frame(state, ci, &data) {
+                return false;
+            }
+        } else if !state.clients[ci].authenticated {
             if !handle_unauthenticated(state, ci, &data) {
                 return false;
             }

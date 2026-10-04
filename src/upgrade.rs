@@ -1,7 +1,7 @@
 //! Network upgrade orchestration (`hub_logic.c`: `CMD_ADMIN_UPGRADE_NET` →
 //! `CMD_UPGRADE_*`).
 //!
-//! hub_admin asks this hub to move the whole network to a version.  The hub
+//! An admin's console `upgrade start` asks this hub to move the whole network to a version.  The hub
 //! freezes the config, asks every node whether it could take that build
 //! (PREPARE → READY/UNABLE), then commits them in a rolling plan: bots in
 //! waves so a channel never loses all its bots at once, peer hubs afterwards
@@ -74,7 +74,6 @@ pub fn admin_cmd_mutates_config(cmd: u8) -> bool {
             | CMD_ADMIN_APPROVE
             | CMD_ADMIN_ADD_PEER
             | CMD_ADMIN_DEL_PEER
-            | CMD_ADMIN_SET_PRIVKEY
             | CMD_ADMIN_SET_PUBKEY
             | CMD_ADMIN_REKEY_BOT
             | CMD_ADMIN_CREATE_BOT
@@ -125,7 +124,7 @@ fn find_client(state: &HubState, uuid: &str, typ: ClientType) -> Option<usize> {
 }
 
 /// The uuid a peer hub knows ITSELF by.  A peer connection's `id` is the
-/// peer's FRIENDLY NAME — that is what the roster, the logs and hub_admin show
+/// peer's FRIENDLY NAME — that is what the roster, the logs and the console show
 /// — while every upgrade frame a peer sends is keyed by its hub uuid.  The two
 /// have to be bridged, or the driver never matches a peer's own
 /// `CMD_UPGRADE_READY` to the node it created for it and files the answer as a
@@ -694,7 +693,7 @@ fn resolve_selection(
     Ok(picks)
 }
 
-/// hub_admin asked for a network upgrade.  Freeze the config, enumerate the
+/// The console asked for a network upgrade.  Freeze the config, enumerate the
 /// nodes and fan PREPARE out; the rolling plan itself runs on the maintenance
 /// tick.  The returned string is what the admin console prints.
 pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
@@ -2474,7 +2473,7 @@ pub fn report_pending(state: &mut HubState, ci: usize) {
 }
 
 /// `CMD_ADMIN_UPGRADE_STATUS` "releases[|bot_base|hub_base]": everything
-/// hub_admin needs to offer choices instead of free text.  Lines:
+/// The console needs to offer choices instead of free text.  Lines:
 ///   bot|<version>|<date>|<variants>     newest first, per product
 ///   hub|<version>|<date>|<variants>
 ///   err|<product>/<variant>|<reason>    a tree that could not be read
@@ -2621,7 +2620,7 @@ pub fn releases(state: &HubState, payload: &str) -> String {
     out
 }
 
-/// `CMD_ADMIN_UPGRADE_STATUS`: one line per node, for hub_admin to print.
+/// `CMD_ADMIN_UPGRADE_STATUS`: one line per node, for the console to print.
 pub fn status(state: &HubState) -> String {
     let u = &state.upgrade;
     // The roll-up plan this hub holds, if any: what a bot that comes back is

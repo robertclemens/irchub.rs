@@ -56,7 +56,11 @@ pub const LOG_WARNING: i32 = 2;
 pub const LOG_INFO: i32 = 3;
 pub const LOG_DEBUG: i32 = 4;
 
-pub const HUB_DEFAULT_LOG_LEVEL: i32 = LOG_DEBUG;
+/// The log FILE is off by default: a production hub writes nothing to disk
+/// until log_level| (or the console's "loglevel file") turns it on.  The
+/// in-memory ring the SSH consoles read has its own level.
+pub const HUB_DEFAULT_LOG_LEVEL: i32 = LOG_NONE;
+pub const HUB_DEFAULT_CONSOLE_LOG_LEVEL: i32 = LOG_DEBUG;
 
 // Rate limiting
 pub const MAX_IP_RATE_LIMITS: usize = 500;
@@ -139,12 +143,12 @@ pub const HUB_UPDATE_MAX_MANIFEST: u64 = 1024 * 1024;
 pub const HUB_UPDATE_MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 pub const HUB_UPDATE_FETCH_TIMEOUT: u64 = 300;
 /// Per-transfer budget for manifest reads made from the event loop (PREPARE
-/// answers, the hub_admin release list): the hub serves nothing meanwhile.
+/// answers, the console's release list): the hub serves nothing meanwhile.
 pub const HUB_UPDATE_QUICK_TIMEOUT: u64 = 8;
 /// The upgrade script's startup watchdog: how long the new build's daemon has
 /// to be up and alive before the script keeps it.
 pub const UPGRADE_WATCH_SECS: u32 = 20;
-/// The bots' release tree ROOT (ircbot-releases), for the hub_admin release
+/// The bots' release tree ROOT (ircbot-releases), for the console's release
 /// list and for walking a bot up via the roll-up.  Mirrors
 /// HUB_BOT_RELEASE_BASE in hub.h.
 pub const HUB_BOT_RELEASE_BASE: &str =
@@ -157,8 +161,6 @@ pub const CONNECT_TIMEOUT: u64 = 5;
 
 /// D4 — pre-authentication handshake timeout.
 pub const PREAUTH_TIMEOUT_SEC: i64 = 10;
-/// D4b — extended pre-auth grace for interactive admin logins.
-pub const PREAUTH_ADMIN_TIMEOUT_SEC: i64 = 120;
 
 /// D2 — two-tier client buffers: unauthenticated clients get a small buffer,
 /// grown to the per-type bulk size on successful auth.
@@ -188,8 +190,11 @@ pub const CMD_ADMIN_ADD_PEER: u8 = 0x18;
 pub const CMD_ADMIN_LIST_PEERS: u8 = 0x19;
 pub const CMD_ADMIN_DEL_PEER: u8 = 0x1A;
 pub const CMD_ADMIN_GET_PUBKEY: u8 = 0x1B;
-pub const CMD_ADMIN_SET_PRIVKEY: u8 = 0x1C;
-pub const CMD_ADMIN_GET_PRIVKEY: u8 = 0x1D;
+/// 0x1C / 0x1D (SET/GET_PRIVKEY) are retired with hub_admin (SSH console): the hub key
+/// never leaves the hub, a backup is a copy of .irchub.cnf.  Never reuse the
+/// values.
+pub const CMD_ADMIN_SET_PRIVKEY: u8 = 0x1C; // RETIRED
+pub const CMD_ADMIN_GET_PRIVKEY: u8 = 0x1D; // RETIRED
 pub const CMD_ADMIN_SET_PUBKEY: u8 = 0x1E;
 pub const CMD_ADMIN_SYNC_MESH: u8 = 0x1F;
 pub const CMD_ADMIN_CREATE_BOT: u8 = 0x32; // 50 decimal
@@ -370,6 +375,47 @@ pub const ACTIVITY_REQ_ID_MAX: usize = 32;
 /// link in the moment before the drop reached its gossip.
 pub const SYNC_RESYNC_AFTER_LINK_LOSS: i64 = 5;
 
+// ---- SSH admin console (docs/console.md) --------------------------------
+// The hub's only admin interface: an SSH server on the hub's own port, run on
+// a console thread (console::ssh) that never touches HubState.  Each
+// logged-in console reaches the core over its own socketpair, as an admin
+// connection that is already authenticated (HubClient::internal): plaintext
+// frames len(4, big-endian) || op(1) || payload.  CMD_CONSOLE is the one
+// opcode that exists only there -- console -> core "sub|<topics>" /
+// "get|tree" / "get|status", core -> console "<topic>|<data>" events.  It
+// never appears on the network.  Mirrors irchub hub.h.
+pub const CMD_CONSOLE: u8 = 0x6C;
+/// core -> console: the reply to the request in flight.
+pub const CONSOLE_REPLY: u8 = 0x00;
+/// SSH connections not yet logged in.
+pub const CONSOLE_MAX_PREAUTH: usize = 8;
+/// Open consoles.
+pub const CONSOLE_MAX_SESSIONS: usize = 8;
+/// Connect -> running shell, seconds.
+pub const CONSOLE_LOGIN_GRACE: u64 = 20;
+/// Seconds without a keystroke.
+pub const CONSOLE_IDLE_TIMEOUT: i64 = 1800;
+/// Refused keys before the drop.
+pub const CONSOLE_MAX_AUTH_TRIES: u32 = 3;
+/// The first bytes of an accepted connection decide console vs. bot/peer.  A
+/// sender that has not produced 4 bytes within this window is treated as the
+/// bot/peer protocol (whose own pre-auth timeout then applies).
+pub const CONSOLE_SNIFF_MS: i64 = 2000;
+/// Core-side queue towards one console.  A reply that does not fit closes the
+/// console (fail-secure); an event or log line that does not fit is dropped
+/// and counted ("drop|<n>").
+pub const CONSOLE_CORE_OUTQ_MAX: usize = 1024 * 1024;
+/// In-memory ring of recent log lines the log view and "log on" replay.
+pub const CONSOLE_LOG_RING: usize = 1024;
+pub const CONSOLE_LOG_LINE_MAX: usize = 512;
+/// Coalescing of pushed events: seconds between two tree events.
+pub const CONSOLE_TREE_MIN_GAP: i64 = 1;
+pub const CONSOLE_NAME_MAX: usize = 64;
+/// Most unauthenticated SSH connections from one address at a time.
+pub const CONSOLE_MAX_PREAUTH_PER_IP: usize = 2;
+/// Largest control / session frame either side accepts.
+pub const CONSOLE_FRAME_MAX: usize = 4 * 1024 * 1024;
+
 pub const MAX_PENDING_CHAN_REQUESTS: usize = 200;
 pub const CHAN_REQUEST_TIMEOUT: i64 = 45;
 
@@ -399,7 +445,7 @@ pub const UPGRADE_OPS_GRACE: i64 = 240;
 /// flag and would start a second daemon) and the staged run's timeout.
 pub const SELFTEST_MIN_HUB: &str = "2.4.3";
 pub const SELFTEST_TIMEOUT: u64 = 15;
-/// Releases listed by the hub_admin "releases" query, per product.
+/// Releases listed by the console's "upgrade releases" query, per product.
 pub const MAX_UPGRADE_RELEASES: usize = 24;
 
 // ---- Offline roll-up (upgrade plan, Task 7) -------------------------------

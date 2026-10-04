@@ -1,8 +1,7 @@
 //! The encrypted config file (hub_config.c): the a|/o| user-record codec,
 //! the writer, and the loader with its one-shot migrations.
 //!
-//! File layout, unchanged from the C hub and shared with `hub_encrypt` /
-//! `hub_decrypt`:
+//! File layout, unchanged from the C hub:
 //!
 //! ```text
 //! salt[SALT_SIZE] | iv[GCM_IV_LEN] | tag[GCM_TAG_LEN] | AES-256-GCM(plaintext)
@@ -166,6 +165,9 @@ pub fn write(state: &mut HubState) {
     // unchanged.
     if state.log_level != HUB_DEFAULT_LOG_LEVEL {
         buf.push_str(&format!("log_level|{}\n", state.log_level));
+    }
+    if state.console_log_level != HUB_DEFAULT_CONSOLE_LOG_LEVEL {
+        buf.push_str(&format!("console_log_level|{}\n", state.console_log_level));
     }
     if state.log_max_size > 0 && state.log_max_size != HUB_LOG_FILE_SIZE {
         buf.push_str(&format!("log_size|{}\n", state.log_max_size));
@@ -749,6 +751,9 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
             "log_level" => {
                 state.log_level = crate::cstr::atoi(v).clamp(LOG_NONE, LOG_DEBUG);
             }
+            "console_log_level" => {
+                state.console_log_level = crate::cstr::atoi(v).clamp(LOG_NONE, LOG_DEBUG);
+            }
             "log_size" => {
                 state.log_max_size = v
                     .trim()
@@ -885,7 +890,7 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
     for u in &state.user_records {
         if u.is_active && !u.has_pubkey {
             crate::hlog_warning!(
-                "[HUB] {} '{}' has no public key and cannot authenticate until given one (hub_admin: Change user public key)\n",
+                "[HUB] {} '{}' has no public key and cannot authenticate until given one (admin console: userkey)\n",
                 if u.typ == 'a' { "Admin" } else { "Oper" },
                 u.name
             );

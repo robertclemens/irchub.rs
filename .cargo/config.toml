@@ -1,0 +1,6 @@
+# ring (russh's crypto backend) compiles C/asm.  On a glibc host the musl
+# target has no x86_64-linux-musl-gcc; the host compiler builds ring's
+# freestanding objects fine for it (tools/mkreleases.py's static artifact).
+[env]
+CC_x86_64_unknown_linux_musl = "cc"
+CC_aarch64_unknown_linux_musl = { value = "cc", force = false }

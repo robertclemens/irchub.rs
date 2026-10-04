@@ -1,7 +1,7 @@
 //! Cryptographic primitives (hub_crypto.c), on RustCrypto and dalek.
 //!
 //! Every construction here is on the wire or on disk and must stay
-//! bit-for-bit compatible with ircbot, hub_admin and the client scripts:
+//! bit-for-bit compatible with ircbot and the client scripts:
 //!
 //! * AES-256-GCM, 12-byte random IV prepended to the ciphertext, 16-byte tag
 //!   carried alongside, no AAD — the shape every hub frame uses.

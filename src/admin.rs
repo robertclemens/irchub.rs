@@ -1,11 +1,9 @@
-//! The hub_admin command surface (hub_logic.c `handle_admin_command`).
+//! The admin command surface, reached only from the SSH console (hub_logic.c `handle_admin_command`).
 //!
 //! Every handler answers with one encrypted `send_response`, and returning
 //! false means the connection is gone (a failed write already dropped it).
 //! Mutations set `config_dirty` and let the write debounce in `maintenance`
 //! flush them, rather than paying PBKDF2(100k) per command.
-
-use zeroize::Zeroizing;
 
 use crate::consts::*;
 use crate::cstr::{now, pad_right, split_fields, trunc_string};
@@ -539,29 +537,19 @@ fn list_peers(state: &mut HubState, ci: usize) -> bool {
         let peer_str = all[row].label();
         // The IP:Port column shows actual connection info.
         let ip_port_str = if all[row].is_me {
-            // For the local hub (peer 1), show the address hub_admin used to
-            // reach us, falling back to bind_ip:port.
-            let c = &state.clients[ci];
-            if !c.admin_connect_ip.is_empty() && c.admin_connect_port > 0 {
-                format!(
-                    "{}:{}",
-                    trunc_string(&c.admin_connect_ip, 46),
-                    c.admin_connect_port
-                )
-            } else {
-                format!(
-                    "{}:{}",
-                    trunc_string(
-                        if state.bind_ip.is_empty() {
-                            "0.0.0.0"
-                        } else {
-                            &state.bind_ip
-                        },
-                        46
-                    ),
-                    state.port
-                )
-            }
+            // For the local hub (peer 1), its own bind_ip:port.
+            format!(
+                "{}:{}",
+                trunc_string(
+                    if state.bind_ip.is_empty() {
+                        "0.0.0.0"
+                    } else {
+                        &state.bind_ip
+                    },
+                    46
+                ),
+                state.port
+            )
         } else {
             format!("{}:{}", trunc_string(&all[row].ip, 46), all[row].port)
         };
@@ -635,9 +623,9 @@ fn list_peers(state: &mut HubState, ci: usize) -> bool {
                 row_total += 1;
                 if link_up {
                     row_connected += 1;
-                    "\x1b[32mUP\x1b[0m"
+                    "UP"
                 } else {
-                    "\x1b[31mDN\x1b[0m"
+                    "DN"
                 }
             } else {
                 "??"
@@ -659,7 +647,7 @@ fn list_peers(state: &mut HubState, ci: usize) -> bool {
             } else if directly_connected {
                 out.push_str(&format!(" 0/{row_total} Partial   |"));
             } else {
-                out.push_str(" \x1b[31mOffline\x1b[0m       |");
+                out.push_str(" Offline       |");
                 is_offline = true;
                 issues += 1;
             }
@@ -668,7 +656,7 @@ fn list_peers(state: &mut HubState, ci: usize) -> bool {
         } else if directly_connected {
             out.push_str(" Connected     |");
         } else {
-            out.push_str(" \x1b[31mOffline\x1b[0m       |");
+            out.push_str(" Offline       |");
             is_offline = true;
             issues += 1;
         }
@@ -756,9 +744,9 @@ fn list_peers(state: &mut HubState, ci: usize) -> bool {
     out.push_str(&"-".repeat(line_len));
     out.push('\n');
     let status_str = if issues == 0 {
-        "\x1b[32mHEALTHY\x1b[0m".to_string()
+        "HEALTHY".to_string()
     } else {
-        format!("\x1b[33mDEGRADED ({issues} ISSUES)\x1b[0m")
+        format!("DEGRADED ({issues} ISSUES)")
     };
     out.push_str(&format!(
         " [i] MESH STATUS: {status_str}\n [Legend: -- = Self, UP = Connected, DN = Down, ?? = Unknown/Not Configured]\n"
@@ -842,11 +830,10 @@ fn add_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
 
 fn del_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
     if payload.is_empty() {
-        let mut out = String::from(" --- Remove Local Peer ---\n");
+        let mut out = String::from(" --- Configured Peers ---\n");
         for (i, p) in state.peers.iter().enumerate() {
             out.push_str(&format!("[{}] {}:{}\n", i + 2, p.ip, p.port));
         }
-        out.push_str("Enter Index to Remove: ");
         return resp(state, ci, &out);
     }
     // The payload is the index LIST_PEERS printed.  Anything that is not a
@@ -995,7 +982,7 @@ fn add_user_record(state: &mut HubState, ci: usize, payload: &str, typ: char) ->
         return resp(state, ci, "ERR:mask must contain ! and @");
     }
     // Name uniqueness across all a|/o| records, and key uniqueness:
-    // hub_admin logins identify the admin by key.
+    // Console logins identify the admin by key.
     for u in state.user_records.iter().filter(|u| u.is_active) {
         if u.name.eq_ignore_ascii_case(&pname) {
             return resp(state, ci, "ERR:name already exists");
@@ -1215,7 +1202,7 @@ fn del_usermask(state: &mut HubState, ci: usize, payload: &str) -> bool {
 fn set_userkey(state: &mut HubState, ci: usize, payload: &str) -> bool {
     // Payload: name|pubkey_b64 — replace a user's key (rotation, a lost key,
     // or giving a legacy keyless user one).  UUID, masks and history stay;
-    // the old key stops working for hub_admin and every bot at sync speed.
+    // the old key stops working for the console and every bot at sync speed.
     if payload.is_empty() {
         return resp(state, ci, "ERR:missing payload");
     }
@@ -1460,6 +1447,10 @@ fn list_opers_legacy(state: &mut HubState, ci: usize) -> bool {
 /// 'sethubpub'.
 fn regen_keys(state: &mut HubState, ci: usize) -> bool {
     let Some((priv64, pub64)) = crypto::generate_combined_keypair() else {
+        crate::hlog_error!(
+            "[AUDIT] Hub keypair regeneration by {} failed; the old key stays\n",
+            state.clients[ci].id
+        );
         return resp(state, ci, "ERROR: Key generation failed.");
     };
     state.set_hub_priv(&priv64);
@@ -1467,6 +1458,12 @@ fn regen_keys(state: &mut HubState, ci: usize) -> bool {
     let pub_b64 = crypto::b64_encode(&pub64);
     state.hub_keys_loaded = true;
     state.config_dirty = true;
+    crate::hlog_warning!(
+        "[AUDIT] Hub keypair regenerated by {}: new key {}; peers and bots are disconnected and must re-learn it\n",
+        state.clients[ci].id,
+        crypto::key_fingerprint(&pub64)
+    );
+    crate::console::hostkey_changed(state); // SSH host key follows, now
 
     // Disconnect peers and bots so they must reauthenticate (and rediscover
     // that this hub's pubkey changed).
@@ -1488,29 +1485,6 @@ fn regen_keys(state: &mut HubState, ci: usize) -> bool {
         .to_string();
     let _ = std::fs::write(&fname, &pub_b64);
     resp(state, ci, &pub_b64)
-}
-
-fn set_privkey(state: &mut HubState, ci: usize, payload: &str) -> bool {
-    if payload.len() < COMBINED_KEY_B64 {
-        return resp(state, ci, "ERROR: Empty or short payload.");
-    }
-    let Some(dec) = crypto::b64_decode(payload).filter(|d| d.len() == COMBINED_KEY_LEN) else {
-        return resp(
-            state,
-            ci,
-            "ERROR: Invalid Curve25519 key (need 64-byte base64).",
-        );
-    };
-    let mut combined = Zeroizing::new([0u8; COMBINED_KEY_LEN]);
-    combined.copy_from_slice(&dec);
-    state.set_hub_priv(&combined);
-    // Derive the public key from the private one — it is not a setting of its
-    // own.
-    let pub64 = crypto::combined_pub_from_priv(&combined);
-    state.set_hub_pub(&pub64);
-    state.hub_keys_loaded = true;
-    state.config_dirty = true;
-    resp(state, ci, "SUCCESS: Private Key Imported & Saved.")
 }
 
 fn set_pubkey(state: &mut HubState, ci: usize, payload: &str) -> bool {
@@ -1548,6 +1522,66 @@ fn set_pubkey(state: &mut HubState, ci: usize, payload: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
+
+/// The admin opcodes an SSH console may send (docs/console.md §2) -- every
+/// command the console offers and nothing else.  The hub's private key never
+/// leaves it and is never set from outside (GET/SET_PRIVKEY are retired: back
+/// up .irchub.cnf instead), and the retired password and legacy global
+/// mask opcodes have no console command.  Mirrors console_admin_op in C.
+pub fn console_admin_op(cmd: u8) -> bool {
+    matches!(
+        cmd,
+        CMD_ADMIN_LIST_FULL
+            | CMD_ADMIN_LIST_SUMMARY
+            | CMD_ADMIN_GET_PENDING
+            | CMD_ADMIN_APPROVE
+            | CMD_ADMIN_ADD
+            | CMD_ADMIN_CREATE_BOT
+            | CMD_ADMIN_DEL
+            | CMD_ADMIN_DISCONNECT_BOT
+            | CMD_ADMIN_REKEY_BOT
+            | CMD_ADMIN_LIST_PEERS
+            | CMD_ADMIN_ADD_PEER
+            | CMD_ADMIN_DEL_PEER
+            | CMD_ADMIN_SET_PEER_PUBKEY
+            | CMD_ADMIN_SYNC_MESH
+            | CMD_ADMIN_GET_PUBKEY
+            | CMD_ADMIN_SET_PUBKEY
+            | CMD_ADMIN_REGEN_KEYS
+            | CMD_ADMIN_SET_HUB_NAME
+            | CMD_ADMIN_SET_BIND_IP
+            | CMD_ADMIN_SET_BIND_PORT
+            | CMD_ADMIN_SET_LOG_SIZE
+            | CMD_ADMIN_PURGE_TOMBSTONES
+            | CMD_ADMIN_SET_PURGE_DAYS
+            | CMD_ADMIN_SET_LOG_LEVEL
+            | CMD_ADMIN_STATS
+            | CMD_ADMIN_LIST_ALLOWLIST
+            | CMD_ADMIN_ADD_ALLOWLIST
+            | CMD_ADMIN_DEL_ALLOWLIST
+            | CMD_ADMIN_LIST_DENYLIST
+            | CMD_ADMIN_ADD_DENYLIST
+            | CMD_ADMIN_DEL_DENYLIST
+            | CMD_ADMIN_GET_OPT_FLAGS
+            | CMD_ADMIN_SET_OPT_FLAGS
+            | CMD_ADMIN_LIST_ADMINS
+            | CMD_ADMIN_ADD_ADMIN
+            | CMD_ADMIN_DEL_ADMIN
+            | CMD_ADMIN_LIST_OPERS_V2
+            | CMD_ADMIN_ADD_OPER_RECORD
+            | CMD_ADMIN_DEL_OPER_RECORD
+            | CMD_ADMIN_ADD_USERMASK
+            | CMD_ADMIN_DEL_USERMASK
+            | CMD_ADMIN_SET_USERKEY
+            | CMD_ADMIN_MATCH
+            | CMD_ADMIN_LIST_CHANNELS
+            | CMD_ADMIN_ADD_CHANNEL
+            | CMD_ADMIN_DEL_CHANNEL
+            | CMD_ADMIN_OP_USER
+            | CMD_ADMIN_UPGRADE_NET
+            | CMD_ADMIN_UPGRADE_STATUS
+    )
+}
 
 /// handle_admin_command().
 ///
@@ -1607,7 +1641,7 @@ pub fn handle_admin_command(
         }
 
         CMD_ADMIN_UPGRADE_STATUS => {
-            // "releases[|bot_base|hub_base]": what hub_admin offers to pick
+            // "releases[|bot_base|hub_base]": what the console's `upgrade releases` offers to pick
             // from — the verified release manifests of both products and the
             // nodes a selective run could name.  Read-only; allowed during a
             // run.
@@ -1772,14 +1806,6 @@ pub fn handle_admin_command(
             let b = crypto::b64_encode(&state.hub_pub_combined());
             resp(state, ci, &b)
         }
-        CMD_ADMIN_SET_PRIVKEY => set_privkey(state, ci, payload),
-        CMD_ADMIN_GET_PRIVKEY => {
-            if !state.hub_keys_loaded {
-                return resp(state, ci, "ERROR: No Private Key in Memory.");
-            }
-            let b = Zeroizing::new(crypto::b64_encode(state.hub_priv_combined().as_ref()));
-            resp(state, ci, &b)
-        }
         CMD_ADMIN_SET_PUBKEY => set_pubkey(state, ci, payload),
 
         CMD_ADMIN_ADD_PEER => add_peer(state, ci, payload),
@@ -1840,7 +1866,7 @@ pub fn handle_admin_command(
         }
 
         // Retired with passwordless (docs/passwordless.md §7.2): an older
-        // hub_admin still offering these gets a clear answer, nothing changes.
+        // client still offering these gets a clear answer, nothing changes.
         CMD_ADMIN_SET_ADMIN_PASS | CMD_ADMIN_SET_BOT_PASS | CMD_ADMIN_SET_USERPASS => resp(
             state,
             ci,
@@ -2015,16 +2041,27 @@ pub fn handle_admin_command(
         CMD_ADMIN_DEL_DENYLIST => ip_acl_change(state, ci, 'x', false, payload),
 
         CMD_ADMIN_SET_LOG_LEVEL => {
-            // One raw byte: level 0 is the byte 0x00, so the frame length
-            // decides, never strlen.
-            if raw_len != 1 {
+            // Raw bytes: level 0 is the byte 0x00, so the frame length
+            // decides, never strlen.  1 byte: the file level.  2 bytes:
+            // <target><level>, target 0 = the log file, 1 = the console log.
+            if !(raw_len == 1 || raw_len == 2 && raw[0] <= 1) {
                 return resp(state, ci, "ERR:invalid payload");
             }
-            let level = i32::from(raw[0]).clamp(LOG_NONE, LOG_DEBUG);
-            state.log_level = level;
-            state.config_dirty = true; // log_level| survives a restart
-            crate::logging::set_level(level);
-            let msg = format!("OK:log_level set to {level}");
+            let ring = raw_len == 2 && raw[0] == 1;
+            let level = i32::from(raw[raw_len - 1]).clamp(LOG_NONE, LOG_DEBUG);
+            if ring {
+                state.console_log_level = level;
+            } else {
+                state.log_level = level;
+            }
+            state.config_dirty = true; // the level survives a restart
+            crate::logging::set_levels(state.log_level, state.console_log_level);
+            let what = if ring {
+                "console_log_level"
+            } else {
+                "log_level"
+            };
+            let msg = format!("OK:{what} set to {level}");
             resp(state, ci, &msg)
         }
 

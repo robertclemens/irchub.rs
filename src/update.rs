@@ -320,7 +320,7 @@ fn tls_ready() -> bool {
     })
 }
 
-/// Manifest reads made from the event loop (a PREPARE answer, the hub_admin
+/// Manifest reads made from the event loop (a PREPARE answer, the console's
 /// release list) run on a short budget: the hub serves nothing while a fetch
 /// blocks, and a peer link that misses its pings is a worse outcome than a
 /// node answering "unable: manifest fetch failed".  0 = the full budget, for
@@ -760,7 +760,7 @@ fn releases_in(manifest: &str, max: usize) -> Vec<Release> {
 }
 
 /// List the distinct versions a release tree offers, newest first — what
-/// hub_admin shows so an admin picks a version instead of typing one.  The
+/// the console shows so an admin picks a version instead of typing one.  The
 /// manifest is signature-verified like any other read of it; an unverifiable
 /// one lists nothing.  An empty `root` is this hub's own release root.
 pub fn list_releases(root: &str, variant: &str, max: usize) -> Result<Vec<Release>, String> {
@@ -944,9 +944,10 @@ rm -rf "$UPGRADE_DIR" "{archive}" 2>/dev/null
 sleep {UPGRADE_WATCH_SECS}
 P=$(cat "{HUB_PID_FILE}" 2>/dev/null | tr -dc 0-9)
 if [ -z "$P" ] || ! kill -0 "$P" 2>/dev/null; then
+  [ -f "{prev}" ] || exit 1
   echo "[UPGRADE] new build did not stay up — restoring previous build"
   mv -f "{exe}" "{exe}.failed" 2>/dev/null
-  mv -f "{prev}" "{exe}" || exit 1
+  mv -f "{prev}" "{exe}" || {{ mv -f "{exe}.failed" "{exe}"; exit 1; }}
   [ -f "{HUB_CONFIG_FILE}{HUB_UPGRADE_PREV_SUFFIX}" ] && cp -f "{HUB_CONFIG_FILE}{HUB_UPGRADE_PREV_SUFFIX}" "{HUB_CONFIG_FILE}"
   rm -f "{HUB_PID_FILE}" "./{HUB_UPGRADE_SCRIPT}"
   exec "{exe}"

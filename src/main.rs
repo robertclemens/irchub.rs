@@ -65,6 +65,44 @@ fn lock_pid_file() -> Option<fs::File> {
     Some(f)
 }
 
+/// Instance directory: .irchub.cnf/.pass/.pid/.log/.upgrade and hub_upgrade.sh all live beside the binary, so the hub behaves the same
+/// whatever the caller's cwd -- cron starts jobs in $HOME.  One binary per hub.  Our own
+/// path comes from /proc/self/exe (`current_exe`; argv[0] has no directory when launched
+/// through PATH); returns it after chdir()ing to its directory.  That directory holds the
+/// binary an upgrade replaces, its .prev and the upgrade script, so refuse one another user
+/// owns or group/other can write -- they could swap any of them.  Mirrors
+/// `instance_dir_enter()` in irchub/hub_main.c.
+fn instance_dir_enter() -> Option<String> {
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("Cannot resolve my own path (/proc/self/exe)");
+        return None;
+    };
+    let Some(dir) = exe.parent() else {
+        eprintln!("Cannot resolve my own directory from {}", exe.display());
+        return None;
+    };
+    let md = match fs::metadata(dir) {
+        Ok(md) if md.is_dir() => md,
+        _ => {
+            eprintln!("Cannot stat my own directory {}", dir.display());
+            return None;
+        }
+    };
+    if md.uid() != nix::unistd::geteuid().as_raw() || md.mode() & 0o022 != 0 {
+        eprintln!(
+            "Refusing to run from {}: it must be owned by this user and not writable by group \
+             or others (chmod go-w)",
+            dir.display()
+        );
+        return None;
+    }
+    if std::env::set_current_dir(dir).is_err() {
+        eprintln!("Cannot change to my own directory {}", dir.display());
+        return None;
+    }
+    Some(exe.to_string_lossy().into_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Machine-bound password file
 // ---------------------------------------------------------------------------
@@ -430,6 +468,12 @@ fn maintenance(state: &mut HubState) {
         let mut i = 0;
         while i < state.clients.len() {
             let c = &state.clients[i];
+            // An SSH console has no pings: the console thread owns its idle
+            // timeout, and the socketpair closes when the session does.
+            if c.internal {
+                i += 1;
+                continue;
+            }
             if t - c.last_seen > CLIENT_TIMEOUT {
                 hlog_warning!("[HUB] Client {} timed out.\n", c.ip);
                 auth::disconnect_client(state, i);
@@ -440,21 +484,14 @@ fn maintenance(state: &mut HubState) {
             // slowloris that dribbles bytes to keep last_seen fresh is still
             // dropped.  Outbound CLIENT_HUB peers are trusted,
             // operator-configured endpoints and are exempt.
-            //
-            // D4b: a connection that spoke ADMIN-HELLO is an interactive
-            // admin login gated on manual entry — give it a longer grace
-            // window.  Everything else keeps the strict one.
-            let preauth_window = if c.admin_hello_seen {
-                PREAUTH_ADMIN_TIMEOUT_SEC
-            } else {
-                PREAUTH_TIMEOUT_SEC
-            };
-            if !c.authenticated && c.typ != ClientType::Hub && t - c.connected_at > preauth_window {
+            if !c.authenticated
+                && c.typ != ClientType::Hub
+                && t - c.connected_at > PREAUTH_TIMEOUT_SEC
+            {
                 hlog_warning!(
-                    "[HUB] Pre-auth timeout for {} ({}s, no handshake{}) — dropping\n",
+                    "[HUB] Pre-auth timeout for {} ({}s, no handshake) — dropping\n",
                     c.ip,
-                    t - c.connected_at,
-                    if c.admin_hello_seen { ", admin" } else { "" }
+                    t - c.connected_at
                 );
                 auth::disconnect_client(state, i);
                 continue;
@@ -650,19 +687,26 @@ fn run_setup(state: &mut HubState) -> i32 {
     println!("    │   - Bots adding this hub will need both         │");
     println!("    │     (ircbot -setup prompts for UUID + pubkey).  │");
     println!("    │   - Peer hubs adding this hub will need the     │");
-    println!("    │     UUID + ip:port + pubkey via hub_admin.      │");
+    println!("    │     UUID + ip:port + pubkey (console: peer add).│");
     println!("    │ The hub's PRIVATE key never leaves this machine │");
     println!("    │ (stored encrypted inside .irchub.cnf).          │");
     println!("    └─────────────────────────────────────────────────┘");
     println!("[+] Curve25519 keypair generated.");
+    // What ssh shows admins on their first login to the console.
+    println!(
+        "[+] SSH console host key: ssh-ed25519 {}",
+        irchub::console::ssh_fingerprint(&state.hub_ed25519_pub)
+    );
+    println!("    Admins check it on first connect (keygen --ssh-fingerprint");
+    println!("    hub_public.b64 prints the same line).");
 
     // Admin user setup — creates the first a| and m| records.  Admins have no
     // password: the operator generates the admin's keypair on the admin's own
     // machine (keygen <name>) and imports only the PUBLIC key here.  The hub
     // never sees or prints a user's private key.
     println!("\n--- First Admin Setup ---");
-    println!("This creates the first named admin, who can log into hub_admin");
-    println!("and command bots over IRC. Admins sign in with a Curve25519 key,");
+    println!("This creates the first named admin, who can log into the hub's SSH");
+    println!("console and command bots over IRC. Admins sign in with a Curve25519 key,");
     println!("not a password: on the admin's own machine run");
     println!("    ./keygen <name>      (irchub/bin/keygen or ircbot/utils/keygen)");
     println!("keep the <ts>_<name>.private.b64 there (chmod 600), and give this");
@@ -744,7 +788,12 @@ fn run_setup(state: &mut HubState) -> i32 {
     }
 
     println!("[+] Admin '{admin_name}' created with {masks_added} usermask(s), UUID {new_uuid}");
-    println!("    Log in with:  ./hub_admin <ip> <port> <its .private.b64>");
+    println!(
+        "    Their SSH key:     <ts>_{admin_name}_ed25519 (keygen writes it with the IRC key)"
+    );
+    println!(
+        "    then log in with:  ssh -i <ts>_{admin_name}_ed25519 -p <hub port> {admin_name}@<hub>"
+    );
 
     config::write(state);
     state.config_pass.wipe();
@@ -787,9 +836,96 @@ fn accept_one(state: &mut HubState) {
     let mut c = HubClient::new(sock, fd, &incoming_ip, PREAUTH_BUF_SIZE);
     c.inbound = true;
     c.last_pong_sent = 0;
+    // First bytes decide: "SSH-" goes to the console.
+    c.sniff_pending = true;
+    c.sniff_deadline_ms = now_ms() + CONSOLE_SNIFF_MS;
     state.clients.push(c);
     ratelimit::increment_active_connections(state, &incoming_ip);
     hlog_info!("[HUB] Incoming connect: {incoming_ip}\n");
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// First-bytes sniff.  Bot and peer frames start with a 4-byte length;
+/// "SSH-" read as one is ~1.4 GB, never valid, so the split is exact.  The
+/// bytes are only peeked: the console gets the stream untouched.
+fn sniff(state: &mut HubState) {
+    let t = now_ms();
+    let mut i = 0;
+    while i < state.clients.len() {
+        let c = &state.clients[i];
+        if !c.sniff_pending || c.fd <= 0 {
+            i += 1;
+            continue;
+        }
+        let mut head = [0u8; 4];
+        let r = nix::sys::socket::recv(
+            c.fd,
+            &mut head,
+            nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT,
+        );
+        match r {
+            Ok(4) => {
+                state.clients[i].sniff_pending = false;
+                if &head == b"SSH-" {
+                    irchub::console::handoff(state, i);
+                    continue;
+                }
+            }
+            Ok(0) => {
+                auth::disconnect_client(state, i);
+                continue;
+            }
+            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) | Ok(_) => {
+                if t >= c.sniff_deadline_ms {
+                    // bot/peer protocol from here
+                    state.clients[i].sniff_pending = false;
+                }
+            }
+            Err(_) => {
+                auth::disconnect_client(state, i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// One readable SSH console link: read what the socketpair has.
+fn read_console(state: &mut HubState, ci: usize) {
+    let space = state.clients[ci]
+        .recv_cap
+        .saturating_sub(state.clients[ci].recv_buf.len());
+    let r = {
+        let c = &mut state.clients[ci];
+        let Some(l) = c.console.as_mut() else { return };
+        let mut chunk = vec![0u8; space.min(64 * 1024)];
+        match std::io::Read::read(&mut l.stream, &mut chunk) {
+            Ok(n) => {
+                c.recv_buf.extend_from_slice(&chunk[..n]);
+                Ok(n)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    match r {
+        Ok(0) if space > 0 => {
+            auth::disconnect_client(state, ci);
+            return;
+        }
+        Ok(_) => state.clients[ci].last_seen = now(),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(_) => {
+            auth::disconnect_client(state, ci);
+            return;
+        }
+    }
+    client::handle_client_data(state, ci);
 }
 
 /// One readable client: fill its buffer, then hand whole frames to the pump.
@@ -797,6 +933,10 @@ fn read_one(state: &mut HubState, fd: i32) {
     let Some(ci) = state.client_by_fd(fd) else {
         return;
     };
+    if state.clients[ci].internal {
+        read_console(state, ci);
+        return;
+    }
     let space = state.clients[ci]
         .recv_cap
         .saturating_sub(state.clients[ci].recv_buf.len());
@@ -844,7 +984,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
         return 1;
     }
     drop(password);
-    logging::set_level(state.log_level);
+    logging::set_levels(state.log_level, state.console_log_level);
     logging::set_max_size(state.log_max_size);
 
     // Ensure next_lamport_seq is above the time-based floor even on the first
@@ -865,11 +1005,11 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
 
     // Per-hub independent keypairs: peers without a registered pubkey are
     // refused at handshake time — the operator must add each peer with its
-    // own pubkey via hub_admin.
+    // own pubkey via the console.
     let peerless = state.peers.iter().filter(|p| !p.has_pubkey).count();
     if peerless > 0 {
         hlog_warning!(
-            "[HUB] {peerless} peer(s) lack a Curve25519 pubkey and will be refused on connect. Re-add them with their hub_public.b64 via hub_admin (Add Peer / Set Peer Pubkey).\n"
+            "[HUB] {peerless} peer(s) lack a Curve25519 pubkey and will be refused on connect. Re-add them with their hub_public.b64 in the admin console (peer add / peer setkey).\n"
         );
     }
 
@@ -903,6 +1043,15 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
 
     storage::init();
 
+    // The SSH admin console (docs/console.md) shares this port: its thread
+    // starts before the first accept.  A hub whose console cannot start still
+    // serves its bots and peers, but no admin can reach it.
+    if !irchub::console::start(&mut state) {
+        hlog_error!(
+            "[CONSOLE] SSH console unavailable — no admin access to this hub until it restarts\n"
+        );
+    }
+
     while state.running && !stop.load(Ordering::Relaxed) {
         check_peers(&mut state);
         maintenance(&mut state);
@@ -910,15 +1059,41 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
         // Frames already read but not yet handled (the pump's 8-per-call
         // cap): poll instead of sleeping, so they are handled this pass.
         let buffered = state.clients.iter().any(HubClient::has_buffered_frame);
-        let timeout_ms: u16 = if buffered { 0 } else { 250 };
+        let sniffing = state.clients.iter().any(|c| c.sniff_pending);
+        let timeout_ms: u16 = if buffered {
+            0
+        } else if sniffing {
+            10
+        } else {
+            250
+        };
 
-        let (listener_ready, ready) = {
+        let (listener_ready, wake_ready, ready) = {
             let Some(listener) = &state.listener else {
                 break;
             };
             let mut watches = vec![net::watch_listener(listener)];
+            if let Some(core) = &state.console {
+                watches.push(net::Watch {
+                    fd: std::os::fd::AsFd::as_fd(&core.wake),
+                    write: false,
+                });
+            }
+            let wake_slot = state.console.is_some();
             let mut fds = Vec::with_capacity(state.clients.len());
             for c in &state.clients {
+                // Not read until its first bytes are known (see sniff()).
+                if c.sniff_pending {
+                    continue;
+                }
+                if let Some(l) = &c.console {
+                    watches.push(net::Watch {
+                        fd: std::os::fd::AsFd::as_fd(&l.stream),
+                        write: l.has_pending(),
+                    });
+                    fds.push(c.fd);
+                    continue;
+                }
                 if c.fd > 0
                     && let Some(s) = &c.sock
                 {
@@ -933,12 +1108,14 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
             }
             let r = net::poll_fds(&watches, timeout_ms);
             let lr = r[0].0;
+            let wr = wake_slot && r[1].0;
+            let skip = if wake_slot { 2 } else { 1 };
             let ready: Vec<(i32, bool, bool)> = fds
                 .into_iter()
-                .zip(r.into_iter().skip(1))
+                .zip(r.into_iter().skip(skip))
                 .map(|(f, (rd, wr))| (f, rd, wr))
                 .collect();
-            (lr, ready)
+            (lr, wr, ready)
         };
 
         // Drain writable peers FIRST.  This keeps URGENT op-flow traffic
@@ -952,6 +1129,12 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
 
         if listener_ready {
             accept_one(&mut state);
+        }
+        if wake_ready {
+            irchub::console::on_wake(&mut state);
+        }
+        if sniffing {
+            sniff(&mut state);
         }
 
         for &(fd, readable, _) in &ready {
@@ -969,6 +1152,9 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
                 }
             }
         }
+
+        // Events and log lines for the SSH consoles.
+        irchub::console::tick(&mut state);
     }
 
     // Shutdown.  The locked pid file is what says "this hub is running" (to
@@ -984,6 +1170,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
         let last = state.clients.len() - 1;
         auth::disconnect_client(&mut state, last);
     }
+    irchub::console::stop(&mut state);
     if state.config_dirty {
         config::write(&mut state);
         state.config_dirty = false;
@@ -1062,13 +1249,21 @@ fn main() {
     if args.iter().skip(1).any(|a| a == "-selftest") {
         std::process::exit(selftest());
     }
+    // -selftest (above) stays in the caller's directory: the updater runs a
+    // staged build from a scratch subdirectory, against this hub's config.
+    let Some(self_exe) = instance_dir_enter() else {
+        std::process::exit(1)
+    };
     let setup_mode = args.iter().skip(1).any(|a| a == "-setup");
     let passfile_mode = args.iter().skip(1).any(|a| a == "-p");
 
     let mut state = HubState::new();
     state.log_level = HUB_DEFAULT_LOG_LEVEL;
     state.log_max_size = HUB_LOG_FILE_SIZE;
-    logging::attach(state.log_level, state.log_max_size);
+    // The console log ring lives in its own mlock'd, MADV_DONTDUMP mapping
+    // (console/mod.rs); allocated before the first line is logged.
+    irchub::console::log_ring_init();
+    logging::attach(state.log_level, state.console_log_level, state.log_max_size);
 
     if setup_mode {
         std::process::exit(run_setup(&mut state));
@@ -1128,17 +1323,9 @@ fn main() {
         let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
     }
 
-    // The binary an upgrade replaces, and the one <exe>.prev sits beside.
-    // Resolved once, here, because exec() through the upgrade script needs an
-    // absolute path and argv[0] alone may be relative.  A hub that cannot
-    // resolve it still runs; update::commit refuses instead.
-    state.executable_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_default();
-    if state.executable_path.is_empty() {
-        hlog_warning!("Could not resolve my own path; self-upgrade disabled\n");
-    }
+    // The binary an upgrade replaces, and the one <exe>.prev sits beside
+    // (resolved by instance_dir_enter() at startup).
+    state.executable_path = self_exe;
 
     let Some(pid_file) = lock_pid_file() else {
         hlog_error!("Hub already running (PID file locked)\n");

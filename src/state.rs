@@ -122,7 +122,7 @@ pub struct UserRecord {
     pub uuid: String,
     pub name: String,
     /// Per-user Curve25519 combined pubkey (Ed25519 + X25519), base64-encoded
-    /// — the user's only credential: hub_admin logins and bot ~A2 commands
+    /// — the user's only credential: SSH console logins and bot ~A2 commands
     /// verify against it.  Empty (`has_pubkey` false) for a legacy record not
     /// yet given a key; such a user can authenticate nowhere.  The matching
     /// private key lives only on the user's machine.
@@ -209,7 +209,7 @@ pub struct IpRateLimit {
     pub churn_count: i32,
 }
 
-/// IP allow/deny list entry (hub_admin 0x38-0x3D).  The lists are local to
+/// IP allow/deny list entry (admin opcodes 0x38-0x3D).  The lists are local to
 /// this hub: never replicated to peers, never pushed to bots; config lines
 /// `w|<pattern>|<ts>` (allow) and `x|<pattern>|<ts>` (deny).  IPv4 only (the
 /// hub listens on AF_INET).  `pattern` is canonical: a bare address, or
@@ -742,13 +742,17 @@ pub struct HubClient {
     pub connected_at: i64,
     /// Accepted on the listener (subject to the IP lists).
     pub inbound: bool,
-    /// D4b: sent ADMIN-HELLO → longer pre-auth grace.
-    pub admin_hello_seen: bool,
-    /// Admin login v2: the one-time challenge handed out in HUB-PUBKEY2.  Set
-    /// on ADMIN-HELLO, consumed (wiped) by the first ADMIN2 attempt either
-    /// way.
-    pub admin_nonce: [u8; 32],
-    pub admin_nonce_set: bool,
+    /// An SSH console's socketpair end (docs/console.md): an admin
+    /// connection the console thread already authenticated.  Plaintext
+    /// frames, no pings, no CLIENT_TIMEOUT (the console has its own idle
+    /// timeout).  `sock` is None; the stream lives in `console`.
+    pub internal: bool,
+    pub console: Option<Box<crate::console::ConsoleLink>>,
+    /// First-bytes sniff of an accepted connection: until 4 bytes are there
+    /// (or CONSOLE_SNIFF_MS passed) it is not read, so an "SSH-" stream can
+    /// be handed to the console thread untouched.
+    pub sniff_pending: bool,
+    pub sniff_deadline_ms: i64,
     /// Protocol version this bot connection advertised ("v|N" in its config
     /// push): 0 = not known yet, 1 = its push carried no v| (a
     /// pre-passwordless build), >= 2 = advertised.  Per connection on
@@ -764,10 +768,6 @@ pub struct HubClient {
     pub bot_eph_x25519_priv: Key32,
     pub bot_eph_x25519_pub: [u8; 32],
     pub bot_eph_priv_set: bool,
-    /// IP that hub_admin used to connect.
-    pub admin_connect_ip: String,
-    /// Port that hub_admin used to connect.
-    pub admin_connect_port: i32,
 
     // ---- Outbound queue (per-lane FIFOs, drained on POLLOUT) ----
     pub out_lanes: [QueueLane; LANE_COUNT],
@@ -808,9 +808,19 @@ pub struct HubClient {
 impl HubClient {
     /// calloc(1, sizeof(hub_client_t)) + hub_client_alloc_buffers(size).
     pub fn new(sock: TcpStream, fd: i32, ip: &str, size: usize) -> HubClient {
+        HubClient::new_inner(Some(sock), fd, ip, size)
+    }
+
+    /// A client with no TCP socket: an SSH console's internal connection
+    /// (its stream lives in `console`).
+    pub fn new_detached(fd: i32, ip: &str, size: usize) -> HubClient {
+        HubClient::new_inner(None, fd, ip, size)
+    }
+
+    fn new_inner(sock: Option<TcpStream>, fd: i32, ip: &str, size: usize) -> HubClient {
         let t = now();
         HubClient {
-            sock: Some(sock),
+            sock,
             fd,
             ip: ip.to_string(),
             id: String::new(),
@@ -821,9 +831,10 @@ impl HubClient {
             last_pong_sent: 0,
             connected_at: t,
             inbound: false,
-            admin_hello_seen: false,
-            admin_nonce: [0; 32],
-            admin_nonce_set: false,
+            internal: false,
+            console: None,
+            sniff_pending: false,
+            sniff_deadline_ms: 0,
             bot_proto: 0,
             recv_buf: Vec::with_capacity(size.min(PREAUTH_BUF_SIZE)),
             recv_cap: size,
@@ -832,8 +843,6 @@ impl HubClient {
             bot_eph_x25519_priv: Zeroizing::new([0u8; 32]),
             bot_eph_x25519_pub: [0; 32],
             bot_eph_priv_set: false,
-            admin_connect_ip: String::new(),
-            admin_connect_port: 0,
             out_lanes: Default::default(),
             out_total_bytes: 0,
             writing_buf: Zeroizing::new(Vec::new()),
@@ -876,6 +885,9 @@ impl HubClient {
     /// peer_has_pending_writes(): a partial in-flight write, or any non-empty
     /// lane.  The main loop uses it to decide whether to watch for POLLOUT.
     pub fn has_pending_writes(&self) -> bool {
+        if let Some(l) = &self.console {
+            return l.has_pending();
+        }
         self.writing_offset < self.writing_buf.len()
             || self.out_lanes.iter().any(|l| !l.msgs.is_empty())
     }
@@ -1036,7 +1048,10 @@ pub struct HubState {
     /// Next slot to write (ring index).
     pub seen_forward_head: usize,
 
+    /// Log FILE level.
     pub log_level: i32,
+    /// Console log ring level (console_log_level|).
+    pub console_log_level: i32,
     pub log_max_size: i64,
 
     /// Network options pushed to bots/peers via the 'opt|' record.  Each
@@ -1087,6 +1102,10 @@ pub struct HubState {
     pub gossip_link_mask: u32,
     /// Ask peers for a sync then (0 = none).
     pub resync_due_at: i64,
+
+    /// SSH console (console module): the core's side of the console thread,
+    /// None when the console is not running.
+    pub console: Option<crate::console::Core>,
 
     pub timers: MaintTimers,
 }
@@ -1149,6 +1168,7 @@ impl HubState {
             seen_forwards: vec![SeenForward::default(); MAX_SEEN_FORWARD_IDS],
             seen_forward_head: 0,
             log_level: HUB_DEFAULT_LOG_LEVEL,
+            console_log_level: HUB_DEFAULT_CONSOLE_LOG_LEVEL,
             log_max_size: HUB_LOG_FILE_SIZE,
             opt_flags: String::new(),
             opt_flags_ts: 0,
@@ -1170,6 +1190,7 @@ impl HubState {
             roster_gen: 0,
             gossip_link_mask: 0,
             resync_due_at: 0,
+            console: None,
             timers: MaintTimers::default(),
         }
     }

@@ -167,6 +167,12 @@ fn push_in_flight(client: &mut HubClient) -> bool {
 
 /// peer_drain_writable(): called when poll reports the socket writable.
 pub fn drain_writable(client: &mut HubClient) {
+    if let Some(l) = client.console.as_mut() {
+        // An SSH console's socketpair: a broken link shows up as EOF on the
+        // read side, which closes it.
+        let _ = l.drain();
+        return;
+    }
     if client.fd < 0 || client.sock.is_none() {
         return;
     }

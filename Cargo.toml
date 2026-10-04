@@ -16,20 +16,8 @@ name = "irchub"
 path = "src/main.rs"
 
 [[bin]]
-name = "hub_admin"
-path = "src/bin/hub_admin.rs"
-
-[[bin]]
 name = "keygen"
 path = "src/bin/keygen.rs"
-
-[[bin]]
-name = "hub_encrypt"
-path = "src/bin/hub_encrypt.rs"
-
-[[bin]]
-name = "hub_decrypt"
-path = "src/bin/hub_decrypt.rs"
 
 [dependencies]
 # Cryptography (RustCrypto + dalek), matched to ircbot.rs so the two trees
@@ -44,6 +32,13 @@ sha2 = "0.11"
 getrandom = "0.4"
 zeroize = "1.9"
 base64 = "0.23"
+# keygen only: passphrase-protected keys (docs/console.md §9) -- scrypt for
+# the irckey-v2 IRC key, bcrypt_pbkdf + AES-256-CTR for the OpenSSH key.
+# All pure Rust.  src/bin/keygen.rs is byte-identical to ircbot.rs's.
+scrypt = { version = "0.12", default-features = false }
+bcrypt-pbkdf = "0.11"
+aes = "0.9"
+ctr = "0.10"
 
 # Networking: the poll(2) loop lives in nix; socket2 gives the listener and
 # the outbound peer connects with their timeouts.
@@ -63,6 +58,18 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 # RLIMIT_CORE, PR_SET_DUMPABLE).
 nix = { version = "0.31", features = ["user", "fs", "process", "term", "resource", "feature", "poll", "socket"] }
 region = "4"
+# The console log ring: an anonymous mapping, mlock'd and MADV_DONTDUMP
+# through memmap2's safe advise/lock (unsafe_code is forbidden here).
+memmap2 = "0.9"
+
+# The SSH admin console (src/console/, docs/console.md): the hub's only admin
+# interface.  russh 0.63 needs a crypto backend; `ring` is the lighter one
+# (aws-lc-rs builds a large C library).  ring compiles a little C/asm, which
+# is why .cargo/config.toml names a C compiler for the musl target.  Pinned
+# exactly: this code runs before authentication.  russh runs on its own
+# single-threaded tokio runtime on the console thread.
+russh = { version = "=0.63.3", default-features = false, features = ["ring"] }
+tokio = { version = "1", default-features = false, features = ["rt", "net", "sync", "time", "macros", "io-util"] }
 signal-hook = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 

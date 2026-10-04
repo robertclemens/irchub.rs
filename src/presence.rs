@@ -102,7 +102,7 @@ fn mesh_hub_get(state: &mut HubState, uuid: &str) -> Option<usize> {
 }
 
 /// True when our link to configured peer `p` is up right now.
-fn peer_is_linked(state: &HubState, p: &PeerConfig) -> bool {
+pub fn peer_is_linked(state: &HubState, p: &PeerConfig) -> bool {
     p.fd > 0
         && state
             .clients
@@ -1132,7 +1132,7 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
 /// bot_version_label(): "<version> (<code base>)" for a bot that is on the
 /// mesh right now, e.g. "2.4.0 (rs)": our own live client first, else the
 /// freshest peer report.  The bare version when the reporter did not say
-/// which code base, "-" when nobody reports the bot at all.  For hub_admin's
+/// which code base, "-" when nobody reports the bot at all.  For the console's
 /// bot list.
 pub fn bot_version_label(state: &HubState, uuid: &str) -> String {
     let (ver, var) = if let Some(c) = state

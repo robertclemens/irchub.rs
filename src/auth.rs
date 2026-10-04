@@ -298,7 +298,10 @@ pub fn disconnect_client(state: &mut HubState, ci: usize) {
         let c = &state.clients[ci];
         (c.ip.clone(), c.fd, c.typ, c.authenticated)
     };
-    crate::hlog_info!("[HUB] Disconnecting client {ip} (FD: {fd})\n");
+    // fd -1: a socket handed to the SSH console, not a disconnect.
+    if fd >= 0 {
+        crate::hlog_info!("[HUB] Disconnecting client {ip} (FD: {fd})\n");
+    }
 
     ratelimit::decrement_active_connections(state, &ip);
 

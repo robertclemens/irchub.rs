@@ -7,8 +7,6 @@
 /irchub
 /hub_admin
 /keygen
-/hub_encrypt
-/hub_decrypt
 /bin/
 /build/
 *.o

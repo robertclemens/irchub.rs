@@ -117,7 +117,7 @@ pub fn read_into(sock: &mut TcpStream, into: &mut Vec<u8>, space: usize) -> io::
     Ok(n)
 }
 
-/// Read exactly `buf.len()` bytes, or fail (hub_admin's recv_all).
+/// Read exactly `buf.len()` bytes, or fail (what the retired hub_admin's recv_all did).
 pub fn read_exact(sock: &mut TcpStream, buf: &mut [u8]) -> bool {
     sock.read_exact(buf).is_ok()
 }

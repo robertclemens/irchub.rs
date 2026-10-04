@@ -89,7 +89,7 @@ fn combined_value(key: &str, value: &str, extra: &str, op: &str, global: bool) -
         "o" if global => {
             // Legacy global oper mask: the password slot is always stored
             // empty.  Oper passwords are retired; one arriving from an old
-            // config, an old peer or an old hub_admin must not be kept,
+            // config, an old peer or an old admin client must not be kept,
             // synced or listed.
             format!("{value}||{op}")
         }
