@@ -16,6 +16,7 @@
 
 use crate::consts::*;
 use crate::cstr::{now, trunc_string};
+use crate::reply::Reply;
 use crate::state::{
     ClientType, HubState, RollupTry, UpgradeNode, UpgradeNodeKind, UpgradeNodeState, UpgradePhase,
     UpgradeRoute, lww_next_ts,
@@ -361,22 +362,6 @@ fn peer_takes_sel(state: &HubState, ci: usize) -> bool {
                 && update::version_cmp(&p.remote_version, UPGRADE_SELECT_MIN_HUB)
                     != std::cmp::Ordering::Less
         })
-}
-
-/// "rs->c" when the node is being moved onto the other build.
-fn variant_label(n: &UpgradeNode, want: &str) -> String {
-    if !want.is_empty() && want != n.variant {
-        format!(
-            "{}->{want}",
-            if n.variant.is_empty() {
-                "?"
-            } else {
-                &n.variant
-            }
-        )
-    } else {
-        n.variant.clone()
-    }
 }
 
 /// A manifest's "v2.4.4" spelled the way nodes announce it ("2.4.4"), so a
@@ -1380,30 +1365,6 @@ pub fn rollup_forget(state: &mut HubState, why: &str) -> bool {
 
 /// The admin's "forget": drop our plan and flood CMD_UPGRADE_FORGET so every
 /// other hub drops its copy.  Returns the admin reply.
-pub fn admin_forget(state: &mut HubState) -> String {
-    if state.upgrade.active || config_frozen(state) {
-        return "ERROR: an upgrade is running — the plan is kept until it ends (abort it first)"
-            .to_string();
-    }
-    let had = state.rollup.have_plan.then(|| state.rollup.target.clone());
-    rollup_forget(state, "forgotten by admin");
-    let id = opflow::generate_request_id();
-    opflow::forward_seen_check_and_add(state, &id);
-    let fwd = format!("{id}|{}", now());
-    let mut told = 0;
-    for ci in state.peer_clients() {
-        if queue::send_urgent(&mut state.clients[ci], CMD_UPGRADE_FORGET, &fwd) {
-            told += 1;
-        }
-    }
-    match had {
-        Some(t) => format!(
-            "OK:roll-up plan {t} forgotten on this hub; told {told} peer hub(s) to drop theirs"
-        ),
-        None => format!("OK:no roll-up plan on this hub; told {told} peer hub(s) to drop theirs"),
-    }
-}
-
 /// CMD_UPGRADE_FORGET from a peer: drop our plan and pass it on.
 pub fn peer_forget(state: &mut HubState, ci: usize, payload: &str) {
     let f: Vec<&str> = payload.split('|').collect();
@@ -2472,33 +2433,39 @@ pub fn report_pending(state: &mut HubState, ci: usize) {
     answer_result(state, ci, &id, status, &detail);
 }
 
-/// `CMD_ADMIN_UPGRADE_STATUS` "releases[|bot_base|hub_base]": everything
-/// The console needs to offer choices instead of free text.  Lines:
-///   bot|<version>|<date>|<variants>     newest first, per product
-///   hub|<version>|<date>|<variants>
-///   err|<product>/<variant>|<reason>    a tree that could not be read
-///   node|<b|h|s>|<uuid>|<name>|<version>|<variant>
+/// CMD_ADMIN_UPGRADE_STATUS "releases[|bot_base|hub_base]": everything the
+/// admin console needs to offer choices instead of free text:
+///   ok|upg.releases
+///   rel|product|ver|date|bases           newest first, per product
+///   relerr|product|base|msg              a tree that could not be read
+///   node|kind|uuid|name|ver|base         the nodes a selective run can name
 /// Manifests are signature-verified exactly as an upgrade would read them;
-/// an unverifiable tree lists nothing.  The output is capped at MAX_BUFFER
-/// like the C twin's response buffer: a line that would not fit ends it.
-pub fn releases(state: &HubState, payload: &str) -> String {
+/// an unverifiable tree lists nothing.
+pub fn releases(state: &HubState, payload: &str, r: &mut Reply) {
+    // wire_field into char[512]: a base that does not fit reads as ""
+    fn fit(s: &str) -> &str {
+        if s.len() < 512 { s } else { "" }
+    }
     let f: Vec<&str> = payload.split('|').collect();
-    let bot_base = f.get(1).copied().unwrap_or("");
-    let hub_base = f.get(2).copied().unwrap_or("");
+    let bot_base = fit(f.get(1).copied().unwrap_or(""));
+    let hub_base = fit(f.get(2).copied().unwrap_or(""));
     if (!bot_base.is_empty() && !plan_field_ok(bot_base))
         || (!hub_base.is_empty() && !plan_field_ok(hub_base))
     {
-        return "ERROR: bad release base".to_string();
+        r.err(
+            "upg.bad_base",
+            Some("that is not a usable release base"),
+            Some("upgrade releases [bot=<url>] [hub=<url>]"),
+        );
+        return;
     }
-    let cap = MAX_BUFFER - 1;
-    let mut out = String::from("OK:releases\n");
-    let push = |out: &mut String, line: String| -> bool {
-        if out.len() + line.len() > cap {
-            return false;
-        }
-        out.push_str(&line);
-        true
-    };
+    r.ok("upg.releases");
+    if !bot_base.is_empty() {
+        r.kv("bot_base", bot_base);
+    }
+    if !hub_base.is_empty() {
+        r.kv("hub_base", hub_base);
+    }
     for (pname, root) in [
         (
             "bot",
@@ -2514,17 +2481,21 @@ pub fn releases(state: &HubState, payload: &str) -> String {
         for v in ["c", "rs"] {
             match update::list_releases(root, v, MAX_UPGRADE_RELEASES) {
                 Err(e) => {
-                    push(&mut out, format!("err|{pname}/{v}|{e}\n"));
+                    r.rec("relerr");
+                    r.kv("product", pname);
+                    r.kv("base", v);
+                    r.kv("msg", &e);
                 }
                 Ok(list) => {
-                    for r in list {
+                    for rel in list {
                         if let Some((_, have)) = merged.iter_mut().find(|(m, _)| {
-                            update::version_cmp(&m.version, &r.version) == std::cmp::Ordering::Equal
+                            update::version_cmp(&m.version, &rel.version)
+                                == std::cmp::Ordering::Equal
                         }) {
                             have.push(',');
                             have.push_str(v);
                         } else if merged.len() < MAX_UPGRADE_RELEASES {
-                            merged.push((r, v.to_string()));
+                            merged.push((rel, v.to_string()));
                         }
                     }
                 }
@@ -2532,70 +2503,58 @@ pub fn releases(state: &HubState, payload: &str) -> String {
         }
         // Newest first across both trees.
         merged.sort_by(|a, b| update::version_cmp(&b.0.version, &a.0.version));
-        for (r, have) in merged {
-            if !push(
-                &mut out,
-                format!("{pname}|{}|{}|{have}\n", r.version, r.date),
-            ) {
-                return out;
+        for (rel, have) in merged {
+            r.rec("rel");
+            r.kv("product", pname);
+            r.kv("ver", &rel.version);
+            if !rel.date.is_empty() {
+                r.kv("date", &rel.date);
             }
+            r.kv("bases", &have);
         }
     }
 
     // The nodes a selective run could name, as this hub sees them now.
-    let dash = |s: &str| {
-        if s.is_empty() {
-            "-".to_string()
-        } else {
-            s.to_string()
+    let opt = |r: &mut Reply, k: &str, v: &str| {
+        if !v.is_empty() {
+            r.kv(k, v);
         }
     };
-    if !push(
-        &mut out,
-        format!(
-            "node|s|{}|{}|{}|{}\n",
-            state.hub_uuid,
-            state.hub_friendly_name,
-            HUB_VERSION,
-            update::host_variant()
-        ),
-    ) {
-        return out;
-    }
+    r.rec("node");
+    r.kv("kind", "self");
+    r.kv("uuid", &state.hub_uuid);
+    r.kv(
+        "name",
+        if state.hub_friendly_name.is_empty() {
+            "hub"
+        } else {
+            &state.hub_friendly_name
+        },
+    );
+    r.kv("ver", HUB_VERSION);
+    r.kv("base", update::host_variant());
     for m in &state.mesh_hubs {
         if m.uuid.is_empty() || m.uuid == state.hub_uuid {
             continue;
         }
-        if !push(
-            &mut out,
-            format!(
-                "node|h|{}|{}|{}|{}\n",
-                m.uuid,
-                m.name,
-                dash(&m.version),
-                dash(&m.variant)
-            ),
-        ) {
-            return out;
-        }
+        r.rec("node");
+        r.kv("kind", "hub");
+        r.kv("uuid", &m.uuid);
+        opt(r, "name", &m.name);
+        opt(r, "ver", &m.version);
+        opt(r, "base", &m.variant);
     }
     for c in &state.clients {
         if c.typ != ClientType::Bot || !c.authenticated {
             continue;
         }
         let nick = state.bot_entry(&c.id, "n").unwrap_or("");
-        if !push(
-            &mut out,
-            format!(
-                "node|b|{}|{}|{}|{}\n",
-                c.id,
-                nick,
-                dash(&c.bot_version),
-                dash(&c.bot_variant)
-            ),
-        ) {
-            return out;
-        }
+        r.rec("node");
+        r.kv("kind", "bot");
+        r.kv("uuid", &c.id);
+        opt(r, "name", nick);
+        opt(r, "ver", &c.bot_version);
+        opt(r, "base", &c.bot_variant);
     }
     for (i, e) in state.roster.iter().enumerate() {
         if e.hub_uuid == state.hub_uuid
@@ -2604,87 +2563,90 @@ pub fn releases(state: &HubState, payload: &str) -> String {
         {
             continue;
         }
-        if !push(
-            &mut out,
-            format!(
-                "node|b|{}|{}|{}|{}\n",
-                e.bot_uuid,
-                e.nick,
-                dash(&e.version),
-                dash(&e.variant)
-            ),
-        ) {
-            return out;
-        }
+        r.rec("node");
+        r.kv("kind", "bot");
+        r.kv("uuid", &e.bot_uuid);
+        opt(r, "name", &e.nick);
+        opt(r, "ver", &e.version);
+        opt(r, "base", &e.variant);
     }
-    out
 }
 
-/// `CMD_ADMIN_UPGRADE_STATUS`: one line per node, for the console to print.
-pub fn status(state: &HubState) -> String {
+/// CMD_ADMIN_UPGRADE_STATUS "": the run this hub drives (or drove last), the
+/// roll-up plan it holds, and one node| record per node of the run:
+///   ok|upg.status[|id|phase|active|started|bot_ver|hub_ver|selective|summary]|frozen
+///   rollup|bot_ver|hub_ver|set
+///   node|kind|uuid|name|state|from|to|base|want|reason
+pub fn status(state: &HubState, r: &mut Reply) {
     let u = &state.upgrade;
+    r.ok("upg.status");
+    if !u.id.is_empty() {
+        r.kv("id", &u.id);
+        r.kv("phase", u.phase.name());
+        r.kvb("active", u.active);
+        r.kvi("started", u.started);
+        r.kv("bot_ver", &u.target_ver);
+        if !u.hub_ver.is_empty() {
+            r.kv("hub_ver", &u.hub_ver);
+        }
+        r.kvi("selective", u.select.len() as i64);
+        if !u.summary.is_empty() {
+            r.kv("summary", &u.summary);
+        }
+    }
+    r.kvb("frozen", config_frozen(state));
     // The roll-up plan this hub holds, if any: what a bot that comes back is
     // walked up to, until an admin's "forget" drops it.
-    let r = &state.rollup;
-    let plan = if r.have_plan {
-        format!(
-            "roll-up plan: bots -> {}{}{} (set {} s ago; \"forget\" drops it)\n",
-            r.target,
-            if r.hub_target.is_empty() {
-                ""
-            } else {
-                ", hubs -> "
-            },
-            r.hub_target,
-            now() - r.plan_set
-        )
-    } else {
-        String::new()
-    };
+    let ru = &state.rollup;
+    if ru.have_plan {
+        r.rec("rollup");
+        r.kv("bot_ver", &ru.target);
+        if !ru.hub_target.is_empty() {
+            r.kv("hub_ver", &ru.hub_target);
+        }
+        r.kvi("set", ru.plan_set);
+    }
     if u.id.is_empty() {
-        let mut out = "No upgrade has run on this hub.".to_string();
-        if !plan.is_empty() {
-            out.push('\n');
-            out.push_str(&plan);
-        }
-        if config_frozen(state) {
-            out.push_str("\nWARNING: config is frozen — clear opt flag 'F' to lift it.");
-        }
-        return out;
+        return;
     }
-    let mut out = format!(
-        "--- Upgrade {} -> {} ({}) ---\nstarted {} s ago{}{}\n",
-        u.id,
-        u.target_ver,
-        u.phase.name(),
-        now() - u.started,
-        if u.summary.is_empty() { "" } else { "; " },
-        u.summary
-    );
-    if !u.select.is_empty() {
-        out.push_str(&format!("selective: {} node(s) named\n", u.select.len()));
-    }
-    if !u.hub_ver.is_empty() {
-        out.push_str(&format!("hubs -> {}\n", u.hub_ver));
-    }
-    out.push_str(&plan);
     for (ni, n) in u.nodes.iter().enumerate() {
-        out.push_str(&format!(
-            "{:<4} {:<36} {:<10} {:<8} {}{}{}\n",
-            n.kind.name(),
-            if n.name.is_empty() { &n.uuid } else { &n.name },
-            n.state.name(),
-            if n.cur_version.is_empty() {
-                "-"
+        r.rec("node");
+        r.kv("kind", n.kind.name());
+        r.kv("uuid", &n.uuid);
+        if !n.name.is_empty() {
+            r.kv("name", &n.name);
+        }
+        r.kv(
+            "state",
+            if n.not_selected {
+                "skipped"
             } else {
-                &n.cur_version
+                n.state.name()
             },
-            variant_label(n, node_variant(u, ni)),
-            if n.reason.is_empty() { "" } else { " " },
-            n.reason
-        ));
+        );
+        if !n.cur_version.is_empty() {
+            r.kv("from", &n.cur_version);
+        }
+        let to = if n.kind == UpgradeNodeKind::Bot {
+            &u.target_ver
+        } else {
+            &u.hub_ver
+        };
+        if !to.is_empty() {
+            r.kv("to", to);
+        }
+        if !n.variant.is_empty() {
+            r.kv("base", &n.variant);
+        }
+        // the build it is being moved onto, when that is the other one
+        let want = node_variant(u, ni);
+        if !want.is_empty() && want != n.variant {
+            r.kv("want", want);
+        }
+        if !n.reason.is_empty() {
+            r.kv("reason", &n.reason);
+        }
     }
-    out
 }
 
 #[cfg(test)]

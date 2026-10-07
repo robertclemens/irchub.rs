@@ -38,6 +38,7 @@ pub mod opflow;
 pub mod presence;
 pub mod queue;
 pub mod ratelimit;
+pub mod reply;
 pub mod secret;
 pub mod state;
 pub mod stats;

@@ -11,6 +11,7 @@
 //! sockets, the channel to the console thread, the pushed events (status,
 //! tree, upgrade, log lines) and the log ring.
 
+pub mod fmt;
 pub mod ssh;
 pub mod ui;
 
@@ -188,6 +189,8 @@ struct LogMeta {
     seq: u64,
     level: i32,
     len: usize,
+    /// When it was logged (log show's "oldest").
+    ts: i64,
 }
 
 /// Not encrypted: the text is a mapping of its own, page-aligned so that
@@ -264,6 +267,7 @@ pub fn log_append(level: i32, line: &[u8]) {
             seq,
             level: level.clamp(LOG_ERROR, LOG_DEBUG),
             len: o,
+            ts: crate::cstr::now(),
         };
     });
 }
@@ -755,16 +759,67 @@ pub fn frame(state: &mut HubState, ci: usize, payload: &str) -> bool {
             None => false,
         };
     }
+    // get|tree and get|status: the result line, then the rows / key=value
+    // lines exactly as the events carry them (docs/console.md §3.4).
     let reply = if payload == "get|tree" || payload == "get|status" {
         let rows = presence::build_tree(state);
         if payload == "get|tree" {
-            rows
+            let rows = rows.trim_end_matches('\n');
+            format!(
+                "ok|network.tree{}{}",
+                if rows.is_empty() { "" } else { "\n" },
+                rows
+            )
         } else {
             // one key=value per line
-            status_line(state, &rows).replace('|', "\n")
+            format!(
+                "ok|network.status\n{}",
+                status_line(state, &rows).replace('|', "\n")
+            )
         }
+    } else if payload == "get|log" {
+        // the log settings and how full the file and the ring are
+        let mut r = crate::reply::Reply::new();
+        r.ok("log.show");
+        r.kvi("file_level", i64::from(state.log_level));
+        r.kvi("console_level", i64::from(state.console_log_level));
+        r.kv("file", HUB_LOG_FILE);
+        r.kvi(
+            "file_bytes",
+            std::fs::metadata(HUB_LOG_FILE).map_or(0, |m| m.len() as i64),
+        );
+        r.kvi(
+            "limit",
+            if state.log_max_size > 0 {
+                state.log_max_size
+            } else {
+                HUB_LOG_FILE_SIZE
+            },
+        );
+        let next = ring_next();
+        let lines = (next.saturating_sub(1)).min(CONSOLE_LOG_RING as u64);
+        r.kvu("ring_lines", lines);
+        r.kvi("ring_cap", CONSOLE_LOG_RING as i64);
+        if lines > 0 {
+            let ts = RING.with_borrow(|rg| {
+                if rg.text.is_none() {
+                    return 0;
+                }
+                let slot = ((next - lines) % CONSOLE_LOG_RING as u64) as usize;
+                rg.meta.get(slot).map_or(0, |e| e.ts)
+            });
+            if ts > 0 {
+                r.kvi("ring_oldest", ts);
+            }
+        }
+        let sl = state.clients[ci]
+            .console
+            .as_ref()
+            .map_or(-1, |l| l.log_level);
+        r.kvi("session_level", i64::from(sl));
+        r.text().to_string()
     } else {
-        "ERROR: unknown console request".to_string()
+        "err|console.unknown|msg=unknown console request".to_string()
     };
     match state.clients[ci].console.as_mut() {
         Some(l) => l.send(CONSOLE_REPLY, reply.as_bytes()),

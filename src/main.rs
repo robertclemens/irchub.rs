@@ -449,7 +449,7 @@ fn maintenance(state: &mut HubState) {
                     state.purge_days_setting
                 );
                 let cutoff = t - i64::from(state.purge_days_setting) * 86400;
-                let (purged, _) = mesh::execute_purge(state, cutoff);
+                let purged = mesh::execute_purge(state, cutoff, None);
                 if purged > 0 {
                     hlog_info!("[HUB] Scheduled purge removed {purged} tombstones\n");
                 }
@@ -1034,7 +1034,11 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
         }
     };
     match net::listen_on(addr) {
-        Ok(l) => state.listener = Some(l),
+        Ok(l) => {
+            state.listener = Some(l);
+            state.listen_ip = addr.ip().to_string();
+            state.listen_port = state.port;
+        }
         Err(_) => {
             hlog_error!("Bind failed\n");
             return 1;

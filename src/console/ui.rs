@@ -1,5 +1,6 @@
 //! SSH admin console — one session's user interface.  docs/console.md;
-//! mirrors irchub `hub_console_ui.c` function for function.
+//! mirrors irchub `hub_console_ui.c` function for function (the output
+//! renderer is `fmt`, hub_console_fmt.c).
 //!
 //! Runs on the console thread only.  Everything the admin sees is built here:
 //! the line-mode transcript (TERM=dumb, the testnet's interface — byte for
@@ -9,6 +10,10 @@
 //! and logs from reaching the terminal as escape sequences.  Pure state
 //! machine: no russh, no HubState.
 
+use super::fmt::{
+    self, Ctx, Flines, RL_CMD, RL_DIM, RL_ERR, RL_HEAD, RL_NORMAL, RL_OK, RL_RULE, RL_TITLE,
+    RL_WARN,
+};
 use crate::consts::*;
 
 /// Bytes waiting for the terminal above this: line mode drops events and log
@@ -142,7 +147,7 @@ fn cp_width(cp: u32) -> i32 {
 }
 
 /// Next character of an already-sanitized string: (bytes, code point, cells).
-fn next_char(s: &[u8]) -> (usize, u32, i32) {
+pub(crate) fn next_char(s: &[u8]) -> (usize, u32, i32) {
     let mut ul = utf8_len(s);
     if ul == 0 {
         ul = 1;
@@ -151,7 +156,7 @@ fn next_char(s: &[u8]) -> (usize, u32, i32) {
     (ul, cp, cp_width(cp))
 }
 
-fn str_width(s: &[u8]) -> i32 {
+pub(crate) fn str_width(s: &[u8]) -> i32 {
     let mut w = 0;
     let mut i = 0;
     while i < s.len() {
@@ -229,6 +234,17 @@ fn utf8_cut(s: &[u8], len: usize) -> usize {
     if i + need > len { i } else { len }
 }
 
+/// `%.*s` precision for at most `max` bytes of s, never splitting a
+/// character — the C `uprec`.
+pub(crate) fn uprec(s: &[u8], max: usize) -> usize {
+    let n = s.len().min(max);
+    if n == max && s.len() > max {
+        utf8_cut(s, n)
+    } else {
+        n
+    }
+}
+
 /// A field copied into a C char[cap]: at most cap-1 bytes, never splitting a
 /// UTF-8 character — the C `copy_field`.
 fn cut_field(s: &[u8], cap: usize) -> &[u8] {
@@ -268,15 +284,6 @@ fn fmtb(parts: &[&[u8]]) -> Vec<u8> {
 // ===========================================================================
 // Scrollback: a ring of sanitized lines, each with a colour class
 // ===========================================================================
-const L_NORMAL: u8 = 0;
-const L_CMD: u8 = 1;
-const L_ERR: u8 = 2;
-#[allow(dead_code)]
-const L_OK: u8 = 3;
-const L_INFO: u8 = 4;
-const L_WARN: u8 = 5;
-const L_DIM: u8 = 6;
-
 #[derive(Clone)]
 struct SLine {
     text: Vec<u8>,
@@ -485,30 +492,52 @@ const V_STATS: usize = 4;
 const V_COUNT: usize = 5;
 const VIEW_NAME: [&str; V_COUNT] = ["console", "log", "network", "upgrades", "stats"];
 
+/// y/N, type an exact word, or type a number that becomes the payload
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirm {
     None,
     Yn,
-    TypeArg,
-    TypeHub,
-    TypeVer,
+    Type,
+    Pick,
 }
 
 /// What a request in flight was for: replies come back in order.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Rq {
+    #[default]
     User,
+    Pre,
     ViewUpg,
     ViewStats,
 }
 
-#[derive(Clone)]
+/// A read made before a confirmation so the question can name the object
+/// (D2): what it reads, and what the question is built from.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Pre {
+    #[default]
+    None,
+    BotDel,
+    BotKick,
+    PeerDel,
+    Opt,
+    UserDel,
+    UserKey,
+    UpgStart,
+}
+
+#[derive(Clone, Default)]
 struct PendingRq {
     kind: Rq,
+    /// the command number
     seq: i32,
+    /// "bot list"
     words: Vec<u8>,
+    /// what the audit line says was asked
     audit: Vec<u8>,
     audit_level: i32,
+    /// fmt::FMT_MODE_*
+    mode: i32,
 }
 
 const MAX_PENDING_RQ: usize = 16;
@@ -529,6 +558,32 @@ struct Status {
     loglevel: i32,
     consolelevel: i32,
     have: bool,
+}
+
+/// The command a pre-read is for, and what its question needs.
+#[derive(Clone, Default)]
+struct PendCmd {
+    pre: Pre,
+    op: u8,
+    payload: Vec<u8>,
+    /// the object: uuid, #, name, flags
+    arg: Vec<u8>,
+    /// upgrade start: hub=, nodes=, botbase=, hubbase=
+    extra: [Vec<u8>; 4],
+    rq: PendingRq,
+}
+
+/// One entry of the full-screen console view: a finished line, or a reply
+/// kept as it came so it can be laid out again at a new width (D5).
+#[derive(Clone, Default)]
+struct Centry {
+    /// a line, or None for a reply
+    text: Option<Vec<u8>>,
+    kind: u8,
+    /// the reply's records
+    reply: Option<Vec<u8>>,
+    words: Vec<u8>,
+    mode: i32,
 }
 
 pub struct Ui {
@@ -559,30 +614,50 @@ pub struct Ui {
     last_cr: bool,
 
     seq: i32,
+    /// commands run, for the goodbye line
+    ncmds: i32,
     user_busy: bool,
     rq: Vec<PendingRq>,
     queued: Vec<Vec<u8>>,
     confirming: Confirm,
     confirm_seq: i32,
     confirm_want: Vec<u8>,
-    confirm_q: Vec<u8>,
+    confirm_pick_max: i32,
     confirm_op: u8,
     confirm_payload: Vec<u8>,
-    confirm_rq: Option<PendingRq>,
+    confirm_rq: PendingRq,
+    pend: PendCmd,
     held: Vec<u8>,
     dropped: u64,
 
+    // display settings (docs/console.md §2 display)
+    raw: bool,
+    /// line mode: 0 default, -1 auto, else n
+    width_set: i32,
+    events_on: bool,
+    greeted: bool,
+    now_ms: i64,
+    start_ms: i64,
+
     st: Status,
-    tree: Vec<u8>,
+    /// rows, '\n'-separated; None until the first tree event
+    tree: Option<Vec<u8>>,
     upg_text: Option<Vec<u8>>,
     stats_text: Option<Vec<u8>>,
     upg_at: i64,
     stats_at: i64,
+    last_upg: Vec<u8>,
     log_on: bool,
     log_sub_level: i32,
 
     view: usize,
     sb: [Option<Sback>; V_COUNT],
+    /// V_CONSOLE entries, a ring (full screen only)
+    ent: Option<Vec<Centry>>,
+    ent_first: i64,
+    ent_next: i64,
+    /// width the console view was laid out at
+    render_w: i32,
     anchor: [i64; V_COUNT],
     act: [bool; V_COUNT],
     pane_user_off: bool,
@@ -610,21 +685,28 @@ pub struct Ui {
 }
 
 // ===========================================================================
-// Command table (docs/console.md §2)
+// Command table (docs/console.md §2): <noun> <verb> [args] (D15)
 // ===========================================================================
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum B {
     None,
     Arg,
-    OptArg,
     Pipe,
-    Colon,
     PeerAdd,
+    PeerDel,
+    PeerSet,
     ChanAdd,
+    ChanSet,
+    ChanOp,
     OptSet,
-    LogLevel,
-    LogSize,
+    LogSet,
     Purge,
+    HubSet,
+    Acl,
+    UserList,
+    UserAdd,
+    UserSet,
+    UserMask,
     UpgReleases,
     UpgStart,
     Fixed,
@@ -639,13 +721,16 @@ struct CmdDef {
     nargs: usize,
     optargs: usize,
     confirm: Confirm,
+    pre: Pre,
     fixed: &'static str,
     usage: &'static str,
     help: &'static str,
+    /// help <group>: a second line for the arguments
+    args: Option<&'static str>,
 }
 
 macro_rules! cmd {
-    ($c:expr, $s:expr, $op:expr, $b:expr, $n:expr, $o:expr, $cf:expr, $fx:expr, $u:expr, $h:expr) => {
+    ($c:expr, $s:expr, $op:expr, $b:expr, $n:expr, $o:expr, $cf:expr, $pre:expr, $fx:expr, $u:expr, $h:expr, $a:expr) => {
         CmdDef {
             cmd: $c,
             sub: $s,
@@ -654,9 +739,11 @@ macro_rules! cmd {
             nargs: $n,
             optargs: $o,
             confirm: $cf,
+            pre: $pre,
             fixed: $fx,
             usage: $u,
             help: $h,
+            args: $a,
         }
     };
 }
@@ -664,69 +751,258 @@ macro_rules! cmd {
 use Confirm as Cf;
 #[rustfmt::skip]
 const CMDS: &[CmdDef] = &[
-    cmd!("help", None, 0, B::Local, 0, 1, Cf::None, "", "help [command]", "list commands, or show one"),
-    cmd!("quit", None, 0, B::Local, 0, 0, Cf::None, "", "quit", "close this console"),
-    cmd!("bot", Some("list"), CMD_ADMIN_LIST_FULL, B::None, 0, 0, Cf::None, "", "bot list", "every bot the hub knows, with its fields"),
-    cmd!("bot", Some("summary"), CMD_ADMIN_LIST_SUMMARY, B::None, 0, 0, Cf::None, "", "bot summary", "bots, one line each"),
-    cmd!("bot", Some("pending"), CMD_ADMIN_GET_PENDING, B::None, 0, 0, Cf::None, "", "bot pending", "bots waiting for approval"),
-    cmd!("bot", Some("approve"), CMD_ADMIN_APPROVE, B::Arg, 1, 0, Cf::None, "", "bot approve <index|uuid>", "approve a pending bot"),
-    cmd!("bot", Some("authorize"), CMD_ADMIN_ADD, B::Arg, 1, 0, Cf::None, "", "bot authorize <uuid>", "authorize a bot uuid"),
-    cmd!("bot", Some("add"), CMD_ADMIN_CREATE_BOT, B::Pipe, 3, 0, Cf::None, "", "bot add <nick> <uuid> <pubkey>", "register a bot by the identity its setup printed"),
-    cmd!("bot", Some("del"), CMD_ADMIN_DEL, B::Arg, 1, 0, Cf::Yn, "", "bot del <uuid>", "delete a bot (disconnects it)"),
-    cmd!("bot", Some("kick"), CMD_ADMIN_DISCONNECT_BOT, B::Arg, 1, 0, Cf::Yn, "", "bot kick <uuid>", "disconnect a bot"),
-    cmd!("bot", Some("rekey"), CMD_ADMIN_REKEY_BOT, B::Arg, 1, 0, Cf::None, "", "bot rekey <uuid>", "how to rekey a bot"),
-    cmd!("peer", Some("list"), CMD_ADMIN_LIST_PEERS, B::None, 0, 0, Cf::None, "", "peer list", "peer hubs and the mesh matrix"),
-    cmd!("peer", Some("add"), CMD_ADMIN_ADD_PEER, B::PeerAdd, 5, 0, Cf::None, "", "peer add <ip> <port> <uuid> <name|-> <pubkey>", "add a peer hub"),
-    cmd!("peer", Some("del"), CMD_ADMIN_DEL_PEER, B::OptArg, 0, 1, Cf::TypeArg, "", "peer del [index]", "remove a peer hub (no index: list the configured peers)"),
-    cmd!("peer", Some("setkey"), CMD_ADMIN_SET_PEER_PUBKEY, B::Colon, 2, 0, Cf::None, "", "peer setkey <uuid> <pubkey>", "set a peer's public key"),
-    cmd!("peer", Some("sync"), CMD_ADMIN_SYNC_MESH, B::None, 0, 0, Cf::None, "", "peer sync", "send a full sync to every peer"),
-    cmd!("hub", Some("pubkey"), CMD_ADMIN_GET_PUBKEY, B::None, 0, 0, Cf::None, "", "hub pubkey", "this hub's public key"),
-    cmd!("hub", Some("setpub"), CMD_ADMIN_SET_PUBKEY, B::Arg, 1, 0, Cf::None, "", "hub setpub <pubkey>", "re-store the public key (must match the private key)"),
-    cmd!("hub", Some("rekey"), CMD_ADMIN_REGEN_KEYS, B::None, 0, 0, Cf::TypeHub, "", "hub rekey", "new hub keypair; every peer and bot must re-learn it"),
-    cmd!("hub", Some("name"), CMD_ADMIN_SET_HUB_NAME, B::Arg, 1, 0, Cf::None, "", "hub name <name>", "set this hub's name"),
-    cmd!("hub", Some("bindip"), CMD_ADMIN_SET_BIND_IP, B::Arg, 1, 0, Cf::None, "", "hub bindip <ip>", "set the bind address (restart)"),
-    cmd!("hub", Some("port"), CMD_ADMIN_SET_BIND_PORT, B::Arg, 1, 0, Cf::None, "", "hub port <port>", "set the listening port (restart)"),
-    cmd!("hub", Some("logsize"), CMD_ADMIN_SET_LOG_SIZE, B::LogSize, 1, 0, Cf::None, "", "hub logsize <MB|nk|nb>", "log file size limit (MB, or k/b suffix), at most 1024 MB"),
-    cmd!("hub", Some("purge"), CMD_ADMIN_PURGE_TOMBSTONES, B::Purge, 1, 0, Cf::Yn, "", "hub purge <now|days>", "purge tombstones now, or older than <days>"),
-    cmd!("hub", Some("autopurge"), CMD_ADMIN_SET_PURGE_DAYS, B::Arg, 1, 0, Cf::None, "", "hub autopurge <days>", "daily purge of tombstones older than <days> (0 = off)"),
-    cmd!("loglevel", None, CMD_ADMIN_SET_LOG_LEVEL, B::LogLevel, 1, 1, Cf::Yn, "", "loglevel [file|console] <none|error|warning|info|debug>", "set the log file's (default) or the console log's level"),
-    cmd!("stats", None, CMD_ADMIN_STATS, B::None, 0, 0, Cf::None, "", "stats", "traffic counters since the hub started"),
-    cmd!("allow", Some("list"), CMD_ADMIN_LIST_ALLOWLIST, B::None, 0, 0, Cf::None, "", "allow list", "the IP allowlist"),
-    cmd!("allow", Some("add"), CMD_ADMIN_ADD_ALLOWLIST, B::Arg, 1, 0, Cf::None, "", "allow add <ip[/n]>", "add to the allowlist"),
-    cmd!("allow", Some("del"), CMD_ADMIN_DEL_ALLOWLIST, B::Arg, 1, 0, Cf::Yn, "", "allow del <ip[/n]>", "remove from the allowlist"),
-    cmd!("deny", Some("list"), CMD_ADMIN_LIST_DENYLIST, B::None, 0, 0, Cf::None, "", "deny list", "the IP denylist"),
-    cmd!("deny", Some("add"), CMD_ADMIN_ADD_DENYLIST, B::Arg, 1, 0, Cf::None, "", "deny add <ip[/n]>", "add to the denylist"),
-    cmd!("deny", Some("del"), CMD_ADMIN_DEL_DENYLIST, B::Arg, 1, 0, Cf::Yn, "", "deny del <ip[/n]>", "remove from the denylist"),
-    cmd!("opt", Some("set"), CMD_ADMIN_SET_OPT_FLAGS, B::OptSet, 1, 0, Cf::Yn, "", "opt set <flags|->", "set the network opt flags (- clears)"),
-    cmd!("opt", None, CMD_ADMIN_GET_OPT_FLAGS, B::None, 0, 0, Cf::None, "", "opt", "the network opt flags"),
-    cmd!("admin", Some("list"), CMD_ADMIN_LIST_ADMINS, B::None, 0, 0, Cf::None, "", "admin list", "admin records"),
-    cmd!("admin", Some("add"), CMD_ADMIN_ADD_ADMIN, B::Pipe, 3, 0, Cf::None, "", "admin add <name> <pubkey> <mask>", "add an admin"),
-    cmd!("admin", Some("del"), CMD_ADMIN_DEL_ADMIN, B::Arg, 1, 0, Cf::TypeArg, "", "admin del <name>", "remove an admin and their masks"),
-    cmd!("oper", Some("list"), CMD_ADMIN_LIST_OPERS_V2, B::None, 0, 0, Cf::None, "", "oper list", "oper records"),
-    cmd!("oper", Some("add"), CMD_ADMIN_ADD_OPER_RECORD, B::Pipe, 3, 0, Cf::None, "", "oper add <name> <pubkey> <mask>", "add an oper"),
-    cmd!("oper", Some("del"), CMD_ADMIN_DEL_OPER_RECORD, B::Arg, 1, 0, Cf::Yn, "", "oper del <name>", "remove an oper and their masks"),
-    cmd!("mask", Some("add"), CMD_ADMIN_ADD_USERMASK, B::Pipe, 2, 0, Cf::None, "", "mask add <name> <mask>", "add a usermask to an admin or oper"),
-    cmd!("mask", Some("del"), CMD_ADMIN_DEL_USERMASK, B::Pipe, 2, 0, Cf::Yn, "", "mask del <name> <mask>", "remove a usermask"),
-    cmd!("userkey", None, CMD_ADMIN_SET_USERKEY, B::Pipe, 2, 0, Cf::Yn, "", "userkey <name> <pubkey>", "replace an admin's or oper's key"),
-    cmd!("match", None, CMD_ADMIN_MATCH, B::Arg, 1, 0, Cf::None, "", "match <name|*>", "a user's records, or everyone's"),
-    cmd!("chan", Some("list"), CMD_ADMIN_LIST_CHANNELS, B::None, 0, 0, Cf::None, "", "chan list", "managed channels"),
-    cmd!("chan", Some("add"), CMD_ADMIN_ADD_CHANNEL, B::ChanAdd, 1, 1, Cf::None, "", "chan add <#chan> [key]", "add a channel"),
-    cmd!("chan", Some("del"), CMD_ADMIN_DEL_CHANNEL, B::Arg, 1, 0, Cf::Yn, "", "chan del <#chan>", "remove a channel from every bot"),
-    cmd!("op", None, CMD_ADMIN_OP_USER, B::Pipe, 2, 0, Cf::None, "", "op <nick> <#chan>", "have the bots op a user"),
-    cmd!("upgrade", Some("status"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::None, "", "upgrade status", "the upgrade run on this hub"),
-    cmd!("upgrade", Some("releases"), CMD_ADMIN_UPGRADE_STATUS, B::UpgReleases, 0, 2, Cf::None, "", "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes"),
-    cmd!("upgrade", Some("start"), CMD_ADMIN_UPGRADE_NET, B::UpgStart, 1, 4, Cf::TypeVer, "", "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade"),
-    cmd!("upgrade", Some("abort"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, "abort", "upgrade abort", "stop the run and roll back"),
-    cmd!("upgrade", Some("forget"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, "forget", "upgrade forget", "drop the roll-up plan on every hub"),
-    cmd!("tree", None, CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, "get|tree", "tree", "the network tree rows"),
-    cmd!("status", None, CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, "get|status", "status", "the status fields"),
-    cmd!("log", Some("on"), 0, B::Local, 0, 1, Cf::None, "", "log on [level]", "line mode: show hub log lines"),
-    cmd!("log", Some("off"), 0, B::Local, 0, 0, Cf::None, "", "log off", "line mode: stop log lines"),
-    cmd!("view", None, 0, B::Local, 1, 0, Cf::None, "", "view <1-5>", "console, log, network, upgrades, stats"),
-    cmd!("pane", None, 0, B::Local, 0, 0, Cf::None, "", "pane", "show or hide the tree pane (F3)"),
-    cmd!("ascii", None, 0, B::Local, 0, 0, Cf::None, "", "ascii", "plain ASCII lines for this session"),
-    cmd!("filter", None, 0, B::Local, 1, 64, Cf::None, "", "filter <text|clear>", "log view: only lines containing <text>"),
-    cmd!("clear", None, 0, B::Local, 0, 0, Cf::None, "", "clear", "clear the current view"),
+    cmd!("help", None, 0, B::Local, 0, 2, Cf::None, Pre::None, "", "help [group [command]]", "the command groups, one group's commands, or one command in full (? does the same)", None),
+    cmd!("quit", None, 0, B::Local, 0, 0, Cf::None, Pre::None, "", "quit", "close this console", None),
+    cmd!("bot", Some("list"), CMD_ADMIN_LIST_FULL, B::None, 0, 0, Cf::None, Pre::None, "", "bot list", "every registered bot: state, hub, version, last seen", None),
+    cmd!("bot", Some("show"), CMD_ADMIN_LIST_FULL, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot show <uuid|nick>", "one bot in detail", None),
+    cmd!("bot", Some("summary"), CMD_ADMIN_LIST_SUMMARY, B::None, 0, 0, Cf::None, Pre::None, "", "bot summary", "every bot's nick and uuid", None),
+    cmd!("bot", Some("pending"), CMD_ADMIN_GET_PENDING, B::None, 0, 0, Cf::None, Pre::None, "", "bot pending", "bots that tried to connect but are not authorized", None),
+    cmd!("bot", Some("approve"), CMD_ADMIN_APPROVE, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot approve <#|uuid>", "approve a pending bot; # is the number from bot pending", None),
+    cmd!("bot", Some("authorize"), CMD_ADMIN_ADD, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot authorize <uuid>", "authorize a uuid before the bot first connects", None),
+    cmd!("bot", Some("add"), CMD_ADMIN_CREATE_BOT, B::Pipe, 3, 0, Cf::None, Pre::None, "", "bot add <nick> <uuid> <key>", "register a bot from the identity its -setup printed", Some("key: the 88-char base64 public key")),
+    cmd!("bot", Some("del"), CMD_ADMIN_DEL, B::Arg, 1, 0, Cf::Yn, Pre::BotDel, "", "bot del <uuid>", "delete a bot everywhere (asks y/N; disconnects it)", None),
+    cmd!("bot", Some("kick"), CMD_ADMIN_DISCONNECT_BOT, B::Arg, 1, 0, Cf::Yn, Pre::BotKick, "", "bot kick <uuid>", "drop its connection to this hub (asks y/N; it reconnects)", None),
+    cmd!("bot", Some("rekey"), CMD_ADMIN_REKEY_BOT, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot rekey <uuid>", "how to rekey a bot (only the bot can)", None),
+    cmd!("peer", Some("list"), CMD_ADMIN_LIST_PEERS, B::None, 0, 0, Cf::None, Pre::None, "", "peer list", "peer hubs, the mesh links and their health", None),
+    cmd!("peer", Some("show"), CMD_ADMIN_LIST_PEERS, B::Arg, 1, 0, Cf::None, Pre::None, "", "peer show <#|uuid|name>", "one peer hub in detail", None),
+    cmd!("peer", Some("add"), CMD_ADMIN_ADD_PEER, B::PeerAdd, 5, 0, Cf::None, Pre::None, "", "peer add <ip> <port> <uuid> <name|-> <key>", "add a peer hub", Some("key: the 88-char key from that hub's hub show")),
+    cmd!("peer", Some("del"), CMD_ADMIN_DEL_PEER, B::PeerDel, 0, 1, Cf::Type, Pre::PeerDel, "", "peer del [#]", "remove a peer hub (types its number to confirm)", None),
+    cmd!("peer", Some("set"), CMD_ADMIN_SET_PEER_PUBKEY, B::PeerSet, 3, 0, Cf::None, Pre::None, "", "peer set <#|uuid|name> key <key>", "replace a peer's key (the link comes back with it)", None),
+    cmd!("peer", Some("sync"), CMD_ADMIN_SYNC_MESH, B::None, 0, 0, Cf::None, Pre::None, "", "peer sync", "send a full sync to every peer", None),
+    cmd!("network", Some("tree"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|tree", "network tree", "every hub and bot as a tree", None),
+    cmd!("network", Some("status"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|status", "network status", "the mesh-wide status (what the status bar shows)", None),
+    cmd!("hub", Some("show"), CMD_ADMIN_GET_PUBKEY, B::None, 0, 0, Cf::None, Pre::None, "", "hub show", "this hub: identity, key, listener, counts", None),
+    cmd!("hub", Some("set"), 0, B::HubSet, 0, 2, Cf::None, Pre::None, "", "hub set <setting> <value>", "name, bindip, port, pubkey or autopurge (alone: the table)", None),
+    cmd!("hub", Some("stats"), CMD_ADMIN_STATS, B::None, 0, 0, Cf::None, Pre::None, "", "hub stats", "traffic counters since the hub started", None),
+    cmd!("hub", Some("rekey"), CMD_ADMIN_REGEN_KEYS, B::None, 0, 0, Cf::Type, Pre::None, "", "hub rekey", "new hub keypair; every peer and bot must re-learn it", None),
+    cmd!("hub", Some("purge"), CMD_ADMIN_PURGE_TOMBSTONES, B::Purge, 1, 0, Cf::Yn, Pre::None, "", "hub purge <now|days>", "purge tombstones now, or those older than <days>", None),
+    cmd!("log", Some("show"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|log", "log show", "log levels, sizes and this session's log", None),
+    cmd!("log", Some("set"), 0, B::LogSet, 2, 0, Cf::None, Pre::None, "", "log set file|console|size <value>", "the file or console ring level, or the file size limit", Some("level: none error warning info debug or 0-4 · size: <MB>, <n>k or <n>b, at most 1024 MB")),
+    cmd!("log", Some("on"), 0, B::Local, 0, 1, Cf::None, Pre::None, "", "log on [level]", "line mode: stream hub log lines", None),
+    cmd!("log", Some("off"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "log off", "line mode: stop the log lines", None),
+    cmd!("log", Some("filter"), 0, B::Local, 1, 64, Cf::None, Pre::None, "", "log filter <text|clear>", "full screen: log view lines containing <text>", None),
+    cmd!("acl", Some("list"), CMD_ADMIN_LIST_ALLOWLIST, B::None, 0, 0, Cf::None, Pre::None, "", "acl list", "the allow and deny lists", None),
+    cmd!("acl", Some("add"), 0, B::Acl, 2, 0, Cf::None, Pre::None, "", "acl add allow|deny <ip[/n]>", "add an address or network", None),
+    cmd!("acl", Some("del"), 0, B::Acl, 2, 0, Cf::Yn, Pre::None, "", "acl del allow|deny <ip[/n]>", "remove an address or network (asks y/N)", None),
+    cmd!("option", Some("list"), CMD_ADMIN_GET_OPT_FLAGS, B::None, 0, 0, Cf::None, Pre::None, "", "option list", "the network option flags", None),
+    cmd!("option", Some("set"), CMD_ADMIN_SET_OPT_FLAGS, B::OptSet, 1, 0, Cf::Yn, Pre::Opt, "", "option set <flags|->", "set the network option flags (- clears)", None),
+    cmd!("user", Some("list"), 0, B::UserList, 0, 1, Cf::None, Pre::None, "", "user list [admin|oper]", "every user (or one role): key, last seen, masks", None),
+    cmd!("user", Some("show"), CMD_ADMIN_MATCH, B::Arg, 1, 0, Cf::None, Pre::None, "", "user show <name|*>", "one user (or all) with masks and their last use", None),
+    cmd!("user", Some("add"), 0, B::UserAdd, 4, 0, Cf::None, Pre::None, "", "user add admin|oper <name> <key> <mask>", "add an admin or an oper", Some("key: their 88-char public key · mask: nick!user@host")),
+    cmd!("user", Some("del"), CMD_ADMIN_DEL_ADMIN, B::Arg, 1, 0, Cf::Yn, Pre::UserDel, "", "user del <name>", "remove a user and their masks", None),
+    cmd!("user", Some("set"), CMD_ADMIN_SET_USERKEY, B::UserSet, 3, 0, Cf::Yn, Pre::UserKey, "", "user set <name> key <key>", "replace a user's key (asks y/N)", None),
+    cmd!("user", Some("mask"), 0, B::UserMask, 3, 0, Cf::None, Pre::None, "", "user mask add|del <name> <mask>", "add or remove a usermask (del asks y/N)", None),
+    cmd!("channel", Some("list"), CMD_ADMIN_LIST_CHANNELS, B::None, 0, 0, Cf::None, Pre::None, "", "channel list", "every managed channel with its settings", None),
+    cmd!("channel", Some("show"), CMD_ADMIN_LIST_CHANNELS, B::Arg, 1, 0, Cf::None, Pre::None, "", "channel show <#chan>", "one channel in detail", None),
+    cmd!("channel", Some("add"), CMD_ADMIN_ADD_CHANNEL, B::ChanAdd, 1, 1, Cf::None, Pre::None, "", "channel add <#chan> [key]", "add (or re-add) a channel", None),
+    cmd!("channel", Some("del"), CMD_ADMIN_DEL_CHANNEL, B::Arg, 1, 0, Cf::Yn, Pre::None, "", "channel del <#chan>", "remove it from every bot (asks y/N)", None),
+    cmd!("channel", Some("set"), CMD_ADMIN_ADD_CHANNEL, B::ChanSet, 3, 0, Cf::None, Pre::None, "", "channel set <#chan> <setting> <value|->", "change one setting (key today; - clears)", None),
+    cmd!("channel", Some("op"), CMD_ADMIN_OP_USER, B::ChanOp, 2, 0, Cf::None, Pre::None, "", "channel op <#chan> <nick>", "have the bots op a user", None),
+    cmd!("upgrade", Some("status"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::None, Pre::None, "", "upgrade status", "the upgrade run on this hub", None),
+    cmd!("upgrade", Some("releases"), CMD_ADMIN_UPGRADE_STATUS, B::UpgReleases, 0, 2, Cf::None, Pre::None, "", "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", None),
+    cmd!("upgrade", Some("start"), CMD_ADMIN_UPGRADE_NET, B::UpgStart, 1, 4, Cf::Type, Pre::UpgStart, "", "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade", None),
+    cmd!("upgrade", Some("abort"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, Pre::None, "abort", "upgrade abort", "stop the run and roll back", None),
+    cmd!("upgrade", Some("forget"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, Pre::None, "forget", "upgrade forget", "drop the roll-up plan on every hub", None),
+    cmd!("display", Some("show"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "display show", "this session's display settings", None),
+    cmd!("display", Some("view"), 0, B::Local, 1, 0, Cf::None, Pre::None, "", "display view <1-5>", "full screen: console, log, network, upgrades, stats", None),
+    cmd!("display", Some("pane"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "display pane", "full screen: show or hide the tree pane (F3)", None),
+    cmd!("display", Some("ascii"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "display ascii", "plain ASCII glyphs for this session (again: Unicode)", None),
+    cmd!("display", Some("format"), 0, B::Local, 1, 0, Cf::None, Pre::None, "", "display format pretty|raw", "laid-out output, or the records as the hub sends them", None),
+    cmd!("display", Some("width"), 0, B::Local, 1, 0, Cf::None, Pre::None, "", "display width <60-250|auto>", "line mode: the output width", None),
+    cmd!("display", Some("events"), 0, B::Local, 1, 0, Cf::None, Pre::None, "", "display events on|off", "line mode: a line for each peer, bot and upgrade change", None),
+    cmd!("display", Some("clear"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "display clear", "full screen: clear the current view", None),
+];
+
+/// The root nouns, in help order, with what each groups.
+const GROUPS: [(&str, &str); 11] = [
+    ("bot", "registered bots"),
+    ("peer", "peer hubs"),
+    ("network", "the whole mesh"),
+    ("hub", "this hub"),
+    ("log", "the hub log"),
+    ("acl", "IP allow / deny lists"),
+    ("option", "network option flags"),
+    ("user", "admins and opers"),
+    ("channel", "managed channels"),
+    ("upgrade", "rolling upgrades"),
+    ("display", "this session's screen"),
+];
+
+/// help <group> <command> (§2.2): each argument, then examples that run as
+/// typed.  args: "name\ttext" lines; examples: one per line.
+macro_rules! ex_uuid {
+    () => {
+        "00010203-0405-4607-8809-0a0b0c0d0e0f"
+    };
+}
+macro_rules! ex_key {
+    () => {
+        "O7Eu2jwpjbXeJVl/VNkk8uF+eKJq2JU+2CGO5oLwu76QIeLzAJ0VLJEb8fJexoOpAnFBZnZ6+9jlvQ+wEk7Lig=="
+    };
+}
+
+/// (cmd, sub, args, examples)
+type CmdHelp = (
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+    &'static str,
+);
+
+#[rustfmt::skip]
+const CMD_HELP: &[CmdHelp] = &[
+    ("help", None,
+     Some("group\tone of: bot peer network hub log acl option user channel upgrade display\n\
+           command\tone of that group's commands: its arguments and an example\n\
+           ?\ttyped in place of help it does the same"),
+     "help\nhelp bot\nhelp bot add\n? upgrade start"),
+    ("quit", None, None, "quit"),
+    ("bot", Some("list"), None, "bot list"),
+    ("bot", Some("show"), Some("uuid|nick\tthe bot's uuid or its current nick (Tab completes both)"),
+     concat!("bot show alpha\nbot show ", ex_uuid!())),
+    ("bot", Some("summary"), None, "bot summary"),
+    ("bot", Some("pending"), None, "bot pending"),
+    ("bot", Some("approve"),
+     Some("#|uuid\tthe number bot pending shows in its # column, or the pending bot's uuid"),
+     concat!("bot approve 1\nbot approve ", ex_uuid!())),
+    ("bot", Some("authorize"), Some("uuid\tthe uuid of a bot that has not connected yet"),
+     concat!("bot authorize ", ex_uuid!())),
+    ("bot", Some("add"),
+     Some("nick\tthe bot's IRC nick\n\
+           uuid\tthe uuid the bot's -setup printed\n\
+           key\tthe 88-character base64 public key the bot's -setup printed"),
+     concat!("bot add alpha ", ex_uuid!(), " ", ex_key!())),
+    ("bot", Some("del"), Some("uuid\tthe bot's uuid (Tab completes); asks y/N, then disconnects it"),
+     concat!("bot del ", ex_uuid!())),
+    ("bot", Some("kick"), Some("uuid\ta connected bot's uuid (Tab completes); asks y/N; it reconnects"),
+     concat!("bot kick ", ex_uuid!())),
+    ("bot", Some("rekey"), Some("uuid\tthe bot's uuid; prints how to rekey it on its host"),
+     concat!("bot rekey ", ex_uuid!())),
+    ("peer", Some("list"), None, "peer list"),
+    ("peer", Some("show"), Some("#|uuid|name\tthe number peer list shows, the hub's uuid, or its name"),
+     "peer show 1\npeer show east"),
+    ("peer", Some("add"),
+     Some("ip\tthe peer hub's address (no ':', so an IPv4 address or a host name)\n\
+           port\tits listening port, 1-65535\n\
+           uuid\tits uuid, from hub show on that hub\n\
+           name|-\ta name for it, or - to learn its name from the peer\n\
+           key\tthe 88-character public key from hub show on that hub"),
+     concat!("peer add 203.0.113.7 6697 ", ex_uuid!(), " east ", ex_key!(), "\n",
+             "peer add 203.0.113.7 6697 ", ex_uuid!(), " - ", ex_key!())),
+    ("peer", Some("del"), Some("#\tthe number peer list shows; alone it lists the peers to pick from; \
+                                 you type the number again to confirm"),
+     "peer del\npeer del 2"),
+    ("peer", Some("set"),
+     Some("#|uuid|name\tthe peer: its number in peer list, its uuid, or its name\n\
+           key\tthe setting; key is the only one\n\
+           key\tthe new 88-character public key from hub show on that hub"),
+     concat!("peer set east key ", ex_key!())),
+    ("peer", Some("sync"), None, "peer sync"),
+    ("network", Some("tree"), None, "network tree"),
+    ("network", Some("status"), None, "network status"),
+    ("hub", Some("show"), None, "hub show"),
+    ("hub", Some("set"),
+     Some("setting\tname, bindip, port, pubkey or autopurge; alone it shows them all\n\
+           value\tname: this hub's name · bindip: the address it listens on · port: 1-65535 · \
+           pubkey: the key its private key derives (a new key is hub rekey) · \
+           autopurge: days to keep tombstones, 0 = off"),
+     "hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30"),
+    ("hub", Some("stats"), None, "hub stats"),
+    ("hub", Some("rekey"), Some("(confirm)\tyou type this hub's name to go ahead; every peer and bot \
+                                 must then learn the new key"),
+     "hub rekey"),
+    ("hub", Some("purge"), Some("now|days\tnow purges every tombstone; a number purges those older \
+                                 than that many days (asks y/N)"),
+     "hub purge now\nhub purge 30"),
+    ("log", Some("show"), None, "log show"),
+    ("log", Some("set"),
+     Some("file|console|size\twhich: the log file's level, the console ring's level, or the file \
+           size limit\n\
+           value\ta level (none error warning info debug, or 0-4) for file and console; for size \
+           <MB>, <n>k or <n>b, at most 1024 MB"),
+     "log set file info\nlog set console debug\nlog set size 50\nlog set size 512k"),
+    ("log", Some("on"), Some("level\tnone error warning info debug, or 0-4 (default info)"),
+     "log on\nlog on debug"),
+    ("log", Some("off"), None, "log off"),
+    ("log", Some("filter"), Some("text|clear\tthe rest of the line is the text a log view line must \
+                                  contain (any case); clear drops the filter"),
+     "log filter UPGRADE\nlog filter peer east\nlog filter clear"),
+    ("acl", Some("list"), None, "acl list"),
+    ("acl", Some("add"),
+     Some("allow|deny\twhich list\n\
+           ip[/n]\tan IPv4 or IPv6 address, or a network as address/prefix"),
+     "acl add allow 203.0.113.0/24\nacl add deny 198.51.100.9"),
+    ("acl", Some("del"),
+     Some("allow|deny\twhich list\n\
+           ip[/n]\tthe entry exactly as acl list shows it (asks y/N)"),
+     "acl del deny 198.51.100.9"),
+    ("option", Some("list"), None, "option list"),
+    ("option", Some("set"), Some("flags|-\tthe whole new set of flag letters (it replaces the old \
+                                  set; option list explains each); - clears them all (asks y/N)"),
+     "option set h\noption set -"),
+    ("user", Some("list"), Some("admin|oper\tonly that role (default both)"),
+     "user list\nuser list oper"),
+    ("user", Some("show"), Some("name|*\ta user's name, or * for every user"), "user show robert\nuser show *"),
+    ("user", Some("add"),
+     Some("admin|oper\tthe role\n\
+           name\tthe user's name\n\
+           key\ttheir 88-character public key (keygen's <stamp>_<name>.public.b64)\n\
+           mask\ta first usermask, nick!user@host (* and ? match)"),
+     concat!("user add oper alice ", ex_key!(), " alice!*@*.example.net")),
+    ("user", Some("del"), Some("name\tthe user, either role; their masks go too (an admin: type the \
+                                name to confirm; an oper: y/N)"), "user del alice"),
+    ("user", Some("set"),
+     Some("name\tthe user\n\
+           key\tthe setting; key is the only one\n\
+           key\ttheir new 88-character public key (asks y/N)"),
+     concat!("user set alice key ", ex_key!())),
+    ("user", Some("mask"),
+     Some("add|del\tadd a mask, or remove one (del asks y/N)\n\
+           name\tthe user\n\
+           mask\tnick!user@host (* and ? match)"),
+     "user mask add alice alice!*@203.0.113.*\nuser mask del alice alice!*@*.example.net"),
+    ("channel", Some("list"), None, "channel list"),
+    ("channel", Some("show"), Some("#chan\tthe channel's name"), "channel show #ops"),
+    ("channel", Some("add"), Some("#chan\tthe channel's name\nkey\tits channel key, if it has one"),
+     "channel add #ops\nchannel add #ops s3cret"),
+    ("channel", Some("del"), Some("#chan\tthe channel; every bot parts it (asks y/N)"), "channel del #ops"),
+    ("channel", Some("set"),
+     Some("#chan\tthe channel\n\
+           setting\tthe setting's name; key today\n\
+           value|-\tthe new value (at most 128 bytes), or - to clear it"),
+     "channel set #ops key s3cret\nchannel set #ops key -"),
+    ("channel", Some("op"), Some("#chan\tthe channel\nnick\tthe user's current nick on IRC"),
+     "channel op #ops alice"),
+    ("upgrade", Some("status"), None, "upgrade status"),
+    ("upgrade", Some("releases"),
+     Some("bot=<base>\ta different release site for the bot builds (a URL)\n\
+           hub=<base>\ta different release site for the hub builds (a URL)"),
+     "upgrade releases\nupgrade releases bot=https://example.net/ircbot"),
+    ("upgrade", Some("start"),
+     Some("botver\tthe bot version to move to, as upgrade releases lists it\n\
+           hub=<ver>\talso move the hubs to this version (- = leave them)\n\
+           nodes=<sel>\tonly these nodes: names or uuids, comma-separated; name=c or name=rs \
+           also switches that node's build (default: the whole network)\n\
+           botbase=<url>\ta different release site for the bot builds\n\
+           hubbase=<url>\ta different release site for the hub builds\n\
+           (confirm)\tit shows the plan, then you type the bot version to start"),
+     "upgrade start 2.4.6\nupgrade start 2.4.6 hub=2.4.4\nupgrade start 2.4.6 nodes=alpha,beta=rs"),
+    ("upgrade", Some("abort"), None, "upgrade abort"),
+    ("upgrade", Some("forget"), None, "upgrade forget"),
+    ("display", Some("show"), None, "display show"),
+    ("display", Some("view"), Some("1-5\t1 console, 2 log, 3 network, 4 upgrades, 5 stats (Alt+1..5)"),
+     "display view 2"),
+    ("display", Some("pane"), None, "display pane"),
+    ("display", Some("ascii"), None, "display ascii"),
+    ("display", Some("format"), Some("pretty|raw\tpretty lays replies out; raw shows the records as the \
+                                       hub sent them"),
+     "display format raw\ndisplay format pretty"),
+    ("display", Some("width"), Some("60-250|auto\tthe columns to lay output out for; auto follows the \
+                                      terminal"),
+     "display width 100\ndisplay width auto"),
+    ("display", Some("events"), Some("on|off\ta line for each peer, bot and upgrade change"),
+     "display events on"),
+    ("display", Some("clear"), None, "display clear"),
 ];
 
 const LEVEL_WORD: [&str; 5] = ["none", "error", "warning", "info", "debug"];
@@ -734,136 +1010,82 @@ const LEVEL_WORD: [&str; 5] = ["none", "error", "warning", "info", "debug"];
 /// What Tab offers for one argument of a command (docs/console.md §2).
 #[derive(Clone, Copy, PartialEq)]
 enum Ck {
-    Cmd,
+    Group,
     Words(&'static str),
     Bot,
     BotOn,
-    Hub,
+    BotNick,
+    HubName,
 }
 
-struct ArgComp {
-    cmd: &'static str,
-    sub: Option<&'static str>,
-    /// argument index after cmd [sub]; None = any
-    pos: Option<usize>,
-    kind: Ck,
-}
+/// (cmd, sub, argument index after cmd [sub] or None = any, kind)
+type ArgComp = (&'static str, Option<&'static str>, Option<usize>, Ck);
 
 const LEVEL_WORDS: &str = "none error warning info debug";
 const ARG_COMP: &[ArgComp] = &[
-    ArgComp {
-        cmd: "help",
-        sub: None,
-        pos: Some(0),
-        kind: Ck::Cmd,
-    },
-    ArgComp {
-        cmd: "bot",
-        sub: Some("del"),
-        pos: Some(0),
-        kind: Ck::Bot,
-    },
-    ArgComp {
-        cmd: "bot",
-        sub: Some("kick"),
-        pos: Some(0),
-        kind: Ck::BotOn,
-    },
-    ArgComp {
-        cmd: "bot",
-        sub: Some("rekey"),
-        pos: Some(0),
-        kind: Ck::Bot,
-    },
-    ArgComp {
-        cmd: "peer",
-        sub: Some("setkey"),
-        pos: Some(0),
-        kind: Ck::Hub,
-    },
-    ArgComp {
-        cmd: "hub",
-        sub: Some("purge"),
-        pos: Some(0),
-        kind: Ck::Words("now"),
-    },
-    ArgComp {
-        cmd: "loglevel",
-        sub: None,
-        pos: Some(0),
-        kind: Ck::Words("file console none error warning info debug"),
-    },
+    ("help", None, Some(0), Ck::Group),
+    ("bot", Some("show"), Some(0), Ck::BotNick),
+    ("bot", Some("del"), Some(0), Ck::Bot),
+    ("bot", Some("kick"), Some(0), Ck::BotOn),
+    ("bot", Some("rekey"), Some(0), Ck::Bot),
+    ("peer", Some("show"), Some(0), Ck::HubName),
+    ("peer", Some("set"), Some(0), Ck::HubName),
+    ("peer", Some("set"), Some(1), Ck::Words("key")),
+    (
+        "hub",
+        Some("set"),
+        Some(0),
+        Ck::Words("name bindip port pubkey autopurge"),
+    ),
+    ("hub", Some("purge"), Some(0), Ck::Words("now")),
+    ("log", Some("set"), Some(0), Ck::Words("file console size")),
     // after file|console
-    ArgComp {
-        cmd: "loglevel",
-        sub: None,
-        pos: Some(1),
-        kind: Ck::Words(LEVEL_WORDS),
-    },
-    ArgComp {
-        cmd: "log",
-        sub: Some("on"),
-        pos: Some(0),
-        kind: Ck::Words(LEVEL_WORDS),
-    },
-    ArgComp {
-        cmd: "view",
-        sub: None,
-        pos: Some(0),
-        kind: Ck::Words("1 2 3 4 5"),
-    },
-    ArgComp {
-        cmd: "filter",
-        sub: None,
-        pos: Some(0),
-        kind: Ck::Words("clear"),
-    },
-    ArgComp {
-        cmd: "upgrade",
-        sub: Some("releases"),
-        pos: None,
-        kind: Ck::Words("bot= hub="),
-    },
-    ArgComp {
-        cmd: "upgrade",
-        sub: Some("start"),
-        pos: None,
-        kind: Ck::Words("hub= nodes= botbase= hubbase="),
-    },
+    ("log", Some("set"), Some(1), Ck::Words(LEVEL_WORDS)),
+    ("log", Some("on"), Some(0), Ck::Words(LEVEL_WORDS)),
+    ("log", Some("filter"), Some(0), Ck::Words("clear")),
+    ("acl", Some("add"), Some(0), Ck::Words("allow deny")),
+    ("acl", Some("del"), Some(0), Ck::Words("allow deny")),
+    ("user", Some("list"), Some(0), Ck::Words("admin oper")),
+    ("user", Some("add"), Some(0), Ck::Words("admin oper")),
+    ("user", Some("set"), Some(1), Ck::Words("key")),
+    ("user", Some("mask"), Some(0), Ck::Words("add del")),
+    ("channel", Some("set"), Some(1), Ck::Words("key")),
+    ("upgrade", Some("releases"), None, Ck::Words("bot= hub=")),
+    (
+        "upgrade",
+        Some("start"),
+        None,
+        Ck::Words("hub= nodes= botbase= hubbase="),
+    ),
+    ("display", Some("view"), Some(0), Ck::Words("1 2 3 4 5")),
+    ("display", Some("format"), Some(0), Ck::Words("pretty raw")),
+    ("display", Some("width"), Some(0), Ck::Words("auto")),
+    ("display", Some("events"), Some(0), Ck::Words("on off")),
 ];
 
 fn cmd_has_subs(cmd: &[u8]) -> bool {
     CMDS.iter().any(|d| d.sub.is_some() && eq_ic(cmd, d.cmd))
 }
 
-/// Local time as "HH:MM:SS" (and its parts).
-fn local_hms() -> (u32, u32, u32) {
-    use chrono::Timelike;
-    let t = chrono::Local::now();
-    (t.hour(), t.minute(), t.second())
+fn now_s() -> i64 {
+    crate::cstr::now()
 }
 
-/// C atoi(): optional blanks, sign, digits; 0 if none.
-fn atoi(s: &[u8]) -> i64 {
-    let mut i = 0;
-    while i < s.len() && (s[i] == b' ' || (9..=13).contains(&s[i])) {
-        i += 1;
+/// "HH:MM:SSZ" (or "HH:MMZ") now, UTC (D3).
+fn clock_utc(secs: bool) -> Vec<u8> {
+    let t = now_s();
+    let s = ((t % 86400) + 86400) % 86400;
+    if secs {
+        format!("{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60).into_bytes()
+    } else {
+        format!("{:02}:{:02}Z", s / 3600, s / 60 % 60).into_bytes()
     }
-    let neg = i < s.len() && s[i] == b'-';
-    if i < s.len() && (s[i] == b'-' || s[i] == b'+') {
-        i += 1;
-    }
-    let mut v: i64 = 0;
-    while i < s.len() && s[i].is_ascii_digit() {
-        v = v.saturating_mul(10).saturating_add(i64::from(s[i] - b'0'));
-        i += 1;
-    }
-    if neg { -v } else { v }
 }
 
-/// sscanf(v, "%d/%d", &a, &b): each stays 0 when it does not parse.
-fn scan_pair(v: &[u8]) -> (i32, i32) {
-    let digits = |s: &[u8]| -> Option<(i64, usize)> {
+/// sscanf(v, "%d/%d", &a, &b): only what parses is assigned (a field that
+/// does not parse keeps its earlier value, as sscanf leaves it alone).
+fn scan_pair(v: &[u8], a: &mut i32, b: &mut i32) {
+    let digits = |s: &[u8]| -> Option<(i32, usize)> {
         let mut i = 0;
         while i < s.len() && (s[i] == b' ' || (9..=13).contains(&s[i])) {
             i += 1;
@@ -879,29 +1101,51 @@ fn scan_pair(v: &[u8]) -> (i32, i32) {
         if i == ds {
             return None;
         }
-        Some((atoi(&s[st..i]), i))
+        Some((fmt::atoi(&s[st..i]), i))
     };
-    let Some((a, n)) = digits(v) else {
-        return (0, 0);
+    let Some((x, n)) = digits(v) else {
+        return;
     };
+    *a = x;
     if v.get(n) != Some(&b'/') {
-        return (a as i32, 0);
+        return;
     }
-    match digits(&v[n + 1..]) {
-        Some((b, _)) => (a as i32, b as i32),
-        None => (a as i32, 0),
+    if let Some((y, _)) = digits(&v[n + 1..]) {
+        *b = y;
     }
+}
+
+/// The bytes before the first NUL (what a C string of them holds).
+fn cstr(s: &[u8]) -> &[u8] {
+    match s.iter().position(|&b| b == 0) {
+        Some(n) => &s[..n],
+        None => s,
+    }
+}
+
+/// `%-*s` / `%*s`: pad with spaces to n bytes (left or right aligned).
+fn padl(s: &[u8], n: usize) -> Vec<u8> {
+    pad_bytes(s, n)
+}
+fn padr(s: &[u8], n: usize) -> Vec<u8> {
+    let mut v = Vec::new();
+    while v.len() + s.len() < n {
+        v.push(b' ');
+    }
+    v.extend_from_slice(s);
+    v
 }
 
 impl Ui {
     // -----------------------------------------------------------------------
     // Output helpers
     // -----------------------------------------------------------------------
+    /// An audit line: a C char[384] keeps 383 bytes, cut anywhere.
     fn audit(&mut self, level: i32, msg: Vec<u8>) {
         if self.audit_q.len() >= MAX_AUDIT {
             return;
         }
-        self.audit_q.push((level, c_cut(&msg, 384).to_vec()));
+        self.audit_q.push((level, fmt::snp(384, msg)));
     }
 
     /// Next audit line, if any.
@@ -935,7 +1179,12 @@ impl Ui {
 
     /// Line mode: one line of output (already sanitized), ending in CRLF.
     fn lm_line(&mut self, s: &[u8]) {
-        self.term.extend_from_slice(s);
+        if self.ascii {
+            let a = fmt::ascii(s);
+            self.term.extend_from_slice(&a);
+        } else {
+            self.term.extend_from_slice(s);
+        }
         self.term.extend_from_slice(b"\r\n");
     }
 
@@ -947,8 +1196,7 @@ impl Ui {
             b"> "
         };
         self.term.extend_from_slice(p);
-        let input = self.input.clone();
-        self.term.extend_from_slice(&input);
+        self.term.extend_from_slice(&self.input);
     }
 
     /// Line mode: something arrives while the admin is at the prompt.  A CR
@@ -957,7 +1205,7 @@ impl Ui {
     /// a command is in flight it is held until that command's marker.
     fn lm_async(&mut self, text: &[u8]) {
         if self.term.len() + self.backlog + self.held.len() > CONSOLE_TERM_OUTQ_MAX {
-            self.dropped += 1;
+            self.dropped = self.dropped.wrapping_add(1);
             return;
         }
         let hold = self.user_busy || self.confirming != Confirm::None;
@@ -965,6 +1213,13 @@ impl Ui {
         if !hold {
             out.push(b'\r');
         }
+        let a;
+        let text = if self.ascii {
+            a = fmt::ascii(text);
+            a.as_slice()
+        } else {
+            text
+        };
         let mut p = 0;
         while p < text.len() {
             let n = text[p..]
@@ -983,8 +1238,73 @@ impl Ui {
         }
     }
 
+    /// The width output is laid out for (§1.4).
+    fn out_width(&self) -> i32 {
+        if !self.line_mode {
+            return self.main_width();
+        }
+        if self.width_set > 0 {
+            return self.width_set;
+        }
+        if self.width_set < 0 {
+            return self.cols.clamp(CONSOLE_MIN_COLS, fmt::CONSOLE_WIDTH_MAX);
+        }
+        fmt::CONSOLE_LINE_WIDTH
+    }
+
+    fn session_log_phrase(&self, cap: usize) -> Vec<u8> {
+        let v = if self.line_mode {
+            if self.log_on {
+                fmtb(&[
+                    LEVEL_WORD[self.log_sub_level as usize].as_bytes(),
+                    b" and worse (log on)",
+                ])
+            } else {
+                b"off (log on [level] streams it here)".to_vec()
+            }
+        } else {
+            fmtb(&[
+                b"log view (Alt+2): ",
+                LEVEL_WORD[self.log_show as usize].as_bytes(),
+                b" and worse",
+                if self.filter.is_empty() {
+                    b""
+                } else {
+                    b", filter "
+                },
+                &self.filter,
+            ])
+        };
+        c_cut(&v, cap).to_vec()
+    }
+
+    /// The renderer's context.  Full screen keeps its lines in Unicode and
+    /// shows them through fmt::ascii, so display ascii can change every line
+    /// both ways; line mode renders ASCII glyphs directly.
+    fn ctx<'a>(&'a self, mode: i32, slog: &'a [u8]) -> Ctx<'a> {
+        Ctx {
+            width: self.out_width(),
+            ascii: self.ascii && self.line_mode,
+            now: now_s(),
+            admin: &self.admin,
+            ip: &self.ip,
+            hubname: &self.hubname,
+            mode,
+            session_log: slog,
+        }
+    }
+
     /// Full screen: add a line to a view's scrollback.
     fn fs_add(&mut self, view: usize, text: &[u8], kind: u8, level: i32) {
+        // the console view is rebuilt on a glyph change (relayout), so it
+        // holds the shown form; other views are filtered as drawn (rb_text)
+        let a;
+        let text = if self.ascii && view == V_CONSOLE {
+            a = fmt::ascii(text);
+            a.as_slice()
+        } else {
+            text
+        };
         if let Some(sb) = self.sb[view].as_mut() {
             sb.add(text, kind, level);
         }
@@ -994,14 +1314,63 @@ impl Ui {
         self.dirty = true;
     }
 
-    fn fs_timestamped(&mut self, view: usize, text: &[u8], kind: u8) {
-        let (h, m, s) = local_hms();
-        let buf = fmtb(&[format!("{h:02}:{m:02}:{s:02} ").as_bytes(), text]);
-        let buf = c_cut(&buf, CONSOLE_INPUT_MAX + 32).to_vec();
-        self.fs_add(view, &buf, kind, LOG_INFO);
+    fn ent_push(
+        &mut self,
+        text: Option<&[u8]>,
+        kind: u8,
+        reply: Option<&[u8]>,
+        words: Option<&[u8]>,
+        mode: i32,
+    ) {
+        let next = self.ent_next;
+        let Some(ent) = self.ent.as_mut() else {
+            return;
+        };
+        ent[(next % CONSOLE_SCROLLBACK as i64) as usize] = Centry {
+            text: text.map(|t| cstr(t).to_vec()),
+            kind,
+            reply: reply.map(|r| cstr(r).to_vec()),
+            words: words.map_or_else(Vec::new, |w| c_cut(w, 32).to_vec()),
+            mode,
+        };
+        self.ent_next += 1;
+        if self.ent_next - self.ent_first > CONSOLE_SCROLLBACK as i64 {
+            self.ent_first = self.ent_next - CONSOLE_SCROLLBACK as i64;
+        }
     }
 
-    /// A console-side message (help, a refused command) in either mode.
+    /// Full screen: a finished console-view line (kept for a re-layout).
+    fn fs_line(&mut self, text: &[u8], kind: u8) {
+        self.fs_add(V_CONSOLE, text, kind, LOG_INFO);
+        self.ent_push(Some(text), kind, None, None, 0);
+    }
+
+    fn fs_timestamped(&mut self, view: usize, text: &[u8], kind: u8) {
+        let buf = fmtb(&[&clock_utc(true), b" ", text]);
+        let buf = c_cut(&buf, CONSOLE_INPUT_MAX + 32).to_vec();
+        if view == V_CONSOLE {
+            self.fs_line(&buf, kind);
+        } else {
+            self.fs_add(view, &buf, kind, LOG_INFO);
+        }
+    }
+
+    /// Lines into the current output: line mode prints, the full screen
+    /// keeps.
+    fn emit_flines(&mut self, mut f: Flines) {
+        if !self.raw {
+            fmt::wrap(&mut f, self.out_width());
+        }
+        for l in &f {
+            if self.line_mode {
+                self.lm_line(&l.text);
+            } else {
+                self.fs_line(&l.text, l.role);
+            }
+        }
+    }
+
+    /// A console-side note (help, a refused command) in either mode.
     fn note(&mut self, text: &[u8], kind: u8) {
         if self.line_mode {
             self.lm_line(text);
@@ -1010,45 +1379,38 @@ impl Ui {
         }
     }
 
+    /// Render a reply into lines (pretty) for the current width.
+    fn render_reply(&self, text: &[u8], words: &[u8], mode: i32) -> Flines {
+        let rep = fmt::creply_parse(text);
+        let sl = self.session_log_phrase(128);
+        let mut c = self.ctx(mode, &sl);
+        c.ascii = self.ascii; // re-rendered by relayout() on a change
+        let mut f = Flines::new();
+        fmt::reply(&c, &rep, words, &mut f);
+        f
+    }
+
+    /// Show a reply: laid out (pretty) or as records (raw).
+    fn show_reply(&mut self, text: &[u8], words: &[u8], mode: i32, err: bool) {
+        if self.raw {
+            let f = raw_lines(text, if err { RL_ERR } else { RL_NORMAL });
+            self.emit_flines(f);
+        } else if self.line_mode {
+            let f = self.render_reply(text, words, mode);
+            self.emit_flines(f);
+        } else {
+            // kept as records so a resize lays it out again (D5)
+            let f = self.render_reply(text, words, mode);
+            for l in &f {
+                self.fs_add(V_CONSOLE, &l.text, l.role, LOG_INFO);
+            }
+            self.ent_push(None, 0, Some(text), Some(words), mode);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Replies and events from the core
     // -----------------------------------------------------------------------
-    fn emit_reply_line(&mut self, line: &[u8], kind: u8) {
-        if self.line_mode {
-            self.lm_line(line);
-        } else {
-            self.fs_add(V_CONSOLE, line, kind, LOG_INFO);
-        }
-    }
-
-    /// Split a reply into sanitized lines, dropping empty trailing ones, and
-    /// emit each.  Returns the first line as snprintf into [256] kept it.
-    fn each_line(&mut self, text: &[u8], kind: u8) -> Vec<u8> {
-        let mut end = text.len();
-        while end > 0 && matches!(text[end - 1], b'\n' | b'\r' | b' ') {
-            end -= 1;
-        }
-        let mut first: Option<Vec<u8>> = None;
-        let mut i = 0;
-        while i < end {
-            let mut j = i;
-            while j < end && text[j] != b'\n' {
-                j += 1;
-            }
-            let mut n = j - i;
-            if n > 0 && text[i + n - 1] == b'\r' {
-                n -= 1;
-            }
-            let clean = sanitize(&text[i..i + n], n + 2);
-            if first.is_none() {
-                first = Some(c_cut(&clean, 256).to_vec());
-            }
-            self.emit_reply_line(&clean, kind);
-            i = j + 1;
-        }
-        first.unwrap_or_default()
-    }
-
     fn flush_held(&mut self) {
         if !self.held.is_empty() {
             let h = std::mem::take(&mut self.held);
@@ -1074,12 +1436,10 @@ impl Ui {
             }
         }
         if self.line_mode && from_reply && !self.user_busy && !self.closing {
-            if self.confirming != Confirm::None {
-                self.lm_prompt();
-            } else {
+            if self.confirming == Confirm::None {
                 self.flush_held();
-                self.lm_prompt();
             }
+            self.lm_prompt();
         }
     }
 
@@ -1090,13 +1450,89 @@ impl Ui {
         }
     }
 
-    fn marker_err(&mut self, seq: i32, why: &[u8]) {
-        if self.line_mode {
-            let m = fmtb(&[format!("[err #{seq}] ").as_bytes(), why]);
-            self.lm_line(c_cut(&m, CONSOLE_INPUT_MAX + 32));
-        } else {
-            self.fs_timestamped(V_CONSOLE, why, L_ERR);
+    /// The error marker: "<msg>" (pretty) or "<code>: <msg>" (raw, D6).
+    fn marker_err(&mut self, seq: i32, code: &[u8], msg: &[u8]) {
+        if !self.line_mode {
+            return;
         }
+        let head = format!("[err #{seq}] ");
+        let m = if self.raw && !code.is_empty() {
+            let mm: &[u8] = if msg.is_empty() { code } else { msg };
+            fmtb(&[head.as_bytes(), code, b": ", mm])
+        } else {
+            let mm: &[u8] = if msg.is_empty() { code } else { msg };
+            fmtb(&[head.as_bytes(), mm])
+        };
+        self.lm_line(c_cut(&m, CONSOLE_INPUT_MAX + 96));
+    }
+
+    /// A console-side refusal: the ✗ block (pretty), then the marker.
+    fn refuse(&mut self, seq: i32, code: &str, msg: &[u8], hint: Option<&[u8]>) {
+        if !self.raw && code != "cmd.cancelled" {
+            let sl = self.session_log_phrase(128);
+            let mut f = Flines::new();
+            fmt::error(
+                &self.ctx(fmt::FMT_MODE_NORMAL, &sl),
+                Some(msg),
+                hint,
+                &mut f,
+            );
+            self.emit_flines(f);
+        }
+        self.marker_err(seq, code.as_bytes(), msg);
+    }
+
+    /// A hub-side refusal the console found itself (a D2 pre-read that ends
+    /// the command): raw format shows it as the err| record the hub would
+    /// have sent, escaped the same way (docs/console.md §3.1), then the
+    /// marker.  msg and hint are at most 255 bytes, so C's 1024-byte record
+    /// never truncates.
+    fn refuse_hub(&mut self, seq: i32, code: &str, msg: &[u8], hint: Option<&[u8]>) {
+        if !self.raw {
+            self.refuse(seq, code, msg, hint);
+            return;
+        }
+        fn esc_kv(out: &mut Vec<u8>, key: &[u8], val: &[u8]) {
+            out.push(b'|');
+            out.extend_from_slice(key);
+            out.push(b'=');
+            for &b in val.iter().take_while(|&&b| b != 0) {
+                match b {
+                    b'%' => out.extend_from_slice(b"%25"),
+                    b'|' => out.extend_from_slice(b"%7C"),
+                    b'\n' => out.extend_from_slice(b"%0A"),
+                    b'\r' => out.extend_from_slice(b"%0D"),
+                    _ => out.push(b),
+                }
+            }
+        }
+        let mut rec = b"err|".to_vec();
+        rec.extend_from_slice(code.as_bytes());
+        esc_kv(&mut rec, b"msg", msg);
+        if let Some(h) = hint {
+            esc_kv(&mut rec, b"hint", h);
+        }
+        let f = raw_lines(&rec, RL_ERR);
+        self.emit_flines(f);
+        self.marker_err(seq, code.as_bytes(), msg);
+    }
+
+    /// ✓ result of a console-side command (display, log on/off, …).
+    fn local_ok(&mut self, what: &[u8], subject: Option<&[u8]>, effect: Option<&[u8]>) {
+        if self.raw {
+            return;
+        }
+        let sl = self.session_log_phrase(128);
+        let mut f = Flines::new();
+        {
+            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+            fmt::ok(&c, what, subject, &mut f);
+            if let Some(e) = effect {
+                let l = fmtb(&[b"   ", fmt::glyph(&c, fmt::G_BULLET), b" ", e]);
+                fmt::flines_add(&mut f, RL_NORMAL, c_cut(&l, 256));
+            }
+        }
+        self.emit_flines(f);
     }
 
     fn on_reply(&mut self, text: &[u8]) {
@@ -1105,43 +1541,35 @@ impl Ui {
         }
         let rq = self.rq.remove(0);
         if rq.kind == Rq::ViewUpg || rq.kind == Rq::ViewStats {
-            // keep the newlines, clean each line
-            let len = text.len();
-            let mut dst: Vec<u8> = Vec::with_capacity(len + 1);
-            let mut i = 0;
-            while i < len {
-                let mut j = i;
-                while j < len && text[j] != b'\n' {
-                    j += 1;
-                }
-                let cap = len + 1 - dst.len();
-                dst.extend_from_slice(&sanitize(&text[i..j], cap));
-                if j < len && dst.len() + 1 < len + 1 {
-                    dst.push(b'\n');
-                }
-                i = j + 1;
-            }
+            // read back as a C string
+            let t = Some(cstr(text).to_vec());
             if rq.kind == Rq::ViewUpg {
-                self.upg_text = Some(dst);
+                self.upg_text = t;
             } else {
-                self.stats_text = Some(dst);
+                self.stats_text = t;
             }
             self.dirty = true;
             return;
         }
-        let err = !text.is_empty()
-            && (text.len() >= 3 && text[..3].eq_ignore_ascii_case(b"ERR")
-                || text == b"Buffer overflow");
-        let first = self.each_line(text, if err { L_ERR } else { L_NORMAL });
+        if rq.kind == Rq::Pre {
+            self.pre_reply(&rq, text);
+            return;
+        }
+        let rep = fmt::creply_parse(text);
+        let err = rep.err;
+        let code = c_cut(&rep.code, 64).to_vec();
+        let msg = match rep.res.rv("msg") {
+            Some(m) if err => c_cut(m, 320).to_vec(),
+            _ => Vec::new(),
+        };
+        drop(rep);
+        self.show_reply(text, &rq.words, rq.mode, err);
         if err {
-            if self.line_mode {
-                let m = fmtb(&[format!("[err #{}] ", rq.seq).as_bytes(), &first]);
-                self.lm_line(c_cut(&m, 320));
-            }
+            self.marker_err(rq.seq, &code, &msg);
         } else {
             self.marker_ok(rq.seq, &rq.words);
         }
-        let msg = fmtb(&[
+        let m = fmtb(&[
             b"[CONSOLE] ",
             &self.admin,
             b"@",
@@ -1150,13 +1578,11 @@ impl Ui {
             &rq.audit,
             b" -> ",
             if err { b"err: " } else { b"ok" },
-            if err {
-                &first[..first.len().min(120)]
-            } else {
-                b""
-            },
+            if err { &code } else { b"" },
+            if err { b": " } else { b"" },
+            if err { &msg[..uprec(&msg, 120)] } else { b"" },
         ]);
-        self.audit(rq.audit_level, msg);
+        self.audit(rq.audit_level, m);
         self.command_done(true);
     }
 
@@ -1175,14 +1601,14 @@ impl Ui {
             let (k, v) = (&f[..eq], &f[eq + 1..]);
             match k {
                 b"name" => st.name = sanitize(v, 64),
-                b"peers" => (st.peers_up, st.peers_total) = scan_pair(v),
-                b"bots" => (st.bots_on, st.bots_total) = scan_pair(v),
+                b"peers" => scan_pair(v, &mut st.peers_up, &mut st.peers_total),
+                b"bots" => scan_pair(v, &mut st.bots_on, &mut st.bots_total),
                 b"upg" => st.upg = sanitize(v, 24),
-                b"frozen" => st.frozen = atoi(v) != 0,
-                b"rollup" => st.rollup = atoi(v) != 0,
-                b"split" => st.split = atoi(v) != 0,
-                b"loglevel" => st.loglevel = atoi(v) as i32,
-                b"consolelevel" => st.consolelevel = atoi(v) as i32,
+                b"frozen" => st.frozen = fmt::atoi(v) != 0,
+                b"rollup" => st.rollup = fmt::atoi(v) != 0,
+                b"split" => st.split = fmt::atoi(v) != 0,
+                b"loglevel" => st.loglevel = fmt::atoi(v),
+                b"consolelevel" => st.consolelevel = fmt::atoi(v),
                 _ => {}
             }
         }
@@ -1199,10 +1625,7 @@ impl Ui {
         }
         self.rq.push(PendingRq {
             kind,
-            seq: 0,
-            words: Vec::new(),
-            audit: Vec::new(),
-            audit_level: 0,
+            ..PendingRq::default()
         });
         if kind == Rq::ViewUpg {
             self.core_frame(CMD_ADMIN_UPGRADE_STATUS, b"");
@@ -1213,27 +1636,166 @@ impl Ui {
         }
     }
 
+    /// Human event lines (§3, D14): pretty only; line mode with display
+    /// events on, the full-screen console view always.
+    fn human_events(&self) -> bool {
+        !self.raw && (!self.line_mode || self.events_on)
+    }
+
+    fn human_event(&mut self, text: &[u8], kind: u8) {
+        if self.line_mode {
+            self.lm_async(text);
+        } else {
+            self.fs_timestamped(V_CONSOLE, text, kind);
+        }
+    }
+
+    /// What changed between two trees, as a line each (D14).
+    fn tree_events(&mut self, old: &[u8], cur: &[u8]) {
+        let a = parse_tree(old);
+        let b = parse_tree(cur);
+        let sl = self.session_log_phrase(128);
+        let (g_on, g_warn, g_off) = {
+            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+            (
+                fmt::glyph(&c, fmt::G_ON),
+                fmt::glyph(&c, fmt::G_WARN),
+                fmt::glyph(&c, fmt::G_OFF),
+            )
+        };
+        // peers up/down
+        for bj in &b {
+            if bj.typ != b'H' || bj.depth < 1 {
+                continue;
+            }
+            if let Some(ai) = a
+                .iter()
+                .find(|ai| ai.typ == b'H' && ai.uuid == bj.uuid && ai.name == bj.name)
+                && ai.online != bj.online
+            {
+                let l = fmtb(&[
+                    if bj.online { g_on } else { g_warn },
+                    b" peer ",
+                    &bj.name,
+                    if bj.online { b" is up" } else { b" went down" },
+                ]);
+                self.human_event(c_cut(&l, 256), if bj.online { RL_DIM } else { RL_WARN });
+            }
+        }
+        // bots in / out / moved: the hub is the nearest H row above
+        let hubs = |rows: &[TRow]| -> Vec<Vec<u8>> {
+            let mut h: Vec<u8> = Vec::new();
+            rows.iter()
+                .map(|r| {
+                    if r.typ == b'H' {
+                        h = r.name.clone();
+                    }
+                    h.clone()
+                })
+                .collect()
+        };
+        let hub_a = hubs(&a);
+        let hub_b = hubs(&b);
+        for (j, bj) in b.iter().enumerate() {
+            if bj.typ != b'B' {
+                continue;
+            }
+            match a.iter().position(|ai| ai.typ == b'B' && ai.uuid == bj.uuid) {
+                None => {
+                    let l = fmtb(&[g_on, b" bot ", &bj.name, b" connected to ", &hub_b[j]]);
+                    self.human_event(c_cut(&l, 256), RL_DIM);
+                }
+                Some(i) if hub_a[i] != hub_b[j] => {
+                    let l = fmtb(&[
+                        g_on,
+                        b" bot ",
+                        &bj.name,
+                        b" moved from ",
+                        &hub_a[i],
+                        b" to ",
+                        &hub_b[j],
+                    ]);
+                    self.human_event(c_cut(&l, 256), RL_DIM);
+                }
+                _ => {}
+            }
+        }
+        for (i, ai) in a.iter().enumerate() {
+            if ai.typ != b'B' {
+                continue;
+            }
+            if !b.iter().any(|bj| bj.typ == b'B' && bj.uuid == ai.uuid) {
+                let l = fmtb(&[g_off, b" bot ", &ai.name, b" disconnected from ", &hub_a[i]]);
+                self.human_event(c_cut(&l, 256), RL_DIM);
+            }
+        }
+    }
+
+    /// After login: what the mesh looks like, once (§2.1).
+    fn greet_status(&mut self) {
+        if self.greeted {
+            return;
+        }
+        self.greeted = true;
+        if self.raw || self.seq > 0 {
+            return;
+        }
+        let sl = self.session_log_phrase(128);
+        let dot = fmt::glyph(&self.ctx(fmt::FMT_MODE_NORMAL, &sl), fmt::G_DOT);
+        let lw = |l: i32| -> &'static str {
+            if (0..=4).contains(&l) {
+                LEVEL_WORD[l as usize]
+            } else {
+                "?"
+            }
+        };
+        let l1 = fmtb(&[
+            format!(" peers {}/{} up ", self.st.peers_up, self.st.peers_total).as_bytes(),
+            dot,
+            format!(" bots {}/{} online ", self.st.bots_on, self.st.bots_total).as_bytes(),
+            dot,
+            format!(
+                " log file {}, console {}",
+                lw(self.st.loglevel),
+                lw(self.st.consolelevel)
+            )
+            .as_bytes(),
+        ]);
+        let l1 = c_cut(&l1, 256).to_vec();
+        let l2 = b" type help for commands";
+        if self.line_mode {
+            self.lm_async(&l1);
+            self.lm_async(l2);
+        } else {
+            self.fs_line(&l1, RL_DIM);
+            self.fs_line(l2, RL_DIM);
+        }
+    }
+
     fn on_event(&mut self, payload: &[u8], now_ms: i64) {
         let Some(bar) = payload.iter().position(|&b| b == b'|') else {
             return;
         };
-        if bar >= 16 {
+        // a NUL inside the topic would end it early for strcmp below
+        if bar >= 16 || payload[..bar].contains(&0) {
             return;
         }
         let topic = &payload[..bar];
         let data = &payload[bar + 1..];
+        let dl = data.len();
         match topic {
             b"status" => {
-                let clean = sanitize(data, data.len() + 1);
+                let clean = sanitize(data, dl + 1);
                 self.parse_status(&clean);
                 if self.line_mode {
                     let line = fmtb(&[b"[evt status] ", &clean]);
-                    self.lm_async(&line);
+                    self.lm_async(c_cut(&line, dl + 32));
                 }
+                self.greet_status();
                 self.dirty = true;
             }
             b"tree" => {
-                let dl = data.len();
+                // sanitize each row, keep the newlines
                 let mut tree = Vec::with_capacity(dl + 1);
                 let mut rows = 0;
                 let mut i = 0;
@@ -1243,31 +1805,35 @@ impl Ui {
                         j += 1;
                     }
                     if j > i {
-                        let cap = dl + 1 - tree.len();
+                        let cap = dl + 2 - tree.len();
                         tree.extend_from_slice(&sanitize(&data[i..j], cap));
                         tree.push(b'\n');
                         rows += 1;
                     }
                     i = j + 1;
                 }
-                self.tree = tree;
                 if self.line_mode {
                     let mut blk = format!("[evt tree] begin {rows}\n").into_bytes();
                     let mut p = 0;
-                    let t = self.tree.clone();
-                    while p < t.len() {
-                        let n = t[p..]
+                    while p < tree.len() {
+                        let n = tree[p..]
                             .iter()
                             .position(|&b| b == b'\n')
-                            .unwrap_or(t.len() - p);
+                            .unwrap_or(tree.len() - p);
                         blk.extend_from_slice(b"[evt tree] ");
-                        blk.extend_from_slice(&t[p..p + n]);
+                        blk.extend_from_slice(&tree[p..p + n]);
                         blk.push(b'\n');
                         p += n + 1;
                     }
                     blk.extend_from_slice(b"[evt tree] end");
                     self.lm_async(&blk);
                 }
+                if self.human_events()
+                    && let Some(old) = self.tree.clone()
+                {
+                    self.tree_events(&old, &tree);
+                }
+                self.tree = Some(tree);
                 self.dirty = true;
             }
             b"upg" => {
@@ -1278,6 +1844,39 @@ impl Ui {
                 } else if self.view == V_UPG {
                     self.request_view(Rq::ViewUpg, now_ms);
                 }
+                if self.human_events() && clean != self.last_upg {
+                    // <id>|<phase>|<done>/<total>|<failed>
+                    let mut f: [Vec<u8>; 4] = Default::default();
+                    let mut k = 0;
+                    let mut p = 0;
+                    while k < 4 {
+                        let q = clean[p..].iter().position(|&b| b == b'|').map(|x| p + x);
+                        let n = q.unwrap_or(clean.len()) - p;
+                        f[k] = clean[p..p + n.min(63)].to_vec();
+                        k += 1;
+                        match q {
+                            Some(q) => p = q + 1,
+                            None => break,
+                        }
+                    }
+                    let failed = fmt::atoi(&f[3]) > 0;
+                    let line = fmtb(&[
+                        b"upgrade ",
+                        &f[0],
+                        b": ",
+                        &f[2],
+                        b" done (",
+                        &f[1],
+                        b")",
+                        if failed { b", " } else { b"" },
+                        if failed { &f[3] } else { b"" },
+                        if failed { b" failed" } else { b"" },
+                    ]);
+                    if !clean.is_empty() {
+                        self.human_event(c_cut(&line, 300), if failed { RL_WARN } else { RL_DIM });
+                    }
+                }
+                self.last_upg = c_cut(&clean, 256).to_vec();
             }
             b"log" => {
                 let Some(b2) = data.iter().position(|&b| b == b'|') else {
@@ -1286,7 +1885,7 @@ impl Ui {
                 if b2 >= 16 {
                     return;
                 }
-                let lvl = &data[..b2];
+                let lvl = cstr(&data[..b2]);
                 let clean = sanitize(&data[b2 + 1..], CONSOLE_LOG_LINE_MAX + 8);
                 let mut level = LOG_INFO;
                 for (i, w) in LEVEL_WORD.iter().enumerate().skip(1) {
@@ -1298,24 +1897,34 @@ impl Ui {
                     if !self.log_on {
                         return;
                     }
-                    let line = fmtb(&[
-                        format!("[log {}] ", LEVEL_WORD[level as usize]).as_bytes(),
-                        &clean,
-                    ]);
-                    self.lm_async(&line);
+                    let line = if self.raw {
+                        fmtb(&[
+                            format!("[log {}] ", LEVEL_WORD[level as usize]).as_bytes(),
+                            &clean,
+                        ])
+                    } else {
+                        fmtb(&[
+                            format!("[log {} ", LEVEL_WORD[level as usize]).as_bytes(),
+                            &clock_utc(true),
+                            b"] ",
+                            &clean,
+                        ])
+                    };
+                    self.lm_async(c_cut(&line, CONSOLE_LOG_LINE_MAX + 48));
                 } else {
                     let kind = match level {
-                        LOG_ERROR => L_ERR,
-                        LOG_WARNING => L_WARN,
-                        LOG_DEBUG => L_DIM,
-                        _ => L_NORMAL,
+                        LOG_ERROR => RL_ERR,
+                        LOG_WARNING => RL_WARN,
+                        LOG_DEBUG => RL_DIM,
+                        _ => RL_NORMAL,
                     };
                     self.fs_add(V_LOG, &clean, kind, level);
                 }
             }
             b"drop" => {
-                let n = atoi(data).max(0) as u64;
-                self.dropped += n;
+                // the payload is not NUL-terminated: parse a bounded copy
+                let n = fmt::strtoull(&data[..dl.min(23)], 10);
+                self.dropped = self.dropped.wrapping_add(n);
             }
             _ => {}
         }
@@ -1323,12 +1932,37 @@ impl Ui {
 
     /// A frame from the core.
     pub fn core_frame_in(&mut self, op: u8, payload: &[u8], now_ms: i64) {
+        self.now_ms = now_ms;
         if op == CONSOLE_REPLY {
             self.on_reply(payload);
         } else if op == CMD_CONSOLE {
             self.on_event(payload, now_ms);
         }
     }
+}
+
+/// Raw format: the records as the hub sent them, sanitized, one per line.
+fn raw_lines(text: &[u8], role: u8) -> Flines {
+    let mut out = Flines::new();
+    let mut end = text.len();
+    while end > 0 && matches!(text[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    let mut i = 0;
+    while i < end {
+        let mut j = i;
+        while j < end && text[j] != b'\n' {
+            j += 1;
+        }
+        let mut n = j - i;
+        if n > 0 && text[i + n - 1] == b'\r' {
+            n -= 1;
+        }
+        let clean = sanitize(&text[i..i + n], n + 2);
+        fmt::flines_add(&mut out, role, &clean);
+        i = j + 1;
+    }
+    out
 }
 
 // ===========================================================================
@@ -1338,7 +1972,7 @@ const MAX_WORDS: usize = 16;
 
 struct Words {
     buf: Vec<u8>,
-    /// (start, end) of each word in `buf`.
+    /// (start, end) of each word in `buf` (= where it starts in the line)
     w: Vec<(usize, usize)>,
 }
 
@@ -1377,7 +2011,11 @@ impl Words {
 }
 
 fn find_cmd(ws: &Words) -> Option<(&'static CmdDef, usize)> {
-    let c = ws.get(0);
+    let c: &[u8] = if ws.get(0) == b"?" {
+        b"help"
+    } else {
+        ws.get(0)
+    }; // ? = help
     for d in CMDS {
         if !eq_ic(c, d.cmd) {
             continue;
@@ -1396,6 +2034,114 @@ fn find_cmd(ws: &Words) -> Option<(&'static CmdDef, usize)> {
 
 fn cmd_known_word(w: &[u8]) -> bool {
     CMDS.iter().any(|d| eq_ic(w, d.cmd))
+}
+
+fn cmd_words(d: &CmdDef) -> Vec<u8> {
+    match d.sub {
+        Some(sub) => format!("{} {}", d.cmd, sub).into_bytes(),
+        None => d.cmd.as_bytes().to_vec(),
+    }
+}
+
+/// help <group> <command>: usage, what it does, each argument, examples.
+fn help_command(c: &Ctx, f: &mut Flines, d: &CmdDef) {
+    let words = c_cut(&cmd_words(d), 32).to_vec();
+    let (mut args, mut ex) = (None, None);
+    for h in CMD_HELP {
+        if h.0 == d.cmd && h.1 == d.sub {
+            args = h.2;
+            ex = Some(h.3);
+        }
+    }
+    let conf = match d.confirm {
+        Confirm::Yn => Some("asks y/N"),
+        Confirm::Type => Some("type to confirm"),
+        _ => None,
+    };
+    let right = if d.sub.is_some() {
+        format!(
+            "{}{}help {} for the group",
+            conf.unwrap_or(""),
+            if conf.is_some() { " · " } else { "" },
+            d.cmd
+        )
+    } else {
+        conf.unwrap_or("").to_string()
+    };
+    let right = c_cut(right.as_bytes(), 64).to_vec();
+    fmt::title(
+        c,
+        f,
+        &words,
+        (!right.is_empty()).then_some(right.as_slice()),
+    );
+    fmt::flines_add(
+        f,
+        RL_NORMAL,
+        c_cut(&fmtb(&[b"   ", d.usage.as_bytes()]), 1024),
+    );
+    fmt::flines_add(f, RL_DIM, c_cut(&fmtb(&[b"   ", d.help.as_bytes()]), 1024));
+    // "name<TAB>text" lines as a two-column list; a long name puts its text
+    // on the next line
+    if let Some(args) = args {
+        let a = args.as_bytes();
+        fmt::flines_add(f, RL_NORMAL, b"");
+        fmt::flines_add(f, RL_HEAD, b" Arguments");
+        let find = |from: usize, ch: u8| a[from..].iter().position(|&b| b == ch).map(|x| from + x);
+        let mut nw = 0usize;
+        let mut p = 0;
+        while p < a.len() {
+            let tab = find(p, b'\t');
+            let nl = find(p, b'\n').unwrap_or(a.len());
+            let w = match tab {
+                Some(t) if t < nl => t - p,
+                _ => 0,
+            };
+            if w > nw && w <= 16 {
+                nw = w;
+            }
+            p = if nl < a.len() { nl + 1 } else { nl };
+        }
+        p = 0;
+        while p < a.len() {
+            let nl = find(p, b'\n').unwrap_or(a.len());
+            let tab = match find(p, b'\t') {
+                Some(t) if t <= nl => t,
+                _ => p,
+            };
+            let w = tab - p;
+            let t = if tab == p { p } else { tab + 1 };
+            let text = &a[t..nl];
+            if w <= nw {
+                let l = fmtb(&[b"   ", &a[p..tab], &vec![b' '; nw - w], b"  ", text]);
+                fmt::flines_add(f, RL_NORMAL, c_cut(&l, 1024));
+            } else {
+                let l = fmtb(&[b"   ", &a[p..tab]]);
+                fmt::flines_add(f, RL_NORMAL, c_cut(&l, 1024));
+                let l = fmtb(&[b"   ", &vec![b' '; nw], b"  ", text]);
+                fmt::flines_add(f, RL_NORMAL, c_cut(&l, 1024));
+            }
+            p = if nl < a.len() { nl + 1 } else { nl };
+        }
+    } else {
+        fmt::flines_add(f, RL_DIM, b"   (no arguments)");
+    }
+    if let Some(ex) = ex {
+        fmt::flines_add(f, RL_NORMAL, b"");
+        fmt::flines_add(
+            f,
+            RL_HEAD,
+            if ex.contains('\n') {
+                b" Examples"
+            } else {
+                b" Example"
+            },
+        );
+        for l in ex.split('\n') {
+            // never wrapped: it copies as typed
+            fmt::flines_add(f, RL_CMD, c_cut(&fmtb(&[b"   ", l.as_bytes()]), 1024));
+        }
+    }
 }
 
 fn level_arg(a: &[u8]) -> i32 {
@@ -1424,49 +2170,99 @@ fn kv_opt<'a>(arg: &'a [u8], key: &str) -> Option<&'a [u8]> {
         .then(|| &arg[kl + 1..])
 }
 
-/// Build the request payload; Err(why) when the arguments are bad.
-fn build_payload(c: &CmdDef, ws: &Words, argi: usize) -> Result<Vec<u8>, &'static str> {
+/// What build_payload settled on.
+struct Built {
+    payload: Vec<u8>,
+    op: u8,
+    confirm: Confirm,
+    mode: i32,
+}
+
+/// Build the request (op and payload); Err((why, hint)) when the arguments
+/// are bad.  The op starts as the table's opcode and the confirmation as
+/// its; a command whose arguments pick the opcode sets both.
+fn build_payload(
+    c: &CmdDef,
+    ws: &Words,
+    argi: usize,
+) -> Result<Built, (Vec<u8>, Option<&'static str>)> {
     const CAP: usize = 1024;
     let na = ws.n() - argi;
     let a = |i: usize| ws.get(argi + i);
-    let too_long = "arguments too long";
-    let out: Vec<u8> = match c.build {
-        B::None | B::Local => return Ok(Vec::new()),
-        B::Fixed => return Ok(c.fixed.as_bytes().to_vec()),
-        B::Arg => a(0).to_vec(),
-        B::OptArg => {
-            if na > 0 {
-                a(0).to_vec()
-            } else {
-                Vec::new()
-            }
+    let hint = Some(c.usage);
+    let mut b = Built {
+        payload: Vec::new(),
+        op: c.op,
+        confirm: c.confirm,
+        mode: fmt::FMT_MODE_NORMAL,
+    };
+    let bad = |why: &str, hint: Option<&'static str>| Err((why.as_bytes().to_vec(), hint));
+    let too_long = || Err((b"arguments too long".to_vec(), Some(c.usage)));
+    let w: Vec<u8> = match c.build {
+        B::None | B::Local => return Ok(b),
+        B::Fixed => {
+            b.payload = c.fixed.as_bytes().to_vec();
+            return Ok(b);
         }
-        B::Pipe | B::Colon => {
-            let sep = if c.build == B::Pipe { b'|' } else { b':' };
+        B::Arg => a(0).to_vec(),
+        B::Pipe => {
             let mut o = Vec::new();
             for i in 0..na {
-                if c.build == B::Colon && a(i).contains(&b':') {
-                    return Err("':' is not allowed in an argument here");
-                }
                 let add = a(i).len() + usize::from(i > 0);
                 if o.len() + add >= CAP {
-                    return Err(too_long);
+                    return too_long();
                 }
                 if i > 0 {
-                    o.push(sep);
+                    o.push(b'|');
                 }
                 o.extend_from_slice(a(i));
             }
-            return Ok(o);
+            b.payload = o;
+            return Ok(b);
         }
         B::PeerAdd => {
             if (0..5).any(|i| a(i).contains(&b':')) {
-                return Err("':' is not allowed in an argument here");
+                return bad("':' is not allowed in an argument here", hint);
             }
             let name: &[u8] = if a(3) == b"-" { b"" } else { a(3) };
             fmtb(&[a(0), b":", a(1), b":", a(2), b":", name, b":", a(4)])
         }
+        B::PeerDel => {
+            if na > 0 && !all_digits(a(0)) {
+                return bad(
+                    "a peer is removed by its number in peer list",
+                    Some("peer del [#]"),
+                );
+            }
+            if na > 0 { a(0).to_vec() } else { Vec::new() }
+        }
+        B::PeerSet => {
+            if !eq_ic(a(1), "key") {
+                return bad("unknown peer setting", Some("settings: key"));
+            }
+            if a(0).contains(&b':') || a(2).contains(&b':') {
+                return bad("':' is not allowed in an argument here", hint);
+            }
+            fmtb(&[a(0), b":", a(2)])
+        }
         B::ChanAdd => fmtb(&[a(0), b"|", if na > 1 { a(1) } else { b"" }]),
+        B::ChanSet => {
+            if a(1)
+                .iter()
+                .any(|&ch| !ch.is_ascii_lowercase() && ch != b'_')
+            {
+                return bad(
+                    "a setting name is lowercase letters and _",
+                    Some("settings: key"),
+                );
+            }
+            if a(2).len() > 128 {
+                return bad("a setting value is at most 128 bytes", hint);
+            }
+            let v: &[u8] = if a(2) == b"-" { b"" } else { a(2) };
+            fmtb(&[b"set|", a(0), b"|", a(1), b"|", v])
+        }
+        B::ChanOp => fmtb(&[a(1), b"|", a(0)]), // the hub takes nick|chan
         B::OptSet => {
             if a(0) == b"-" {
                 Vec::new()
@@ -1474,54 +2270,151 @@ fn build_payload(c: &CmdDef, ws: &Words, argi: usize) -> Result<Vec<u8>, &'stati
                 a(0).to_vec()
             }
         }
-        B::LogLevel => {
-            // <target><level>: target 0 = the log file, 1 = the console log.
-            let target = if na == 2 {
-                if a(0).eq_ignore_ascii_case(b"file") {
-                    0
-                } else if a(0).eq_ignore_ascii_case(b"console") {
-                    1
+        B::LogSet => {
+            if eq_ic(a(0), "size") {
+                // <n> MB, <n>k KiB or <n>b bytes, at most 1024 MB (the hub
+                // clamps it to its own limits)
+                let arg = a(1);
+                let al = arg.len();
+                let mut mult: u64 = 1024 * 1024;
+                let mut num = c_cut(arg, 16).to_vec();
+                if al > 1 && al < 16 && b"kKbB".contains(&arg[al - 1]) {
+                    mult = if arg[al - 1] == b'k' || arg[al - 1] == b'K' {
+                        1024
+                    } else {
+                        1
+                    };
+                    num.truncate(al - 1);
+                }
+                let v = if all_digits(&num) {
+                    fmt::strtoull(&num, 10).wrapping_mul(mult)
                 } else {
-                    return Err("target: file or console");
+                    0
+                };
+                if !(1..=1024 * 1024 * 1024).contains(&v) {
+                    return bad(
+                        "size: <MB>, <n>k or <n>b, at most 1024 MB",
+                        Some("log set size <MB|nk|nb>"),
+                    );
                 }
-            } else {
+                b.payload = (v as u32).to_be_bytes().to_vec();
+                b.op = CMD_ADMIN_SET_LOG_SIZE;
+                b.confirm = Confirm::None;
+                return Ok(b);
+            }
+            // <target><level>: target 0 = the log file, 1 = the console log
+            let target = if eq_ic(a(0), "file") {
                 0
+            } else if eq_ic(a(0), "console") {
+                1
+            } else {
+                return bad("say file, console or size", hint);
             };
-            let lvl = level_arg(a(na - 1));
+            let lvl = level_arg(a(1));
             if lvl < 0 {
-                return Err("level: none, error, warning, info, debug or 0-4");
+                return bad("level: none, error, warning, info, debug or 0-4", hint);
             }
-            return Ok(vec![target, lvl as u8]);
-        }
-        B::LogSize => {
-            // <n> MB, <n>k KiB or <n>b bytes, at most 1024 MB (the hub
-            // clamps it to its own limits).
-            let arg = a(0);
-            let (num, mult): (&[u8], u64) = match arg.last() {
-                Some(b'k' | b'K') if arg.len() > 1 && arg.len() < 16 => {
-                    (&arg[..arg.len() - 1], 1024)
-                }
-                Some(b'b' | b'B') if arg.len() > 1 && arg.len() < 16 => (&arg[..arg.len() - 1], 1),
-                _ => (c_cut(arg, 16), 1024 * 1024),
-            };
-            let v = if all_digits(num) {
-                (atoi(num) as u64).saturating_mul(mult)
-            } else {
-                0
-            };
-            if !(1..=1024 * 1024 * 1024).contains(&v) {
-                return Err("size: <MB>, <n>k or <n>b, at most 1024 MB");
-            }
-            return Ok((v as u32).to_be_bytes().to_vec());
+            b.payload = vec![target, lvl as u8];
+            b.op = CMD_ADMIN_SET_LOG_LEVEL;
+            b.confirm = Confirm::Yn;
+            return Ok(b);
         }
         B::Purge => {
             if eq_ic(a(0), "now") {
                 b"immediate".to_vec()
-            } else if all_digits(a(0)) && atoi(a(0)) > 0 {
+            } else if all_digits(a(0)) && fmt::atoll(a(0)) > 0 {
                 a(0).to_vec()
             } else {
-                return Err("purge now, or purge <days>");
+                return bad("purge now, or purge <days>", hint);
             }
+        }
+        B::HubSet => {
+            if na == 0 {
+                // the settings table: hub show's record, laid out as one
+                b.op = CMD_ADMIN_GET_PUBKEY;
+                b.mode = fmt::FMT_MODE_HUB_SETTINGS;
+                return Ok(b);
+            }
+            const HS: [(&str, u8); 5] = [
+                ("name", CMD_ADMIN_SET_HUB_NAME),
+                ("bindip", CMD_ADMIN_SET_BIND_IP),
+                ("port", CMD_ADMIN_SET_BIND_PORT),
+                ("pubkey", CMD_ADMIN_SET_PUBKEY),
+                ("autopurge", CMD_ADMIN_SET_PURGE_DAYS),
+            ];
+            let Some(k) = HS.iter().rposition(|h| eq_ic(a(0), h.0)) else {
+                let m = fmtb(&[b"unknown hub setting \"", &a(0)[..uprec(a(0), 40)], b"\""]);
+                return Err((
+                    c_cut(&m, 96).to_vec(),
+                    Some("name, bindip, port, pubkey, autopurge"),
+                ));
+            };
+            if na < 2 {
+                return bad("say the new value", hint);
+            }
+            b.op = HS[k].1;
+            a(1).to_vec()
+        }
+        B::Acl => {
+            let add = c.sub == Some("add");
+            if eq_ic(a(0), "allow") {
+                b.op = if add {
+                    CMD_ADMIN_ADD_ALLOWLIST
+                } else {
+                    CMD_ADMIN_DEL_ALLOWLIST
+                };
+            } else if eq_ic(a(0), "deny") {
+                b.op = if add {
+                    CMD_ADMIN_ADD_DENYLIST
+                } else {
+                    CMD_ADMIN_DEL_DENYLIST
+                };
+            } else {
+                return bad("say which list", hint);
+            }
+            a(1).to_vec()
+        }
+        B::UserList => {
+            if na == 0 {
+                b.op = CMD_ADMIN_LIST_ADMINS;
+                b"*".to_vec()
+            } else if eq_ic(a(0), "admin") {
+                b.op = CMD_ADMIN_LIST_ADMINS;
+                Vec::new()
+            } else if eq_ic(a(0), "oper") {
+                b.op = CMD_ADMIN_LIST_OPERS_V2;
+                Vec::new()
+            } else {
+                return bad("role is admin or oper", hint);
+            }
+        }
+        B::UserAdd => {
+            if eq_ic(a(0), "admin") {
+                b.op = CMD_ADMIN_ADD_ADMIN;
+            } else if eq_ic(a(0), "oper") {
+                b.op = CMD_ADMIN_ADD_OPER_RECORD;
+            } else {
+                return bad("role is admin or oper", hint);
+            }
+            fmtb(&[a(1), b"|", a(2), b"|", a(3)])
+        }
+        B::UserSet => {
+            if !eq_ic(a(1), "key") {
+                return bad("unknown user setting", Some("settings: key"));
+            }
+            fmtb(&[a(0), b"|", a(2)])
+        }
+        B::UserMask => {
+            if eq_ic(a(0), "add") {
+                b.op = CMD_ADMIN_ADD_USERMASK;
+                b.confirm = Confirm::None;
+            } else if eq_ic(a(0), "del") {
+                b.op = CMD_ADMIN_DEL_USERMASK;
+                b.confirm = Confirm::Yn;
+            } else {
+                return bad("say add or del", hint);
+            }
+            fmtb(&[a(1), b"|", a(2)])
         }
         B::UpgReleases => {
             let (mut bot, mut hub): (&[u8], &[u8]) = (b"", b"");
@@ -1531,7 +2424,7 @@ fn build_payload(c: &CmdDef, ws: &Words, argi: usize) -> Result<Vec<u8>, &'stati
                 } else if let Some(v) = kv_opt(a(i), "hub") {
                     hub = v;
                 } else {
-                    return Err("options: bot=<base> hub=<base>");
+                    return bad("options: bot=<base> hub=<base>", hint);
                 }
             }
             if !bot.is_empty() || !hub.is_empty() {
@@ -1553,7 +2446,10 @@ fn build_payload(c: &CmdDef, ws: &Words, argi: usize) -> Result<Vec<u8>, &'stati
                 } else if let Some(v) = kv_opt(a(i), "hubbase") {
                     hb = v;
                 } else {
-                    return Err("options: hub=<ver> nodes=<list> botbase=<url> hubbase=<url>");
+                    return bad(
+                        "options: hub=<ver> nodes=<list> botbase=<url> hubbase=<url>",
+                        hint,
+                    );
                 }
             }
             // ver|variant|kind|min_from|base|hub_ver|hub_base|sel — variant,
@@ -1562,40 +2458,210 @@ fn build_payload(c: &CmdDef, ws: &Words, argi: usize) -> Result<Vec<u8>, &'stati
             fmtb(&[a(0), b"||||", bb, b"|", hubv, b"|", hbv, b"|", nodes])
         }
     };
-    if out.len() >= CAP {
-        return Err(too_long);
+    if w.len() >= CAP {
+        return too_long();
     }
-    Ok(out)
+    b.payload = w;
+    Ok(b)
+}
+
+fn opt_meaning(f: u8) -> &'static str {
+    match f {
+        b'h' => "hub-only mutation",
+        b'F' => "config frozen",
+        _ => "unknown flag",
+    }
 }
 
 impl Ui {
-    fn show_help(&mut self, topic: Option<&[u8]>) {
-        for d in CMDS {
-            if let Some(t) = topic
-                && !eq_ic(t, d.cmd)
-            {
-                continue;
+    /// help: the groups; help <group>: its commands; help <group> <command>:
+    /// one command in full (§2.2).
+    fn show_help(&mut self, topic: Option<&[u8]>, one: Option<&CmdDef>) {
+        let sl = self.session_log_phrase(128);
+        let mut f = Flines::new();
+        {
+            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+            let dot = fmt::glyph(&c, fmt::G_DOT);
+            if let Some(d) = one {
+                help_command(&c, &mut f, d);
+            } else if let Some(topic) = topic {
+                let mut n = 0;
+                let mut uw = 0;
+                for d in CMDS.iter().filter(|d| eq_ic(topic, d.cmd)) {
+                    n += 1;
+                    uw = uw.max(str_width(d.usage.as_bytes()));
+                }
+                uw = uw.min(34);
+                let right = fmtb(&[
+                    format!("{n} command{} ", if n == 1 { "" } else { "s" }).as_bytes(),
+                    dot,
+                    b" help ",
+                    topic,
+                    b" <command> for one",
+                ]);
+                let right = c_cut(&right, 96).to_vec();
+                fmt::title(&c, &mut f, topic, Some(&right));
+                for d in CMDS.iter().filter(|d| eq_ic(topic, d.cmd)) {
+                    let w = str_width(d.usage.as_bytes());
+                    let pad = |k: i32| vec![b' '; k.max(0) as usize];
+                    if w <= uw && 1 + uw + 2 + str_width(d.help.as_bytes()) <= c.width {
+                        let l = fmtb(&[
+                            b" ",
+                            d.usage.as_bytes(),
+                            &pad(uw - w),
+                            b"  ",
+                            d.help.as_bytes(),
+                        ]);
+                        fmt::flines_add(&mut f, RL_NORMAL, c_cut(&l, 512));
+                    } else {
+                        let l = fmtb(&[b" ", d.usage.as_bytes()]);
+                        fmt::flines_add(&mut f, RL_NORMAL, c_cut(&l, 512));
+                        let l = fmtb(&[b" ", &pad(uw), b"  ", d.help.as_bytes()]);
+                        fmt::flines_add(&mut f, RL_NORMAL, c_cut(&l, 512));
+                    }
+                    if let Some(args) = d.args {
+                        let l = fmtb(&[b" ", &pad(uw), b"  ", args.as_bytes()]);
+                        fmt::flines_add(&mut f, RL_DIM, c_cut(&l, 512));
+                    }
+                }
+            } else {
+                let right = fmtb(&[
+                    format!("{} groups ", GROUPS.len()).as_bytes(),
+                    dot,
+                    b" help <group> for its commands",
+                ]);
+                fmt::title(&c, &mut f, b"Commands", Some(&right));
+                for (name, what) in GROUPS {
+                    // the separator, once per verb
+                    let sep = fmtb(&[b" ", dot, b" "]);
+                    let mut joined: Vec<u8> = Vec::new();
+                    let mut first = true;
+                    for d in CMDS {
+                        let Some(sub) = d.sub else { continue };
+                        if d.cmd != name {
+                            continue;
+                        }
+                        if !first {
+                            joined.extend_from_slice(&sep);
+                        }
+                        joined.extend_from_slice(sub.as_bytes());
+                        first = false;
+                    }
+                    let l = fmtb(&[
+                        b"   ",
+                        &padl(name.as_bytes(), 9),
+                        b" ",
+                        &padl(what.as_bytes(), 22),
+                        b" ",
+                        &joined,
+                    ]);
+                    let l = c_cut(&l, 512).to_vec();
+                    if str_width(&l) <= c.width {
+                        fmt::flines_add(&mut f, RL_NORMAL, &l);
+                    } else {
+                        let l = fmtb(&[b"   ", &padl(name.as_bytes(), 9), b" ", what.as_bytes()]);
+                        fmt::flines_add(&mut f, RL_NORMAL, &l);
+                        let l = fmtb(&[b"             ", &joined]);
+                        fmt::flines_add(&mut f, RL_DIM, c_cut(&l, 512));
+                    }
+                }
+                let l = fmtb(&[
+                    b"   help [group [command]] ",
+                    dot,
+                    b" ? [group [command]] ",
+                    dot,
+                    b" quit",
+                ]);
+                fmt::flines_add(&mut f, RL_NORMAL, &l);
+                if !self.line_mode {
+                    fmt::flines_add(&mut f, RL_NORMAL, b"");
+                    fmt::flines_add(
+                        &mut f,
+                        RL_DIM,
+                        b" Keys  Alt+1..5 views, Alt+Left/Right cycle, F2 log level, F3 tree pane,",
+                    );
+                    fmt::flines_add(
+                        &mut f,
+                        RL_DIM,
+                        b"       PgUp/PgDn/End scroll, Tab completes, Up/Down history, Ctrl-C cancels",
+                    );
+                }
             }
-            let line = format!("{:<44} {}", d.usage, d.help);
-            self.note(c_cut(line.as_bytes(), 256), L_INFO);
         }
-        if topic.is_none() && !self.line_mode {
-            self.note(
-                b"Alt+1..5 views, Alt+Left/Right cycle, F2 log level, F3 tree pane, \
-PgUp/PgDn/End scroll, Tab completes, Ctrl-C cancels",
-                L_INFO,
-            );
-        }
+        self.emit_flines(f);
     }
 
     fn send_request(&mut self, op: u8, payload: &[u8], rq: PendingRq) {
         if self.rq.len() >= MAX_PENDING_RQ {
-            self.marker_err(rq.seq, b"too many requests in flight");
+            self.refuse(rq.seq, "cmd.busy", b"too many requests in flight", None);
             return;
         }
         self.rq.push(rq);
         self.core_frame(op, payload);
         self.user_busy = true;
+    }
+
+    fn display_show(&mut self) {
+        let sl = self.session_log_phrase(128);
+        let mut f = Flines::new();
+        {
+            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+            let right = if self.line_mode {
+                format!("line mode {}", self.out_width())
+            } else {
+                format!("full screen {}×{}", self.cols, self.rows)
+            };
+            fmt::title(&c, &mut f, b"Display", Some(c_cut(right.as_bytes(), 64)));
+            const L: i32 = 9;
+            let card = |f: &mut Flines, label: &str, v: &[u8]| {
+                fmt::card_line(f, L, label.as_bytes(), Some(v), RL_NORMAL)
+            };
+            if !self.line_mode {
+                let v = format!("{} (Alt+{})", VIEW_NAME[self.view], self.view + 1);
+                card(&mut f, "view", v.as_bytes());
+                let shown = if self.cols >= CONSOLE_PANE_MIN_COLS {
+                    !self.pane_user_off
+                } else {
+                    self.overlay
+                };
+                card(
+                    &mut f,
+                    "tree pane",
+                    if shown {
+                        b"shown (F3 hides it)"
+                    } else {
+                        b"hidden (F3 shows it)"
+                    },
+                );
+            }
+            card(
+                &mut f,
+                "glyphs",
+                if self.ascii { b"ascii" } else { b"unicode" },
+            );
+            card(&mut f, "format", if self.raw { b"raw" } else { b"pretty" });
+            if self.line_mode {
+                let v = if self.width_set < 0 {
+                    format!("auto ({})", self.out_width())
+                } else {
+                    format!("{}", self.out_width())
+                };
+                card(&mut f, "width", v.as_bytes());
+                card(
+                    &mut f,
+                    "events",
+                    if self.events_on { b"on" } else { b"off" },
+                );
+                card(&mut f, "colors", b"off (line mode)");
+            } else {
+                let v = format!("{} for output", self.out_width());
+                card(&mut f, "width", v.as_bytes());
+                card(&mut f, "colors", b"on");
+            }
+            let v = self.session_log_phrase(192);
+            card(&mut f, "log", &v);
+        }
+        self.emit_flines(f);
     }
 
     fn local_command(
@@ -1607,76 +2673,301 @@ PgUp/PgDn/End scroll, Tab completes, Ctrl-C cancels",
         seq: i32,
         words: &[u8],
     ) {
-        let a1: Option<Vec<u8>> = (ws.n() > argi).then(|| ws.get(argi).to_vec());
-        match c.cmd {
-            "help" => {
-                if let Some(a) = &a1
+        let a1: Option<&[u8]> = (ws.n() > argi).then(|| ws.get(argi));
+        let arrow = "→".as_bytes(); // lm_line / fs_add show it as ->
+        match (c.cmd, c.sub.unwrap_or("")) {
+            ("help", _) => {
+                if let Some(a) = a1
                     && !cmd_known_word(a)
                 {
-                    self.marker_err(seq, b"unknown command");
+                    let m = fmtb(&[b"no command group \"", &a[..uprec(a, 40)], b"\""]);
+                    self.refuse(seq, "cmd.unknown", c_cut(&m, 96), Some(b"help"));
                     return;
                 }
-                self.show_help(a1.as_deref());
+                let mut one: Option<&CmdDef> = None;
+                let a2: Option<&[u8]> = (ws.n() > argi + 1).then(|| ws.get(argi + 1));
+                if let Some(a) = a1
+                    && (a2.is_some() || !cmd_has_subs(a))
+                {
+                    one = CMDS.iter().find(|d| {
+                        eq_ic(a, d.cmd)
+                            && match d.sub {
+                                Some(sub) => a2.is_some_and(|x| eq_ic(x, sub)),
+                                None => a2.is_none(),
+                            }
+                    });
+                    if one.is_none() {
+                        let x = a2.unwrap_or(b"");
+                        let m = fmtb(&[a, b" has no command ", &x[..uprec(x, 40)]]);
+                        let h = fmtb(&[b"help ", a]);
+                        self.refuse(seq, "cmd.unknown", c_cut(&m, 128), Some(c_cut(&h, 64)));
+                        return;
+                    }
+                }
+                self.show_help(a1, one);
             }
-            "quit" => {
+            ("quit", _) => {
+                if !self.raw {
+                    let s = ((self.now_ms - self.start_ms) / 1000).max(0);
+                    let d = format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60);
+                    let d = c_cut(d.as_bytes(), 32).to_vec();
+                    let sl = self.session_log_phrase(128);
+                    let dot = fmt::glyph(&self.ctx(fmt::FMT_MODE_NORMAL, &sl), fmt::G_DOT);
+                    let m = fmtb(&[
+                        b" Goodbye ",
+                        &self.admin,
+                        b" ",
+                        dot,
+                        b" session ",
+                        &d,
+                        b" ",
+                        dot,
+                        format!(
+                            " {} command{}",
+                            self.ncmds,
+                            if self.ncmds == 1 { "" } else { "s" }
+                        )
+                        .as_bytes(),
+                    ]);
+                    let m = c_cut(&m, 160).to_vec();
+                    self.note(&m, RL_DIM);
+                }
                 self.marker_ok(seq, words);
                 self.closing = true;
                 self.close_why = "quit".to_string();
                 return;
             }
-            "log" => {
-                if !self.line_mode {
-                    self.marker_err(seq, b"the log is the Alt+2 view in the full-screen console");
+            ("log", "filter") => {
+                if self.line_mode {
+                    self.refuse(
+                        seq,
+                        "cmd.mode",
+                        b"only in the full-screen console",
+                        Some(b"log on [level] in line mode"),
+                    );
                     return;
                 }
-                if c.sub == Some("on") {
-                    let lvl = a1.as_deref().map_or(LOG_INFO, level_arg);
+                let rest = &line[ws.w[argi].0..];
+                let from: Vec<u8> = c_cut(
+                    if self.filter.is_empty() {
+                        b"-"
+                    } else {
+                        &self.filter
+                    },
+                    64,
+                )
+                .to_vec();
+                if eq_ic(rest, "clear") {
+                    self.filter.clear();
+                } else {
+                    self.filter = c_cut(rest, 128).to_vec();
+                }
+                self.dirty = true;
+                let to: Vec<u8> = if self.filter.is_empty() {
+                    b"-".to_vec()
+                } else {
+                    self.filter.clone()
+                };
+                let s = fmtb(&[b"filter   ", &from, b" ", arrow, b" ", &to]);
+                self.local_ok(b"Log", Some(c_cut(&s, 300)), None);
+            }
+            ("log", sub) => {
+                if !self.line_mode {
+                    self.refuse(
+                        seq,
+                        "cmd.mode",
+                        b"the log is the Alt+2 view in the full-screen console",
+                        None,
+                    );
+                    return;
+                }
+                if sub == "on" {
+                    let lvl = a1.map_or(LOG_INFO, level_arg);
                     if lvl <= 0 {
-                        self.marker_err(seq, b"level: error, warning, info or debug");
+                        self.refuse(
+                            seq,
+                            "cmd.bad_arg",
+                            b"level: error, warning, info or debug",
+                            Some(b"log on [level]"),
+                        );
                         return;
                     }
                     self.log_on = true;
                     self.log_sub_level = lvl;
+                    let s = format!("{} and worse", LEVEL_WORD[lvl as usize]);
+                    let cl = self.st.consolelevel;
+                    let e = format!(
+                        "the ring keeps {}; log off stops it",
+                        if self.st.have && (0..=4).contains(&cl) {
+                            LEVEL_WORD[cl as usize]
+                        } else {
+                            "what its level says"
+                        }
+                    );
+                    self.local_ok(b"Log stream on", Some(s.as_bytes()), Some(e.as_bytes()));
                 } else {
                     self.log_on = false;
+                    self.local_ok(b"Log stream off", None, None);
                 }
                 self.subscribe();
             }
-            _ => {
-                if self.line_mode {
-                    self.marker_err(seq, b"not available in line mode");
+            ("display", sub) => {
+                let fs_only = matches!(sub, "view" | "pane" | "clear");
+                let lm_only = matches!(sub, "width" | "events");
+                if fs_only && self.line_mode {
+                    self.refuse(seq, "cmd.mode", b"only in the full-screen console", None);
                     return;
                 }
-                match c.cmd {
+                if lm_only && !self.line_mode {
+                    self.refuse(seq, "cmd.mode", b"only in line mode", None);
+                    return;
+                }
+                let a1v = a1.unwrap_or(b"");
+                match sub {
+                    "show" => self.display_show(),
                     "view" => {
-                        let ok = a1
-                            .as_deref()
-                            .filter(|a| a.len() == 1 && (b'1'..=b'5').contains(&a[0]));
-                        let Some(a) = ok else {
-                            self.marker_err(seq, b"view 1-5");
+                        if a1v.len() != 1 || !(b'1'..=b'5').contains(&a1v[0]) {
+                            self.refuse(
+                                seq,
+                                "cmd.bad_arg",
+                                b"view 1-5",
+                                Some(b"display view <1-5>"),
+                            );
                             return;
-                        };
-                        self.view = usize::from(a[0] - b'1');
+                        }
+                        let from = VIEW_NAME[self.view];
+                        self.view = usize::from(a1v[0] - b'1');
                         self.act[self.view] = false;
+                        let s = fmtb(&[
+                            b"view   ",
+                            from.as_bytes(),
+                            b" ",
+                            arrow,
+                            b" ",
+                            VIEW_NAME[self.view].as_bytes(),
+                        ]);
+                        self.local_ok(b"Display", Some(&s), None);
                     }
                     "pane" => {
-                        if self.cols >= CONSOLE_PANE_MIN_COLS {
+                        let was = if self.cols >= CONSOLE_PANE_MIN_COLS {
+                            let w = !self.pane_user_off;
                             self.pane_user_off = !self.pane_user_off;
+                            w
                         } else {
+                            let w = self.overlay;
                             self.overlay = !self.overlay;
-                        }
+                            w
+                        };
+                        let s = fmtb(&[
+                            b"tree pane   ",
+                            if was { b"shown" } else { b"hidden" },
+                            b" ",
+                            arrow,
+                            b" ",
+                            if was { b"hidden" } else { b"shown" },
+                            b" (F3 toggles)",
+                        ]);
+                        self.local_ok(b"Display", Some(&s), None);
                     }
                     "ascii" => {
+                        let was = self.ascii;
                         self.ascii = !self.ascii;
                         self.full_redraw = true;
+                        self.render_w = -1;
+                        let s = fmtb(&[
+                            b"glyphs   ",
+                            if was { b"ascii" } else { b"unicode" },
+                            b" ",
+                            arrow,
+                            b" ",
+                            if self.ascii { b"ascii" } else { b"unicode" },
+                        ]);
+                        self.local_ok(b"Display", Some(&s), None);
                     }
-                    "filter" => {
-                        let rest = &line[ws.w[argi].0..];
-                        if eq_ic(rest, "clear") {
-                            self.filter.clear();
+                    "format" => {
+                        let raw = if eq_ic(a1v, "raw") {
+                            true
+                        } else if eq_ic(a1v, "pretty") {
+                            false
                         } else {
-                            self.filter = c_cut(rest, 128).to_vec();
+                            self.refuse(
+                                seq,
+                                "cmd.bad_arg",
+                                b"format: pretty or raw",
+                                Some(b"display format pretty|raw"),
+                            );
+                            return;
+                        };
+                        let s = fmtb(&[
+                            b"format   ",
+                            if self.raw { b"raw" } else { b"pretty" },
+                            b" ",
+                            arrow,
+                            b" ",
+                            if raw { b"raw" } else { b"pretty" },
+                            if raw {
+                                b" (records as the hub sends them)"
+                            } else {
+                                b""
+                            },
+                        ]);
+                        self.local_ok(b"Display", Some(&s), None);
+                        self.raw = raw;
+                    }
+                    "width" => {
+                        let was = self.out_width();
+                        if eq_ic(a1v, "auto") {
+                            self.width_set = -1;
+                        } else if all_digits(a1v)
+                            && (fmt::CONSOLE_WIDTH_MIN..=fmt::CONSOLE_WIDTH_MAX)
+                                .contains(&fmt::atoi(a1v))
+                        {
+                            self.width_set = fmt::atoi(a1v);
+                        } else {
+                            self.refuse(
+                                seq,
+                                "cmd.bad_arg",
+                                b"width: 60-250 or auto",
+                                Some(b"display width <60-250|auto>"),
+                            );
+                            return;
                         }
+                        let s = fmtb(&[
+                            format!("width   {was} ").as_bytes(),
+                            arrow,
+                            format!(
+                                " {}{}",
+                                self.out_width(),
+                                if self.width_set < 0 { " (auto)" } else { "" }
+                            )
+                            .as_bytes(),
+                        ]);
+                        self.local_ok(b"Display", Some(&s), None);
+                    }
+                    "events" => {
+                        let on = if eq_ic(a1v, "on") {
+                            true
+                        } else if eq_ic(a1v, "off") {
+                            false
+                        } else {
+                            self.refuse(
+                                seq,
+                                "cmd.bad_arg",
+                                b"events: on or off",
+                                Some(b"display events on|off"),
+                            );
+                            return;
+                        };
+                        let s = fmtb(&[
+                            b"events   ",
+                            if self.events_on { b"on" } else { b"off" },
+                            b" ",
+                            arrow,
+                            b" ",
+                            if on { b"on" } else { b"off" },
+                        ]);
+                        self.events_on = on;
+                        self.local_ok(b"Display", Some(&s), None);
                     }
                     "clear" => {
                         if (self.view == V_CONSOLE || self.view == V_LOG)
@@ -1684,14 +2975,512 @@ PgUp/PgDn/End scroll, Tab completes, Ctrl-C cancels",
                         {
                             sb.clear();
                         }
+                        if self.view == V_CONSOLE {
+                            if let Some(ent) = self.ent.as_mut() {
+                                for e in self.ent_first..self.ent_next {
+                                    ent[(e % CONSOLE_SCROLLBACK as i64) as usize] =
+                                        Centry::default();
+                                }
+                            }
+                            self.ent_first = self.ent_next;
+                        }
                         self.anchor[self.view] = -1;
+                        let s = format!("{} view cleared", VIEW_NAME[self.view]);
+                        self.local_ok(b"Display", Some(s.as_bytes()), None);
                     }
                     _ => {}
                 }
                 self.dirty = true;
             }
+            _ => {}
         }
         self.marker_ok(seq, words);
+    }
+
+    /// Enter a confirmation: the question as [confirm #N] (line mode) or a
+    /// highlighted line, and the next input line answers it.
+    fn ask_confirm(&mut self, kind: Confirm, want: &[u8], pick_max: i32, question: &[u8]) {
+        self.confirming = kind;
+        self.confirm_want = c_cut(want, 128).to_vec();
+        self.confirm_pick_max = pick_max;
+        if self.line_mode {
+            let m = fmtb(&[
+                format!("[confirm #{}] ", self.confirm_seq).as_bytes(),
+                question,
+            ]);
+            self.lm_line(c_cut(&m, CONSOLE_INPUT_MAX));
+        } else {
+            self.fs_timestamped(V_CONSOLE, question, RL_WARN);
+        }
+    }
+
+    fn stage_confirm(&mut self, seq: i32, op: u8, p: &[u8], rq: &PendingRq) {
+        self.confirm_seq = seq;
+        self.confirm_op = op;
+        self.confirm_payload = p.to_vec();
+        self.confirm_rq = rq.clone();
+    }
+
+    /// Warning lines above a question (hub rekey).
+    fn warn_lines(&mut self, lines: &[&[u8]]) {
+        if self.raw {
+            return;
+        }
+        let sl = self.session_log_phrase(128);
+        let mut f = Flines::new();
+        {
+            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+            for (i, l) in lines.iter().enumerate() {
+                let t = if i == 0 {
+                    fmtb(&[b" ", fmt::glyph(&c, fmt::G_WARN), b" ", l])
+                } else {
+                    fmtb(&[b"   ", l])
+                };
+                fmt::flines_add(&mut f, RL_WARN, c_cut(&t, 300));
+            }
+        }
+        self.emit_flines(f);
+    }
+}
+
+impl Ui {
+    /// A pre-read came back: the question names the object, or the command
+    /// ends here with what the read found (D2).
+    fn pre_reply(&mut self, rq: &PendingRq, text: &[u8]) {
+        let rep = fmt::creply_parse(text);
+        if rep.err || !rep.ok {
+            self.show_reply(text, &rq.words, fmt::FMT_MODE_NORMAL, true);
+            let code = c_cut(&rep.code, 64).to_vec();
+            let msg = c_cut(rep.res.rv("msg").unwrap_or(b"failed"), 320).to_vec();
+            self.marker_err(rq.seq, &code, &msg);
+            let m = fmtb(&[
+                b"[CONSOLE] ",
+                &self.admin,
+                b"@",
+                &self.ip,
+                format!(" #{} ", rq.seq).as_bytes(),
+                &self.pend.rq.audit,
+                b" -> err: ",
+                &code,
+            ]);
+            self.audit(rq.audit_level, m);
+            self.command_done(true);
+            return;
+        }
+        let pc = self.pend.clone();
+        let sl = self.session_log_phrase(128);
+        let (dot, arrow, dash, ell, g_on, g_err) = {
+            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+            (
+                fmt::glyph(&c, fmt::G_DOT),
+                fmt::glyph(&c, fmt::G_ARROW),
+                fmt::glyph(&c, fmt::G_DASH),
+                fmt::glyph(&c, fmt::G_ELL),
+                fmt::glyph(&c, fmt::G_ON),
+                fmt::glyph(&c, fmt::G_ERR),
+            )
+        };
+        const QCAP: usize = CONSOLE_INPUT_MAX - 64;
+        let mut q: Vec<u8> = Vec::new();
+        let mut kind = Confirm::Yn;
+        let mut want: Vec<u8> = Vec::new();
+        let mut pick = 0;
+        self.stage_confirm(rq.seq, pc.op, &pc.payload, &pc.rq);
+        let mut fail: Option<(&str, Vec<u8>, Vec<u8>)> = None;
+        let arg = pc.arg.as_slice();
+        match pc.pre {
+            Pre::BotDel | Pre::BotKick => {
+                let b = rep.r.iter().find(|x| x.typ == b"bot");
+                let nick: &[u8] = match b.and_then(|b| b.rvs("nick")) {
+                    Some(n) => n,
+                    None => arg,
+                };
+                let on = b.is_some_and(|b| b.rvb("online"));
+                let local = on && b.and_then(|b| b.rv("hub")) == Some(b"local");
+                let id: &[u8] = b.and_then(|b| b.rv("uuid")).unwrap_or(arg);
+                let u8s = c_cut(&fmtb(&[&id[..uprec(id, 8)], ell]), 16).to_vec();
+                let hub_name: &[u8] = b.and_then(|b| b.rvs("hub_name")).unwrap_or(b"another hub");
+                if pc.pre == Pre::BotDel {
+                    q = if local {
+                        fmtb(&[
+                            b"Delete bot ",
+                            nick,
+                            b" (",
+                            &u8s,
+                            b")? It is online on this hub and will be disconnected. (y/N)",
+                        ])
+                    } else if on {
+                        fmtb(&[
+                            b"Delete bot ",
+                            nick,
+                            b" (",
+                            &u8s,
+                            b")? It is online on ",
+                            hub_name,
+                            b" and is dropped everywhere. (y/N)",
+                        ])
+                    } else {
+                        fmtb(&[
+                            b"Delete bot ",
+                            nick,
+                            b" (",
+                            &u8s,
+                            b")? It is offline. (y/N)",
+                        ])
+                    };
+                } else if !local {
+                    let msg = fmtb(&[nick, b" is not connected to this hub"]);
+                    let hint = if on {
+                        fmtb(&[b"it is on ", hub_name, b": kick it there"])
+                    } else {
+                        b"bot list".to_vec()
+                    };
+                    fail = Some((
+                        "bot.not_local",
+                        c_cut(&msg, 256).to_vec(),
+                        c_cut(&hint, 256).to_vec(),
+                    ));
+                } else {
+                    q = fmtb(&[
+                        b"Disconnect bot ",
+                        nick,
+                        b" from this hub? It will reconnect on its own. (y/N)",
+                    ]);
+                }
+            }
+            Pre::PeerDel => {
+                let mut n = 0;
+                let mut hit: Option<&fmt::Crec> = None;
+                for r in rep.r.iter().filter(|x| x.typ == b"peer") {
+                    n += 1;
+                    if !arg.is_empty() && r.rvi("n", 0) == fmt::atoll(arg) {
+                        hit = Some(r);
+                    }
+                }
+                if n == 0 {
+                    fail = Some((
+                        "peer.none",
+                        b"no peer hubs are configured".to_vec(),
+                        b"peer list".to_vec(),
+                    ));
+                } else if !arg.is_empty() {
+                    match hit {
+                        None => {
+                            let msg =
+                                fmtb(&[b"no peer #", arg, format!(" ({n} configured)").as_bytes()]);
+                            fail = Some((
+                                "peer.not_found",
+                                c_cut(&msg, 256).to_vec(),
+                                b"peer list".to_vec(),
+                            ));
+                        }
+                        Some(h) => {
+                            kind = Confirm::Type;
+                            want = c_cut(arg, 128).to_vec();
+                            q = fmtb(&[
+                                b"Type ",
+                                arg,
+                                b" to remove peer ",
+                                h.rvs("name").or_else(|| h.rv("ip")).unwrap_or(b"?"),
+                                b" (",
+                                h.rv("ip").unwrap_or(b"?"),
+                                b":",
+                                &fmt::num(h.rvi("port", 0)),
+                                b"):",
+                            ]);
+                        }
+                    }
+                } else {
+                    // no number: the configured peers, then the number is
+                    // the answer
+                    if self.raw {
+                        self.show_reply(text, &rq.words, fmt::FMT_MODE_NORMAL, false);
+                    } else {
+                        let mut f = Flines::new();
+                        {
+                            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+                            let right = format!("{n} configured");
+                            fmt::title(&c, &mut f, b"Peer hubs", Some(right.as_bytes()));
+                            let mut nw = 4;
+                            let mut aw = 7;
+                            let ad_of = |p: &fmt::Crec| -> Vec<u8> {
+                                c_cut(
+                                    &fmtb(&[
+                                        p.rv("ip").unwrap_or(b"?"),
+                                        b":",
+                                        &fmt::num(p.rvi("port", 0)),
+                                    ]),
+                                    96,
+                                )
+                                .to_vec()
+                            };
+                            for p in rep.r.iter().filter(|x| x.typ == b"peer") {
+                                let nm = p.rvs("name").unwrap_or(dash);
+                                nw = nw.max(str_width(nm));
+                                aw = aw.max(str_width(&ad_of(p)));
+                            }
+                            let l = fmtb(&[
+                                b"   #  ",
+                                &padl(b"NAME", nw as usize),
+                                b"  ",
+                                &padl(b"ADDRESS", aw as usize),
+                                b"  LINK",
+                            ]);
+                            fmt::flines_add(&mut f, RL_HEAD, c_cut(&l, 512));
+                            for p in rep.r.iter().filter(|x| x.typ == b"peer") {
+                                let ad = ad_of(p);
+                                let nm = p.rvs("name").unwrap_or(dash);
+                                let up = p.rvb("up");
+                                let l = fmtb(&[
+                                    b"  ",
+                                    &padr(&fmt::num(p.rvi("n", 0)), 2),
+                                    b"  ",
+                                    nm,
+                                    &vec![b' '; (nw - str_width(nm)).max(0) as usize],
+                                    b"  ",
+                                    &ad,
+                                    &vec![b' '; (aw - str_width(&ad)).max(0) as usize],
+                                    b"  ",
+                                    if up { g_on } else { g_err },
+                                    b" ",
+                                    if up { b"up" } else { b"down" },
+                                ]);
+                                fmt::flines_add(
+                                    &mut f,
+                                    if up { RL_NORMAL } else { RL_WARN },
+                                    c_cut(&l, 512),
+                                );
+                            }
+                        }
+                        self.emit_flines(f);
+                    }
+                    kind = Confirm::Pick;
+                    pick = n;
+                    q = b"Type the number of the peer to remove:".to_vec();
+                }
+            }
+            Pre::Opt => {
+                let cur = rep.res.rv("flags").unwrap_or(b"");
+                // what the hub will store: letters and digits, each once
+                let mut nf: Vec<u8> = Vec::new();
+                for &p in arg {
+                    if nf.len() + 1 >= 64 {
+                        break;
+                    }
+                    if p.is_ascii_alphanumeric() && !nf.contains(&p) {
+                        nf.push(p);
+                    }
+                }
+                // changes[256]: co counts what was asked for; nothing more
+                // is appended once it reaches the end
+                let mut changes: Vec<u8> = Vec::new();
+                let mut co = 0usize;
+                let add = |e: Vec<u8>, changes: &mut Vec<u8>, co: &mut usize| {
+                    if *co + 1 < 256 {
+                        changes.extend_from_slice(c_cut(&e, 256 - *co));
+                        *co += e.len();
+                    }
+                };
+                for &p in &nf {
+                    if !cur.contains(&p) {
+                        let sep: &[u8] = if co > 0 { b"; " } else { b"" };
+                        let e = fmtb(&[sep, b"adds ", &[p], b": ", opt_meaning(p).as_bytes()]);
+                        add(e, &mut changes, &mut co);
+                    }
+                }
+                for &p in cur {
+                    if !nf.contains(&p) {
+                        let sep: &[u8] = if co > 0 { b"; " } else { b"" };
+                        let e = fmtb(&[sep, b"removes ", &[p], b": ", opt_meaning(p).as_bytes()]);
+                        add(e, &mut changes, &mut co);
+                    }
+                }
+                q = fmtb(&[
+                    b"Change flags ",
+                    if cur.is_empty() { b"none" } else { cur },
+                    b" ",
+                    arrow,
+                    b" ",
+                    if nf.is_empty() { b"none" } else { &nf },
+                    if co > 0 { b" (" } else { b"" },
+                    &changes,
+                    if co > 0 { b")" } else { b"" },
+                    b"? (y/N)",
+                ]);
+            }
+            Pre::UserDel | Pre::UserKey => {
+                // the named user's record (MATCH sends only it), and its masks
+                let mut u: Option<&fmt::Crec> = None;
+                let mut masks = 0;
+                for r in &rep.r {
+                    if u.is_none()
+                        && r.typ == b"user"
+                        && r.rv("name").is_some_and(|n| n.eq_ignore_ascii_case(arg))
+                    {
+                        u = Some(r);
+                    } else if u.is_some() && r.typ == b"mask" {
+                        masks += 1;
+                    } else if u.is_some() && r.typ == b"user" {
+                        break;
+                    }
+                }
+                match u {
+                    None => {
+                        let msg = fmtb(&[b"no user called \"", arg, b"\""]);
+                        fail = Some((
+                            "user.not_found",
+                            c_cut(&msg, 256).to_vec(),
+                            b"user list".to_vec(),
+                        ));
+                    }
+                    Some(u) => {
+                        let name = u.rv("name").unwrap_or(arg);
+                        let admin = u.rv("role") == Some(b"admin");
+                        let ms: &[u8] = if masks == 1 { b"" } else { b"s" };
+                        if pc.pre == Pre::UserDel {
+                            if admin {
+                                kind = Confirm::Type;
+                                want = c_cut(name, 128).to_vec();
+                                q = fmtb(&[
+                                    b"Type ",
+                                    name,
+                                    b" to remove admin ",
+                                    name,
+                                    format!(" and their {masks} mask").as_bytes(),
+                                    ms,
+                                    b":",
+                                ]);
+                            } else {
+                                q = fmtb(&[
+                                    b"Remove oper ",
+                                    name,
+                                    format!(" and their {masks} mask").as_bytes(),
+                                    ms,
+                                    b"? (y/N)",
+                                ]);
+                            }
+                        } else {
+                            q = fmtb(&[
+                                b"Replace ",
+                                name,
+                                b"'s key ",
+                                u.rvs("fp").unwrap_or(b"(none)"),
+                                b" with the new one?",
+                                if admin {
+                                    b" Their open consoles close."
+                                } else {
+                                    b""
+                                },
+                                b" (y/N)",
+                            ]);
+                        }
+                    }
+                }
+            }
+            Pre::UpgStart => {
+                // the plan card: how many nodes already run the target (D2)
+                let bv = arg;
+                let hv = pc.extra[0].as_slice();
+                let (mut b_on, mut b_to, mut h_on, mut h_to) = (0, 0, 0, 0);
+                for nd in rep.r.iter().filter(|x| x.typ == b"node") {
+                    let bot = nd.rv("kind") == Some(b"bot");
+                    let ver = nd.rv("ver").unwrap_or(b"");
+                    if bot && ver == bv {
+                        b_on += 1;
+                    } else if bot {
+                        b_to += 1;
+                    } else if !hv.is_empty() && ver == hv {
+                        h_on += 1;
+                    } else {
+                        h_to += 1;
+                    }
+                }
+                if !self.raw {
+                    let mut f = Flines::new();
+                    {
+                        let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+                        fmt::title(&c, &mut f, b"Upgrade plan", None);
+                        let card = |f: &mut Flines, label: &str, v: &[u8]| {
+                            fmt::card_line(f, 6, label.as_bytes(), Some(v), RL_NORMAL)
+                        };
+                        let v = fmtb(&[
+                            arrow,
+                            b" ",
+                            bv,
+                            format!("   ({b_on} already on it, {b_to} to upgrade)").as_bytes(),
+                        ]);
+                        card(&mut f, "bots", c_cut(&v, 512));
+                        let v = if !hv.is_empty() {
+                            fmtb(&[
+                                arrow,
+                                b" ",
+                                hv,
+                                format!("   ({h_on} already on it, {h_to} to upgrade)").as_bytes(),
+                            ])
+                        } else {
+                            b"stay where they are".to_vec()
+                        };
+                        card(&mut f, "hubs", c_cut(&v, 512));
+                        card(
+                            &mut f,
+                            "nodes",
+                            if pc.extra[1].is_empty() {
+                                b"whole network"
+                            } else {
+                                &pc.extra[1]
+                            },
+                        );
+                        let v = fmtb(&[
+                            b"bots: ",
+                            if pc.extra[2].is_empty() {
+                                b"default"
+                            } else {
+                                &pc.extra[2]
+                            },
+                            b" ",
+                            dot,
+                            b" hubs: ",
+                            if pc.extra[3].is_empty() {
+                                b"default"
+                            } else {
+                                &pc.extra[3]
+                            },
+                        ]);
+                        card(&mut f, "bases", c_cut(&v, 512));
+                    }
+                    self.emit_flines(f);
+                }
+                kind = Confirm::Type;
+                want = c_cut(bv, 128).to_vec();
+                q = fmtb(&[b"Type ", bv, b" to start the upgrade:"]);
+            }
+            Pre::None => q = b"Go ahead? (y/N)".to_vec(),
+        }
+        if let Some((code, msg, hint)) = fail {
+            self.refuse_hub(
+                rq.seq,
+                code,
+                &msg,
+                (!hint.is_empty()).then_some(hint.as_slice()),
+            );
+            let m = fmtb(&[
+                b"[CONSOLE] ",
+                &self.admin,
+                b"@",
+                &self.ip,
+                format!(" #{} ", rq.seq).as_bytes(),
+                &pc.rq.audit,
+                b" -> err: ",
+                code.as_bytes(),
+            ]);
+            self.audit(LOG_INFO, m);
+            self.command_done(true);
+            return;
+        }
+        let q = c_cut(&q, QCAP).to_vec();
+        self.ask_confirm(kind, &want, pick, &q);
+        // lines typed ahead answer it; then the prompt
+        self.command_done(true);
     }
 
     fn run_line(&mut self, line: &[u8]) {
@@ -1707,7 +3496,7 @@ PgUp/PgDn/End scroll, Tab completes, Ctrl-C cancels",
             if self.queued.len() < MAX_QUEUED_LINES {
                 self.queued.push(line.to_vec());
             } else {
-                self.note(b"busy: line dropped", L_ERR);
+                self.note(b"busy: line dropped", RL_ERR);
             }
             return;
         }
@@ -1718,161 +3507,254 @@ PgUp/PgDn/End scroll, Tab completes, Ctrl-C cancels",
         };
         self.seq += 1;
         let seq = self.seq;
+        self.ncmds += 1;
         let ws = Words::split(&l);
         if ws.n() == 0 {
-            self.marker_err(seq, b"empty command");
-            return;
-        }
-        let Some((c, argi)) = find_cmd(&ws) else {
-            if cmd_known_word(ws.get(0)) {
-                let why = fmtb(&[b"usage: see help ", ws.get(0)]);
-                self.marker_err(seq, c_cut(&why, 128));
-            } else {
-                self.marker_err(seq, b"unknown command (help lists them)");
-            }
-            return;
-        };
-        let words = match c.sub {
-            Some(sub) => format!("{} {}", c.cmd, sub),
-            None => c.cmd.to_string(),
-        }
-        .into_bytes();
-        let na = ws.n() - argi;
-        if na < c.nargs
-            || (c.build != B::Local && na > c.nargs + c.optargs)
-            || (c.build == B::Local && c.cmd != "filter" && na > c.nargs + c.optargs)
-        {
-            let why = format!("usage: {}", c.usage);
-            self.marker_err(seq, c_cut(why.as_bytes(), 160));
-            return;
-        }
-        if c.build != B::Local && (argi..ws.n()).any(|i| ws.get(i).contains(&b'|')) {
-            self.marker_err(seq, b"'|' is not allowed in an argument");
+            self.refuse(seq, "cmd.empty", b"empty command", None);
             return;
         }
         if !self.line_mode {
             let echo = fmtb(&[b"> ", &l]);
-            self.fs_timestamped(V_CONSOLE, c_cut(&echo, CONSOLE_INPUT_MAX + 4), L_CMD);
+            self.fs_timestamped(V_CONSOLE, c_cut(&echo, CONSOLE_INPUT_MAX + 4), RL_CMD);
+        }
+        let Some((c, argi)) = find_cmd(&ws) else {
+            let w0 = ws.get(0);
+            if cmd_known_word(w0) {
+                let m = if ws.n() >= 2 {
+                    let w1 = ws.get(1);
+                    fmtb(&[w0, b" has no command ", &w1[..uprec(w1, 40)]])
+                } else {
+                    fmtb(&[w0, b" needs a command"])
+                };
+                let h = fmtb(&[b"help ", w0]);
+                self.refuse(seq, "cmd.usage", c_cut(&m, 128), Some(c_cut(&h, 64)));
+            } else {
+                let m = fmtb(&[b"unknown command \"", &w0[..uprec(w0, 40)], b"\""]);
+                self.refuse(seq, "cmd.unknown", c_cut(&m, 128), Some(b"help"));
+            }
+            return;
+        };
+        let words = c_cut(&cmd_words(c), 32).to_vec();
+        let na = ws.n() - argi;
+        let rest_arg = c.build == B::Local && c.sub == Some("filter");
+        if na < c.nargs || (!rest_arg && na > c.nargs + c.optargs) {
+            let m = format!("usage: {}", c.usage);
+            self.refuse(seq, "cmd.usage", c_cut(m.as_bytes(), 160), None);
+            return;
+        }
+        if c.build != B::Local && (argi..ws.n()).any(|i| ws.get(i).contains(&b'|')) {
+            self.refuse(
+                seq,
+                "cmd.bad_arg",
+                b"'|' is not allowed in an argument",
+                None,
+            );
+            return;
         }
         if c.build == B::Local {
             self.local_command(c, &ws, argi, &l, seq, &words);
             return;
         }
-        let payload = match build_payload(c, &ws, argi) {
-            Ok(p) => p,
-            Err(why) => {
-                self.marker_err(seq, why.as_bytes());
+        let built = match build_payload(c, &ws, argi) {
+            Ok(b) => b,
+            Err((why, hint)) => {
+                self.refuse(seq, "cmd.bad_arg", &why, hint.map(str::as_bytes));
                 return;
             }
         };
+        let (op, confirm) = (built.op, built.confirm);
         let rq = PendingRq {
             kind: Rq::User,
             seq,
             words: words.clone(),
-            audit: l[..l.len().min(300)].to_vec(),
-            audit_level: if c.confirm != Confirm::None || c.op == CMD_ADMIN_SET_LOG_LEVEL {
+            audit: l[..uprec(&l, 300)].to_vec(),
+            audit_level: if confirm != Confirm::None || op == CMD_ADMIN_SET_LOG_LEVEL {
                 LOG_WARNING
             } else {
                 LOG_INFO
             },
+            mode: built.mode,
         };
-        // An optional argument that was left out asks nothing (peer del
-        // alone lists what could be deleted).
-        if c.confirm == Confirm::None || (c.build == B::OptArg && na == 0) {
-            self.send_request(c.op, &payload, rq);
-            return;
-        }
-        // Ask first; the next line answers.
-        self.confirming = c.confirm;
-        self.confirm_seq = seq;
-        self.confirm_op = c.op;
-        self.confirm_payload = payload;
-        self.confirm_rq = Some(rq);
         let a1: Vec<u8> = if na > 0 {
             ws.get(argi).to_vec()
         } else {
             Vec::new()
         };
-        let q: Vec<u8> = match c.confirm {
-            Confirm::Yn => {
-                // every argument: "Really loglevel console debug?"
-                let args: Vec<&[u8]> = (argi..ws.n()).map(|i| ws.get(i)).collect();
-                let all = c_cut(&args.join(&b' '), 256).to_vec();
-                self.confirm_want.clear();
-                fmtb(&[b"Really ", &words, b" ", &all, b"? (y/N)"])
-            }
-            Confirm::TypeArg => {
-                self.confirm_want = c_cut(&a1, 128).to_vec();
-                fmtb(&[b"Type '", &a1, b"' to confirm ", &words, b":"])
-            }
-            Confirm::TypeHub => {
-                let h: Vec<u8> = if self.hubname.is_empty() {
-                    b"hub".to_vec()
-                } else {
-                    self.hubname.clone()
-                };
-                self.confirm_want = c_cut(&h, 128).to_vec();
+        if confirm == Confirm::None {
+            self.send_request(op, &built.payload, rq);
+            return;
+        }
+
+        // D2: read first, so the question names the object
+        if c.pre != Pre::None {
+            let mut pc = PendCmd {
+                pre: c.pre,
+                op,
+                payload: built.payload.clone(),
+                arg: c_cut(&a1, 256).to_vec(),
+                extra: Default::default(),
+                rq: rq.clone(),
+            };
+            let (pop, pp): (u8, Vec<u8>) = match c.pre {
+                Pre::BotDel | Pre::BotKick => (CMD_ADMIN_LIST_FULL, c_cut(&a1, 600).to_vec()),
+                Pre::PeerDel => (CMD_ADMIN_LIST_PEERS, Vec::new()),
+                Pre::Opt => {
+                    pc.arg = c_cut(if a1 == b"-" { b"" } else { &a1 }, 256).to_vec();
+                    (CMD_ADMIN_GET_OPT_FLAGS, Vec::new())
+                }
+                Pre::UserDel | Pre::UserKey => (CMD_ADMIN_MATCH, c_cut(&a1, 600).to_vec()),
+                Pre::UpgStart => {
+                    let (mut bb, mut hb): (&[u8], &[u8]) = (b"", b"");
+                    for i in argi + 1..ws.n() {
+                        let w = ws.get(i);
+                        if let Some(v) = kv_opt(w, "hub") {
+                            pc.extra[0] = c_cut(if v == b"-" { b"" } else { v }, 256).to_vec();
+                        } else if let Some(v) = kv_opt(w, "nodes") {
+                            pc.extra[1] = c_cut(v, 256).to_vec();
+                        } else if let Some(v) = kv_opt(w, "botbase") {
+                            bb = v;
+                        } else if let Some(v) = kv_opt(w, "hubbase") {
+                            hb = v;
+                        }
+                    }
+                    pc.extra[2] = c_cut(bb, 256).to_vec();
+                    pc.extra[3] = c_cut(hb, 256).to_vec();
+                    let pp = if !bb.is_empty() || !hb.is_empty() {
+                        fmtb(&[b"releases|", bb, b"|", hb])
+                    } else {
+                        b"releases".to_vec()
+                    };
+                    (CMD_ADMIN_UPGRADE_STATUS, c_cut(&pp, 600).to_vec())
+                }
+                Pre::None => (0, Vec::new()),
+            };
+            self.pend = pc;
+            let pr = PendingRq {
+                kind: Rq::Pre,
+                ..rq
+            };
+            self.send_request(pop, &pp, pr);
+            return;
+        }
+
+        // Ask first; the next line answers.
+        self.stage_confirm(seq, op, &built.payload, &rq);
+        let mut want: Vec<u8> = Vec::new();
+        let mut kind = Confirm::Yn;
+        let a2: &[u8] = if na > 1 { ws.get(argi + 1) } else { b"" };
+        let q: Vec<u8> = if op == CMD_ADMIN_REGEN_KEYS {
+            let hn: Vec<u8> = if self.hubname.is_empty() {
+                b"hub".to_vec()
+            } else {
+                self.hubname.clone()
+            };
+            let l1 = fmtb(&[b"hub rekey makes a new identity for ", &hn, b"."]);
+            let l1 = c_cut(&l1, 160).to_vec();
+            self.warn_lines(&[
+                &l1,
+                b"Every peer and bot link drops now; each peer runs peer set <uuid> key, each bot +hub with the new key.",
+                b"Back up .irchub.cnf first: the old key is overwritten.",
+            ]);
+            kind = Confirm::Type;
+            want = c_cut(&hn, 128).to_vec();
+            fmtb(&[b"Type ", &hn, b" to go ahead:"])
+        } else if op == CMD_ADMIN_PURGE_TOMBSTONES {
+            if eq_ic(&a1, "now") {
+                b"Purge every tombstone now, here and on all peers? (y/N)".to_vec()
+            } else {
                 fmtb(&[
-                    b"Type the hub name '",
-                    &self.confirm_want,
-                    b"' to confirm ",
-                    &words,
-                    b":",
+                    b"Purge tombstones older than ",
+                    &a1,
+                    b" days, here and on all peers? (y/N)",
                 ])
             }
-            Confirm::TypeVer => {
-                self.confirm_want = c_cut(&a1, 128).to_vec();
-                fmtb(&[b"Type the bot version '", &a1, b"' to start the upgrade:"])
-            }
-            Confirm::None => Vec::new(),
-        };
-        self.confirm_q = c_cut(&q, 256).to_vec();
-        if self.line_mode {
-            let m = fmtb(&[format!("[confirm #{seq}] ").as_bytes(), &self.confirm_q]);
-            self.lm_line(c_cut(&m, 320));
+        } else if op == CMD_ADMIN_DEL_ALLOWLIST || op == CMD_ADMIN_DEL_DENYLIST {
+            fmtb(&[
+                b"Remove ",
+                a2,
+                b" from the ",
+                if op == CMD_ADMIN_DEL_ALLOWLIST {
+                    b"allow"
+                } else {
+                    b"deny"
+                },
+                b" list? (y/N)",
+            ])
+        } else if op == CMD_ADMIN_SET_LOG_LEVEL {
+            let lvl = level_arg(a2);
+            fmtb(&[
+                b"Set the ",
+                if built.payload[0] != 0 {
+                    b"console"
+                } else {
+                    b"file"
+                },
+                b" log level to ",
+                if (0..=4).contains(&lvl) {
+                    LEVEL_WORD[lvl as usize].as_bytes()
+                } else {
+                    a2
+                },
+                b"? (y/N)",
+            ])
+        } else if op == CMD_ADMIN_DEL_USERMASK {
+            let a3: &[u8] = if na > 2 { ws.get(argi + 2) } else { b"" };
+            fmtb(&[b"Remove mask ", a3, b" from ", a2, b"? (y/N)"])
+        } else if op == CMD_ADMIN_DEL_CHANNEL {
+            fmtb(&[b"Remove ", &a1, b" from every bot? They part it. (y/N)"])
+        } else if op == CMD_ADMIN_UPGRADE_STATUS && c.sub == Some("abort") {
+            b"Abort the running upgrade and roll back what it moved? (y/N)".to_vec()
+        } else if op == CMD_ADMIN_UPGRADE_STATUS && c.sub == Some("forget") {
+            b"Forget the roll-up plan here and on every hub? (y/N)".to_vec()
         } else {
-            let q = self.confirm_q.clone();
-            self.fs_timestamped(V_CONSOLE, &q, L_WARN);
-        }
+            fmtb(&[b"Really ", &words, b"? (y/N)"])
+        };
+        let q = c_cut(&q, CONSOLE_INPUT_MAX - 64).to_vec();
+        self.ask_confirm(kind, &want, 0, &q);
     }
 
     fn confirm_answer(&mut self, answer: &[u8], cancelled: bool) {
         let kind = self.confirming;
         self.confirming = Confirm::None;
-        let ok = !cancelled
-            && if kind == Confirm::Yn {
-                eq_ic(answer, "y") || eq_ic(answer, "yes")
-            } else {
-                answer == self.confirm_want.as_slice()
+        let mut ok = !cancelled;
+        if ok {
+            ok = match kind {
+                Confirm::Yn => eq_ic(answer, "y") || eq_ic(answer, "yes"),
+                Confirm::Pick => {
+                    let v = fmt::atoi(answer);
+                    let good = all_digits(answer) && v >= 1 && v <= self.confirm_pick_max;
+                    if good {
+                        self.confirm_payload = v.to_string().into_bytes();
+                    }
+                    good
+                }
+                _ => answer == self.confirm_want.as_slice(),
             };
-        let rq = self.confirm_rq.take();
+        }
         if !ok {
-            self.marker_err(self.confirm_seq, b"cancelled");
-            let audit = rq.map(|r| r.audit).unwrap_or_default();
-            let msg = fmtb(&[
+            self.refuse(self.confirm_seq, "cmd.cancelled", b"cancelled", None);
+            let m = fmtb(&[
                 b"[CONSOLE] ",
                 &self.admin,
                 b"@",
                 &self.ip,
                 format!(" #{} ", self.confirm_seq).as_bytes(),
-                &audit,
+                &self.confirm_rq.audit,
                 b" -> cancelled",
             ]);
-            self.audit(LOG_INFO, msg);
+            self.audit(LOG_INFO, m);
             crate::crypto::wipe(&mut self.confirm_payload);
             self.confirm_payload.clear();
             self.command_done(false);
             return;
         }
         let payload = std::mem::take(&mut self.confirm_payload);
-        if let Some(rq) = rq {
-            self.send_request(self.confirm_op, &payload, rq);
-        }
+        let rq = self.confirm_rq.clone();
+        self.send_request(self.confirm_op, &payload, rq);
         let mut p = payload;
         crate::crypto::wipe(&mut p);
     }
 }
-
 // ===========================================================================
 // Input line
 // ===========================================================================
@@ -1976,13 +3858,13 @@ impl Ui {
     /// it (the first without its '/').  Arguments only complete where a
     /// command takes a known kind of value: never a bot or hub name in place
     /// of an ip, a pubkey or an admin name.
-    fn completions(&self, word_idx: usize, w: &[Vec<u8>; 3], prefix: &[u8]) -> Vec<Vec<u8>> {
+    fn completions(&self, word_idx: usize, w: &mut [Vec<u8>; 3], prefix: &[u8]) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut pooln = 0usize;
         let starts =
             |s: &[u8]| s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix);
         let add = |out: &mut Vec<Vec<u8>>, s: &[u8]| -> bool {
-            if out.len() < 64 && starts(s) && !out.iter().any(|o| o == s) {
+            if !out.iter().any(|o| o == s) && out.len() < 64 && starts(s) {
                 out.push(s.to_vec());
                 return true;
             }
@@ -1991,6 +3873,20 @@ impl Ui {
         if word_idx == 0 {
             for d in CMDS {
                 add(&mut out, d.cmd.as_bytes());
+            }
+            return out;
+        }
+        if w[0] == b"?" {
+            w[0] = b"help".to_vec();
+        }
+        // help <group> <command>
+        if eq_ic(&w[0], "help") && word_idx == 2 {
+            for d in CMDS {
+                if let Some(sub) = d.sub
+                    && eq_ic(&w[1], d.cmd)
+                {
+                    add(&mut out, sub.as_bytes());
+                }
             }
             return out;
         }
@@ -2022,40 +3918,49 @@ impl Ui {
             }
             pos -= 1;
         }
-        if eq_ic(&w[0], "loglevel") && pos == 1 && !eq_ic(&w[1], "file") && !eq_ic(&w[1], "console")
+        if eq_ic(&w[0], "log")
+            && sub == Some("set")
+            && pos == 1
+            && !eq_ic(&w[2], "file")
+            && !eq_ic(&w[2], "console")
         {
             return out;
         }
-        let Some(ac) = ARG_COMP.iter().find(|a| {
-            eq_ic(&w[0], a.cmd) && a.sub == sub && (a.pos.is_none() || a.pos == Some(pos))
-        }) else {
+        let Some(ac) = ARG_COMP
+            .iter()
+            .find(|a| eq_ic(&w[0], a.0) && a.1 == sub && (a.2.is_none() || a.2 == Some(pos)))
+        else {
             return out;
         };
-        match ac.kind {
-            Ck::Cmd => {
-                for d in CMDS {
-                    add(&mut out, d.cmd.as_bytes());
+        match ac.3 {
+            Ck::Group => {
+                for g in GROUPS {
+                    add(&mut out, g.0.as_bytes());
                 }
                 return out;
             }
             Ck::Words(words) => {
-                for wd in words.split(' ').filter(|x| !x.is_empty()) {
-                    if pooln >= 128 {
-                        break;
-                    }
-                    if add(&mut out, c_cut(wd.as_bytes(), 72)) {
+                let mut p = words.as_bytes();
+                while !p.is_empty() && pooln < 128 {
+                    let l = p.iter().position(|&b| b == b' ').unwrap_or(p.len());
+                    if add(&mut out, c_cut(&p[..l], 72)) {
                         pooln += 1;
+                    }
+                    p = &p[l..];
+                    while p.first() == Some(&b' ') {
+                        p = &p[1..];
                     }
                 }
                 return out;
             }
             _ => {}
         }
-        // uuids from the tree rows: H|depth|name|uuid|..., B|depth|nick|uuid|...,
-        // D|nick|uuid|... (a bot that is offline)
-        for row in self.tree.split(|&b| b == b'\n') {
+        // uuids (and for show / peer set, names) from the tree rows:
+        // H|depth|name|uuid|..., B|depth|nick|uuid|..., D|nick|uuid|... (offline)
+        let tree = self.tree.as_deref().unwrap_or(b"");
+        for row in tree.split(|&b| b == b'\n') {
             if row.is_empty() || out.len() >= 64 || pooln >= 128 {
-                continue;
+                break;
             }
             if row.len() > TREE_ROW_MAX {
                 continue;
@@ -2065,17 +3970,37 @@ impl Ui {
                 .filter(|x| !x.is_empty())
                 .take(10)
                 .collect();
+            let nf = f.len();
             let ty = f.first().map_or(0, |x| x[0]);
-            let uuid = match (ac.kind, ty) {
-                (Ck::Hub, b'H') | (Ck::Bot | Ck::BotOn, b'B') if f.len() >= 4 => Some(f[3]),
-                (Ck::Bot, b'D') if f.len() >= 3 => Some(f[2]),
-                _ => None,
-            };
-            if let Some(u) = uuid
-                && u != b"-"
-                && add(&mut out, c_cut(u, 72))
-            {
-                pooln += 1;
+            let mut cand: [Option<&[u8]>; 2] = [None, None];
+            match ac.3 {
+                Ck::HubName if ty == b'H' && nf >= 4 && f[1] != b"0" => {
+                    cand = [Some(f[2]), Some(f[3])];
+                }
+                Ck::Bot | Ck::BotOn | Ck::BotNick if ty == b'B' && nf >= 4 => {
+                    cand[0] = Some(f[3]);
+                    if ac.3 == Ck::BotNick {
+                        cand[1] = Some(f[2]);
+                    }
+                }
+                Ck::Bot | Ck::BotNick if ty == b'D' && nf >= 3 => {
+                    cand[0] = Some(f[2]);
+                    if ac.3 == Ck::BotNick {
+                        cand[1] = Some(f[1]);
+                    }
+                }
+                _ => {}
+            }
+            for c in cand.iter().flatten() {
+                if pooln >= 128 {
+                    break;
+                }
+                if *c == b"-" {
+                    continue;
+                }
+                if add(&mut out, c_cut(c, 72)) {
+                    pooln += 1;
+                }
             }
         }
         out
@@ -2086,7 +4011,7 @@ impl Ui {
         while ws > 0 && self.input[ws - 1] != b' ' {
             ws -= 1;
         }
-        let prefix_full = self.input[ws..self.in_cur].to_vec();
+        let prefix_full = c_cut(&self.input[ws..self.in_cur], CONSOLE_INPUT_MAX).to_vec();
         // the words before this one (the first without its '/')
         let mut w: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         let mut idx = 0;
@@ -2113,7 +4038,7 @@ impl Ui {
         } else {
             &prefix_full
         };
-        let out = self.completions(idx, &w, pfx);
+        let out = self.completions(idx, &mut w, pfx);
         if out.is_empty() {
             return;
         }
@@ -2127,14 +4052,12 @@ impl Ui {
         }
         let have = pfx.len();
         if common > have || out.len() == 1 {
-            let mut add = out[0][have.min(common)..common.max(have)].to_vec();
-            if common < have {
-                add.clear();
-            }
             // a key= option takes its value right after the '='
-            if out.len() == 1 && out[0].last() != Some(&b'=') {
-                add.push(b' ');
-            }
+            let space = out.len() == 1 && out[0].last() != Some(&b'=');
+            let add = fmtb(&[
+                &out[0][have..common.max(have)],
+                if space { b" " } else { b"" },
+            ]);
             let add = c_cut(&add, 128).to_vec();
             self.in_insert(&add);
         } else if !self.line_mode {
@@ -2143,13 +4066,14 @@ impl Ui {
                 if line.len() + 2 >= 512 {
                     break;
                 }
-                if i > 0 {
-                    line.extend_from_slice(b"  ");
+                let e = fmtb(&[if i > 0 { b"  " } else { b"" }, o]);
+                let room = 512 - line.len();
+                line.extend_from_slice(c_cut(&e, room));
+                if e.len() >= room {
+                    break;
                 }
-                line.extend_from_slice(o);
             }
-            let line = c_cut(&line, 512).to_vec();
-            self.note(&line, L_INFO);
+            self.note(&line, RL_RULE);
         }
         self.dirty = true;
     }
@@ -2164,7 +4088,7 @@ impl Ui {
         }
         if self.searching {
             self.searching = false;
-            self.search = c_cut(&line, 128).to_vec();
+            self.search = line[..uprec(&line, 127)].to_vec();
             self.dirty = true;
             return;
         }
@@ -2450,6 +4374,7 @@ impl Ui {
     /// Bytes typed at the terminal.
     pub fn input(&mut self, data: &[u8], now_ms: i64) {
         self.last_input_ms = now_ms;
+        self.now_ms = now_ms;
         for &b in data {
             if !self.esc.is_empty() {
                 if self.esc.len() < 32 {
@@ -2551,20 +4476,26 @@ const SGR_SEL: &str = "0;7";
 
 fn kind_sgr(kind: u8) -> &'static str {
     match kind {
-        L_CMD => "0;1",
-        L_ERR => "0;31",
-        L_OK => "0;32",
-        L_INFO => "0;36",
-        L_WARN => "0;33",
-        L_DIM => "0;90",
+        RL_CMD => "0;1",
+        RL_ERR => "0;31",
+        RL_OK => "0;32",
+        RL_TITLE => "0;1;36",
+        RL_RULE => "0;36",
+        RL_HEAD => "0;1",
+        RL_WARN => "0;33",
+        RL_DIM => "0;90",
         _ => SGR_RESET,
     }
 }
 
 struct RowB {
     b: Vec<u8>,
+    /// cells used
     w: i32,
+    /// cells allowed
     max: i32,
+    /// display ascii: non-ASCII through fmt::ascii_char
+    ascii: bool,
 }
 
 impl RowB {
@@ -2573,6 +4504,7 @@ impl RowB {
             b: Vec::new(),
             w: 0,
             max,
+            ascii: false,
         }
     }
 
@@ -2591,11 +4523,21 @@ impl RowB {
         let mut used = 0;
         let mut i = 0;
         while i < s.len() {
-            let (ul, _, cw) = next_char(&s[i..]);
+            let (ul, _, mut cw) = next_char(&s[i..]);
+            let mut a: Option<&[u8]> = None;
+            if self.ascii && s[i] >= 0x80 {
+                a = fmt::ascii_char(&s[i..]).0;
+                if let Some(x) = a {
+                    cw = x.len() as i32;
+                }
+            }
             if used + cw > lim {
                 break;
             }
-            self.b.extend_from_slice(&s[i..(i + ul).min(s.len())]);
+            match a {
+                Some(x) => self.b.extend_from_slice(x),
+                None => self.b.extend_from_slice(&s[i..(i + ul).min(s.len())]),
+            }
             used += cw;
             i += ul;
         }
@@ -2657,29 +4599,29 @@ fn parse_tree(tree: &[u8]) -> Vec<TRow> {
             ..TRow::default()
         };
         if t.typ == b'H' && nf >= 9 {
-            t.depth = atoi(f[1]) as i32;
+            t.depth = fmt::atoi(f[1]);
             t.name = cut(f[2], 64);
             t.uuid = cut(f[3], 64);
-            t.online = atoi(f[4]) != 0;
+            t.online = fmt::atoi(f[4]) != 0;
             t.ver = cut(f[6], 24);
             t.var = cut(f[7], 8);
-            t.started = atoi(f[8]);
+            t.started = fmt::atoll(f[8]);
             out.push(t);
         } else if t.typ == b'B' && nf >= 9 {
-            t.depth = atoi(f[1]) as i32;
+            t.depth = fmt::atoi(f[1]);
             t.name = cut(f[2], 64);
             t.uuid = cut(f[3], 64);
             t.ver = cut(f[4], 24);
             t.server = cut(f[5], 72);
             t.var = cut(f[7], 8);
-            t.started = atoi(f[8]);
+            t.started = fmt::atoll(f[8]);
             t.online = true;
             out.push(t);
         } else if t.typ == b'D' && nf >= 4 {
             t.depth = 1;
             t.name = cut(f[1], 64);
             t.uuid = cut(f[2], 64);
-            t.started = atoi(f[3]);
+            t.started = fmt::atoll(f[3]);
             out.push(t);
         }
     }
@@ -2912,40 +4854,52 @@ impl Ui {
         self.dirty = true;
     }
 
-    /// A text blob (upgrade status, stats) shown from line anchor[view] on.
-    fn blob_rows(&self, view: usize, text: &[u8], w: i32, h: usize, rows: &mut [RowB], col0: i32) {
-        let top = if self.anchor[view] < 0 {
-            0
-        } else {
-            self.anchor[view]
-        };
-        let mut line = 0i64;
-        let mut y = 0;
-        let mut p = 0;
-        while p < text.len() && y < h {
-            let n = text[p..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(text.len() - p);
-            if line >= top {
-                let buf = c_cut(&text[p..p + n], 1024);
-                rows[y].sgr(SGR_RESET);
-                rows[y].text(buf, w);
-                rows[y].pad(col0 + w);
-                y += 1;
+    /// Views 4 and 5: the upgrade status / statistics reply, laid out by
+    /// the same renderer as the commands (no result line), from line
+    /// anchor[view].
+    fn view_rows(
+        &self,
+        view: usize,
+        text: Option<&[u8]>,
+        w: i32,
+        h: usize,
+        rows: &mut [RowB],
+        col0: i32,
+    ) {
+        let mut f = Flines::new();
+        match text {
+            None => fmt::flines_add(&mut f, RL_DIM, b"(asking the hub...)"),
+            Some(text) => {
+                let rep = fmt::creply_parse(text);
+                let sl = self.session_log_phrase(128);
+                let mut c = self.ctx(fmt::FMT_MODE_VIEW, &sl);
+                c.ascii = self.ascii;
+                c.width = w;
+                let words: &[u8] = if view == V_UPG {
+                    b"upgrade status"
+                } else {
+                    b"hub stats"
+                };
+                fmt::reply(&c, &rep, words, &mut f);
             }
-            line += 1;
-            p += n + 1;
+        }
+        let top = self.anchor[view].max(0);
+        let start = (top.min(f.len() as i64)) as usize;
+        for (y, l) in f[start..].iter().take(h).enumerate() {
+            rows[y].sgr(kind_sgr(l.role));
+            rows[y].text(&l.text, w);
+            rows[y].sgr(SGR_RESET);
+            rows[y].pad(col0 + w);
         }
     }
 
     fn net_rows_count(&self) -> i32 {
-        parse_tree(&self.tree).len() as i32
+        parse_tree(self.tree.as_deref().unwrap_or(b"")).len() as i32
     }
 
     /// View 3: every tree column, and the selected node's details.
     fn net_view(&mut self, w: i32, h: usize, rows: &mut [RowB], col0: i32) {
-        let tr = parse_tree(&self.tree);
+        let tr = parse_tree(self.tree.as_deref().unwrap_or(b""));
         let n = tr.len() as i32;
         if self.net_sel >= n {
             self.net_sel = if n > 0 { n - 1 } else { 0 };
@@ -2981,17 +4935,18 @@ impl Ui {
             } else {
                 SGR_RESET
             });
+            // %*s: a negative width pads as much on the left side
             let ind = if t.typ == b'D' {
                 0
             } else {
-                (t.depth * 2) as usize
+                (t.depth.wrapping_mul(2).unsigned_abs() as usize).min(200)
             };
             let kind: &[u8] = match t.typ {
                 b'H' => b"hub",
                 b'B' => b"bot",
                 _ => b"off",
             };
-            let name = fmtb(&[" ".repeat(ind).as_bytes(), kind, b" ", &t.name]);
+            let name = fmtb(&[&vec![b' '; ind], kind, b" ", &t.name]);
             r.text(c_cut(&name, 128), 32);
             r.pad(col0 + 32);
             let age = fmt_age(if t.typ == b'D' { 0 } else { t.started });
@@ -3010,15 +4965,9 @@ impl Ui {
         if detail > 0 && n > 0 {
             let t = &tr[self.net_sel as usize];
             let when = if t.started > 0 {
-                chrono::DateTime::from_timestamp(t.started, 0)
-                    .map(|d| {
-                        d.with_timezone(&chrono::Local)
-                            .format("%Y-%m-%d %H:%M:%S")
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| "--".into())
+                c_cut(&fmt::when(t.started, now_s()), 64).to_vec()
             } else {
-                "--".into()
+                b"--".to_vec()
             };
             let kind: &[u8] = match t.typ {
                 b'H' => b"hub",
@@ -3053,7 +5002,7 @@ impl Ui {
                     b"started  "
                 },
                 b"  ",
-                when.as_bytes(),
+                &when,
             ]);
             rows[y0 + 4].text(c_cut(&l4, 256), w);
             rows[y0 + 4].pad(col0 + w);
@@ -3062,7 +5011,7 @@ impl Ui {
 
     fn status_bar(&self, r: &mut RowB, now_ms: i64, pane_hidden: bool) {
         let mut s: Vec<(Vec<u8>, i32, &'static str)> = Vec::new();
-        let (hh, mm, _) = local_hms();
+        let clk = clock_utc(false);
         let push =
             |s: &mut Vec<(Vec<u8>, i32, &'static str)>, p: i32, sg: &'static str, t: Vec<u8>| {
                 if s.len() < 16 {
@@ -3078,12 +5027,7 @@ impl Ui {
             &mut s,
             1,
             SGR_STATUS,
-            fmtb(&[
-                format!("{hh:02}:{mm:02} ").as_bytes(),
-                c_cut(hub, 41),
-                b" ",
-                c_cut(&self.admin, 41),
-            ]),
+            fmtb(&[&clk, b" ", c_cut(hub, 41), b" ", c_cut(&self.admin, 41)]),
         );
         if self.st.have {
             push(
@@ -3211,7 +5155,11 @@ impl Ui {
     fn compose(&mut self, now_ms: i64) -> (Vec<RowB>, i32, i32) {
         let (c, r) = (self.cols, self.rows);
         let mut rows: Vec<RowB> = (0..r)
-            .map(|y| RowB::new(if y == r - 1 { c - 1 } else { c }))
+            .map(|y| {
+                let mut rb = RowB::new(if y == r - 1 { c - 1 } else { c });
+                rb.ascii = self.ascii;
+                rb
+            })
             .collect();
         if c < CONSOLE_MIN_COLS || r < CONSOLE_MIN_ROWS {
             rows[0].text(b"terminal too small (40x10 at least)", -1);
@@ -3275,7 +5223,15 @@ impl Ui {
                     let Some(l) = self.sb[self.view].as_ref().and_then(|sb| sb.get(seg.seq)) else {
                         continue;
                     };
-                    let buf = c_cut(&l.text[seg.from..seg.to], CONSOLE_INPUT_MAX * 2).to_vec();
+                    // a C char[2048]: a row of 3-byte glyphs (or zero-width
+                    // marks) can outgrow it; cut where no character is split
+                    let seg_text = &l.text[seg.from..seg.to];
+                    let n = if seg_text.len() >= CONSOLE_INPUT_MAX * 2 {
+                        utf8_cut(seg_text, CONSOLE_INPUT_MAX * 2 - 1)
+                    } else {
+                        seg_text.len()
+                    };
+                    let buf = seg_text[..n].to_vec();
                     let hit = self.view == V_LOG
                         && !self.search.is_empty()
                         && ci_contains(&l.text, &self.search)
@@ -3288,14 +5244,11 @@ impl Ui {
                 self.net_view(main_w, h, body, 0);
             } else {
                 let text = if self.view == V_UPG {
-                    &self.upg_text
+                    self.upg_text.as_deref()
                 } else {
-                    &self.stats_text
+                    self.stats_text.as_deref()
                 };
-                let text = text
-                    .clone()
-                    .unwrap_or_else(|| b"(asking the hub...)".to_vec());
-                self.blob_rows(self.view, &text, main_w, h, body, 0);
+                self.view_rows(self.view, text, main_w, h, body, 0);
             }
             for row in body.iter_mut() {
                 row.sgr(SGR_RESET);
@@ -3303,7 +5256,7 @@ impl Ui {
             }
             // tree pane
             if pane_w > 0 {
-                let tr = parse_tree(&self.tree);
+                let tr = parse_tree(self.tree.as_deref().unwrap_or(b""));
                 for (y, row) in body.iter_mut().enumerate() {
                     row.sgr(SGR_LINE);
                     row.text(self.g("│").as_bytes(), 1);
@@ -3320,6 +5273,7 @@ impl Ui {
 
         // status bar + input
         let mut sbar = RowB::new(rows[(r - 2) as usize].max);
+        sbar.ascii = self.ascii;
         self.status_bar(&mut sbar, now_ms, !wide && !overlay);
         rows[(r - 2) as usize] = sbar;
         let (cur_row, cur_col);
@@ -3366,10 +5320,61 @@ impl Ui {
         (rows, cur_row, cur_col)
     }
 
+    /// The output pane's width (the terminal minus the tree pane).
+    fn main_width(&self) -> i32 {
+        let c = self.cols;
+        let wide = c >= CONSOLE_PANE_MIN_COLS;
+        let mut pane_w = 0;
+        if wide && !self.pane_user_off {
+            pane_w = (c * 30 / 100).clamp(CONSOLE_PANE_MIN, CONSOLE_PANE_MAX);
+        }
+        if !wide && self.overlay {
+            pane_w = if c - 20 < CONSOLE_PANE_MIN {
+                c - 20
+            } else {
+                CONSOLE_PANE_MIN
+            };
+        }
+        pane_w = pane_w.max(0);
+        if pane_w > 0 { c - pane_w - 1 } else { c }
+    }
+
+    /// D5: the console view laid out again for a new width — every reply it
+    /// holds is rendered anew from its records.
+    fn relayout(&mut self) {
+        let w = self.main_width();
+        if self.render_w == w || self.ent.is_none() {
+            return;
+        }
+        self.render_w = w;
+        let mut lines: Vec<(Vec<u8>, u8)> = Vec::new();
+        if let Some(ent) = self.ent.as_ref() {
+            for e in self.ent_first..self.ent_next {
+                let x = &ent[(e % CONSOLE_SCROLLBACK as i64) as usize];
+                if let Some(t) = &x.text {
+                    let t = if self.ascii { fmt::ascii(t) } else { t.clone() };
+                    lines.push((t, x.kind));
+                } else if let Some(r) = &x.reply {
+                    for l in self.render_reply(r, &x.words, x.mode) {
+                        lines.push((l.text, l.role));
+                    }
+                }
+            }
+        }
+        if let Some(sb) = self.sb[V_CONSOLE].as_mut() {
+            sb.clear();
+            for (t, k) in &lines {
+                sb.add(t, *k, LOG_INFO);
+            }
+        }
+        self.anchor[V_CONSOLE] = -1;
+    }
+
     fn draw(&mut self, now_ms: i64) {
         if self.line_mode {
             return;
         }
+        self.relayout();
         let r = self.rows as usize;
         let (rows, cr, cc) = self.compose(now_ms);
         if self.prev_rows.len() != r {
@@ -3427,28 +5432,37 @@ impl Ui {
             utf8: Vec::new(),
             last_cr: false,
             seq: 0,
+            ncmds: 0,
             user_busy: false,
             rq: Vec::new(),
             queued: Vec::new(),
             confirming: Confirm::None,
             confirm_seq: 0,
             confirm_want: Vec::new(),
-            confirm_q: Vec::new(),
+            confirm_pick_max: 0,
             confirm_op: 0,
             confirm_payload: Vec::new(),
-            confirm_rq: None,
+            confirm_rq: PendingRq::default(),
+            pend: PendCmd::default(),
             held: Vec::new(),
             dropped: 0,
+            raw: false,
+            width_set: 0,
+            events_on: false,
+            greeted: false,
+            now_ms: 0,
+            start_ms: 0,
             st: Status {
                 loglevel: -1,
                 consolelevel: -1,
                 ..Status::default()
             },
-            tree: Vec::new(),
+            tree: None,
             upg_text: None,
             stats_text: None,
             upg_at: 0,
             stats_at: 0,
+            last_upg: Vec::new(),
             log_on: false,
             log_sub_level: LOG_INFO,
             view: V_CONSOLE,
@@ -3463,6 +5477,10 @@ impl Ui {
                     None,
                 ]
             },
+            ent: (!line_mode).then(|| vec![Centry::default(); CONSOLE_SCROLLBACK]),
+            ent_first: 0,
+            ent_next: 0,
+            render_w: -1,
             anchor: [-1; V_COUNT],
             act: [false; V_COUNT],
             pane_user_off: false,
@@ -3491,20 +5509,26 @@ impl Ui {
     /// Greeting, first draw, subscriptions.
     pub fn start(&mut self, now_ms: i64) {
         self.last_input_ms = now_ms;
+        self.now_ms = now_ms;
+        self.start_ms = now_ms;
         self.started = true;
         self.subscribe();
+        // §2.1: "irchub console" stays the first words (scripts look for
+        // it); the mesh summary follows once the first status event is in
         let hub: &[u8] = if self.hubname.is_empty() {
             b"hub"
         } else {
             &self.hubname
         };
         let hello = fmtb(&[
-            format!("irchub console {HUB_VERSION} on ").as_bytes(),
+            format!("irchub console {HUB_VERSION} ({HUB_UPDATE_VARIANT}) · ").as_bytes(),
             hub,
-            b" - logged in as ",
+            " · admin ".as_bytes(),
             &self.admin,
+            b" from ",
+            &self.ip,
         ]);
-        let hello = c_cut(&hello, 256).to_vec();
+        let hello = c_cut(&hello, 320).to_vec();
         if self.line_mode {
             self.lm_line(&hello);
             self.lm_prompt();
@@ -3513,12 +5537,7 @@ impl Ui {
         // alternate screen, bracketed paste
         self.term
             .extend_from_slice(b"\x1b[?1049h\x1b[?2004h\x1b[H\x1b[2J");
-        self.fs_timestamped(V_CONSOLE, &hello, L_INFO);
-        self.fs_timestamped(
-            V_CONSOLE,
-            b"help lists the commands; Alt+1..5 switch views (or: view <n>)",
-            L_INFO,
-        );
+        self.fs_line(&hello, RL_TITLE);
         self.dirty = true;
     }
 
@@ -3542,6 +5561,7 @@ impl Ui {
         if !self.started {
             return;
         }
+        self.now_ms = now_ms;
         if !self.esc.is_empty() && now_ms - self.esc_ms >= CONSOLE_ESC_MS {
             if self.esc.len() == 1 {
                 self.handle_key(key(K::Esc, 0), now_ms);
@@ -3562,7 +5582,7 @@ impl Ui {
                 self.fs_add(
                     V_LOG,
                     format!("[{n} lines dropped]").as_bytes(),
-                    L_WARN,
+                    RL_WARN,
                     LOG_ERROR,
                 );
             }
@@ -3621,8 +5641,8 @@ impl Ui {
         }
         self.term
             .extend_from_slice(b"\x1b[0m\x1b[?2004l\x1b[?25h\x1b[?1049l");
-        self.term
-            .extend_from_slice(format!("irchub console closed: {why}\r\n").as_bytes());
+        let m = format!("irchub console closed: {why}\r\n");
+        self.term.extend_from_slice(&fmt::snp(512, m.into_bytes()));
     }
 }
 
@@ -3630,6 +5650,7 @@ impl Drop for Ui {
     fn drop(&mut self) {
         crate::crypto::wipe(&mut self.input);
         crate::crypto::wipe(&mut self.confirm_payload);
+        crate::crypto::wipe(&mut self.pend.payload);
         crate::crypto::wipe(&mut self.term);
         crate::crypto::wipe(&mut self.core);
     }
@@ -3676,29 +5697,40 @@ mod tests {
         let hello = String::from_utf8_lossy(&ui.take_term()).into_owned();
         assert_eq!(
             hello,
-            format!("irchub console {HUB_VERSION} on hub1 - logged in as robert\r\n> ")
+            format!(
+                "irchub console {HUB_VERSION} ({HUB_UPDATE_VARIANT}) · hub1 · admin robert from 127.0.0.1\r\n> "
+            )
         );
-        assert!(run(&mut ui, "foo\r").contains("[err #1] unknown command (help lists them)\r\n> "));
+        assert!(run(&mut ui, "foo\r").contains("[err #1] unknown command \"foo\"\r\n> "));
         assert!(
             run(&mut ui, "bot del x|y\r").contains("[err #2] '|' is not allowed in an argument")
         );
-        let t = run(&mut ui, "bot del abc\r");
+        // bot del reads the bot first (D2), then asks
+        let _ = ui.take_core();
+        run(&mut ui, "bot del abc\r");
+        assert_eq!(&ui.take_core()[4..], b"\x11abc");
+        ui.core_frame_in(
+            CONSOLE_REPLY,
+            b"ok|bot.list|total=1|online=0\nbot|uuid=abc|nick=alpha|online=0",
+            1,
+        );
+        let t = String::from_utf8_lossy(&ui.take_term()).into_owned();
         assert!(
-            t.contains("[confirm #3] Really bot del abc? (y/N)\r\n? "),
+            t.contains("[confirm #3] Delete bot alpha (abc…)? It is offline. (y/N)\r\n? "),
             "{t}"
         );
         assert!(run(&mut ui, "n\r").contains("[err #3] cancelled\r\n> "));
-        let _ = ui.take_core();
         run(&mut ui, "bot list\r");
         let core = ui.take_core();
         assert_eq!(core, [0, 0, 0, 1, CMD_ADMIN_LIST_FULL]);
-        ui.core_frame_in(CONSOLE_REPLY, b"--- Registered Bots (0) ---\n", 1);
+        ui.core_frame_in(CONSOLE_REPLY, b"ok|bot.list|total=0|online=0", 1);
         let t = String::from_utf8_lossy(&ui.take_term()).into_owned();
-        assert_eq!(t, "--- Registered Bots (0) ---\r\n[ok #4] bot list\r\n> ");
-        run(&mut ui, "match *\r");
-        ui.core_frame_in(CONSOLE_REPLY, b"ERR:user not found", 1);
+        assert!(t.contains("(no bots registered)"), "{t}");
+        assert!(t.ends_with("[ok #4] bot list\r\n> "), "{t}");
+        run(&mut ui, "user show *\r");
+        ui.core_frame_in(CONSOLE_REPLY, b"err|user.not_found|msg=no such user", 1);
         let t = String::from_utf8_lossy(&ui.take_term()).into_owned();
-        assert_eq!(t, "ERR:user not found\r\n[err #5] ERR:user not found\r\n> ");
+        assert_eq!(t, " ✗ no such user\r\n[err #5] no such user\r\n> ");
     }
 
     #[test]
@@ -3706,18 +5738,42 @@ mod tests {
         let mut ui = Ui::new(true, 80, 24, "a", "ip", "h");
         ui.start(1);
         let _ = ui.take_term();
+        ui.input(b"display format raw\r", 1);
+        let _ = ui.take_term();
         ui.core_frame_in(CMD_CONSOLE, b"status|name=h|peers=0/0", 1);
         assert_eq!(
             String::from_utf8_lossy(&ui.take_term()),
             "\r[evt status] name=h|peers=0/0\r\n> "
         );
-        run(&mut ui, "stats\r");
+        run(&mut ui, "hub stats\r");
         ui.core_frame_in(CMD_CONSOLE, b"tree|H|0|h|u|1|0|2.4.3|rs|0\n", 1);
         assert!(ui.take_term().is_empty());
-        ui.core_frame_in(CONSOLE_REPLY, b"stats|up=1", 1);
+        ui.core_frame_in(CONSOLE_REPLY, b"ok|stats|up=1", 1);
         assert_eq!(
             String::from_utf8_lossy(&ui.take_term()),
-            "stats|up=1\r\n[ok #1] stats\r\n[evt tree] begin 1\r\n[evt tree] H|0|h|u|1|0|2.4.3|rs|0\r\n[evt tree] end\r\n> "
+            "ok|stats|up=1\r\n[ok #2] hub stats\r\n[evt tree] begin 1\r\n[evt tree] H|0|h|u|1|0|2.4.3|rs|0\r\n[evt tree] end\r\n> "
         );
+    }
+
+    #[test]
+    fn ascii_filter_and_help_examples() {
+        let mut ui = Ui::new(true, 80, 24, "a", "ip", "h");
+        ui.start(1);
+        let _ = ui.take_term();
+        run(&mut ui, "display ascii\r");
+        let t = run(&mut ui, "help bot add\r");
+        assert!(t.is_ascii(), "{t}");
+        // examples are never wrapped, whatever the width
+        assert!(
+            t.contains(&format!(
+                "   bot add alpha {} {}\r\n",
+                ex_uuid!(),
+                ex_key!()
+            )),
+            "{t}"
+        );
+        let t = run(&mut ui, "? upgrade nope\r");
+        assert!(t.contains("upgrade has no command nope"), "{t}");
+        assert!(t.contains("hint  help upgrade"), "{t}");
     }
 }

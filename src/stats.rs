@@ -3,7 +3,6 @@
 //! snapshots.  One set per process; atomics only so the queue code, which
 //! sees a client and not the hub state, can count without `unsafe`.
 
-use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 struct Stats {
@@ -83,41 +82,32 @@ pub fn sync_done(updates: u64) {
     }
 }
 
-/// The CMD_ADMIN_STATS reply (format in consts::CMD_ADMIN_STATS), capped at
-/// `cap` bytes; opcode rows with no traffic are left out.
-pub fn report(uptime: i64, cap: usize) -> String {
+/// The CMD_ADMIN_STATS reply as records: ok|stats|up, cfg|, sync|, then
+/// one op| per opcode that saw traffic.
+pub fn report(uptime: i64, r: &mut crate::reply::Reply) {
     let g = |a: &AtomicU64| a.load(Relaxed);
     let s = &STATS;
-    let mut out = format!(
-        "stats|up={uptime}\ncfg|sent={}|same={}|lost={}\n\
-         sync|frames={}|noop={}|records={}|applied={}\n",
-        g(&s.cfg_sent),
-        g(&s.cfg_same),
-        g(&s.cfg_lost),
-        g(&s.sync_frames),
-        g(&s.sync_noop),
-        g(&s.sync_records),
-        g(&s.sync_applied),
-    );
+    r.ok("stats");
+    r.kvi("up", uptime);
+    r.rec("cfg");
+    r.kvu("sent", g(&s.cfg_sent));
+    r.kvu("same", g(&s.cfg_same));
+    r.kvu("lost", g(&s.cfg_lost));
+    r.rec("sync");
+    r.kvu("frames", g(&s.sync_frames));
+    r.kvu("noop", g(&s.sync_noop));
+    r.kvu("records", g(&s.sync_records));
+    r.kvu("applied", g(&s.sync_applied));
     for op in 0..256 {
         let (rf, tf) = (g(&s.rx_frames[op]), g(&s.tx_frames[op]));
         if rf == 0 && tf == 0 {
             continue;
         }
-        let mut row = String::new();
-        let _ = writeln!(
-            row,
-            "op|0x{op:02X}|rx={rf}/{}|tx={tf}/{}",
-            g(&s.rx_bytes[op]),
-            g(&s.tx_bytes[op])
-        );
-        if out.len() + row.len() >= cap {
-            break;
-        }
-        out.push_str(&row);
+        r.rec("op");
+        r.kv("code", &format!("0x{op:02X}"));
+        r.kvu("rx_f", rf);
+        r.kvu("rx_b", g(&s.rx_bytes[op]));
+        r.kvu("tx_f", tf);
+        r.kvu("tx_b", g(&s.tx_bytes[op]));
     }
-    if out.ends_with('\n') {
-        out.pop();
-    }
-    out
 }

@@ -76,7 +76,7 @@ pub fn roster_expire(state: &mut HubState, now_ts: i64) {
 }
 
 /// The mesh-map record for hub `uuid`, or None.
-fn mesh_hub_find(state: &HubState, uuid: &str) -> Option<usize> {
+pub fn mesh_hub_find(state: &HubState, uuid: &str) -> Option<usize> {
     state.mesh_hubs.iter().position(|h| h.uuid == uuid)
 }
 
@@ -277,7 +277,7 @@ fn follower_presence_ok(
 
 /// The nick the config knows this bot by (the persisted 'n' key); empty if
 /// none.
-fn bot_nick_from_config(state: &HubState, uuid: &str) -> String {
+pub fn bot_nick_from_config(state: &HubState, uuid: &str) -> String {
     match state.bot_entry(uuid, "n") {
         Some(v) => roster_clean(v, MAX_NICK),
         None => String::new(),
@@ -409,7 +409,9 @@ fn gossip_bot_roster(state: &mut HubState) {
         let nick = bot_nick_from_config(state, &c.id);
         let c = &state.clients[ci];
         let row = format!(
-            "b|{}|{}|{}|{}|{}|{}\n",
+            // 7th field: when the bot linked to this hub (a hub that
+            // predates it stops reading after the 6th).
+            "b|{}|{}|{}|{}|{}|{}|{}\n",
             c.id,
             if nick.is_empty() { "-" } else { &nick },
             if c.bot_version.is_empty() {
@@ -427,7 +429,8 @@ fn gossip_bot_roster(state: &mut HubState) {
                 "-"
             } else {
                 &c.bot_variant
-            }
+            },
+            c.connected_at
         );
         if row.len() >= TREE_ROW_MAX {
             continue; // an unrepresentable row
@@ -697,7 +700,9 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
 
         // Five fields from any hub; a sixth (the bot's code base) from one
         // that knows it.
-        let f = crate::cstr::split_fields(body, 6);
+        // Five fields from any hub; a sixth (the bot's code base) and a
+        // seventh (when it linked to that hub) from one that knows them.
+        let f = crate::cstr::split_fields(body, 7);
         if f.len() < 5 || f[0].is_empty() {
             continue;
         }
@@ -740,6 +745,10 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 started
             } else {
                 0
+            },
+            link_since: match f.get(6).map(|s| atoll(s)) {
+                Some(s) if s > 0 && s <= now_ts => s,
+                _ => 0,
             },
             reported_at: now_ts,
         };
@@ -1129,36 +1138,6 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
     }
 }
 
-/// bot_version_label(): "<version> (<code base>)" for a bot that is on the
-/// mesh right now, e.g. "2.4.0 (rs)": our own live client first, else the
-/// freshest peer report.  The bare version when the reporter did not say
-/// which code base, "-" when nobody reports the bot at all.  For the console's
-/// bot list.
-pub fn bot_version_label(state: &HubState, uuid: &str) -> String {
-    let (ver, var) = if let Some(c) = state
-        .clients
-        .iter()
-        .find(|c| c.typ == ClientType::Bot && c.authenticated && c.id == uuid)
-    {
-        (c.bot_version.as_str(), c.bot_variant.as_str())
-    } else {
-        let mut best: Option<&BotRoster> = None;
-        for e in state.roster.iter().filter(|e| e.bot_uuid == uuid) {
-            if best.is_none_or(|b| e.reported_at >= b.reported_at) {
-                best = Some(e);
-            }
-        }
-        best.map_or(("", ""), |e| (e.version.as_str(), e.variant.as_str()))
-    };
-    if ver.is_empty() {
-        "-".to_string()
-    } else if var.is_empty() {
-        ver.to_string()
-    } else {
-        format!("{ver} ({var})")
-    }
-}
-
 /// The `seen`/nick lookup the offline tail of the tree uses, exported for the
 /// admin listing that shows the same value.
 pub fn bot_last_seen(state: &HubState, uuid: &str) -> i64 {
@@ -1438,7 +1417,7 @@ mod tests {
         assert_eq!(s.peers[0].remote_variant, "rs");
         assert_eq!(s.roster[0].version, "2.4.0");
         assert_eq!(s.roster[0].variant, "c");
-        assert_eq!(bot_version_label(&s, "bot-1"), "2.4.0 (c)");
+
         // A pre-variant hub: five fields, no v| line.
         process_bot_roster(
             &mut s,
@@ -1446,8 +1425,11 @@ mod tests {
             "h|them|Them|0|2.3.0\nb|bot-2|n|2.3.0|srv|0\n",
         );
         assert_eq!(s.roster[1].variant, "");
-        assert_eq!(bot_version_label(&s, "bot-2"), "2.3.0");
-        assert_eq!(bot_version_label(&s, "nobody"), "-");
+        assert!(
+            s.roster
+                .iter()
+                .any(|e| e.bot_uuid == "bot-2" && e.variant.is_empty())
+        );
     }
 
     #[test]

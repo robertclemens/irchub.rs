@@ -326,56 +326,6 @@ pub fn delete(state: &mut HubState, uuid: &str) -> Option<i64> {
     Some(ts)
 }
 
-/// The nick a bot record carries ('n'), or `unknown`.
-fn bot_nick(b: &BotConfig, unknown: &str) -> String {
-    b.entry("n")
-        .map_or_else(|| unknown.to_string(), |e| trunc_string(&e.value, 32))
-}
-
-fn local_time(ts: i64) -> String {
-    match chrono::DateTime::from_timestamp(ts, 0) {
-        Some(dt) => dt
-            .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string(),
-        None => "invalid".to_string(),
-    }
-}
-
-/// hub_storage_get_full_list().
-pub fn get_full_list(state: &HubState) -> String {
-    let active = state.bots.iter().filter(|b| b.is_active).count();
-    let mut out = format!("--- Registered Bots ({active}) ---\n");
-    for b in state.bots.iter().filter(|b| b.is_active) {
-        let time_buf = if b.last_sync_time == 0 {
-            "Never".to_string()
-        } else {
-            local_time(b.last_sync_time)
-        };
-        out.push_str(&format!(
-            "[{}] {} | Last Sync: {}\n",
-            b.uuid,
-            bot_nick(b, "Unknown"),
-            time_buf
-        ));
-    }
-    out
-}
-
-/// hub_storage_get_summary_list().
-pub fn get_summary_list(state: &HubState) -> String {
-    let mut out = String::from("--- Bot List ---\n");
-    for b in state.bots.iter().filter(|b| b.is_active) {
-        let nick = bot_nick(b, "");
-        if nick.is_empty() {
-            out.push_str(&format!("{}\n", b.uuid));
-        } else {
-            out.push_str(&format!("{:<16}  [{}]\n", nick, b.uuid));
-        }
-    }
-    out
-}
-
 /// hub_generate_bot_payload(): global + bot-specific config for one bot.
 /// Global items carry no "b|uuid|" prefix, preserving protocol
 /// compatibility.

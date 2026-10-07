@@ -265,17 +265,11 @@ pub fn write(state: &mut HubState) {
         buf.push_str(&format!("x|{}|{}\n", e.pattern(), e.added));
     }
 
-    // Named admin/oper records (a| and o| lines) — skip duplicates by
-    // type+name.
-    let mut seen: Vec<(char, String)> = Vec::new();
+    // Named admin/oper records (a| and o| lines) — every record: a name
+    // added, deleted and added again has one record per incarnation (each its
+    // own uuid).  Writing only the first per name kept the oldest tombstone
+    // and lost the live user on the next start.
     for u in &state.user_records {
-        if seen
-            .iter()
-            .any(|(t, n)| *t == u.typ && n.eq_ignore_ascii_case(&u.name))
-        {
-            continue;
-        }
-        seen.push((u.typ, u.name.clone()));
         let line = format_user_record(u, false);
         if line.len() >= USER_LINE_MAX {
             crate::hlog_error!(
@@ -602,9 +596,11 @@ fn dedup_records(state: &mut HubState) -> bool {
     let mut remap: Vec<(String, String)> = Vec::new();
 
     for u in &state.user_records {
-        let existing = users
-            .iter()
-            .position(|w| w.typ == u.typ && w.name.eq_ignore_ascii_case(&u.name));
+        // Only two live records are one user (see mesh.rs); a tombstone is a
+        // past incarnation and keeps its own uuid.
+        let existing = users.iter().position(|w| {
+            u.is_active && w.is_active && w.typ == u.typ && w.name.eq_ignore_ascii_case(&u.name)
+        });
         match existing {
             None => users.push(u.clone()),
             Some(j) => {

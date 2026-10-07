@@ -165,6 +165,8 @@ pub struct PendingBot {
     pub nick: String,
     pub ip: String,
     pub last_attempt: i64,
+    /// Connection attempts while pending (console).
+    pub attempts: i32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -280,6 +282,9 @@ pub struct PeerConfig {
     /// hub that sends one reports in.
     pub remote_variant: String,
     pub last_gossip: String,
+    /// When the link last went down (volatile, 0 = not since this hub
+    /// started): the console's "down since".
+    pub link_down_at: i64,
     /// Peer auth (HUBv3): per-peer Curve25519 public keys.  `has_pubkey` is
     /// required — a peer without one is refused (there is no shared secret).
     pub ed_pub: [u8; ED25519_KEY_LEN],
@@ -304,6 +309,7 @@ impl Default for PeerConfig {
             remote_version: String::new(),
             remote_variant: String::new(),
             last_gossip: String::new(),
+            link_down_at: 0,
             ed_pub: [0; ED25519_KEY_LEN],
             x25519_pub: [0; X25519_KEY_LEN],
             has_pubkey: false,
@@ -603,8 +609,10 @@ pub struct BotRoster {
     pub variant: String,
     /// The bot's IRC link.
     pub server: String,
-    /// bot -> hub, for uptime.
+    /// The bot's own start, for uptime.
     pub connected_at: i64,
+    /// Bot -> its hub link, 0 = unknown.
+    pub link_since: i64,
     /// Local clock: drives the TTL.
     pub reported_at: i64,
 }
@@ -951,6 +959,10 @@ pub struct HubState {
     pub port: i32,
     /// IP this hub advertises itself as in the mesh.
     pub bind_ip: String,
+    /// What the listener actually bound at startup: bind_ip / port changed
+    /// since take effect on the next start (the console's "pending").
+    pub listen_ip: String,
+    pub listen_port: i32,
     pub hub_uuid: String,
     /// `realpath(argv[0])` — the binary an upgrade replaces, and the one
     /// `<exe>.prev` sits beside.  Empty when it could not be resolved, which
@@ -1122,6 +1134,8 @@ impl HubState {
             listener: None,
             port: 0,
             bind_ip: String::new(),
+            listen_ip: String::new(),
+            listen_port: 0,
             hub_uuid: String::new(),
             executable_path: String::new(),
             hub_friendly_name: String::new(),

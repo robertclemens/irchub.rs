@@ -238,6 +238,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
 pub fn add_pending_bot(state: &mut HubState, uuid: &str, ip: &str) {
     if let Some(p) = state.pending.iter_mut().find(|p| p.uuid == uuid) {
         p.last_attempt = now();
+        p.attempts += 1;
         p.ip = trunc_string(ip, 64);
         return;
     }
@@ -246,6 +247,7 @@ pub fn add_pending_bot(state: &mut HubState, uuid: &str, ip: &str) {
         nick: "Unknown".to_string(),
         ip: trunc_string(ip, 64),
         last_attempt: now(),
+        attempts: 1,
     };
     if state.pending.len() < MAX_PENDING_BOTS {
         state.pending.push(entry);
@@ -311,6 +313,7 @@ pub fn disconnect_client(state: &mut HubState, ci: usize) {
         if p.fd == fd && fd != -1 {
             p.connected = false;
             p.fd = -1;
+            p.link_down_at = now();
             // Its uptime stops being a fact the moment the link drops; the
             // bots beneath it age out of the roster on the TTL.
             p.remote_started = 0;

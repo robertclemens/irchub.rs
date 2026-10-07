@@ -663,13 +663,14 @@ fn sync_user_record(state: &mut HubState, key: char, vstart: &str, cnt: &mut Syn
         .position(|u| u.uuid == incoming.uuid);
     let mut discard_incoming = false;
 
-    if found.is_none() {
-        // No UUID match — check for a name collision before inserting.
-        if let Some(ni) = state
-            .user_records
-            .iter()
-            .position(|ex| ex.typ == key && ex.name.eq_ignore_ascii_case(&incoming.name))
-        {
+    if found.is_none() && incoming.is_active {
+        // No UUID match — two LIVE records of one name are the same user
+        // created on two hubs at once: merge them.  A tombstone is never
+        // merged by name: it is a past incarnation (add, del, add again) and
+        // keeps its own uuid, as on the hub that made it.
+        if let Some(ni) = state.user_records.iter().position(|ex| {
+            ex.is_active && ex.typ == key && ex.name.eq_ignore_ascii_case(&incoming.name)
+        }) {
             let ex = &state.user_records[ni];
             let incoming_wins = incoming.last_seen > ex.last_seen
                 || (incoming.last_seen == ex.last_seen && incoming.timestamp > ex.timestamp)
@@ -905,7 +906,7 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bc
                         );
                     } else {
                         record_recent_purge(state, cutoff, &purge_id);
-                        let purged = execute_purge(state, cutoff).0;
+                        let purged = execute_purge(state, cutoff, None);
                         if purged > 0 {
                             crate::hlog_info!("[MESH] Purged {purged} entries from peer sync\n");
                             cnt.updates += purged as u32;
@@ -1052,19 +1053,45 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bc
 /// tombstones regardless of age; `cutoff > 0` purges those older than it.
 /// Peer-hub propagation is the caller's responsibility.
 ///
-/// Returns (count, log).
-pub fn execute_purge(state: &mut HubState, cutoff: i64) -> (i32, String) {
+/// Returns the count; `tombs` (may be None) gets one
+/// tomb|kind|id|name|ts record per tombstone.
+pub fn execute_purge(
+    state: &mut HubState,
+    cutoff: i64,
+    mut tombs: Option<&mut crate::reply::Reply>,
+) -> i32 {
     let mut purged_count = 0;
-    let mut log_out = String::new();
+    // One purged tombstone, for the console.
+    let mut note = |kind: &str, id: &str, name: &str, ts: i64| {
+        if let Some(r) = tombs.as_deref_mut() {
+            r.rec("tomb");
+            r.kv("kind", kind);
+            if !id.is_empty() {
+                r.kv("id", id);
+            }
+            if !name.is_empty() {
+                r.kv("name", name);
+            }
+            if ts > 0 {
+                r.kvi("ts", ts);
+            }
+        }
+    };
 
     // --- Tombstoned global entries (channels, admin masks, oper masks) ---
     let mut kept: Vec<ConfigEntry> = Vec::new();
     for e in std::mem::take(&mut state.global_entries) {
-        let is_tombstone =
-            matches!(e.key.as_str(), "c" | "m" | "o") && e.value.rsplit('|').next() == Some("del");
+        let is_tombstone = matches!(e.key.as_str(), "c" | "m" | "o")
+            && e.value.rsplit_once('|').is_some_and(|(_, l)| l == "del");
         if is_tombstone && (cutoff == 0 || e.timestamp < cutoff) {
             purged_count += 1;
-            log_out.push_str(&format!("  Purged: {}|{}\n", e.key, e.value));
+            let name = e.value.split('|').next().unwrap_or("");
+            let kind = match e.key.as_str() {
+                "c" => "channel",
+                "m" => "mask",
+                _ => "oper",
+            };
+            note(kind, "", &trunc_string(name, 256), e.timestamp);
         } else if kept.len() < MAX_BOT_ENTRIES {
             kept.push(e);
         }
@@ -1076,6 +1103,7 @@ pub fn execute_purge(state: &mut HubState, cutoff: i64) -> (i32, String) {
     for u in std::mem::take(&mut state.user_records) {
         if !u.is_active && (cutoff == 0 || u.timestamp < cutoff) {
             purged_count += 1;
+            note("user", "", &u.name, u.timestamp);
         } else if kept_users.len() < MAX_HUB_USER_RECORDS {
             kept_users.push(u);
         }
@@ -1093,6 +1121,7 @@ pub fn execute_purge(state: &mut HubState, cutoff: i64) -> (i32, String) {
         let owned = state.user_records.iter().any(|u| u.uuid == m.uuid);
         if !owned || (!m.is_active && (cutoff == 0 || m.timestamp < cutoff)) {
             purged_count += 1;
+            note("mask", "", &m.mask, m.timestamp);
         } else if kept_masks.len() < MAX_HUB_USER_MASKS {
             kept_masks.push(m);
         }
@@ -1113,14 +1142,12 @@ pub fn execute_purge(state: &mut HubState, cutoff: i64) -> (i32, String) {
         };
         if purge_bot {
             purged_count += 1;
-            match b.entry("n") {
-                Some(n) => log_out.push_str(&format!(
-                    "  Purged bot: {} ({})\n",
-                    b.uuid,
-                    trunc_string(&n.value, 32)
-                )),
-                None => log_out.push_str(&format!("  Purged bot: {}\n", b.uuid)),
-            }
+            note(
+                "bot",
+                &b.uuid,
+                b.entry("n").map_or("", |n| n.value.as_str()),
+                del_ts.unwrap_or(0),
+            );
         } else if kept_bots.len() < MAX_BOTS {
             kept_bots.push(b);
         }
@@ -1154,7 +1181,7 @@ pub fn execute_purge(state: &mut HubState, cutoff: i64) -> (i32, String) {
         }
     }
 
-    (purged_count, log_out)
+    purged_count
 }
 
 #[cfg(test)]
@@ -1314,11 +1341,13 @@ mod tests {
         storage::update_entry(&mut s, "bot-dead", "d", "1", "", "", 100);
         storage::update_entry(&mut s, "bot-live", "n", "y", "", "", 100);
 
-        let (n, log) = execute_purge(&mut s, 0);
+        let mut r = crate::reply::Reply::new();
+        let n = execute_purge(&mut s, 0, Some(&mut r));
+        let log = r.text().to_string();
         // dead channel + dead user + its now-orphaned mask + dead bot
         assert_eq!(n, 4);
         assert!(log.contains("#dead"));
-        assert!(log.contains("bot-dead (x)"));
+        assert!(log.contains("tomb|kind=bot|id=bot-dead|name=x"));
         assert_eq!(s.global_entries.len(), 1);
         assert!(s.user_records.is_empty());
         assert!(s.mask_records.is_empty());
@@ -1331,7 +1360,7 @@ mod tests {
         let mut s = HubState::new();
         storage::update_global_entry(&mut s, "c", "#old", "|0", "del", 100);
         storage::update_global_entry(&mut s, "c", "#new", "|0", "del", 900);
-        let (n, _) = execute_purge(&mut s, 500);
+        let n = execute_purge(&mut s, 500, None);
         assert_eq!(n, 1);
         assert_eq!(s.global_entries.len(), 1);
         assert!(s.global_entries[0].value.starts_with("#new"));

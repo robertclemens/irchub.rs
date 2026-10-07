@@ -1292,7 +1292,7 @@ fn handle_console_frame(state: &mut HubState, ci: usize, data: &[u8]) -> bool {
     if admin::console_admin_op(op) {
         admin::handle_admin_command(state, ci, op, &payload, body, body.len())
     } else {
-        send_response(state, ci, "ERROR: not an admin command")
+        send_response(state, ci, "err|admin.not_allowed|msg=not an admin command")
     }
 }
 
