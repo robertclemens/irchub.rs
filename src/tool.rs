@@ -22,6 +22,9 @@ use zeroize::Zeroizing;
 ///
 /// Neither defends against root.  Mirrors harden_process() in ircbot.
 pub fn harden_process() {
+    // Private by default whatever the shell's umask (Ubuntu's is 002): the setup wizard,
+    // pid, log and upgrade staging all inherit it.
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
     let _ = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0);
     let _ = nix::sys::prctl::set_dumpable(false);
 }

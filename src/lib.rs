@@ -31,6 +31,7 @@ pub mod console;
 pub mod consts;
 pub mod crypto;
 pub mod cstr;
+pub mod elect;
 pub mod logging;
 pub mod mesh;
 pub mod net;

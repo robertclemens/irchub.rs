@@ -665,7 +665,7 @@ pub fn status_line(state: &HubState, tree: &str) -> String {
         bots_total,
         upg,
         i32::from(upgrade::config_frozen(state)),
-        i32::from(state.rollup.have_plan),
+        i32::from(state.rollup.active),
         i32::from(split),
         state.log_level,
         state.console_log_level

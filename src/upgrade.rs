@@ -1632,8 +1632,96 @@ pub fn rollup_note_presence(
     rollup_consider(state, uuid, node_kind, version);
 }
 
-/// Time out an attempt that went nowhere.  Runs on the maintenance clock.
+/// The newest version this hub knows a bot runs: its live link here, or any
+/// hub's presence report.  None when nobody reports it (it is down).
+fn rollup_bot_version<'a>(state: &'a HubState, uuid: &str) -> Option<&'a str> {
+    let mut best: Option<&str> = None;
+    for c in &state.clients {
+        if c.typ == ClientType::Bot && c.authenticated && !c.bot_version.is_empty() && c.id == uuid
+        {
+            best = Some(&c.bot_version);
+        }
+    }
+    for e in &state.roster {
+        if !e.version.is_empty()
+            && e.bot_uuid == uuid
+            && best
+                .is_none_or(|b| update::version_cmp(&e.version, b) == std::cmp::Ordering::Greater)
+        {
+            best = Some(&e.version);
+        }
+    }
+    best
+}
+
+fn rollup_hub_on(state: &HubState, uuid: &str, target: &str) -> bool {
+    if uuid.is_empty() {
+        return false; // a peer never heard from
+    }
+    if !state.hub_uuid.is_empty() && uuid == state.hub_uuid {
+        return update::version_cmp(HUB_VERSION, target) != std::cmp::Ordering::Less;
+    }
+    state
+        .mesh_hubs
+        .iter()
+        .find(|m| m.uuid == uuid)
+        .is_some_and(|m| {
+            !m.version.is_empty()
+                && update::version_cmp(&m.version, target) != std::cmp::Ordering::Less
+        })
+}
+
+/// Is anybody still owed the plan?  Every registered bot heard from on the
+/// target or later and, when the run moved hubs, this hub, every configured
+/// peer and every hub in the mesh map on the hub target.  A node that is down
+/// is unknown here, so it keeps the plan alive -- that is what it is for.
+fn rollup_owed(state: &HubState) -> bool {
+    let r = &state.rollup;
+    for b in &state.bots {
+        if !b.is_active || b.entry("pub").is_none() {
+            continue;
+        }
+        match rollup_bot_version(state, &b.uuid) {
+            Some(v) if update::version_cmp(v, &r.target) != std::cmp::Ordering::Less => {}
+            _ => return true,
+        }
+    }
+    if r.hub_target.is_empty() {
+        return false;
+    }
+    !rollup_hub_on(state, &state.hub_uuid, &r.hub_target)
+        || state
+            .peers
+            .iter()
+            .any(|p| !rollup_hub_on(state, &p.uuid, &r.hub_target))
+        || state
+            .mesh_hubs
+            .iter()
+            .any(|m| !rollup_hub_on(state, &m.uuid, &r.hub_target))
+}
+
+/// Drop a plan nobody is owed any more, or one past ROLLUP_PLAN_TTL.  Never
+/// under a run or the freeze that announces one: a follower holds the
+/// driver's plan from PREPARE on, long before the nodes have moved.
+fn rollup_settle(state: &mut HubState, t_now: i64) {
+    let r = &state.rollup;
+    if !r.have_plan || r.active || state.upgrade.active || config_frozen(state) {
+        return;
+    }
+    if r.plan_set > 0 && t_now - r.plan_set > ROLLUP_PLAN_TTL {
+        rollup_forget(
+            state,
+            "expired: the stragglers never came back within 7 days",
+        );
+    } else if !rollup_owed(state) {
+        rollup_forget(state, "complete: every bot and hub is on the target");
+    }
+}
+
+/// Time out an attempt that went nowhere, and drop a plan nobody is owed.
+/// Runs on the maintenance clock.
 fn rollup_tick(state: &mut HubState, t_now: i64) {
+    rollup_settle(state, t_now);
     if !state.rollup.active || t_now - state.rollup.started <= ROLLUP_TIMEOUT {
         return;
     }
@@ -2605,6 +2693,7 @@ pub fn status(state: &HubState, r: &mut Reply) {
             r.kv("hub_ver", &ru.hub_target);
         }
         r.kvi("set", ru.plan_set);
+        r.kvi("expires", ru.plan_set + ROLLUP_PLAN_TTL);
     }
     if u.id.is_empty() {
         return;

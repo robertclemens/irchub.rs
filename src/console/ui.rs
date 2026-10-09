@@ -797,7 +797,8 @@ const CMDS: &[CmdDef] = &[
     cmd!("channel", Some("add"), CMD_ADMIN_ADD_CHANNEL, B::ChanAdd, 1, 1, Cf::None, Pre::None, "", "channel add <#chan> [key]", "add (or re-add) a channel", None),
     cmd!("channel", Some("del"), CMD_ADMIN_DEL_CHANNEL, B::Arg, 1, 0, Cf::Yn, Pre::None, "", "channel del <#chan>", "remove it from every bot (asks y/N)", None),
     cmd!("channel", Some("set"), CMD_ADMIN_ADD_CHANNEL, B::ChanSet, 3, 0, Cf::None, Pre::None, "", "channel set <#chan> <setting> <value|->", "change one setting (key today; - clears)", None),
-    cmd!("channel", Some("op"), CMD_ADMIN_OP_USER, B::ChanOp, 2, 0, Cf::None, Pre::None, "", "channel op <#chan> <nick>", "have the bots op a user", None),
+    cmd!("channel", Some("op"), CMD_ADMIN_OP_USER, B::ChanOp, 2, 0, Cf::None, Pre::None, "", "channel op <#chan> <nick>", "have one opped bot op a user", None),
+    cmd!("channel", Some("invite"), CMD_ADMIN_INVITE_USER, B::ChanOp, 2, 0, Cf::None, Pre::None, "", "channel invite <#chan> <nick>", "have one opped bot invite a user", None),
     cmd!("upgrade", Some("status"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::None, Pre::None, "", "upgrade status", "the upgrade run on this hub", None),
     cmd!("upgrade", Some("releases"), CMD_ADMIN_UPGRADE_STATUS, B::UpgReleases, 0, 2, Cf::None, Pre::None, "", "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", None),
     cmd!("upgrade", Some("start"), CMD_ADMIN_UPGRADE_NET, B::UpgStart, 1, 4, Cf::Type, Pre::UpgStart, "", "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade", None),
@@ -973,6 +974,8 @@ const CMD_HELP: &[CmdHelp] = &[
      "channel set #ops key s3cret\nchannel set #ops key -"),
     ("channel", Some("op"), Some("#chan\tthe channel\nnick\tthe user's current nick on IRC"),
      "channel op #ops alice"),
+    ("channel", Some("invite"), Some("#chan\tthe channel\nnick\tthe user's current nick on IRC"),
+     "channel invite #ops alice"),
     ("upgrade", Some("status"), None, "upgrade status"),
     ("upgrade", Some("releases"),
      Some("bot=<base>\ta different release site for the bot builds (a URL)\n\
@@ -1620,6 +1623,11 @@ impl Ui {
     }
 
     fn request_view(&mut self, kind: Rq, now_ms: i64) {
+        // Replies come back in request order, and a command may be answered
+        // late (channel op waits for a bot): refresh only between commands.
+        if self.user_busy {
+            return;
+        }
         if self.rq.iter().any(|r| r.kind == kind) || self.rq.len() >= MAX_PENDING_RQ {
             return;
         }
@@ -4102,6 +4110,7 @@ impl Ui {
                 return;
             }
             self.hist_add(&line);
+            self.hist_pos = self.hist.len(); // after the add: Up must land on this line
             self.run_line(&line);
         }
         if self.line_mode && !self.closing {

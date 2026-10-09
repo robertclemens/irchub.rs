@@ -70,7 +70,7 @@ fn lock_pid_file() -> Option<fs::File> {
 /// path comes from /proc/self/exe (`current_exe`; argv[0] has no directory when launched
 /// through PATH); returns it after chdir()ing to its directory.  That directory holds the
 /// binary an upgrade replaces, its .prev and the upgrade script, so refuse one another user
-/// owns or group/other can write -- they could swap any of them.  Mirrors
+/// owns and chmod go-w one group/other can write -- they could swap any of them.  Mirrors
 /// `instance_dir_enter()` in irchub/hub_main.c.
 fn instance_dir_enter() -> Option<String> {
     let Ok(exe) = std::env::current_exe() else {
@@ -88,13 +88,30 @@ fn instance_dir_enter() -> Option<String> {
             return None;
         }
     };
-    if md.uid() != nix::unistd::geteuid().as_raw() || md.mode() & 0o022 != 0 {
+    if md.uid() != nix::unistd::geteuid().as_raw() {
         eprintln!(
-            "Refusing to run from {}: it must be owned by this user and not writable by group \
-             or others (chmod go-w)",
+            "Refusing to run from {}: it must be owned by this user",
             dir.display()
         );
         return None;
+    }
+    // Group/other write (a 002 umask makes 0775 directories): we own it, so close the hole
+    // rather than refuse -- refusing turned every upgrade on such a host into a watchdog
+    // rollback and a fresh install into a dead start.  Nothing is weakened: the directory
+    // was open before we ran.
+    if md.mode() & 0o022 != 0 {
+        let m = md.mode() & 0o7777 & !0o022;
+        if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(m)) {
+            eprintln!(
+                "Refusing to run from {}: group/other can write it and chmod go-w failed ({e})",
+                dir.display()
+            );
+            return None;
+        }
+        eprintln!(
+            "Removed group/other write from {} (now {m:04o})",
+            dir.display()
+        );
     }
     if std::env::set_current_dir(dir).is_err() {
         eprintln!("Cannot change to my own directory {}", dir.display());
@@ -373,6 +390,9 @@ fn maintenance(state: &mut HubState) {
 
     // Rolling network upgrade: one step per tick (no-op unless running).
     upgrade::tick(state, t);
+
+    // Channel-request elections: probe windows and hand-off timeouts.
+    irchub::elect::tick(state, t);
 
     // The full config push owed to the bots, coalesced across a burst.
     client::flush_bot_config(state, t);
@@ -1202,6 +1222,11 @@ fn selftest() -> i32 {
         return fail(&format!(
             "this CPU lacks {f}, which the Rust build's TLS needs — use the C build"
         ));
+    }
+    // The swap happens in this directory: one another user owns is refused at start (a
+    // group/other-writable one we own is tightened there).
+    if !fs::metadata(".").is_ok_and(|m| m.uid() == nix::unistd::geteuid().as_raw()) {
+        return fail("this directory is not owned by this user");
     }
     if fs::metadata(HUB_CONFIG_FILE).is_err() {
         return fail(&format!("no {HUB_CONFIG_FILE}"));

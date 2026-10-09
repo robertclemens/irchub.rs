@@ -181,6 +181,68 @@ pub struct PendingOpRequest {
     pub active: bool,
 }
 
+/// One election (see CMD_CHAN_PROBE).  `from_fd` is the peer the question
+/// came from (-1: this hub started it); `admin_fd` the console owed the
+/// answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChanElectPhase {
+    /// Asking our own bots.
+    #[default]
+    Probe,
+    /// One of our bots was handed the action.
+    LocalDo,
+    /// Origin: flooded, collecting the other hubs' answers.
+    MeshWait,
+    /// Origin: one hub was handed the action.
+    MeshDo,
+    /// Relay: answered the origin, routing DO/DONE now.
+    Acked,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChanElectBot {
+    pub uuid: String,
+    pub nick: String,
+    /// a asked, y ready, n no, t tried.
+    pub st: u8,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChanElectHub {
+    pub uuid: String,
+    pub name: String,
+    /// The peer its answer came from.
+    pub fd: i32,
+    pub asked: i64,
+    pub ready: i64,
+    pub silent: i64,
+    pub tried: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ChanElect {
+    pub active: bool,
+    pub id: String,
+    pub origin: bool,
+    pub from_fd: i32,
+    pub admin_fd: i32,
+    /// admin_fd's conn_serial.
+    pub admin_serial: u64,
+    pub kind: String,
+    pub channel: String,
+    pub requester: String,
+    pub nick: String,
+    pub hostmask: String,
+    pub phase: ChanElectPhase,
+    pub phase_at: i64,
+    pub created: i64,
+    pub bots: Vec<ChanElectBot>,
+    pub hubs: Vec<ChanElectHub>,
+    /// Bot (LocalDo) or hub uuid (MeshDo) being tried.
+    pub doing: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PendingChanRequest {
     pub request_id: String,
@@ -613,6 +675,8 @@ pub struct BotRoster {
     pub connected_at: i64,
     /// Bot -> its hub link, 0 = unknown.
     pub link_since: i64,
+    /// The bot's address as its hub sees it, "" = unknown.
+    pub ip: String,
     /// Local clock: drives the TTL.
     pub reported_at: i64,
 }
@@ -734,6 +798,14 @@ pub enum BotAuthState {
     Complete,
 }
 
+/// Connection serials start at 1 and only grow: at one connection per
+/// nanosecond a 64-bit counter would take ~584 years to wrap
+/// (hub_main.c hub_next_conn_serial).
+pub fn next_conn_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 pub struct HubClient {
     /// The connection.  `None` once the socket is closed.
     pub sock: Option<TcpStream>,
@@ -755,6 +827,10 @@ pub struct HubClient {
     /// frames, no pings, no CLIENT_TIMEOUT (the console has its own idle
     /// timeout).  `sock` is None; the stream lives in `console`.
     pub internal: bool,
+    /// Never reused while the process lives (`next_conn_serial`): what a
+    /// late answer is bound to, so a console that took over a closed one's
+    /// fd never gets a reply it did not ask for.
+    pub conn_serial: u64,
     pub console: Option<Box<crate::console::ConsoleLink>>,
     /// First-bytes sniff of an accepted connection: until 4 bytes are there
     /// (or CONSOLE_SNIFF_MS passed) it is not read, so an "SSH-" stream can
@@ -840,6 +916,7 @@ impl HubClient {
             connected_at: t,
             inbound: false,
             internal: false,
+            conn_serial: next_conn_serial(),
             console: None,
             sniff_pending: false,
             sniff_deadline_ms: 0,
@@ -997,6 +1074,7 @@ pub struct HubState {
 
     pub pending_op_requests: Vec<PendingOpRequest>,
     pub pending_chan_requests: Vec<PendingChanRequest>,
+    pub chan_elections: Vec<ChanElect>,
 
     /// The network upgrade this hub is driving, if any (one at a time).
     pub upgrade: PendingUpgrade,
@@ -1155,6 +1233,7 @@ impl HubState {
             pending_head: 0,
             pending_op_requests: vec![PendingOpRequest::default(); MAX_PENDING_OP_REQUESTS],
             pending_chan_requests: vec![PendingChanRequest::default(); MAX_PENDING_CHAN_REQUESTS],
+            chan_elections: vec![ChanElect::default(); MAX_CHAN_ELECTIONS],
             upgrade: PendingUpgrade::default(),
             follow_id: String::new(),
             follow_origin: String::new(),

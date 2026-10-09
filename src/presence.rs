@@ -409,9 +409,10 @@ fn gossip_bot_roster(state: &mut HubState) {
         let nick = bot_nick_from_config(state, &c.id);
         let c = &state.clients[ci];
         let row = format!(
-            // 7th field: when the bot linked to this hub (a hub that
-            // predates it stops reading after the 6th).
-            "b|{}|{}|{}|{}|{}|{}|{}\n",
+            // 7th field: when the bot linked to this hub; 8th: the bot's
+            // address as this hub sees it (a hub that predates either stops
+            // reading before it).
+            "b|{}|{}|{}|{}|{}|{}|{}|{}\n",
             c.id,
             if nick.is_empty() { "-" } else { &nick },
             if c.bot_version.is_empty() {
@@ -430,7 +431,8 @@ fn gossip_bot_roster(state: &mut HubState) {
             } else {
                 &c.bot_variant
             },
-            c.connected_at
+            c.connected_at,
+            if c.ip.is_empty() { "-" } else { &c.ip }
         );
         if row.len() >= TREE_ROW_MAX {
             continue; // an unrepresentable row
@@ -698,11 +700,10 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
             continue;
         }
 
-        // Five fields from any hub; a sixth (the bot's code base) from one
-        // that knows it.
-        // Five fields from any hub; a sixth (the bot's code base) and a
-        // seventh (when it linked to that hub) from one that knows them.
-        let f = crate::cstr::split_fields(body, 7);
+        // Five fields from any hub; a sixth (the bot's code base), a seventh
+        // (when it linked to that hub) and an eighth (its address) from one
+        // that knows them.
+        let f = crate::cstr::split_fields(body, 8);
         if f.len() < 5 || f[0].is_empty() {
             continue;
         }
@@ -749,6 +750,20 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
             link_since: match f.get(6).map(|s| atoll(s)) {
                 Some(s) if s > 0 && s <= now_ts => s,
                 _ => 0,
+            },
+            // Display only, but still a peer's word: an IPv4/IPv6 literal or
+            // nothing.
+            ip: match f.get(7) {
+                Some(s)
+                    if *s != "-"
+                        && !s.is_empty()
+                        && s.len() <= ROSTER_IP_MAX
+                        && s.bytes()
+                            .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.') =>
+                {
+                    (*s).to_string()
+                }
+                _ => String::new(),
             },
             reported_at: now_ts,
         };

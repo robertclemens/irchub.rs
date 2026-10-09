@@ -2545,6 +2545,15 @@ fn opname(op: u64) -> Option<&'static str> {
         0x6A => "CMD_ACTIVITY_QUERY",
         0x6B => "CMD_ACTIVITY_REPLY",
         0x6C => "CMD_CONSOLE",
+        0x6D => "CMD_CHAN_PROBE",
+        0x6E => "CMD_CHAN_PROBE_ACK",
+        0x6F => "CMD_CHAN_DO",
+        0x70 => "CMD_CHAN_DONE",
+        0x71 => "CMD_CHAN_ELECT_FWD",
+        0x72 => "CMD_CHAN_ELECT_ACK",
+        0x73 => "CMD_CHAN_ELECT_DO",
+        0x74 => "CMD_CHAN_ELECT_DONE",
+        0x75 => "CMD_ADMIN_INVITE_USER",
         _ => return None,
     })
 }
@@ -3494,10 +3503,64 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         };
         effect(ctx, out, &ph);
     } else {
+        let inv = code == b"channel.invite";
         let nick = r.rv("nick").unwrap_or(b"?");
         let chan = r.rv("chan").unwrap_or(b"?");
-        let subj = cat(&[nick, b" on ", chan]);
-        ok(ctx, b"Op request sent", Some(&snp(256, subj)), out);
+        let subj = snp(256, cat(&[nick, b" on ", chan]));
+        let asked = r.rvi("asked", 0);
+        let hubs = r.rvi("hubs", 0);
+        if let Some(by) = r.rvs("by") {
+            // one bot was picked and did it
+            ok(
+                ctx,
+                if inv { b"Invited" } else { b"Opped" },
+                Some(&subj),
+                out,
+            );
+            let detail = r.rvs("detail");
+            let ph = cat(&[
+                by,
+                b" on ",
+                r.rv("hub_name").unwrap_or(b"?"),
+                b" did it",
+                if detail.is_some() { b" (" } else { b"" },
+                detail.unwrap_or(b""),
+                if detail.is_some() { b")" } else { b"" },
+            ]);
+            effect(ctx, out, &snp(160, ph));
+            let ph = cat(&[
+                &num(asked),
+                b" bot",
+                pl(asked),
+                b" asked on ",
+                &num(hubs),
+                b" hub",
+                pl(hubs),
+                b"; one acted",
+            ]);
+            effect(ctx, out, &snp(160, ph));
+            return;
+        }
+        let title: &[u8] = if inv {
+            b"Invite request sent"
+        } else {
+            b"Op request sent"
+        };
+        let lg = r.rvi("legacy", 0);
+        if lg > 0 {
+            // nobody ready; older bots asked
+            ok(ctx, title, Some(&subj), out);
+            let ph = cat(&[
+                b"no bot reported ready; ",
+                &num(lg),
+                b" older bot",
+                pl(lg),
+                b" asked the old way",
+            ]);
+            effect(ctx, out, &snp(160, ph));
+            return;
+        }
+        ok(ctx, title, Some(&subj), out);
         let local = r.rvi("local", 0);
         let ph = if local > 0 {
             cat(&[
@@ -3521,9 +3584,11 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         let ph = cat(&[
             b"a bot that is opped on ",
             chan,
-            b" and sees ",
-            nick,
-            b" will op them",
+            if inv {
+                b" will invite them"
+            } else {
+                b" and sees them will op them"
+            },
         ]);
         effect(ctx, out, &snp(160, ph));
     }
@@ -3575,6 +3640,15 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             let b = span(ctx.now.wrapping_sub(ru.rvi("set", 0)));
             let v = cat(&[&plan, b"  (set ", &a, b" ", dot, b" ", &b, b" ago)"]);
             card(out, L, "roll-up plan", &snp(512, v), RL_NORMAL);
+            // Kept only for nodes that were down when the run went through.
+            if ru.rvi("expires", 0) > 0 {
+                let left = ru.rvi("expires", 0) - ctx.now;
+                let v = cat(&[
+                    b"waiting for nodes that missed the run; dropped in ",
+                    &span(left.max(0)),
+                ]);
+                card(out, L, "", &snp(512, v), RL_DIM);
+            }
         } else {
             card(out, L, "roll-up plan", b"none", RL_NORMAL);
         }

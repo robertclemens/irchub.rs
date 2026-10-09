@@ -21,12 +21,18 @@ fn resp(state: &mut HubState, ci: usize, msg: &str) -> bool {
     client::send_response(state, ci, msg)
 }
 
-fn send_reply(state: &mut HubState, ci: usize, r: &mut Reply) -> bool {
+pub(crate) fn send_reply(state: &mut HubState, ci: usize, r: &mut Reply) -> bool {
     let t = r.text().to_string();
     resp(state, ci, &t)
 }
 
-fn admin_err(state: &mut HubState, ci: usize, code: &str, msg: &str, hint: Option<&str>) -> bool {
+pub(crate) fn admin_err(
+    state: &mut HubState,
+    ci: usize,
+    code: &str,
+    msg: &str,
+    hint: Option<&str>,
+) -> bool {
     let mut r = Reply::new();
     r.err(code, Some(msg), hint);
     send_reply(state, ci, &mut r)
@@ -40,7 +46,7 @@ fn refind(state: &HubState, fd: i32) -> Option<usize> {
 
 /// Field `idx` of a '|' payload, None when missing or `cap` bytes or more
 /// (hub_logic.c wire_field).
-fn wire_field(s: &str, idx: usize, cap: usize) -> Option<String> {
+pub(crate) fn wire_field(s: &str, idx: usize, cap: usize) -> Option<String> {
     let mut rest = s;
     for _ in 0..idx {
         rest = &rest[rest.find('|')? + 1..];
@@ -53,7 +59,7 @@ fn wire_field(s: &str, idx: usize, cap: usize) -> Option<String> {
 }
 
 /// Field `idx` and everything after it, clamped (hub_logic.c wire_tail).
-fn wire_tail(s: &str, idx: usize, cap: usize) -> Option<String> {
+pub(crate) fn wire_tail(s: &str, idx: usize, cap: usize) -> Option<String> {
     let mut rest = s;
     for _ in 0..idx {
         rest = &rest[rest.find('|')? + 1..];
@@ -75,7 +81,7 @@ fn scan_word(f: &str, w: usize) -> Option<String> {
 }
 
 /// Peer hubs a sync sent now reaches, and bots a config push reaches.
-fn linked_peer_count(state: &HubState) -> i64 {
+pub(crate) fn linked_peer_count(state: &HubState) -> i64 {
     state
         .clients
         .iter()
@@ -98,7 +104,7 @@ fn local_bot_client(state: &HubState, uuid: &str) -> Option<usize> {
         .position(|c| c.typ == ClientType::Bot && c.authenticated && c.id == uuid)
 }
 
-fn hub_display_name(state: &HubState) -> &str {
+pub(crate) fn hub_display_name(state: &HubState) -> &str {
     if state.hub_friendly_name.is_empty() {
         "hub"
     } else {
@@ -190,6 +196,7 @@ fn reply_bot(state: &HubState, r: &mut Reply, b: &BotConfig) {
         if e.link_since > 0 {
             r.kvi("since", e.link_since);
         }
+        opt(r, "ip", &e.ip);
     }
     if let Some(p) = b.entry("pub")
         && !p.value.is_empty()
@@ -2075,6 +2082,7 @@ pub fn console_admin_op(cmd: u8) -> bool {
             | CMD_ADMIN_ADD_CHANNEL
             | CMD_ADMIN_DEL_CHANNEL
             | CMD_ADMIN_OP_USER
+            | CMD_ADMIN_INVITE_USER
             | CMD_ADMIN_UPGRADE_NET
             | CMD_ADMIN_UPGRADE_STATUS
     )
@@ -2601,6 +2609,28 @@ pub fn handle_admin_command(
             let nick = f[0].to_string();
             let channel = chan.unwrap_or_default();
             let admin_fd = state.clients[ci].fd;
+            // One bot does it (CMD_CHAN_PROBE); the answer goes out when the
+            // election ends.  A mesh with an older hub keeps the old fan-out.
+            if crate::elect::mesh_ready(state) {
+                if crate::elect::start(
+                    state,
+                    "op",
+                    &channel,
+                    "ADMIN",
+                    &nick,
+                    "",
+                    Some((admin_fd, state.clients[ci].conn_serial)),
+                ) {
+                    return true;
+                }
+                return admin_err(
+                    state,
+                    ci,
+                    "channel.busy",
+                    "too many channel requests in flight",
+                    Some("try again in a few seconds"),
+                );
+            }
             // Every local bot is asked; one that is not opped there ignores
             // it.  Forwarding may drop a peer whose URGENT queue was full,
             // which swap-removes the client list.
@@ -2613,6 +2643,82 @@ pub fn handle_admin_command(
             r.kv("nick", &nick);
             r.kv("chan", &channel);
             r.kvi("local", sent as i64);
+            r.kvi("peers", linked_peer_count(state));
+            send_reply(state, ci, &mut r)
+        }
+
+        CMD_ADMIN_INVITE_USER => {
+            // sscanf("%63[^|]|%63s") != 2, and a channel name
+            let f = split_fields(payload, 2);
+            let chan = f.get(1).and_then(|c| scan_word(c, 63));
+            if f.len() < 2
+                || !scan_ok(f[0], 63)
+                || !chan
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with('#') || c.starts_with('&'))
+            {
+                return admin_err(
+                    state,
+                    ci,
+                    "channel.usage",
+                    "say which channel and nick",
+                    Some("channel invite <#chan> <nick>"),
+                );
+            }
+            let nick = f[0].to_string();
+            let channel = chan.unwrap_or_default();
+            let admin_fd = state.clients[ci].fd;
+            if crate::elect::mesh_ready(state) {
+                if crate::elect::start(
+                    state,
+                    "invite",
+                    &channel,
+                    "ADMIN",
+                    &nick,
+                    "",
+                    Some((admin_fd, state.clients[ci].conn_serial)),
+                ) {
+                    return true;
+                }
+                return admin_err(
+                    state,
+                    ci,
+                    "channel.busy",
+                    "too many channel requests in flight",
+                    Some("try again in a few seconds"),
+                );
+            }
+            // Older hub in the mesh: the bots' own invite path, asked of
+            // everyone.
+            let request_id = opflow::generate_request_id();
+            opflow::forward_seen_check_and_add(state, &request_id);
+            let told = opflow::broadcast_chan_action(
+                state,
+                &request_id,
+                "ADMIN",
+                "invite",
+                &channel,
+                &nick,
+                "",
+            );
+            opflow::forward_chan_request_to_peers(
+                state,
+                &request_id,
+                "ADMIN",
+                "invite",
+                &channel,
+                &nick,
+                "",
+                -1,
+            );
+            let Some(ci) = refind(state, admin_fd) else {
+                return false;
+            };
+            let mut r = Reply::new();
+            r.ok("channel.invite");
+            r.kv("nick", &nick);
+            r.kv("chan", &channel);
+            r.kvi("local", told as i64);
             r.kvi("peers", linked_peer_count(state));
             send_reply(state, ci, &mut r)
         }

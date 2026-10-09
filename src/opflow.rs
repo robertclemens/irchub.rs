@@ -526,13 +526,13 @@ pub fn process_forward_op_failed(state: &mut HubState, payload: &str) {
 // Channel-access requests (unban / invite / key)
 // ---------------------------------------------------------------------------
 
-fn chan_kind_valid(kind: &str) -> bool {
+pub(crate) fn chan_kind_valid(kind: &str) -> bool {
     matches!(kind, "unban" | "invite" | "key")
 }
 
 /// add_pending_chan_request(): reuse a slot whose reply never came rather
 /// than filling the table.
-fn add_pending_chan_request(
+pub(crate) fn add_pending_chan_request(
     state: &mut HubState,
     request_id: &str,
     requester_uuid: &str,
@@ -568,7 +568,7 @@ fn find_pending_chan_request(state: &HubState, request_id: &str) -> Option<usize
 
 // As with forward_op_request_to_peers: these are the wire fields.
 #[allow(clippy::too_many_arguments)]
-fn forward_chan_request_to_peers(
+pub(crate) fn forward_chan_request_to_peers(
     state: &mut HubState,
     request_id: &str,
     requester_uuid: &str,
@@ -609,7 +609,7 @@ fn forward_chan_request_to_peers(
 
 /// Push the action to every authenticated local bot except the requester.
 /// Returns how many bots were told.
-fn broadcast_chan_action(
+pub(crate) fn broadcast_chan_action(
     state: &mut HubState,
     request_id: &str,
     requester_uuid: &str,
@@ -727,6 +727,13 @@ pub fn process_chan_request(state: &mut HubState, ci: usize, payload: &str) {
     }
 
     crate::hlog_info!("[HUB] CHAN_REQUEST {kind} from {id} for {channel}\n");
+    // One bot answers it (CMD_CHAN_PROBE) unless an older hub is in the mesh.
+    if crate::elect::mesh_ready(state) {
+        if !crate::elect::start(state, &kind, &channel, &id, &nick, &hostmask, None) {
+            crate::hlog_warning!("[CHANREQ] Election table full — dropping {kind} for {channel}\n");
+        }
+        return;
+    }
     let request_id = generate_request_id();
     forward_seen_check_and_add(state, &request_id);
     chan_request_dispatch(

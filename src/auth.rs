@@ -300,6 +300,11 @@ pub fn disconnect_client(state: &mut HubState, ci: usize) {
         let c = &state.clients[ci];
         (c.ip.clone(), c.fd, c.typ, c.authenticated)
     };
+    // A console that goes away is owed nothing any more.
+    if state.clients[ci].internal {
+        let serial = state.clients[ci].conn_serial;
+        crate::elect::forget_admin(state, serial);
+    }
     // fd -1: a socket handed to the SSH console, not a disconnect.
     if fd >= 0 {
         crate::hlog_info!("[HUB] Disconnecting client {ip} (FD: {fd})\n");

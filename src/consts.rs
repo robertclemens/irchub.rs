@@ -108,7 +108,7 @@ pub const HIDEPINGPONG: bool = true;
 /// the bots tree and the one every upgrade comparison is made against.
 pub const HUB_VERSION: &str = match option_env!("IRCHUB_VERSION") {
     Some(v) => v,
-    None => "2.4.4",
+    None => "2.4.5",
 };
 
 /// Signed-release channel for the hub (irchub-releases).  Same Ed25519 key
@@ -290,6 +290,52 @@ pub const CMD_CHAN_REPLY: u8 = 0x5B;
 pub const CMD_CHAN_FWD_REQUEST: u8 = 0x5C;
 pub const CMD_CHAN_FWD_REPLY: u8 = 0x5D;
 
+// ---- Channel-request election (docs/plans/2026-10-07_chan_election_plan.md
+// in irchub) ----
+// One bot acts, not every bot that could.  The hub asks its own bots whether
+// they can (PROBE -> PROBE_ACK, answered at once from the bot's own state),
+// hands the action to ONE ready bot picked at random (DO -> DONE), and moves
+// on to the next ready bot when that one fails.  With nobody ready here the
+// origin floods the question to the mesh (ELECT_FWD), each hub probes its own
+// bots and answers ELECT_ACK back along the path, and the origin hands it to
+// one hub with a ready bot (ELECT_DO -> ELECT_DONE, along the same path).
+// Bots that never answer a probe predate it: when nobody is ready they get
+// the old CMD_OP_GRANT / CMD_CHAN_ACTION.  A mesh holding any hub older than
+// CHAN_ELECT_MIN_HUB keeps the old ask-everyone path.  Mirrors irchub/hub.h.
+//   PROBE      hub->bot  eid|kind|channel
+//   PROBE_ACK  bot->hub  eid|1| or eid|0|reason
+//   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
+//   DONE       bot->hub  eid|ok|detail or eid|fail|detail
+//   ELECT_FWD  hub->hub  eid|origin_hub|kind|channel|requester|nick|hostmask|origin_ts
+//   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|silent
+//   ELECT_DO   hub->hub  eid|hub_uuid|elect or eid|hub_uuid|legacy
+//   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
+// kind = op / invite / unban / key; requester = a bot uuid, or ADMIN.
+pub const CMD_CHAN_PROBE: u8 = 0x6D;
+pub const CMD_CHAN_PROBE_ACK: u8 = 0x6E;
+pub const CMD_CHAN_DO: u8 = 0x6F;
+pub const CMD_CHAN_DONE: u8 = 0x70;
+pub const CMD_CHAN_ELECT_FWD: u8 = 0x71;
+pub const CMD_CHAN_ELECT_ACK: u8 = 0x72;
+pub const CMD_CHAN_ELECT_DO: u8 = 0x73;
+pub const CMD_CHAN_ELECT_DONE: u8 = 0x74;
+/// Admin: invite a user (nick|#chan).
+pub const CMD_ADMIN_INVITE_USER: u8 = 0x75;
+/// Every hub in the mesh map at least this.
+pub const CHAN_ELECT_MIN_HUB: &str = "2.4.5";
+/// Seconds: local bots' answers.
+pub const CHAN_ELECT_PROBE_WAIT: i64 = 2;
+/// Seconds: other hubs' answers, after the flood.
+pub const CHAN_ELECT_MESH_WAIT: i64 = 4;
+/// Seconds: one bot's DONE.
+pub const CHAN_ELECT_DO_WAIT: i64 = 5;
+/// Seconds: one hub's ELECT_DONE (it may retry its own bots).
+pub const CHAN_ELECT_HUB_WAIT: i64 = 12;
+/// Seconds: hard end of any election.
+pub const CHAN_ELECT_TTL: i64 = 40;
+pub const MAX_CHAN_ELECTIONS: usize = 16;
+pub const CHAN_ELECT_REASON_MAX: usize = 48;
+
 // Network-wide upgrade coordination (mirrors irchub/hub.h).
 pub const CMD_UPGRADE_PREPARE: u8 = 0x5E;
 pub const CMD_UPGRADE_READY: u8 = 0x5F;
@@ -465,6 +511,11 @@ pub const ROLLUP_SETTLE: i64 = 20;
 pub const ROLLUP_TIMEOUT: i64 = 300;
 /// Nodes remembered in the attempt ledger.
 pub const MAX_ROLLUP_TRIES: usize = 64;
+/// A plan only exists while somebody is owed it: it is dropped as soon as
+/// every registered bot and every known hub is on the target, and after this
+/// long regardless -- a bot down for a day is likely coming back, one down for
+/// months is not, and its admin can still run an upgrade by hand.
+pub const ROLLUP_PLAN_TTL: i64 = 7 * 86400;
 /// Stop waiting for READY acks.
 pub const UPGRADE_PREPARE_TIMEOUT: i64 = 45;
 /// PREPARE also stays open this long after the node table last grew: a hub
@@ -565,6 +616,8 @@ pub const ROSTER_VERSION_MAX: usize = 15;
 /// Code base: "c" / "rs".
 pub const ROSTER_VARIANT_MAX: usize = 7;
 pub const ROSTER_SERVER_MAX: usize = 63;
+/// INET6_ADDRSTRLEN - 1: a bot's address in a roster row.
+pub const ROSTER_IP_MAX: usize = 45;
 pub const ROSTER_FRAME_BUDGET: usize = 8192;
 pub const TREE_ROW_MAX: usize = 256;
 /// One entry per (reporting hub, bot).  A hub only ever reports bots

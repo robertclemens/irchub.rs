@@ -1003,6 +1003,8 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
         CMD_OP_REQUEST => opflow::process_op_request(state, ci, payload),
         CMD_CHAN_REQUEST => opflow::process_chan_request(state, ci, payload),
         CMD_CHAN_REPLY => opflow::process_chan_reply(state, ci, payload),
+        CMD_CHAN_PROBE_ACK => crate::elect::process_probe_ack(state, ci, payload),
+        CMD_CHAN_DONE => crate::elect::process_done(state, ci, payload),
         CMD_INVITE_REQUEST => process_invite_request(state, ci, payload),
         CMD_BOT_RELAY => process_bot_relay(state, ci, payload),
         _ => {}
@@ -1221,6 +1223,10 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         CMD_UPGRADE_FORGET => upgrade::peer_forget(state, ci, payload),
         CMD_CHAN_FWD_REQUEST => opflow::process_forward_chan_request(state, ci, payload),
         CMD_CHAN_FWD_REPLY => opflow::process_forward_chan_reply(state, ci, payload),
+        CMD_CHAN_ELECT_FWD => crate::elect::process_elect_fwd(state, ci, payload),
+        CMD_CHAN_ELECT_ACK => crate::elect::process_elect_ack(state, ci, payload),
+        CMD_CHAN_ELECT_DO => crate::elect::process_elect_do(state, ci, payload),
+        CMD_CHAN_ELECT_DONE => crate::elect::process_elect_done(state, ci, payload),
         // A peer driving a run we are a node of...
         CMD_UPGRADE_PREPARE => upgrade::peer_prepare(state, ci, payload),
         CMD_UPGRADE_COMMIT => upgrade::peer_commit(state, ci, payload),
