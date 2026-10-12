@@ -94,6 +94,11 @@ pub fn admin_cmd_mutates_config(cmd: u8) -> bool {
             | CMD_ADMIN_DEL_USERMASK
             | CMD_ADMIN_SET_PEER_PUBKEY
             | CMD_ADMIN_SET_USERKEY
+            // the changing forms only: admin::mf_payload_mutates
+            | CMD_ADMIN_CHAN_MODE
+            | CMD_ADMIN_CHAN_SET
+            | CMD_ADMIN_BAN
+            | CMD_ADMIN_NET_SET
     )
 }
 

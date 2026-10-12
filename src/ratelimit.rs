@@ -7,10 +7,12 @@
 //!     exceeds the concurrency cap and never fails an auth.
 //!
 //! Plus a failed-auth counter that temporarily blocks an address once it has
-//! burned MAX_FAILED_AUTH_ATTEMPTS.
+//! burned its allowance.  The limits are `HubState::conn_cfg` (`hub set conn`,
+//! built-ins in `consts`); the SSH-only table is in `connlimits`.
 
 use std::net::Ipv4Addr;
 
+use crate::connlimits;
 use crate::consts::*;
 use crate::cstr::now;
 
@@ -38,7 +40,7 @@ fn find_or_create(state: &mut HubState, ip: &str) -> Option<usize> {
 /// D3: loopback is exempt only when explicitly trusted.  The default is to
 /// treat 127.0.0.1/::1 like any other IP, so a local / SSRF / co-tenant
 /// source cannot bypass per-IP limits.
-fn trusted_loopback(state: &HubState, ip: &str) -> bool {
+pub fn trusted_loopback(state: &HubState, ip: &str) -> bool {
     state.trust_loopback && (ip == "127.0.0.1" || ip == "::1")
 }
 
@@ -69,24 +71,34 @@ pub fn is_ip_allowed(state: &mut HubState, ip: &str) -> bool {
     // D1: churn-based throttle.  Count attempts in a sliding window; a
     // connect/close flood trips a temporary block here even though it never
     // exceeds the concurrency limit or fails auth.
-    if t - state.ip_limits[i].churn_window_start >= CHURN_WINDOW_SEC {
+    let cc = state.conn_cfg; // hub set conn
+    // An address with a console login in the last 24 h is not held to the
+    // churn limit (a tightened limit must not lock its admin out); the block
+    // above (authfail, or a churn block from before) still applies.
+    if connlimits::ssh_table_recent_ok(&state.ssh_ips, ip, t) {
+        return state.ip_limits[i].active_connections < cc.perip;
+    }
+    if t - state.ip_limits[i].churn_window_start >= i64::from(cc.churn_s) {
         state.ip_limits[i].churn_window_start = t;
         state.ip_limits[i].churn_count = 0;
     }
     state.ip_limits[i].churn_count += 1;
-    if state.ip_limits[i].churn_count > CHURN_MAX_CONNS {
-        state.ip_limits[i].blocked_until = t + CHURN_BLOCK_SEC;
+    if state.ip_limits[i].churn_count > cc.churn_n {
+        state.ip_limits[i].blocked_until = t + i64::from(cc.churn_block);
         crate::hlog_warning!(
-            "[RATE_LIMIT] IP {ip} connection churn flood ({} conns/{CHURN_WINDOW_SEC}s) — blocked {CHURN_BLOCK_SEC}s\n",
-            state.ip_limits[i].churn_count
+            "[RATE_LIMIT] IP {ip} connection churn flood ({} conns/{}s) — blocked {}s\n",
+            state.ip_limits[i].churn_count,
+            cc.churn_s,
+            cc.churn_block
         );
         return false;
     }
 
-    if state.ip_limits[i].active_connections >= MAX_CONNECTIONS_PER_IP {
+    if state.ip_limits[i].active_connections >= cc.perip {
         crate::hlog_warning!(
-            "[RATE_LIMIT] IP {ip} exceeded connection limit ({}/{MAX_CONNECTIONS_PER_IP})\n",
-            state.ip_limits[i].active_connections
+            "[RATE_LIMIT] IP {ip} exceeded connection limit ({}/{})\n",
+            state.ip_limits[i].active_connections,
+            cc.perip
         );
         return false;
     }
@@ -117,25 +129,69 @@ pub fn record_failed_auth(state: &mut HubState, ip: &str) {
     };
     let t = now();
 
-    // Reset the counter if the last failure was over FAILED_AUTH_RESET_TIME
-    // ago.
-    if t - state.ip_limits[i].last_failed_auth > FAILED_AUTH_RESET_TIME {
+    // Reset the counter if the last failure was over the window ago.
+    let cc = state.conn_cfg; // hub set conn
+    if t - state.ip_limits[i].last_failed_auth > i64::from(cc.fail_s) {
         state.ip_limits[i].failed_auth_count = 0;
     }
     state.ip_limits[i].failed_auth_count += 1;
     state.ip_limits[i].last_failed_auth = t;
 
     crate::hlog_warning!(
-        "[AUTH_FAIL] IP {ip} failed auth (attempt {}/{MAX_FAILED_AUTH_ATTEMPTS})\n",
-        state.ip_limits[i].failed_auth_count
+        "[AUTH_FAIL] IP {ip} failed auth (attempt {}/{})\n",
+        state.ip_limits[i].failed_auth_count,
+        cc.fail_n
     );
 
-    if state.ip_limits[i].failed_auth_count >= MAX_FAILED_AUTH_ATTEMPTS {
-        state.ip_limits[i].blocked_until = t + FAILED_AUTH_BLOCK_DURATION;
+    if state.ip_limits[i].failed_auth_count >= cc.fail_n {
+        state.ip_limits[i].blocked_until = t + i64::from(cc.fail_block);
         crate::hlog_warning!(
-            "[AUTH_BLOCK] IP {ip} blocked for {FAILED_AUTH_BLOCK_DURATION} seconds (too many failed attempts)\n"
+            "[AUTH_BLOCK] IP {ip} blocked for {} seconds (too many failed attempts)\n",
+            cc.fail_block
         );
     }
+}
+
+/// hub_console_ssh_failed(): a refused SSH login (FAIL frame), counted in the
+/// SSH-only table (D26), so an admin's mistyped keys never block a bot or
+/// peer on the same address.
+pub fn ssh_failed(state: &mut HubState, ip: &str) {
+    if trusted_loopback(state, ip) {
+        return;
+    }
+    let blk = connlimits::ssh_table_failed(&mut state.ssh_ips, &state.conn_cfg, ip, now());
+    if blk > 0 {
+        crate::hlog_warning!(
+            "[AUTH_BLOCK] SSH from {ip} blocked for {blk} seconds (too many refused logins)\n"
+        );
+    }
+}
+
+/// hub_console_ssh_admit(): the connection from `ip` just sniffed as SSH: the
+/// console scope of the ACL (D27), then the SSH block and connect window.
+/// False = close it.
+pub fn ssh_admit(state: &mut HubState, ip: &str) -> bool {
+    if !ip_acl_permits_console(state, ip) {
+        crate::hlog_warning!(
+            "[ACCESS_CONTROL] SSH from {ip} refused (console scope of the allow/deny lists)\n"
+        );
+        return false;
+    }
+    if trusted_loopback(state, ip) {
+        return true;
+    }
+    let (ok, blk) = connlimits::ssh_table_connect(&mut state.ssh_ips, &state.conn_cfg, ip, now());
+    if ok {
+        return true;
+    }
+    if blk > 0 {
+        crate::hlog_warning!(
+            "[RATE_LIMIT] SSH from {ip} connecting too fast; blocked for {blk} seconds\n"
+        );
+    } else {
+        crate::hlog_info!("[RATE_LIMIT] SSH from {ip} refused (blocked)\n");
+    }
+    false
 }
 
 /// cleanup_old_ip_limits(): drop idle, unblocked entries older than an hour.
@@ -207,21 +263,33 @@ pub fn ip_acl_parse(input: &str) -> Option<IpAcl> {
     Some(out)
 }
 
-fn ip_acl_match(list: &[IpAcl], addr: u32) -> bool {
-    list.iter().any(|e| addr & e.mask == e.net)
+/// Entries of one scope: console (D27, applies once the first bytes say SSH)
+/// or not (every inbound connection).  The two scopes never mix: an allowlist
+/// with only console entries leaves bots and peers unrestricted.
+fn ip_acl_match(list: &[IpAcl], addr: u32, console: bool) -> bool {
+    list.iter()
+        .any(|e| e.console == console && addr & e.mask == e.net)
+}
+
+pub fn ip_acl_scope_count(list: &[IpAcl], console: bool) -> usize {
+    list.iter().filter(|e| e.console == console).count()
 }
 
 /// 0 = permitted, 1 = on the denylist, 2 = not on a non-empty allowlist.
-fn ip_acl_verdict(state: &HubState, ip: &str) -> i32 {
+fn ip_acl_verdict(state: &HubState, ip: &str, console: bool) -> i32 {
     let parsed = ip.parse::<Ipv4Addr>().ok();
     let addr = parsed.map_or(0u32, u32::from);
 
     // An address that does not parse is refused whenever either list has
     // entries: policy that cannot be evaluated is policy that failed.
-    if !state.ip_deny.is_empty() && (parsed.is_none() || ip_acl_match(&state.ip_deny, addr)) {
+    if ip_acl_scope_count(&state.ip_deny, console) > 0
+        && (parsed.is_none() || ip_acl_match(&state.ip_deny, addr, console))
+    {
         return 1;
     }
-    if !state.ip_allow.is_empty() && (parsed.is_none() || !ip_acl_match(&state.ip_allow, addr)) {
+    if ip_acl_scope_count(&state.ip_allow, console) > 0
+        && (parsed.is_none() || !ip_acl_match(&state.ip_allow, addr, console))
+    {
         return 2;
     }
     0
@@ -230,12 +298,18 @@ fn ip_acl_verdict(state: &HubState, ip: &str) -> i32 {
 /// hub_ip_acl_permits(): the silent decision.  Deny wins; a non-empty
 /// allowlist must match.
 pub fn ip_acl_permits(state: &HubState, ip: &str) -> bool {
-    ip_acl_verdict(state, ip) == 0
+    ip_acl_verdict(state, ip, false) == 0
+}
+
+/// hub_ip_acl_permits_console(): the same decision over the entries written
+/// with the `console` word (D27).
+pub fn ip_acl_permits_console(state: &HubState, ip: &str) -> bool {
+    ip_acl_verdict(state, ip, true) == 0
 }
 
 /// check_ip_access_lists(): the accept-time decision, which logs a refusal.
 pub fn check_ip_access_lists(state: &HubState, ip: &str) -> bool {
-    let verdict = ip_acl_verdict(state, ip);
+    let verdict = ip_acl_verdict(state, ip, false);
     if verdict == 0 {
         return true;
     }

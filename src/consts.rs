@@ -321,6 +321,40 @@ pub const CMD_CHAN_ELECT_DO: u8 = 0x73;
 pub const CMD_CHAN_ELECT_DONE: u8 = 0x74;
 /// Admin: invite a user (nick|#chan).
 pub const CMD_ADMIN_INVITE_USER: u8 = 0x75;
+
+// ---- Modes, settings, bans, flood protection (docs/modes.md, 2.4.5) --------
+// Mirrors irchub/hub.h and ircbot/bot.h.
+//   CMD_ADMIN_CHAN_MODE  console->hub  #chan (view) | #chan|<modes>|<arg>... | #chan|-
+//   CMD_ADMIN_CHAN_SET   console->hub  <#chan|default> | <#chan|default>|<tok>|<tok>...
+//   CMD_ADMIN_BAN        console->hub  list|<#c|*|""> | add|<#c|*>|<mask>|<min|perm>|<sticky 0/1>|<reason>
+//                                      | del|<#c|*>|<mask>
+//   CMD_ADMIN_NET_SET    console->hub  "" | flood|<cmd|msg|ctcp>|<N:S|off|default> | ignoretime|<min|default> | sendq|<B:I|default>
+//   CMD_ADMIN_SET_SSH    console->hub  "" | <name>|<value|default> | conn|<name>|<value>
+//   CMD_CHAN_EVENT       bot->hub      #chan|<action>|<target>|<detail>   (D42)
+// CMD_CHAN_EVENT: action is deop reop kick ban unban moderevert limit
+// floodtrip ignore; target (nick or mask) <= CHAN_EVENT_TARGET_MAX bytes,
+// detail <= CHAN_EVENT_DETAIL_MAX, no control characters.  The hub checks the
+// bounds, rate-limits per bot connection (CHAN_EVENT_MAX_PER_WINDOW per
+// CHAN_EVENT_WINDOW seconds, the rest dropped) and writes one info line to
+// its log ring, "chan #c <action> <target> by <botname>: <detail>".  Hub
+// local: never stored, never forwarded to peers or other bots.
+pub const CMD_ADMIN_CHAN_MODE: u8 = 0x76;
+pub const CMD_ADMIN_CHAN_SET: u8 = 0x77;
+pub const CMD_ADMIN_BAN: u8 = 0x78;
+pub const CMD_ADMIN_NET_SET: u8 = 0x79;
+pub const CMD_ADMIN_SET_SSH: u8 = 0x7A;
+pub const CMD_CHAN_EVENT: u8 = 0x7B;
+pub const CHAN_EVENT_TARGET_MAX: usize = 120;
+pub const CHAN_EVENT_DETAIL_MAX: usize = 160;
+pub const CHAN_EVENT_WINDOW: i64 = 60;
+pub const CHAN_EVENT_MAX_PER_WINDOW: i32 = 30;
+// kind = "mode" (2.4.5, docs/modes.md §3.1): apply the stored modes of a
+// channel once.  The DO payload carries nothing extra (eid|mode|channel); the
+// elected bot reads the stored C| modes + c| key (it has them in its config)
+// and sends the MODE line(s) that move the live modes there.  DONE ok|detail,
+// or fail|reason; a `channel op` to a nick that is not authorised on a +bitch
+// channel answers fail|bitch, which the origin turns into
+// channel.not_authorised.
 /// Every hub in the mesh map at least this.
 pub const CHAN_ELECT_MIN_HUB: &str = "2.4.5";
 /// Seconds: local bots' answers.
@@ -457,8 +491,6 @@ pub const CONSOLE_LOG_LINE_MAX: usize = 512;
 /// Coalescing of pushed events: seconds between two tree events.
 pub const CONSOLE_TREE_MIN_GAP: i64 = 1;
 pub const CONSOLE_NAME_MAX: usize = 64;
-/// Most unauthenticated SSH connections from one address at a time.
-pub const CONSOLE_MAX_PREAUTH_PER_IP: usize = 2;
 /// Largest control / session frame either side accepts.
 pub const CONSOLE_FRAME_MAX: usize = 4 * 1024 * 1024;
 
@@ -535,6 +567,54 @@ pub const UPGRADE_PREPARE_TTL: i64 = 900;
 pub const MESH_ANTI_ENTROPY_INTERVAL: i64 = 300;
 pub const MAX_BOT_ENTRIES: usize = 64;
 
+// ---- Modes / settings / bans records (docs/modes.md §2, 2.4.5) -------------
+// C|<#chan>|<modes>|<settings>|<op>|<ts>   channel settings (console only)
+// D|<modes>|<settings>|<ts>                network defaults (console only)
+// B|<#chan|*>|<mask>|<expires>|<flags>|<setter>|<reason>|<op>|<ts>   one ban
+// They live in `global_entries` beside c|, under the same LWW store.  Every
+// field is capped at the single ingest point (storage::put_record), and the
+// bulk ceilings below grow by exactly these counts x line sizes, so they stay
+// hard bounds.  Mirrored in ircbot/bot.h.  MAX_BANS_TOTAL counts live bans
+// AND tombstones.
+/// c| and C| records each.
+pub const MAX_CHANNELS: usize = MAX_BOT_ENTRIES;
+/// Modes field, e.g. "+stnkl 20".
+pub const C_MODES_MAX: usize = 64;
+/// C| settings field.
+pub const C_SETTINGS_MAX: usize = 512;
+/// D| settings field.
+pub const D_SETTINGS_MAX: usize = 512;
+pub const BAN_MASK_MAX: usize = 120;
+pub const BAN_REASON_MAX: usize = 120;
+/// Admin name or bot uuid, with the NUL.
+pub const BAN_SETTER_MAX: usize = 64;
+pub const MAX_BANS_PER_CHAN: usize = 100;
+/// Bans whose channel is "*".
+pub const MAX_GLOBAL_BANS: usize = 100;
+pub const MAX_BANS_TOTAL: usize = MAX_CHANNELS * MAX_BANS_PER_CHAN + MAX_GLOBAL_BANS;
+// One serialized line each: tag + every field at its cap + op + 20-digit
+// stamp + separators + newline, rounded up.
+pub const C_LINE_MAX: usize = 704;
+pub const D_LINE_MAX: usize = 640;
+pub const B_LINE_MAX: usize = 448;
+/// `global_entries`: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B.
+pub const MAX_GLOBAL_ENTRIES: usize = MAX_BOT_ENTRIES + MAX_CHANNELS + 1 + MAX_BANS_TOTAL;
+/// Oldest hub that stores and forwards C|/D|/B| (older ones drop them).
+pub const MODES_MIN_HUB: &str = "2.4.5";
+/// Live bans one bot may hold per channel.
+pub const BOT_BANS_PER_CHAN: usize = 10;
+/// Tombstone age kept when purge is off (seconds).
+pub const TOMB_MIN_AGE_OFF: i64 = 7 * 86400;
+/// Seconds a bot-written ban may exceed bantime.
+pub const BAN_BOT_SLACK: i64 = 60;
+/// Built-in bantime (minutes).
+pub const BANTIME_DEFAULT_MIN: i64 = 120;
+/// Seconds between expiry sweeps.
+pub const BAN_SWEEP_INTERVAL: i64 = 60;
+/// What C|, D| and B| add to a bulk payload at their caps.
+pub const MODES_RECORDS_MAX: usize =
+    MAX_CHANNELS * C_LINE_MAX + D_LINE_MAX + MAX_BANS_TOTAL * B_LINE_MAX;
+
 pub const MAX_HUB_USER_RECORDS: usize = 40;
 pub const MAX_HUB_USER_MASKS: usize = 200;
 
@@ -565,6 +645,7 @@ pub const MAX_CONFIG_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + MAX_HUB_USER_MASKS * MASK_LINE_MAX
     + BOT_SYNC_FIELDS * BOT_FIELD_LINE
     + MAX_BOTS * BLINE_MAX
+    + MODES_RECORDS_MAX
     + PAYLOAD_SLACK;
 
 /// Hub<->hub full-state sync (`mesh::generate_sync_packet`): globals + users +
@@ -574,6 +655,7 @@ pub const MAX_SYNC_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + MAX_HUB_USER_MASKS * MASK_LINE_MAX
     + MAX_BOTS * BOT_SYNC_FIELDS * BOT_FIELD_LINE
     + MAX_PEERS * PEER_LINE_MAX
+    + MODES_RECORDS_MAX
     + PAYLOAD_SLACK;
 
 /// `config::write()` buffer: every serialized section at its bound, with the
@@ -587,6 +669,7 @@ pub const HUB_CONFIG_FIXED_MAX: usize = 8192
     + MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + MAX_HUB_USER_RECORDS * USER_LINE_MAX
     + MAX_HUB_USER_MASKS * MASK_LINE_MAX
+    + MODES_RECORDS_MAX
     + 2 * MAX_IP_ACL_ENTRIES * IP_ACL_LINE_MAX
     + MAX_PEERS * 512;
 pub const HUB_CONFIG_PER_BOT_MAX: usize = MAX_BOT_ENTRIES * 1100;

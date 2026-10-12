@@ -14,6 +14,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use zeroize::Zeroizing;
 
+use crate::connlimits::Group;
 use crate::consts::*;
 use crate::cstr::{atoll, now, split_fields, trunc_string};
 use crate::state::{HubState, IpAclAdd, MaskRecord, UserRecord, lww_next_ts, parse_uint};
@@ -173,6 +174,10 @@ pub fn write(state: &mut HubState) {
         buf.push_str(&format!("log_size|{}\n", state.log_max_size));
     }
 
+    // hub set ssh / hub set conn: ssh|<name>|<value> and conn|<name>|<value>,
+    // only for values that differ from the built-ins.
+    buf.push_str(&state.conn_cfg.lines());
+
     if state.purge_days_setting > 0 {
         buf.push_str(&format!("purge_days|{}\n", state.purge_days_setting));
     }
@@ -258,11 +263,14 @@ pub fn write(state: &mut HubState) {
     }
 
     // Local IP access lists: w|<pattern>|<added> (allow), x|... (deny).
+    // The console scope (D27) is written wc|/xc|, which older hubs ignore.
     for e in &state.ip_allow {
-        buf.push_str(&format!("w|{}|{}\n", e.pattern(), e.added));
+        let k = if e.console { "wc" } else { "w" };
+        buf.push_str(&format!("{k}|{}|{}\n", e.pattern(), e.added));
     }
     for e in &state.ip_deny {
-        buf.push_str(&format!("x|{}|{}\n", e.pattern(), e.added));
+        let k = if e.console { "xc" } else { "x" };
+        buf.push_str(&format!("{k}|{}|{}\n", e.pattern(), e.added));
     }
 
     // Named admin/oper records (a| and o| lines) — every record: a name
@@ -372,7 +380,7 @@ pub fn write(state: &mut HubState) {
 /// than guessed at (the old matcher read "10.0.0.0/" as /0, i.e. every
 /// address).  False when the line should not stay in the file as written:
 /// dropped, a duplicate, or not in canonical form.
-fn load_ip_acl_line(state: &mut HubState, list: char, v: &str) -> bool {
+fn load_ip_acl_line(state: &mut HubState, list: char, v: &str, console: bool) -> bool {
     let name = if list == 'w' { "allowlist" } else { "denylist" };
     let Some(s_ts) = v.rfind('|') else {
         crate::hlog_warning!("[CONFIG] Dropping {name} line without a timestamp\n");
@@ -404,6 +412,7 @@ fn load_ip_acl_line(state: &mut HubState, list: char, v: &str) -> bool {
         return false;
     };
     e.added = ts;
+    e.console = console;
     let r = ratelimit::ip_acl_add(state, list, &e);
     if r == IpAclAdd::Full {
         crate::hlog_warning!(
@@ -838,7 +847,7 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
             // Older layout of the local IP lists: g|<w|x>|<pattern>|<ts>
             "g" if v.starts_with("w|") || v.starts_with("x|") => {
                 let list = v.as_bytes()[0] as char;
-                load_ip_acl_line(state, list, &v[2..]);
+                load_ip_acl_line(state, list, &v[2..], false);
                 cfg_acl_fixed += 1; // rewrite as w|/x|
             }
             "g" => load_global_line(state, v),
@@ -861,10 +870,33 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
             }
             "m" => load_mask_line(state, v),
             "c" => load_channel_line(state, v),
+            // 2.4.5 records: key|value|ts.  The same ingest point as the wire,
+            // so a hand-edited or damaged line is dropped, not trusted.  Case
+            // variants of one channel / mask (from an older c|-style store)
+            // merge there, newest stamp wins.
+            "C" | "D" | "B" => {
+                if let Some(p) = v.rfind('|') {
+                    storage::put_record(state, k, &v[..p], atoll(&v[p + 1..]));
+                }
+            }
             // Retired shared bot password: dropped (bots use public keys).
             "p" => cfg_legacy_users += 1,
-            "w" | "x" if !load_ip_acl_line(state, k.as_bytes()[0] as char, v) => {
+            "w" | "x" | "wc" | "xc"
+                if !load_ip_acl_line(state, k.as_bytes()[0] as char, v, k.len() == 2) =>
+            {
                 cfg_acl_fixed += 1;
+            }
+            // An invalid line leaves the built-in: a damaged file never
+            // loosens a limit below its floor.
+            "ssh" | "conn" => {
+                let g = if k == "ssh" { Group::Ssh } else { Group::Conn };
+                if !state.conn_cfg.load(g, v) {
+                    crate::hlog_warning!(
+                        "[CONFIG] Ignoring invalid {k} setting '{}'\n",
+                        trunc_string(v, 41)
+                    );
+                }
+                state.conn_cfg.fix();
             }
             _ => {}
         }

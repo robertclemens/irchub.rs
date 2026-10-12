@@ -45,6 +45,28 @@ pub fn send_cmd_to_bot(client: &mut HubClient, cmd: u8, payload: &str) -> bool {
     net::write_framed(sock, &wire)
 }
 
+/// send_cmd_to_bot_after_config(): for a frame that acts on config the bot
+/// may not have yet (a `mode` job reads the C| modes and c| key the console
+/// has just stored): send the owed config push now, past the coalescing
+/// window, and queue the frame behind it in the bulk lane --
+/// [`send_cmd_to_bot`] writes straight to the socket and would overtake a
+/// config still waiting in the bot's queue.
+pub fn send_cmd_to_bot_after_config(
+    state: &mut HubState,
+    ci: usize,
+    cmd: u8,
+    payload: &str,
+) -> bool {
+    if state.bot_config_pending {
+        send_owed_bot_config(state, now());
+    }
+    let c = &mut state.clients[ci];
+    if !c.has_pending_writes() {
+        return send_cmd_to_bot(c, cmd, payload);
+    }
+    QueuedMsg::new(cmd, Lane::Bulk, payload.as_bytes()).is_some_and(|m| queue::enqueue(c, m))
+}
+
 /// The largest reply the old hub_admin client accepted: its frame check refused anything
 /// past a 65536-byte plaintext plus IV and tag.  The C hub built each reply in
 /// a fixed buffer (8 KB for the user listings, 16 KB for most, 64 KB for the
@@ -235,6 +257,11 @@ pub fn flush_bot_config(state: &mut HubState, now_ts: i64) {
     if !state.bot_config_pending || now_ts - state.last_bot_config_push < BOT_CONFIG_PUSH_COALESCE {
         return;
     }
+    send_owed_bot_config(state, now_ts);
+}
+
+/// send_owed_bot_config(): the push itself, past any coalescing window.
+fn send_owed_bot_config(state: &mut HubState, now_ts: i64) {
     state.bot_config_pending = false;
     state.last_bot_config_push = now_ts;
     let bots = state.bot_clients();
@@ -487,8 +514,10 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
         }
 
         // Reject hub-authoritative record types from bots while opt 'h' is
-        // active.
-        if hub_only_mutations && matches!(typ, 'a' | 'o' | 'm' | 'c') {
+        // active.  'c' is the exception for what a bot learns (key / modes of
+        // a channel that is already managed): that is enforcement, not an
+        // admin change, and stays accepted (D43) -- see the 'c' branch below.
+        if hub_only_mutations && matches!(typ, 'a' | 'o' | 'm') {
             crate::hlog_warning!(
                 "[HUB] opt 'h' active: REJECTED bot-pushed '{typ}' record from {id} (hub-authoritative — mutation must originate from the admin console)\n"
             );
@@ -500,6 +529,16 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 let Some((chan, key, modes_val, op, ts)) = parse_push_channel(data) else {
                     continue;
                 };
+                // Opt 'h': a bot may only report the key / modes of a channel
+                // the admins already manage; it may not add or remove one
+                // (D43).
+                if hub_only_mutations && (op != "add" || storage::chan_live(state, &chan).is_none())
+                {
+                    crate::hlog_warning!(
+                        "[HUB] opt 'h' active: REJECTED bot-pushed 'c' {op} for {chan} from {id} (hub-authoritative)\n"
+                    );
+                    continue;
+                }
                 // Build extra as "key|modes" so the stored value becomes
                 // "chan|key|modes|op".
                 let extra = trunc_string(&format!("{key}|{modes_val}"), 80);
@@ -516,6 +555,28 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                         &format!("b|{id}|c|{chan}|{key}|{modes_val}|{op}|{ts}\n"),
                     );
                 }
+            }
+            'B' => {
+                // Enforcement ban: B|chan|mask|expires|flags|setter|reason|op|ts.
+                // A bot writes only its own timed bans (modes::ban_bot_write
+                // holds the rules); opt 'h' does not gate it (D43).
+                let Some(p) = data.rfind('|') else { continue };
+                if p == 0 || p >= 1024 {
+                    continue;
+                }
+                let bval = &data[..p];
+                let bts = atoll(&data[p + 1..]);
+                if crate::modes::ban_bot_write(state, &id, bval, bts) {
+                    updates += 1;
+                    push_sync(&mut sync_buffer, &format!("B|{bval}|{bts}\n"));
+                }
+            }
+            'C' | 'D' => {
+                // Channel settings and network defaults are written by the
+                // console only.
+                crate::hlog_warning!(
+                    "[HUB] Ignored bot-pushed '{typ}' record from {id} (console only)\n"
+                );
             }
             'm' => {
                 // New format: uuid|mask|add/del|last_used|timestamp.  The old
@@ -1005,6 +1066,7 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
         CMD_CHAN_REPLY => opflow::process_chan_reply(state, ci, payload),
         CMD_CHAN_PROBE_ACK => crate::elect::process_probe_ack(state, ci, payload),
         CMD_CHAN_DONE => crate::elect::process_done(state, ci, payload),
+        CMD_CHAN_EVENT => crate::modes::chan_event_receive(state, ci, payload),
         CMD_INVITE_REQUEST => process_invite_request(state, ci, payload),
         CMD_BOT_RELAY => process_bot_relay(state, ci, payload),
         _ => {}

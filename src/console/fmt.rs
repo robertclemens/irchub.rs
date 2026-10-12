@@ -33,6 +33,8 @@ pub const FMT_MODE_NORMAL: i32 = 0;
 pub const FMT_MODE_HUB_SETTINGS: i32 = 1;
 /// Full-screen views 4/5.
 pub const FMT_MODE_VIEW: i32 = 2;
+/// "hub set ssh|conn" alone: the limits table.
+pub const FMT_MODE_LIMITS: i32 = 3;
 
 // ===========================================================================
 // Small byte-string helpers (the C printf family, byte for byte)
@@ -2214,12 +2216,176 @@ fn render_hub_settings(ctx: &Ctx, h: &Crec, out: &mut Flines) {
     t.render(ctx, out);
 }
 
+/// hub set ssh / hub set conn: this hub's connection limits.  ok|hub.show
+/// with group=ssh|conn and, per setting, <name>=<value> and
+/// <name>_def=<built-in>.
+const LIMIT_ROWS: [(&str, &str, &str); 13] = [
+    (
+        "ssh",
+        "preauth",
+        "SSH logins in progress, all addresses (1-64)",
+    ),
+    (
+        "ssh",
+        "preauthip",
+        "SSH logins in progress from one address (1 to preauth)",
+    ),
+    ("ssh", "sessions", "open consoles (1-32)"),
+    (
+        "ssh",
+        "grace",
+        "seconds from connect to a running console (5-120)",
+    ),
+    (
+        "ssh",
+        "authtries",
+        "refused keys before a connection is dropped (1-6)",
+    ),
+    (
+        "ssh",
+        "idle",
+        "seconds without a keystroke before the console closes (60-86400)",
+    ),
+    (
+        "ssh",
+        "authfail",
+        "refused SSH logins per address, N:S, then blocked",
+    ),
+    (
+        "ssh",
+        "connect",
+        "new SSH connections per address, N:S, then blocked",
+    ),
+    (
+        "ssh",
+        "block",
+        "seconds blocked; doubles per repeat within 24 h, up to 24 h (30-86400)",
+    ),
+    (
+        "ssh",
+        "cmdrate",
+        "console commands per session, N:S; more are queued, not dropped",
+    ),
+    (
+        "conn",
+        "perip",
+        "connections at once from one address, bots, peers and SSH (2-64)",
+    ),
+    (
+        "conn",
+        "churn",
+        "new connections per address, N:S[:B], then blocked B seconds",
+    ),
+    (
+        "conn",
+        "authfail",
+        "failed logins per address, N:S[:B], then blocked B seconds",
+    ),
+];
+
+fn render_limits(ctx: &Ctx, h: &Crec, out: &mut Flines) {
+    let group = h.rv("group").unwrap_or(b"ssh");
+    let conn = group == b"conn";
+    const COLS: [Col; 4] = [
+        col("SETTING", b'L', 1),
+        col("VALUE", b'L', 1),
+        col("FROM", b'L', 1),
+        col("MEANING", b'L', 2),
+    ];
+    let mut t = Tbl::new(&COLS, -1, 0, 1);
+    let mut changed = 0;
+    for (g, name, meaning) in &LIMIT_ROWS {
+        if g.as_bytes() != group {
+            continue;
+        }
+        let key = format!("{name}_def");
+        let v = h.rv(name).unwrap_or(glyph(ctx, G_DASH));
+        let d = h.rv(&key).unwrap_or(b"");
+        let set = v != d;
+        if set {
+            changed += 1;
+        }
+        let cells: [Option<&[u8]>; 4] = [
+            Some(name.as_bytes()),
+            Some(v),
+            Some(if set { b"set here" } else { b"built-in" }),
+            Some(meaning.as_bytes()),
+        ];
+        t.row(ctx, RL_NORMAL, None, &cells);
+    }
+    let right = snp(
+        96,
+        cat(&[
+            b"this hub only ",
+            glyph(ctx, G_DOT),
+            b" ",
+            &num(changed),
+            b" changed",
+        ]),
+    );
+    title(
+        ctx,
+        out,
+        if conn {
+            b"Connection limits"
+        } else {
+            b"SSH limits"
+        },
+        Some(&right),
+    );
+    t.render(ctx, out);
+    rule_line(ctx, out);
+    line(
+        out,
+        RL_DIM,
+        &[b"  a change applies to the next connection; logins in progress keep theirs"],
+    );
+    hint(
+        out,
+        if conn {
+            b"hub set conn <perip|churn|authfail> <value|default>"
+        } else {
+            "hub set ssh <name> <value|default> \u{b7} hub set conn shows the shared limits"
+                .as_bytes()
+        },
+    );
+}
+
 fn render_hub_set(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let r = &rep.res;
     let arrow = glyph(ctx, G_ARROW);
     let setting = r.rv("setting").unwrap_or(b"?");
     let old = r.rvs("old").unwrap_or(glyph(ctx, G_DASH));
     let val = r.rvs("value").unwrap_or(glyph(ctx, G_DASH));
+    if r.rvs("group").is_some() {
+        // hub set ssh|conn
+        let what: &[u8] = if r.rv("group") == Some(b"conn") {
+            b"Connection limits"
+        } else {
+            b"SSH limits"
+        };
+        let subj = snp(512, cat(&[setting, b"   ", old, b" ", arrow, b" ", val]));
+        ok(ctx, &snp(160, what.to_vec()), Some(&subj), out);
+        if !r.rvb("written") {
+            effect(ctx, out, b"no change: it already had that value");
+        } else {
+            effect(
+                ctx,
+                out,
+                if r.rvb("reset") {
+                    b"built-in value restored"
+                } else {
+                    b"saved on this hub"
+                },
+            );
+            effect(
+                ctx,
+                out,
+                b"applies to the next connection; logins in progress keep theirs",
+            );
+        }
+        return;
+    }
     let hn: &[u8] = if setting == b"name" {
         old
     } else if !ctx.hubname.is_empty() {
@@ -2554,6 +2720,12 @@ fn opname(op: u64) -> Option<&'static str> {
         0x73 => "CMD_CHAN_ELECT_DO",
         0x74 => "CMD_CHAN_ELECT_DONE",
         0x75 => "CMD_ADMIN_INVITE_USER",
+        0x76 => "CMD_ADMIN_CHAN_MODE",
+        0x77 => "CMD_ADMIN_CHAN_SET",
+        0x78 => "CMD_ADMIN_BAN",
+        0x79 => "CMD_ADMIN_NET_SET",
+        0x7A => "CMD_ADMIN_SET_SSH",
+        0x7B => "CMD_CHAN_EVENT",
         _ => return None,
     })
 }
@@ -2891,10 +3063,11 @@ fn render_acl_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 b"these addresses are refused"
             }),
         );
-        const COLS: [Col; 5] = [
+        const COLS: [Col; 6] = [
             col("#", b'R', 1),
             col("PATTERN", b'L', 1),
             col("COVERS", b'L', 1),
+            col("SCOPE", b'L', 1),
             col("ADDED", b'L', 1),
             col("", b'L', 1),
         ];
@@ -2925,6 +3098,7 @@ fn render_acl_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 Some(nn.as_slice()),
                 x.rv("pattern"),
                 Some(&cov),
+                Some(x.rv("scope").unwrap_or(b"all")),
                 Some(&added),
                 Some(cov_you),
             ];
@@ -2952,7 +3126,12 @@ fn render_acl_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let r = &rep.res;
     let add = rep.code == b"acl.added";
     let list = r.rv("list").unwrap_or(b"?");
-    let what = cat(&[if list == b"allow" { b"Allow" } else { b"Deny" }, b" list"]);
+    let cscope = r.rv("scope") == Some(b"console");
+    let what = cat(&[
+        if list == b"allow" { b"Allow" } else { b"Deny" },
+        b" list",
+        if cscope { b" (console)" } else { b"" },
+    ]);
     let sz = strtoull(r.rv("size").unwrap_or(b"0"), 10);
     let c = count(sz);
     let subj = cat(&[
@@ -2967,18 +3146,34 @@ fn render_acl_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     ]);
     ok(ctx, &what, Some(&snp(160, subj)), out);
     effect(ctx, out, b"local to this hub (the lists are not synced)");
+    if cscope {
+        effect(
+            ctx,
+            out,
+            b"console scope: applies to SSH logins only, bots and peers are not affected",
+        );
+    }
     if r.rvb("first") {
         warn(
             ctx,
             out,
-            b"the allow list was empty: from now on only listed addresses can connect",
+            if cscope {
+                b"the console allow list was empty: from now on only listed addresses can open the console".as_slice()
+            } else {
+                b"the allow list was empty: from now on only listed addresses can connect"
+            },
         );
     }
     if r.rvb("empty") {
         warn(
             ctx,
             out,
-            b"the allow list is empty now: every address may connect",
+            if cscope {
+                b"the console allow list is empty now: every address may open the console"
+                    .as_slice()
+            } else {
+                b"the allow list is empty now: every address may connect"
+            },
         );
     }
     let closing = r.rvi("closing", 0);
@@ -3407,10 +3602,56 @@ fn render_channel_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let t = snp(96, cat(&[b"Channel ", c.rv("name").unwrap_or(b"?")]));
     title(ctx, out, &t, Some(b"managed"));
     const L: i32 = 12;
-    for cs in CHAN_SETTINGS {
-        let v = chan_value(cs.0, c.rv(cs.0), 160);
-        let v: &[u8] = if v.is_empty() { glyph(ctx, G_DASH) } else { &v };
-        card(out, L, cs.2, v, RL_NORMAL);
+    if rep.res.rvs("want").is_some() {
+        // 2.4.5: the key, the stored modes (and where they come from), the
+        // live modes a bot last reported, the channel's own settings, its bans
+        let res = &rep.res;
+        let dash = glyph(ctx, G_DASH);
+        card(
+            out,
+            L,
+            "key",
+            if c.rvs("key").is_some() {
+                c.rv("key").unwrap_or(b"")
+            } else {
+                dash
+            },
+            RL_NORMAL,
+        );
+        let v = snp(
+            160,
+            cat(&[
+                res.rv("want").unwrap_or(b""),
+                b"   (",
+                modes_source_phrase(res.rv("want_src")),
+                b")",
+            ]),
+        );
+        card(out, L, "modes", &v, RL_NORMAL);
+        let v = match c.rvs("modes") {
+            Some(m) => snp(
+                160,
+                cat(&[b"+", m, b"   (i and k as last reported by a bot)"]),
+            ),
+            None => b"not reported".to_vec(),
+        };
+        card(out, L, "live modes", &v, RL_NORMAL);
+        let ov = overrides_phrase(res.rv("overrides"), 512);
+        card(
+            out,
+            L,
+            "settings",
+            if ov.is_empty() { b"all default" } else { &ov },
+            RL_NORMAL,
+        );
+        let v = snp(160, num(res.rvi("bans", 0)));
+        card(out, L, "bans", &v, RL_NORMAL);
+    } else {
+        for cs in CHAN_SETTINGS {
+            let v = chan_value(cs.0, c.rv(cs.0), 160);
+            let v: &[u8] = if v.is_empty() { glyph(ctx, G_DASH) } else { &v };
+            card(out, L, cs.2, v, RL_NORMAL);
+        }
     }
     let v = when_ago(ctx, c.rvi("ts", 0), 160);
     card(out, L, "changed", &v, RL_NORMAL);
@@ -3421,6 +3662,12 @@ fn render_channel_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         RL_DIM,
         &[b"  bot presence per channel: not reported yet"],
     );
+    if rep.res.rvs("want").is_some() {
+        hint(
+            out,
+            "channel mode <#chan> \u{b7} channel set <#chan> \u{b7} ban list <#chan>".as_bytes(),
+        );
+    }
 }
 
 fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
@@ -3470,20 +3717,6 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 &snp(160, cat(&[b"recorded modes +", m, b" kept"])),
             );
         }
-    } else if code == b"channel.set" {
-        let what = snp(96, cat(&[b"Channel ", name]));
-        let subj = cat(&[
-            r.rv("setting").unwrap_or(b"?"),
-            b"   ",
-            r.rvs("old").unwrap_or(glyph(ctx, G_DASH)),
-            b" ",
-            arrow,
-            b" ",
-            r.rvs("value").unwrap_or(glyph(ctx, G_DASH)),
-        ]);
-        ok(ctx, &what, Some(&snp(256, subj)), out);
-        let ph = cat(&[b"pushed to ", &num(bots), b" bot", pl(bots), b"; ", &pp]);
-        effect(ctx, out, &snp(160, ph));
     } else if code == b"channel.removed" {
         ok(ctx, b"Channel removed", Some(name), out);
         if !r.rvb("existed") {
@@ -3592,6 +3825,570 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         ]);
         effect(ctx, out, &snp(160, ph));
     }
+}
+
+// ===========================================================================
+// Modes, settings, bans (docs/modes.md §5.1)
+// ===========================================================================
+/// The on/off options: a setting not in this list is valued (a number or a
+/// flood limit).  A new on/off option is one word here.
+const FLAG_SETTINGS: &[&str] = &[
+    "enforcemodes",
+    "bitch",
+    "protectops",
+    "revenge",
+    "stopnethack",
+    "enforcebans",
+    "dynamicbans",
+    "dontkickops",
+    "cycle",
+    "dynamiclimit",
+];
+
+fn is_flag_setting(name: &[u8]) -> bool {
+    FLAG_SETTINGS.iter().any(|f| f.as_bytes() == name)
+}
+
+/// A setting's value as a person reads it: on / off, minutes, seconds,
+/// permanent; floods stay N:S or off.
+fn setting_value(name: &[u8], kind: Option<&[u8]>, v: Option<&[u8]>, cap: usize) -> Vec<u8> {
+    let v = v.unwrap_or(b"");
+    let out = if kind == Some(b"flag") {
+        if v == b"1" {
+            b"on".to_vec()
+        } else {
+            b"off".to_vec()
+        }
+    } else if name == b"bantime" && v == b"0" {
+        b"permanent".to_vec()
+    } else if name == b"bantime" || name == b"banidle" || name == b"ignoretime" {
+        cat(&[v, b" min"])
+    } else if name == b"limitdelay" {
+        cat(&[v, b" s"])
+    } else {
+        v.to_vec()
+    };
+    snp(cap, out)
+}
+
+fn src_phrase(src: Option<&[u8]>) -> &'static [u8] {
+    match src {
+        None => b"?",
+        Some(b"chan") => b"channel",
+        Some(b"net") => b"network",
+        Some(_) => b"built-in",
+    }
+}
+
+fn modes_source_phrase(src: Option<&[u8]>) -> &'static [u8] {
+    match src {
+        None => b"",
+        Some(b"chan") => b"set on this channel",
+        Some(b"net") => b"network default",
+        Some(_) => b"built-in default",
+    }
+}
+
+/// D38: a command that wrote C|/D|/B| names the hubs that will drop them.
+fn old_hubs_warn(ctx: &Ctx, r: &Crec, out: &mut Flines) {
+    let Some(h) = r.rvs("old_hubs") else {
+        return;
+    };
+    let m = snp(
+        512,
+        cat(&[
+            b"older hubs drop settings, modes and bans: ",
+            h,
+            b" ",
+            glyph(ctx, G_DASH),
+            b" upgrade them to 2.4.5 or the bots behind them get none",
+        ]),
+    );
+    warn(ctx, out, &m);
+}
+
+fn push_effects(ctx: &Ctx, r: &Crec, out: &mut Flines) {
+    let bots = r.rvi("bots", 0);
+    let peers = r.rvi("peers", 0);
+    let pp = if peers > 0 {
+        snp(
+            96,
+            cat(&[b"synced to ", &num(peers), b" peer hub", pl(peers)]),
+        )
+    } else {
+        b"no peer hub linked".to_vec()
+    };
+    let ph = snp(
+        160,
+        cat(&[b"pushed to ", &num(bots), b" bot", pl(bots), b"; ", &pp]),
+    );
+    effect(ctx, out, &ph);
+}
+
+/// channel.mode: the view (view=1) or the answer to a store-and-apply.
+fn render_channel_mode(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    let chan = r.rv("chan").unwrap_or(b"?");
+    let eff = r.rv("effective");
+    if r.rvb("view") {
+        let title_s = snp(96, cat(&[b"Modes ", chan]));
+        title(ctx, out, &title_s, Some(b"managed"));
+        const L: i32 = 8;
+        let v = snp(
+            256,
+            cat(&[
+                eff.unwrap_or(b"?"),
+                b"   (",
+                modes_source_phrase(r.rv("source")),
+                b")",
+            ]),
+        );
+        card(out, L, "stored", &v, RL_NORMAL);
+        card(
+            out,
+            L,
+            "key",
+            if r.rvb("key_set") {
+                b"set (channel show has it)"
+            } else {
+                b"none"
+            },
+            RL_NORMAL,
+        );
+        let v = match r.rvs("live") {
+            Some(l) => snp(
+                256,
+                cat(&[b"+", l, b"   (i and k as last reported by a bot)"]),
+            ),
+            None => b"not reported".to_vec(),
+        };
+        card(out, L, "live", &v, RL_NORMAL);
+        if r.rvb("dynlimit") {
+            warn(
+                ctx,
+                out,
+                b"+l is stored but +dynamiclimit is on: the dynamic limit wins",
+            );
+        }
+        hint(
+            out,
+            b"channel mode <#chan> <+modes> [key] [limit]  stores and applies \xc2\xb7 channel mode <#chan> -  network default",
+        );
+        return;
+    }
+    let v = snp(256, cat(&[chan, b"   ", eff.unwrap_or(b"?")]));
+    ok(ctx, b"Modes applied", Some(&v), out);
+    let ph = snp(
+        200,
+        cat(&[
+            b"stored on every hub and bot (",
+            modes_source_phrase(r.rv("source")),
+            b")",
+        ]),
+    );
+    effect(ctx, out, &ph);
+    if let Some(by) = r.rvs("by") {
+        let detail = r.rvs("detail");
+        let ph = snp(
+            200,
+            cat(&[
+                by,
+                b" on ",
+                r.rv("hub_name").unwrap_or(b"?"),
+                b" applied them",
+                if detail.is_some() { b" (" } else { b"" },
+                detail.unwrap_or(b""),
+                if detail.is_some() { b")" } else { b"" },
+            ]),
+        );
+        effect(ctx, out, &ph);
+        let asked = r.rvi("asked", 0);
+        let hubs = r.rvi("hubs", 0);
+        let ph = snp(
+            200,
+            cat(&[
+                &num(asked),
+                b" bot",
+                pl(asked),
+                b" asked on ",
+                &num(hubs),
+                b" hub",
+                pl(hubs),
+                b"; one acted",
+            ]),
+        );
+        effect(ctx, out, &ph);
+    }
+    if r.rvb("dynlimit") {
+        warn(
+            ctx,
+            out,
+            b"+l is stored but +dynamiclimit is on: the dynamic limit wins",
+        );
+    }
+    old_hubs_warn(ctx, r, out);
+}
+
+/// channel.settings / network.settings: every setting, its value, where it
+/// comes from.
+fn render_settings_table(ctx: &Ctx, rep: &Creply, out: &mut Flines, network: bool) {
+    let r = &rep.res;
+    let net_target = !network && r.rv("name") == Some(b"default");
+    let mut overrides = 0;
+    let mut rows = 0;
+    for c in rep.r.iter().filter(|c| c.is("setting")) {
+        rows += 1;
+        // a channel counts its own values; the network default and the bot
+        // floods count what the network changed
+        let want: &[u8] = if net_target || network {
+            b"net"
+        } else {
+            b"chan"
+        };
+        if c.rv("src") == Some(want) {
+            overrides += 1;
+        }
+    }
+    let (title_s, right) = if network {
+        (
+            b"Bot floods".to_vec(),
+            snp(
+                160,
+                cat(&[
+                    b"network-wide ",
+                    glyph(ctx, G_DOT),
+                    b" ",
+                    &num(overrides),
+                    b" changed",
+                ]),
+            ),
+        )
+    } else {
+        (
+            snp(96, cat(&[b"Settings ", r.rv("name").unwrap_or(b"?")])),
+            snp(
+                160,
+                cat(&[
+                    &num(overrides),
+                    b" ",
+                    if net_target {
+                        b"changed"
+                    } else {
+                        b"of its own"
+                    },
+                ]),
+            ),
+        )
+    };
+    title(ctx, out, &title_s, Some(&right));
+    const COLS: [Col; 3] = [
+        col("SETTING", b'L', 1),
+        col("VALUE", b'L', 1),
+        col("FROM", b'L', 1),
+    ];
+    let mut t = Tbl::new(&COLS, -1, 0, 0);
+    for c in rep.r.iter().filter(|c| c.is("setting")) {
+        let name = c.rv("name").unwrap_or(b"?");
+        let val = setting_value(name, c.rv("kind"), c.rv("value"), 48);
+        let from = src_phrase(c.rv("src"));
+        t.row(ctx, RL_NORMAL, None, &[Some(name), Some(&val), Some(from)]);
+    }
+    if rows == 0 {
+        empty_note(out, "no settings", None);
+        return;
+    }
+    t.render(ctx, out);
+    rule_line(ctx, out);
+    if network {
+        line(
+            out,
+            RL_DIM,
+            &[b"  cmd counts per user, msg and ctcp per host; a flooding host is ignored for ignoretime"],
+        );
+        line(
+            out,
+            RL_DIM,
+            &[b"  sendq paces what a bot says: B lines at once, then one every I ms (I 0 = no delay)"],
+        );
+        hint(
+            out,
+            b"network set flood <cmd|msg|ctcp> <N:S|off|default> \xc2\xb7 network set ignoretime <min|default> \xc2\xb7 network set sendq <B:I|default>",
+        );
+    } else {
+        let eff = r.rv("effective");
+        let v = snp(
+            200,
+            cat(&[
+                b"  modes ",
+                eff.unwrap_or(b"?"),
+                b" (",
+                modes_source_phrase(r.rv("source")),
+                b")",
+            ]),
+        );
+        line(out, RL_DIM, &[&v]);
+        hint(
+            out,
+            if net_target {
+                b"channel set default +opt|-opt|<name> <value|default>"
+            } else {
+                b"channel set <#chan> +opt|-opt|<name> <value|default> \xc2\xb7 flood <type> <N:S|off|default>"
+            },
+        );
+    }
+}
+
+/// channel.set / network.set: what changed, old -> new.
+fn render_settings_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    let network = rep.code == b"network.set";
+    let name = r.rv("name").unwrap_or(b"?");
+    let net_target = !network && name == b"default";
+    let arrow = glyph(ctx, G_ARROW);
+    if network {
+        let st = r.rv("setting").unwrap_or(b"?");
+        let a = setting_value(st, r.rv("kind"), r.rv("old"), 48);
+        let b = setting_value(st, r.rv("kind"), r.rv("value"), 48);
+        let subj = snp(160, cat(&[st, b"   ", &a, b" ", arrow, b" ", &b]));
+        ok(ctx, b"Bot floods", Some(&subj), out);
+        if !r.rvb("written") {
+            effect(ctx, out, b"no change: it already had that value");
+        } else {
+            let ph = snp(
+                200,
+                cat(&[b"now ", &b, b" (", src_phrase(r.rv("src")), b")"]),
+            );
+            effect(ctx, out, &ph);
+            push_effects(ctx, r, out);
+        }
+        old_hubs_warn(ctx, r, out);
+        return;
+    }
+    let what = if net_target {
+        b"Network default".to_vec()
+    } else {
+        snp(96, cat(&[b"Channel ", name]))
+    };
+    let n = r.rvi("changes", 0);
+    let subj = snp(160, cat(&[&num(n), b" setting", pl(n)]));
+    ok(ctx, &what, Some(&subj), out);
+    for c in rep.r.iter().filter(|c| c.is("chg")) {
+        let st = c.rv("setting").unwrap_or(b"?");
+        let a = setting_value(st, c.rv("kind"), c.rv("old"), 48);
+        let b = setting_value(st, c.rv("kind"), c.rv("value"), 48);
+        let how: &[u8] = if c.rvb("reset") {
+            b"default restored"
+        } else {
+            src_phrase(c.rv("src"))
+        };
+        let ph = snp(
+            200,
+            cat(&[st, b"   ", &a, b" ", arrow, b" ", &b, b"   (", how, b")"]),
+        );
+        effect(ctx, out, &ph);
+    }
+    if !r.rvb("written") {
+        effect(ctx, out, b"no change: it already had these values");
+    } else {
+        push_effects(ctx, r, out);
+    }
+    old_hubs_warn(ctx, r, out);
+}
+
+/// ban.*
+fn ban_expiry(ctx: &Ctx, expires: i64, cap: usize) -> Vec<u8> {
+    if expires <= 0 {
+        b"permanent".to_vec()
+    } else if expires <= ctx.now {
+        b"expired".to_vec()
+    } else {
+        let w = when(expires, ctx.now);
+        let sp = span(expires - ctx.now);
+        snp(cap, cat(&[&w, b" ", glyph(ctx, G_DOT), b" in ", &sp]))
+    }
+}
+
+fn ban_row_cmp(a: &&Crec, b: &&Crec) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let ca = a.rv("chan").unwrap_or(b"");
+    let cb = b.rv("chan").unwrap_or(b"");
+    // "*" (every channel) first, then channel, mask, added
+    let (ga, gb) = (ca == b"*", cb == b"*");
+    if ga != gb {
+        return if ga {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let c = ci_cmp(ca, cb);
+    if c != 0 {
+        return c.cmp(&0);
+    }
+    let c = cmp(ca, cb);
+    if c != Ordering::Equal {
+        return c;
+    }
+    let ma = a.rv("mask").unwrap_or(b"");
+    let mb = b.rv("mask").unwrap_or(b"");
+    let c = ci_cmp(ma, mb);
+    if c != 0 {
+        return c.cmp(&0);
+    }
+    let c = cmp(ma, mb);
+    if c != Ordering::Equal {
+        return c;
+    }
+    a.rvi("ts", 0).cmp(&b.rvi("ts", 0))
+}
+
+fn render_ban_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    let count = r.rvi("count", 0);
+    let right = if let Some(ch) = r.rvs("chan") {
+        snp(
+            120,
+            cat(&[
+                &num(count),
+                b" ban",
+                pl(count),
+                b" ",
+                glyph(ctx, G_DOT),
+                b" ",
+                if ch == b"*" { b"global" } else { ch },
+            ]),
+        )
+    } else {
+        snp(120, cat(&[&num(count), b" ban", pl(count)]))
+    };
+    title(ctx, out, b"Bans", Some(&right));
+    let mut rows: Vec<&Crec> = rep.r.iter().filter(|c| c.is("ban")).collect();
+    if rows.is_empty() {
+        empty_note(
+            out,
+            "no bans listed",
+            Some("ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]"),
+        );
+        return;
+    }
+    rows.sort_by(ban_row_cmp);
+    const COLS: [Col; 7] = [
+        col("CHANNEL", b'L', 1),
+        col("MASK", b'L', 1),
+        col("EXPIRES", b'L', 1),
+        col("STICKY", b'L', 2),
+        col("BY", b'L', 2),
+        col("REASON", b'L', 2),
+        col("ADDED", b'L', 2),
+    ];
+    let mut t = Tbl::new(&COLS, -1, 1, 1);
+    for c in rows {
+        let ex = ban_expiry(ctx, c.rvi("expires", 0), 96);
+        let when_s = when_ago(ctx, c.rvi("ts", 0), 64);
+        let sticky: &[u8] = if c.rvb("sticky") { b"yes" } else { b"no" };
+        t.row(
+            ctx,
+            RL_NORMAL,
+            None,
+            &[
+                c.rv("chan"),
+                c.rv("mask"),
+                Some(&ex),
+                Some(sticky),
+                c.rv("setter"),
+                c.rv("reason"),
+                Some(&when_s),
+            ],
+        );
+    }
+    t.render(ctx, out);
+    if r.rvb("truncated") {
+        warn(
+            ctx,
+            out,
+            b"only the first bans are shown; name a channel to narrow the list",
+        );
+    }
+}
+
+fn render_ban_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    let chan = r.rv("chan").unwrap_or(b"?");
+    let mask = r.rv("mask").unwrap_or(b"?");
+    let subj = snp(
+        256,
+        cat(&[
+            if chan == b"*" { b"every channel" } else { chan },
+            b"   ",
+            mask,
+        ]),
+    );
+    if rep.code == b"ban.removed" {
+        ok(ctx, b"Ban removed", Some(&subj), out);
+        push_effects(ctx, r, out);
+        old_hubs_warn(ctx, r, out);
+        return;
+    }
+    ok(
+        ctx,
+        if r.rvb("existed") {
+            b"Ban updated"
+        } else {
+            b"Ban added"
+        },
+        Some(&subj),
+        out,
+    );
+    let ex = ban_expiry(ctx, r.rvi("expires", 0), 96);
+    effect(ctx, out, &snp(256, cat(&[b"lasts: ", &ex])));
+    if r.rvb("sticky") {
+        effect(
+            ctx,
+            out,
+            b"sticky: the bots put it back at once if an op removes it",
+        );
+    }
+    if let Some(reason) = r.rvs("reason") {
+        effect(ctx, out, &snp(256, cat(&[b"reason: ", reason])));
+    }
+    push_effects(ctx, r, out);
+    old_hubs_warn(ctx, r, out);
+}
+
+/// The settings a channel overrides ("bitch=1,flood join=5:60") as a person
+/// would type them: +bitch, flood join 5:60.
+fn overrides_phrase(ov: Option<&[u8]>, cap: usize) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut p = ov.unwrap_or(b"");
+    while !p.is_empty() {
+        let tl = p.iter().position(|&c| c == b',').unwrap_or(p.len());
+        let tok = &p[..tl];
+        if let Some(eq) = tok.iter().position(|&c| c == b'=')
+            && eq < 48
+            && tl - eq - 1 < 48
+        {
+            let (name, val) = (&tok[..eq], &tok[eq + 1..]);
+            let one = if is_flag_setting(name) {
+                snp(112, cat(&[if val == b"1" { b"+" } else { b"-" }, name]))
+            } else {
+                snp(112, cat(&[name, b" ", val]))
+            };
+            let sep: &[u8] = if out.is_empty() { b"" } else { b", " };
+            let piece = cat(&[sep, &one]);
+            let room = cap - out.len();
+            if piece.len() >= room {
+                // snprintf leaves the cut-off text
+                out.extend_from_slice(&piece[..room - 1]);
+                return out;
+            }
+            out.extend_from_slice(&piece);
+        }
+        p = &p[tl..];
+        if let Some(r) = p.strip_prefix(b",") {
+            p = r;
+        }
+    }
+    out
 }
 
 // ===========================================================================
@@ -4562,6 +5359,7 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
     let c = rep.code.as_slice();
     if rep.err {
         error(ctx, rep.res.rv("msg"), rep.res.rv("hint"), out);
+        old_hubs_warn(ctx, &rep.res, out);
         if c == b"bot.ambiguous" {
             const COLS: [Col; 3] = [
                 col("UUID", b'L', 1),
@@ -4594,6 +5392,8 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
     let has = |p: &[u8]| c.starts_with(p);
     if ctx.mode == FMT_MODE_HUB_SETTINGS && c == b"hub.show" {
         render_hub_settings(ctx, &rep.res, out);
+    } else if ctx.mode == FMT_MODE_LIMITS && c == b"hub.show" {
+        render_limits(ctx, &rep.res, out);
     } else if c == b"bot.list" {
         render_bot_list(ctx, rep, out);
     } else if c == b"bot.show" {
@@ -4642,6 +5442,20 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
         render_channel_list(ctx, rep, out);
     } else if c == b"channel.show" {
         render_channel_show(ctx, rep, out);
+    } else if c == b"channel.settings" {
+        render_settings_table(ctx, rep, out, false);
+    } else if c == b"channel.mode" {
+        render_channel_mode(ctx, rep, out);
+    } else if c == b"channel.set" {
+        render_settings_change(ctx, rep, out);
+    } else if c == b"ban.list" {
+        render_ban_list(ctx, rep, out);
+    } else if has(b"ban.") {
+        render_ban_change(ctx, rep, out);
+    } else if c == b"network.settings" {
+        render_settings_table(ctx, rep, out, true);
+    } else if c == b"network.set" {
+        render_settings_change(ctx, rep, out);
     } else if has(b"channel.") {
         render_channel_change(ctx, rep, out);
     } else if c == b"upg.status" {

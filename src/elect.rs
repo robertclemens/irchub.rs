@@ -135,16 +135,26 @@ fn try_local(state: &mut HubState, ei: usize) -> bool {
         else {
             return false;
         };
-        let act = trunc_string(
-            &format!(
-                "{}|{}|{}|{}|{}|{}",
-                e.id, e.kind, e.channel, e.requester, e.nick, e.hostmask
-            ),
-            MAX_MASK_LEN + 256,
-        );
+        let act = if e.kind == "mode" {
+            // The bot needs only eid|mode|channel.
+            trunc_string(
+                &format!("{}|{}|{}", e.id, e.kind, e.channel),
+                MAX_MASK_LEN + 256,
+            )
+        } else {
+            trunc_string(
+                &format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    e.id, e.kind, e.channel, e.requester, e.nick, e.hostmask
+                ),
+                MAX_MASK_LEN + 256,
+            )
+        };
         let uuid = e.bots[bi].uuid.clone();
         state.chan_elections[ei].bots[bi].st = b't';
+        let mode = state.chan_elections[ei].kind == "mode";
         let sent = match bot(state, &uuid) {
+            Some(ci) if mode => client::send_cmd_to_bot_after_config(state, ci, CMD_CHAN_DO, &act),
             Some(ci) => client::send_cmd_to_bot(&mut state.clients[ci], CMD_CHAN_DO, &act),
             None => false,
         };
@@ -164,6 +174,10 @@ fn try_local(state: &mut HubState, ei: usize) -> bool {
 /// many were told.
 fn legacy_local(state: &mut HubState, ei: usize) -> i64 {
     let e = state.chan_elections[ei].clone();
+    // "mode" is new in 2.4.5: an older bot has no old-style request for it.
+    if e.kind == "mode" {
+        return 0;
+    }
     let mut told = 0;
     for b in e.bots.iter().filter(|b| b.st == b'a') {
         let Some(ci) = bot(state, &b.uuid) else {
@@ -224,6 +238,7 @@ fn kind_word(kind: &str) -> &'static str {
         "op" => "op",
         "invite" => "invite",
         "unban" => "unban",
+        "mode" => "mode",
         _ => "key",
     }
 }
@@ -247,13 +262,20 @@ fn finish(
     let hubs = 1 + e.hubs.len() as i64;
     let ok = status == "ok";
     let leg = status == "legacy";
+    let bitch = status == "bitch";
     let who = if e.nick.is_empty() {
         &e.requester
     } else {
         &e.nick
     };
     let kw = kind_word(&e.kind);
-    if ok {
+    if bitch {
+        crate::hlog_info!(
+            "[CHANREQ] {kw} {who} on {} (id:{}): refused, not authorised and +bitch is on\n",
+            e.channel,
+            e.id
+        );
+    } else if ok {
         crate::hlog_info!(
             "[CHANREQ] {kw} {who} on {} (id:{}): done by {} on {hub_name}\n",
             e.channel,
@@ -283,12 +305,28 @@ fn finish(
     } else {
         None
     };
-    if let Some(ai) = admin {
+    if let (Some(ai), true) = (admin, bitch) {
+        // A bot answered fail|bitch: the nick is not authorised on a +bitch
+        // channel (D12).  Deterministic for that nick, so no other bot is
+        // tried.
+        let msg = format!(
+            "{} is not authorised on {} and +bitch is on",
+            crate::cstr::trunc(&e.nick, 32),
+            crate::cstr::trunc(&e.channel, 65)
+        );
+        let hint = format!(
+            "add the user as an operator, or channel set {} -bitch",
+            crate::cstr::trunc(&e.channel, 65)
+        );
+        admin_err(state, ai, "channel.not_authorised", &msg, Some(&hint));
+    } else if let Some(ai) = admin {
         let code = format!("channel.{}", e.kind);
         if ok || leg {
             let mut r = Reply::new();
             r.ok(&code);
-            r.kv("nick", &e.nick);
+            if !e.nick.is_empty() || e.kind != "mode" {
+                r.kv("nick", &e.nick);
+            }
             r.kv("chan", &e.channel);
             if ok {
                 r.kv("by", if by_nick.is_empty() { by_uuid } else { by_nick });
@@ -302,6 +340,14 @@ fn finish(
             }
             r.kvi("asked", asked);
             r.kvi("hubs", hubs);
+            if e.kind == "mode"
+                && let Some(cn) = crate::storage::chan_live(state, &e.channel)
+            {
+                // the stored string and the warnings ride the apply answer: it
+                // is the one reply channel mode gets
+                crate::admin::mf_mode_card_extra(state, &mut r, &cn);
+                crate::admin::mf_reply_old_hubs(state, &mut r);
+            }
             send_reply(state, ai, &mut r);
         } else {
             let mut why = reasons(&e, 160);
@@ -314,24 +360,53 @@ fn finish(
             } else {
                 detail
             };
-            let msg = trunc_string(
-                &format!(
-                    "no bot could {kw} {} on {}: {asked} bot{} asked on {hubs} hub{}{}{tail}",
-                    e.nick,
-                    e.channel,
-                    if asked == 1 { "" } else { "s" },
-                    if hubs == 1 { "" } else { "s" },
-                    if !tail.is_empty() { "; " } else { "" },
-                ),
-                256,
-            );
-            admin_err(
-                state,
-                ai,
-                "channel.nobody",
-                &msg,
-                Some("a bot must be in the channel and opped there"),
-            );
+            let msg = if e.kind == "mode" {
+                trunc_string(
+                    &format!(
+                        "no bot could apply the modes of {}: {asked} bot{} asked on {hubs} hub{}{}{tail}",
+                        e.channel,
+                        if asked == 1 { "" } else { "s" },
+                        if hubs == 1 { "" } else { "s" },
+                        if !tail.is_empty() { "; " } else { "" },
+                    ),
+                    256,
+                )
+            } else {
+                trunc_string(
+                    &format!(
+                        "no bot could {kw} {} on {}: {asked} bot{} asked on {hubs} hub{}{}{tail}",
+                        e.nick,
+                        e.channel,
+                        if asked == 1 { "" } else { "s" },
+                        if hubs == 1 { "" } else { "s" },
+                        if !tail.is_empty() { "; " } else { "" },
+                    ),
+                    256,
+                )
+            };
+            if e.kind == "mode" {
+                // the modes were stored before the election: say so, and warn
+                // about older hubs here too (D38)
+                let mut er = Reply::new();
+                er.err(
+                    "channel.nobody",
+                    Some(&msg),
+                    Some(
+                        "the modes are stored; a bot must be in the channel and opped there to apply them (channel mode again)",
+                    ),
+                );
+                er.kvb("stored", true);
+                crate::admin::mf_reply_old_hubs(state, &mut er);
+                send_reply(state, ai, &mut er);
+            } else {
+                admin_err(
+                    state,
+                    ai,
+                    "channel.nobody",
+                    &msg,
+                    Some("a bot must be in the channel and opped there"),
+                );
+            }
         }
     }
     state.chan_elections[ei].active = false;
@@ -388,7 +463,7 @@ fn try_hub(state: &mut HubState, ei: usize) {
     }
     let mut legacy = legacy_local(state, ei);
     let e = state.chan_elections[ei].clone();
-    for h in e.hubs.iter().filter(|h| h.silent > 0) {
+    for h in e.hubs.iter().filter(|h| h.silent > 0 && e.kind != "mode") {
         if send_peer(
             state,
             h.fd,
@@ -546,6 +621,18 @@ pub fn process_done(state: &mut HubState, ci: usize, payload: &str) {
         }
         return;
     }
+    // fail|bitch: not authorised on a +bitch channel.  The answer is about
+    // the nick, not the bot, so it ends the election (D12).
+    if status == "fail" && clean == "bitch" && state.chan_elections[ei].kind == "op" {
+        if state.chan_elections[ei].origin {
+            let hn = hub_display_name(state).to_string();
+            finish(state, ei, "bitch", &from, &nick, &hn, &clean, 0);
+        } else {
+            done_up(state, ei, &from, &nick, "fail", &clean);
+            state.chan_elections[ei].phase = ChanElectPhase::Acked;
+        }
+        return;
+    }
     let e = &mut state.chan_elections[ei];
     if let Some(b) = e.bots.iter_mut().rfind(|b| b.uuid == from) {
         b.reason = roster_clean(
@@ -570,7 +657,7 @@ pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
         return;
     };
     if id.is_empty()
-        || !(chan_kind_valid(&kind) || kind == "op")
+        || !(chan_kind_valid(&kind) || kind == "op" || kind == "mode")
         || !(channel.starts_with('#') || channel.starts_with('&'))
     {
         crate::hlog_warning!("[CHANREQ] Malformed CHAN_ELECT_FWD from peer fd={fd}\n");
@@ -734,9 +821,34 @@ pub fn process_elect_done(state: &mut HubState, _ci: usize, payload: &str) {
             &roster_clean(&detail, 96),
             0,
         );
+    } else if status == "fail"
+        && roster_clean(&detail, 96) == "bitch"
+        && state.chan_elections[ei].kind == "op"
+    {
+        finish(
+            state,
+            ei,
+            "bitch",
+            &roster_clean(&bot_uuid, 64),
+            &roster_clean(&nick, MAX_NICK),
+            &cn,
+            &roster_clean(&detail, 96),
+            0,
+        );
     } else {
         try_hub(state, ei);
     }
+}
+
+/// hub_chan_mode_apply(): console entry point, apply a channel's stored modes
+/// once (kind "mode").  One elected bot reads the stored C| modes and the c|
+/// key and sends the MODE line(s); the answer reaches `admin` when the
+/// election ends.  False = the election table is full.
+pub fn chan_mode_apply(state: &mut HubState, channel: &str, admin: Option<(i32, u64)>) -> bool {
+    if !(channel.starts_with('#') || channel.starts_with('&')) {
+        return false;
+    }
+    start(state, "mode", channel, "ADMIN", "", "", admin)
 }
 
 /// A console disconnected: the elections it waits on still finish and log,

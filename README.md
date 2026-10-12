@@ -60,7 +60,7 @@ Which one to run is a deployment choice, not a protocol one. `docs/ARCHITECTURE_
 | POSIX | — | Linux, FreeBSD, and other POSIX systems (uses `termios`, `flock`, `poll`, POSIX sockets) |
 | C compiler | any `cc` | `ring` (the SSH console's crypto backend) compiles a little C/asm; for the static musl target `.cargo/config.toml` points it at the host `cc` |
 
-No OpenSSL and no `make`: the hub's own crypto is RustCrypto + dalek; the SSH admin console uses [russh](https://crates.io/crates/russh) **=0.63.3** (Apache-2.0) with the `ring` backend on a single-threaded `tokio` runtime; everything else is `std` plus safe wrappers (`nix`, `socket2`, `region`, `signal-hook`, `chrono`).
+No OpenSSL and no `make`: the hub's own crypto is RustCrypto + dalek; the SSH admin console uses [russh](https://crates.io/crates/russh) **=0.64.1** (Apache-2.0) with the `ring` backend on a single-threaded `tokio` runtime; everything else is `std` plus safe wrappers (`nix`, `socket2`, `region`, `signal-hook`, `chrono`).
 
 ### Installing Rust
 

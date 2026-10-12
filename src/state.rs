@@ -109,6 +109,66 @@ pub fn parse_uint(s: &str, max: u64) -> Option<u64> {
 // Records
 // ---------------------------------------------------------------------------
 
+/// Status every store-side modes function returns (hub_modes_status_t); the
+/// console renders it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModesStatus {
+    Ok,
+    /// Not a channel name (or "*" where one is needed).
+    BadChan,
+    /// No live c| record: channel.not_found.
+    NotManaged,
+    /// Mode string fails docs/modes.md §3.2: channel.bad_mode.
+    BadModes,
+    /// Unknown name / bad value / bad range; `bad` names it.
+    BadSetting,
+    /// A field is over its cap.
+    TooLong,
+    /// Ban mask empty, too long, or has a bad character.
+    BadMask,
+    /// Ban reason too long or has a control character.
+    BadReason,
+    /// Expiry in the past or absurdly far.
+    BadExpiry,
+    /// ban.protected: overlaps a trusted bot / usermask.
+    Protected,
+    /// Ban del: no such live ban.
+    NotFound,
+    /// MAX_BANS_PER_CHAN / MAX_GLOBAL_BANS / MAX_BANS_TOTAL.
+    Full,
+    /// An upgrade run holds the config freeze.
+    Frozen,
+}
+
+/// One C| (channel settings) or D| (network defaults) record, live
+/// (hub_chanset_t; `present` is the Option).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Chanset {
+    /// Stored spelling ("" for D|).
+    pub chan: String,
+    /// "" = network default.
+    pub modes: String,
+    /// Only overrides, "" = none.
+    pub settings: String,
+    pub ts: i64,
+}
+
+/// One live B| ban (hub_ban_t).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ban {
+    /// "#chan" or "*".
+    pub chan: String,
+    pub mask: String,
+    /// Absolute unix time, 0 = permanent.
+    pub expires: i64,
+    /// "s" = sticky, "" = none.
+    pub flags: String,
+    /// Admin name or bot uuid.
+    pub setter: String,
+    pub reason: String,
+    pub ts: i64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ConfigEntry {
     pub key: String,
@@ -287,6 +347,8 @@ pub struct IpAcl {
     /// Host byte order.
     pub mask: u32,
     pub added: i64,
+    /// D27: applies only once the first bytes say SSH (`wc|`/`xc|` lines).
+    pub console: bool,
 }
 
 impl IpAcl {
@@ -305,10 +367,10 @@ impl IpAcl {
         true
     }
 
-    /// Same network and prefix — how add refuses a duplicate and remove finds
-    /// its target.
+    /// Same network, prefix and scope — how add refuses a duplicate and
+    /// remove finds its target.
     pub fn same_net(&self, other: &IpAcl) -> bool {
-        self.net == other.net && self.mask == other.mask
+        self.net == other.net && self.mask == other.mask && self.console == other.console
     }
 }
 
@@ -843,6 +905,12 @@ pub struct HubClient {
     /// purpose: a downgraded binary reconnecting is never mistaken for a
     /// passwordless one.
     pub bot_proto: i32,
+    /// CMD_CHAN_EVENT rate limit for this connection
+    /// (CHAN_EVENT_MAX_PER_WINDOW per CHAN_EVENT_WINDOW seconds); dropped
+    /// events are counted.
+    pub chan_ev_window: i64,
+    pub chan_ev_count: i32,
+    pub chan_ev_dropped: i32,
     /// D2: PREAUTH_BUF_SIZE, then the per-type bulk size on auth.  `len()` is
     /// the C `recv_len`.
     pub recv_buf: Vec<u8>,
@@ -921,6 +989,9 @@ impl HubClient {
             sniff_pending: false,
             sniff_deadline_ms: 0,
             bot_proto: 0,
+            chan_ev_window: 0,
+            chan_ev_count: 0,
+            chan_ev_dropped: 0,
             recv_buf: Vec::with_capacity(size.min(PREAUTH_BUF_SIZE)),
             recv_cap: size,
             bot_auth_state: BotAuthState::Idle,
@@ -1062,6 +1133,9 @@ pub struct HubState {
 
     /// GLOBAL CONFIG STORE (shared by all bots).
     pub global_entries: Vec<ConfigEntry>,
+    /// Derived from `global_entries` (storage.rs): lookup index, per-class
+    /// and per-channel ban counts.  `storage::global_reindex` rebuilds it.
+    pub global_idx: crate::storage::GlobalIdx,
 
     /// Named admin/oper records and their usermasks.
     pub user_records: Vec<UserRecord>,
@@ -1118,6 +1192,12 @@ pub struct HubState {
     pub ip_deny: Vec<IpAcl>,
     pub ip_acl_changed: bool,
 
+    /// `hub set ssh` / `hub set conn`; the console thread gets a copy
+    /// (`console::limits_changed`).
+    pub conn_cfg: crate::connlimits::ConnCfg,
+    /// D26: SSH-only failure and connect table (memory only).
+    pub ssh_ips: Vec<crate::connlimits::SshIp>,
+
     /// Days threshold for the tombstone purge (0 = disabled).
     pub purge_days_setting: i32,
     /// D3: if true, 127.0.0.1/::1 bypass rate limiting (default false —
@@ -1157,6 +1237,9 @@ pub struct HubState {
     /// A full config push to every local bot is owed
     /// (`client::flush_bot_config`, at most once per BOT_CONFIG_PUSH_COALESCE).
     pub bot_config_pending: bool,
+    /// When `modes::bans_sweep` last ran (the C file-scope `static time_t
+    /// last`), so the 60 s self-throttle lives in the state.
+    pub bans_swept_at: i64,
     pub last_bot_config_push: i64,
     pub last_config_write: i64,
     /// Set on peer connect/disconnect; clears after gossip.
@@ -1226,6 +1309,7 @@ impl HubState {
             clients: Vec::new(),
             bots: Vec::new(),
             global_entries: Vec::new(),
+            global_idx: Default::default(),
             user_records: Vec::new(),
             mask_records: Vec::new(),
             peers: Vec::new(),
@@ -1252,6 +1336,8 @@ impl HubState {
             ip_allow: Vec::new(),
             ip_deny: Vec::new(),
             ip_acl_changed: false,
+            conn_cfg: crate::connlimits::ConnCfg::default(),
+            ssh_ips: Vec::new(),
             purge_days_setting: 0,
             trust_loopback: false,
             pid_file: None,
@@ -1267,6 +1353,7 @@ impl HubState {
             opt_flags_ts: 0,
             config_dirty: false,
             bot_config_pending: false,
+            bans_swept_at: 0,
             last_bot_config_push: 0,
             last_config_write: 0,
             mesh_state_dirty: false,

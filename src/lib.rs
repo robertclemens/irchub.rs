@@ -9,7 +9,9 @@
 //! | `hub.h`           | `consts` (wire contract), `state` (records, rules) |
 //! | `hub_crypto.c`    | `crypto`                                          |
 //! | `hub_storage.c`   | `storage`                                         |
+//! | `hub_modes.c`     | `modes`, `glob_overlap` (+ `glob_overlap.c`)      |
 //! | `hub_config.c`    | `config`                                          |
+//! | `hub_connlimits.c`| `connlimits`                                      |
 //! | `hub_main.c`      | `main.rs`, `logging`, `net`, `tool`               |
 //! | `hub_logic.c`     | `queue`, `ratelimit`, `auth`, `presence`, `mesh`, |
 //! |                   | `opflow`, `admin`, `client`, `activity`           |
@@ -27,13 +29,16 @@ pub mod admin;
 pub mod auth;
 pub mod client;
 pub mod config;
+pub mod connlimits;
 pub mod console;
 pub mod consts;
 pub mod crypto;
 pub mod cstr;
 pub mod elect;
+pub mod glob_overlap;
 pub mod logging;
 pub mod mesh;
+pub mod modes;
 pub mod net;
 pub mod opflow;
 pub mod presence;

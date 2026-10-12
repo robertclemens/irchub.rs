@@ -14,6 +14,7 @@ use super::fmt::{
     self, Ctx, Flines, RL_CMD, RL_DIM, RL_ERR, RL_HEAD, RL_NORMAL, RL_OK, RL_RULE, RL_TITLE,
     RL_WARN,
 };
+use crate::connlimits::{SSH_DEF_CMDRATE_N, SSH_DEF_CMDRATE_S};
 use crate::consts::*;
 
 /// Bytes waiting for the terminal above this: line mode drops events and log
@@ -619,6 +620,15 @@ pub struct Ui {
     user_busy: bool,
     rq: Vec<PendingRq>,
     queued: Vec<Vec<u8>>,
+    /// hub set ssh idle (seconds) and cmdrate (cmd_n per cmd_s seconds).
+    idle_s: i64,
+    cmd_n: i32,
+    cmd_s: i32,
+    /// Start of the current command window, and commands started in it.
+    rate_start_ms: i64,
+    rate_used: i32,
+    /// run_line is replaying a held line.
+    from_queue: bool,
     confirming: Confirm,
     confirm_seq: i32,
     confirm_want: Vec<u8>,
@@ -711,6 +721,9 @@ enum B {
     UpgStart,
     Fixed,
     Local,
+    ChanModes,
+    Ban,
+    NetSet,
 }
 
 struct CmdDef {
@@ -771,8 +784,9 @@ const CMDS: &[CmdDef] = &[
     cmd!("peer", Some("sync"), CMD_ADMIN_SYNC_MESH, B::None, 0, 0, Cf::None, Pre::None, "", "peer sync", "send a full sync to every peer", None),
     cmd!("network", Some("tree"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|tree", "network tree", "every hub and bot as a tree", None),
     cmd!("network", Some("status"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|status", "network status", "the mesh-wide status (what the status bar shows)", None),
+    cmd!("network", Some("set"), CMD_ADMIN_NET_SET, B::NetSet, 0, 3, Cf::None, Pre::None, "", "network set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default>]", "show the bot network settings, or change one (every bot gets it)", None),
     cmd!("hub", Some("show"), CMD_ADMIN_GET_PUBKEY, B::None, 0, 0, Cf::None, Pre::None, "", "hub show", "this hub: identity, key, listener, counts", None),
-    cmd!("hub", Some("set"), 0, B::HubSet, 0, 2, Cf::None, Pre::None, "", "hub set <setting> <value>", "name, bindip, port, pubkey or autopurge (alone: the table)", None),
+    cmd!("hub", Some("set"), 0, B::HubSet, 0, 3, Cf::None, Pre::None, "", "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>]", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table)", None),
     cmd!("hub", Some("stats"), CMD_ADMIN_STATS, B::None, 0, 0, Cf::None, Pre::None, "", "hub stats", "traffic counters since the hub started", None),
     cmd!("hub", Some("rekey"), CMD_ADMIN_REGEN_KEYS, B::None, 0, 0, Cf::Type, Pre::None, "", "hub rekey", "new hub keypair; every peer and bot must re-learn it", None),
     cmd!("hub", Some("purge"), CMD_ADMIN_PURGE_TOMBSTONES, B::Purge, 1, 0, Cf::Yn, Pre::None, "", "hub purge <now|days>", "purge tombstones now, or those older than <days>", None),
@@ -782,8 +796,8 @@ const CMDS: &[CmdDef] = &[
     cmd!("log", Some("off"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "log off", "line mode: stop the log lines", None),
     cmd!("log", Some("filter"), 0, B::Local, 1, 64, Cf::None, Pre::None, "", "log filter <text|clear>", "full screen: log view lines containing <text>", None),
     cmd!("acl", Some("list"), CMD_ADMIN_LIST_ALLOWLIST, B::None, 0, 0, Cf::None, Pre::None, "", "acl list", "the allow and deny lists", None),
-    cmd!("acl", Some("add"), 0, B::Acl, 2, 0, Cf::None, Pre::None, "", "acl add allow|deny <ip[/n]>", "add an address or network", None),
-    cmd!("acl", Some("del"), 0, B::Acl, 2, 0, Cf::Yn, Pre::None, "", "acl del allow|deny <ip[/n]>", "remove an address or network (asks y/N)", None),
+    cmd!("acl", Some("add"), 0, B::Acl, 2, 1, Cf::None, Pre::None, "", "acl add allow|deny <ip[/n]> [console]", "add an address or network (console: applies only to SSH logins)", None),
+    cmd!("acl", Some("del"), 0, B::Acl, 2, 1, Cf::Yn, Pre::None, "", "acl del allow|deny <ip[/n]> [console]", "remove an address or network (asks y/N)", None),
     cmd!("option", Some("list"), CMD_ADMIN_GET_OPT_FLAGS, B::None, 0, 0, Cf::None, Pre::None, "", "option list", "the network option flags", None),
     cmd!("option", Some("set"), CMD_ADMIN_SET_OPT_FLAGS, B::OptSet, 1, 0, Cf::Yn, Pre::Opt, "", "option set <flags|->", "set the network option flags (- clears)", None),
     cmd!("user", Some("list"), 0, B::UserList, 0, 1, Cf::None, Pre::None, "", "user list [admin|oper]", "every user (or one role): key, last seen, masks", None),
@@ -796,9 +810,13 @@ const CMDS: &[CmdDef] = &[
     cmd!("channel", Some("show"), CMD_ADMIN_LIST_CHANNELS, B::Arg, 1, 0, Cf::None, Pre::None, "", "channel show <#chan>", "one channel in detail", None),
     cmd!("channel", Some("add"), CMD_ADMIN_ADD_CHANNEL, B::ChanAdd, 1, 1, Cf::None, Pre::None, "", "channel add <#chan> [key]", "add (or re-add) a channel", None),
     cmd!("channel", Some("del"), CMD_ADMIN_DEL_CHANNEL, B::Arg, 1, 0, Cf::Yn, Pre::None, "", "channel del <#chan>", "remove it from every bot (asks y/N)", None),
-    cmd!("channel", Some("set"), CMD_ADMIN_ADD_CHANNEL, B::ChanSet, 3, 0, Cf::None, Pre::None, "", "channel set <#chan> <setting> <value|->", "change one setting (key today; - clears)", None),
+    cmd!("channel", Some("mode"), CMD_ADMIN_CHAN_MODE, B::ChanModes, 1, 3, Cf::None, Pre::None, "", "channel mode <#chan> [<+modes> [key] [limit] | -]", "show the channel's modes, or store them and apply them once", Some("modes: i m n p s t k l \u{b7} - = the network default")),
+    cmd!("channel", Some("set"), CMD_ADMIN_CHAN_SET, B::ChanSet, 1, 48, Cf::None, Pre::None, "", "channel set <#chan|default> [+opt|-opt|<name> <value>|flood <type> <N:S|off>]", "show a channel's settings, or change them (default = the network default)", None),
     cmd!("channel", Some("op"), CMD_ADMIN_OP_USER, B::ChanOp, 2, 0, Cf::None, Pre::None, "", "channel op <#chan> <nick>", "have one opped bot op a user", None),
     cmd!("channel", Some("invite"), CMD_ADMIN_INVITE_USER, B::ChanOp, 2, 0, Cf::None, Pre::None, "", "channel invite <#chan> <nick>", "have one opped bot invite a user", None),
+    cmd!("ban", Some("list"), CMD_ADMIN_BAN, B::Ban, 0, 1, Cf::None, Pre::None, "", "ban list [#chan|*]", "the network's listed bans (one channel, or * = every channel)", None),
+    cmd!("ban", Some("add"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; the bots set it on the channel (never on a bot or user)", None),
+    cmd!("ban", Some("del"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban del <#chan|*> <mask>", "remove a listed ban", None),
     cmd!("upgrade", Some("status"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::None, Pre::None, "", "upgrade status", "the upgrade run on this hub", None),
     cmd!("upgrade", Some("releases"), CMD_ADMIN_UPGRADE_STATUS, B::UpgReleases, 0, 2, Cf::None, Pre::None, "", "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", None),
     cmd!("upgrade", Some("start"), CMD_ADMIN_UPGRADE_NET, B::UpgStart, 1, 4, Cf::Type, Pre::UpgStart, "", "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade", None),
@@ -815,7 +833,7 @@ const CMDS: &[CmdDef] = &[
 ];
 
 /// The root nouns, in help order, with what each groups.
-const GROUPS: [(&str, &str); 11] = [
+const GROUPS: [(&str, &str); 12] = [
     ("bot", "registered bots"),
     ("peer", "peer hubs"),
     ("network", "the whole mesh"),
@@ -825,6 +843,7 @@ const GROUPS: [(&str, &str); 11] = [
     ("option", "network option flags"),
     ("user", "admins and opers"),
     ("channel", "managed channels"),
+    ("ban", "listed bans"),
     ("upgrade", "rolling upgrades"),
     ("display", "this session's screen"),
 ];
@@ -853,7 +872,7 @@ type CmdHelp = (
 #[rustfmt::skip]
 const CMD_HELP: &[CmdHelp] = &[
     ("help", None,
-     Some("group\tone of: bot peer network hub log acl option user channel upgrade display\n\
+     Some("group\tone of: bot peer network hub log acl option user channel ban upgrade display\n\
            command\tone of that group's commands: its arguments and an example\n\
            ?\ttyped in place of help it does the same"),
      "help\nhelp bot\nhelp bot add\n? upgrade start"),
@@ -901,13 +920,29 @@ const CMD_HELP: &[CmdHelp] = &[
     ("peer", Some("sync"), None, "peer sync"),
     ("network", Some("tree"), None, "network tree"),
     ("network", Some("status"), None, "network status"),
+    ("network", Some("set"),
+     Some("flood\tbot flood limits: cmd = commands per user, msg = other messages per host, \
+           ctcp = CTCP per host\n\
+           N:S|off|default\tmore than N events in S seconds trips it (N 1-1000, S 1-3600); off \
+           disables it; default returns to the built-in\n\
+           ignoretime\tminutes a flooding host stays ignored (1-1440); alone the command shows all\n\
+           sendq\thow fast a bot may send lines to IRC: B:I lets B lines (1-100) out at once, then \
+           one every I ms (0-10000, 0 = no delay); default is 10:100"),
+     "network set\nnetwork set flood cmd 10:30\nnetwork set flood msg off\nnetwork set ignoretime 20\nnetwork set sendq 5:250"),
     ("hub", Some("show"), None, "hub show"),
     ("hub", Some("set"),
-     Some("setting\tname, bindip, port, pubkey or autopurge; alone it shows them all\n\
+     Some("setting\tname, bindip, port, pubkey or autopurge; alone it shows them all. ssh and conn \
+           are this hub's connection limits: hub set ssh | hub set conn show them; ssh <name> \
+           <value|default> changes one (ssh: preauth preauthip sessions grace authtries idle \
+           authfail connect block cmdrate; conn: perip churn authfail). N:S is N per S seconds; \
+           block doubles per repeat within 24 h up to 24 h. A change applies to the next \
+           connection\n\
            value\tname: this hub's name · bindip: the address it listens on · port: 1-65535 · \
            pubkey: the key its private key derives (a new key is hub rekey) · \
            autopurge: days to keep tombstones, 0 = off"),
-     "hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30"),
+     "hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30\nhub set ssh\n\
+      hub set ssh preauth 16\nhub set ssh authfail 3:3600\nhub set conn perip 8\n\
+      hub set conn churn 30:10:30"),
     ("hub", Some("stats"), None, "hub stats"),
     ("hub", Some("rekey"), Some("(confirm)\tyou type this hub's name to go ahead; every peer and bot \
                                  must then learn the new key"),
@@ -931,12 +966,15 @@ const CMD_HELP: &[CmdHelp] = &[
     ("acl", Some("list"), None, "acl list"),
     ("acl", Some("add"),
      Some("allow|deny\twhich list\n\
-           ip[/n]\tan IPv4 or IPv6 address, or a network as address/prefix"),
-     "acl add allow 203.0.113.0/24\nacl add deny 198.51.100.9"),
+           ip[/n]\tan IPv4 or IPv6 address, or a network as address/prefix\n\
+           console\toptional scope word: the entry applies only once the connection says SSH \
+           (bots and peers are not affected); without it the entry applies to everything"),
+     "acl add allow 203.0.113.0/24\nacl add deny 198.51.100.9\nacl add allow 203.0.113.7 console"),
     ("acl", Some("del"),
      Some("allow|deny\twhich list\n\
-           ip[/n]\tthe entry exactly as acl list shows it (asks y/N)"),
-     "acl del deny 198.51.100.9"),
+           ip[/n]\tthe entry exactly as acl list shows it\n\
+           console\tgive it for an entry that was added with it (asks y/N)"),
+     "acl del deny 198.51.100.9\nacl del allow 203.0.113.7 console"),
     ("option", Some("list"), None, "option list"),
     ("option", Some("set"), Some("flags|-\tthe whole new set of flag letters (it replaces the old \
                                   set; option list explains each); - clears them all (asks y/N)"),
@@ -967,15 +1005,42 @@ const CMD_HELP: &[CmdHelp] = &[
     ("channel", Some("add"), Some("#chan\tthe channel's name\nkey\tits channel key, if it has one"),
      "channel add #ops\nchannel add #ops s3cret"),
     ("channel", Some("del"), Some("#chan\tthe channel; every bot parts it (asks y/N)"), "channel del #ops"),
+    ("channel", Some("mode"),
+     Some("#chan\tthe channel; alone it shows its stored and live modes\n\
+           +modes\tthe modes it should have, from i m n p s t k l with + and - (+nt, +stnkl key 20, \
+           -i); stored on every hub and bot, then applied once by one opped bot\n\
+           key, limit\tthe argument +k takes (no space or comma, 30 bytes), then the one +l takes \
+           (1-99999), left to right\n\
+           -\tgo back to the network default (+nt unless the network sets one)"),
+     "channel mode #ops\nchannel mode #ops +nt\nchannel mode #ops +stnkl s3cret 20\n\
+      channel mode #ops -"),
     ("channel", Some("set"),
-     Some("#chan\tthe channel\n\
-           setting\tthe setting's name; key today\n\
-           value|-\tthe new value (at most 128 bytes), or - to clear it"),
-     "channel set #ops key s3cret\nchannel set #ops key -"),
+     Some("#chan|default\tthe channel, or default for the network default every channel inherits; \
+           alone it lists every setting and where its value comes from\n\
+           +opt -opt\tturn an on/off option on or off: enforcemodes bitch protectops revenge \
+           stopnethack enforcebans dynamicbans dontkickops cycle dynamiclimit\n\
+           name value\tbantime (minutes, 0 = permanent), bantype (0-9), banidle (minutes), limitgap, \
+           limitdelay (seconds); default removes the channel's own value\n\
+           flood type\tchan ctcp join nick deop kick ban, then N:S (more than N in S seconds), off \
+           or default"),
+     "channel set #ops\nchannel set #ops +bitch +enforcemodes\nchannel set #ops bantime 60\n\
+      channel set #ops flood join 10:60\nchannel set default -dynamicbans"),
     ("channel", Some("op"), Some("#chan\tthe channel\nnick\tthe user's current nick on IRC"),
      "channel op #ops alice"),
     ("channel", Some("invite"), Some("#chan\tthe channel\nnick\tthe user's current nick on IRC"),
      "channel invite #ops alice"),
+    ("ban", Some("list"), Some("#chan|*\tonly that channel's bans, or * for the global ones (default: all)"),
+     "ban list\nban list #ops\nban list *"),
+    ("ban", Some("add"),
+     Some("#chan|*\tthe channel, or * for every managed channel\n\
+           mask\tnick!user@host (* and ? match); refused if it would also match a bot or an \
+           authorised user\n\
+           min|perm\thow long it lasts (default perm)\n\
+           sticky\tthe bots put it back at once if an op removes it from the channel\n\
+           reason\tthe rest of the line (120 bytes)"),
+     "ban add #ops *!*@203.0.113.7\nban add * *!*@*.badhost.example 1440 sticky open proxy"),
+    ("ban", Some("del"), Some("#chan|*\tas listed by ban list\nmask\tthe mask exactly as ban list shows it"),
+     "ban del #ops *!*@203.0.113.7"),
     ("upgrade", Some("status"), None, "upgrade status"),
     ("upgrade", Some("releases"),
      Some("bot=<base>\ta different release site for the bot builds (a URL)\n\
@@ -989,7 +1054,7 @@ const CMD_HELP: &[CmdHelp] = &[
            botbase=<url>\ta different release site for the bot builds\n\
            hubbase=<url>\ta different release site for the hub builds\n\
            (confirm)\tit shows the plan, then you type the bot version to start"),
-     "upgrade start 2.4.6\nupgrade start 2.4.6 hub=2.4.4\nupgrade start 2.4.6 nodes=alpha,beta=rs"),
+     "upgrade start 2.4.5\nupgrade start 2.4.5 hub=2.4.4\nupgrade start 2.4.5 nodes=alpha,beta=rs"),
     ("upgrade", Some("abort"), None, "upgrade abort"),
     ("upgrade", Some("forget"), None, "upgrade forget"),
     ("display", Some("show"), None, "display show"),
@@ -1019,6 +1084,9 @@ enum Ck {
     BotOn,
     BotNick,
     HubName,
+    ChSet,
+    NetSet,
+    HubSet,
 }
 
 /// (cmd, sub, argument index after cmd [sub] or None = any, kind)
@@ -1034,12 +1102,7 @@ const ARG_COMP: &[ArgComp] = &[
     ("peer", Some("show"), Some(0), Ck::HubName),
     ("peer", Some("set"), Some(0), Ck::HubName),
     ("peer", Some("set"), Some(1), Ck::Words("key")),
-    (
-        "hub",
-        Some("set"),
-        Some(0),
-        Ck::Words("name bindip port pubkey autopurge"),
-    ),
+    ("hub", Some("set"), None, Ck::HubSet),
     ("hub", Some("purge"), Some(0), Ck::Words("now")),
     ("log", Some("set"), Some(0), Ck::Words("file console size")),
     // after file|console
@@ -1048,11 +1111,26 @@ const ARG_COMP: &[ArgComp] = &[
     ("log", Some("filter"), Some(0), Ck::Words("clear")),
     ("acl", Some("add"), Some(0), Ck::Words("allow deny")),
     ("acl", Some("del"), Some(0), Ck::Words("allow deny")),
+    ("acl", Some("add"), Some(2), Ck::Words("console")),
+    ("acl", Some("del"), Some(2), Ck::Words("console")),
     ("user", Some("list"), Some(0), Ck::Words("admin oper")),
     ("user", Some("add"), Some(0), Ck::Words("admin oper")),
     ("user", Some("set"), Some(1), Ck::Words("key")),
     ("user", Some("mask"), Some(0), Ck::Words("add del")),
-    ("channel", Some("set"), Some(1), Ck::Words("key")),
+    ("channel", Some("set"), Some(0), Ck::Words("default")),
+    ("channel", Some("set"), None, Ck::ChSet),
+    ("ban", Some("list"), Some(0), Ck::Words("*")),
+    ("ban", Some("add"), Some(0), Ck::Words("*")),
+    ("ban", Some("add"), Some(2), Ck::Words("perm sticky")),
+    ("ban", Some("add"), Some(3), Ck::Words("sticky")),
+    ("ban", Some("del"), Some(0), Ck::Words("*")),
+    (
+        "network",
+        Some("set"),
+        Some(0),
+        Ck::Words("flood ignoretime sendq"),
+    ),
+    ("network", Some("set"), None, Ck::NetSet),
     ("upgrade", Some("releases"), None, Ck::Words("bot= hub=")),
     (
         "upgrade",
@@ -1065,6 +1143,59 @@ const ARG_COMP: &[ArgComp] = &[
     ("display", Some("width"), Some(0), Ck::Words("auto")),
     ("display", Some("events"), Some(0), Ck::Words("on off")),
 ];
+
+/// channel set: the setting words that fit after the words before this one
+/// (p1 = the previous word, p2 = the one before it).
+const CHSET_FLAGS_ON: &str = "+enforcemodes +bitch +protectops +revenge +stopnethack +enforcebans \
+                              +dynamicbans +dontkickops +cycle +dynamiclimit";
+const CHSET_FLAGS_OFF: &str = "-enforcemodes -bitch -protectops -revenge -stopnethack -enforcebans \
+                               -dynamicbans -dontkickops -cycle -dynamiclimit";
+const CHSET_VALUED: &str = "bantime bantype banidle limitgap limitdelay flood";
+fn chset_words(prefix: &[u8], p1: &[u8], p2: &[u8]) -> &'static str {
+    if eq_ic(p1, "flood") {
+        return "chan ctcp join nick deop kick ban";
+    }
+    if eq_ic(p2, "flood") {
+        return "off default";
+    }
+    for v in ["bantime", "bantype", "banidle", "limitgap", "limitdelay"] {
+        if eq_ic(p1, v) {
+            return "default";
+        }
+    }
+    match prefix.first() {
+        Some(b'+') => CHSET_FLAGS_ON,
+        Some(b'-') => CHSET_FLAGS_OFF,
+        _ => CHSET_VALUED,
+    }
+}
+
+fn netset_words(p1: &[u8], p2: &[u8]) -> &'static str {
+    if eq_ic(p1, "flood") {
+        "cmd msg ctcp"
+    } else if eq_ic(p2, "flood") {
+        "off default"
+    } else if eq_ic(p1, "ignoretime") || eq_ic(p1, "sendq") {
+        "default"
+    } else {
+        ""
+    }
+}
+
+/// hub set <setting> | ssh <name> <value> | conn <name> <value>
+fn hubset_words(pos: usize, p1: &[u8], p2: &[u8]) -> &'static str {
+    if pos == 0 {
+        "name bindip port pubkey autopurge ssh conn"
+    } else if pos == 1 && eq_ic(p1, "ssh") {
+        "preauth preauthip sessions grace authtries idle authfail connect block cmdrate"
+    } else if pos == 1 && eq_ic(p1, "conn") {
+        "perip churn authfail"
+    } else if pos == 2 && (eq_ic(p2, "ssh") || eq_ic(p2, "conn")) {
+        "default"
+    } else {
+        ""
+    }
+}
 
 fn cmd_has_subs(cmd: &[u8]) -> bool {
     CMDS.iter().any(|d| d.sub.is_some() && eq_ic(cmd, d.cmd))
@@ -1202,6 +1333,13 @@ impl Ui {
         self.term.extend_from_slice(&self.input);
     }
 
+    /// Line mode: a command is in flight or a typed line waits its turn (a
+    /// rate token, an earlier command): no prompt is owed yet, so nothing may
+    /// print over one — the waiting line's reply would land on it.
+    fn line_pending(&self) -> bool {
+        self.user_busy || self.confirming != Confirm::None || !self.queued.is_empty()
+    }
+
     /// Line mode: something arrives while the admin is at the prompt.  A CR
     /// puts it over the prompt (a reader takes the text after a line's last
     /// CR), then the prompt and the partial input are printed again.  While
@@ -1211,7 +1349,7 @@ impl Ui {
             self.dropped = self.dropped.wrapping_add(1);
             return;
         }
-        let hold = self.user_busy || self.confirming != Confirm::None;
+        let hold = self.line_pending();
         let mut out = Vec::with_capacity(text.len() + 16);
         if !hold {
             out.push(b'\r');
@@ -1421,6 +1559,27 @@ impl Ui {
         }
     }
 
+    /// hub set ssh cmdrate: at most cmd_n commands start per cmd_s seconds.
+    /// A token is taken when a command starts; without one the line waits in
+    /// the queue (never dropped) and tick releases it when the window turns
+    /// over.
+    fn rate_take(&mut self) -> bool {
+        if self.now_ms - self.rate_start_ms >= i64::from(self.cmd_s) * 1000 {
+            self.rate_start_ms = self.now_ms;
+            self.rate_used = 0;
+        }
+        if self.rate_used >= self.cmd_n {
+            return false;
+        }
+        self.rate_used += 1;
+        true
+    }
+
+    fn rate_ready(&self) -> bool {
+        self.now_ms - self.rate_start_ms >= i64::from(self.cmd_s) * 1000
+            || self.rate_used < self.cmd_n
+    }
+
     /// The command in flight finished: held events, then the next queued
     /// line.  from_reply: it ended with the core's answer (asynchronously),
     /// so line mode owes the prompt here; otherwise the input handler prints
@@ -1431,14 +1590,26 @@ impl Ui {
         // Lines typed ahead: the next one answers a confirmation a queued
         // command asked for, as it would have at the prompt.
         while !self.user_busy && !self.queued.is_empty() && !self.closing {
+            // a command (not a confirmation answer) needs a rate token; none:
+            // it stays at the head and tick comes back for it
+            if self.confirming == Confirm::None && !self.rate_ready() {
+                break;
+            }
             let next = self.queued.remove(0);
             if self.confirming != Confirm::None {
                 self.confirm_answer(&next, false);
             } else {
+                self.from_queue = true;
                 self.run_line(&next);
+                self.from_queue = false;
             }
         }
-        if self.line_mode && from_reply && !self.user_busy && !self.closing {
+        if self.line_mode
+            && from_reply
+            && !self.user_busy
+            && self.queued.is_empty()
+            && !self.closing
+        {
             if self.confirming == Confirm::None {
                 self.flush_held();
             }
@@ -1976,12 +2147,16 @@ fn raw_lines(text: &[u8], role: u8) -> Flines {
 // ===========================================================================
 // Running a command line
 // ===========================================================================
-const MAX_WORDS: usize = 16;
+/// channel set <#chan> takes the hub's 16 tokens of up to three words each
+/// (flood <type> <value>): 3 + 16 * 3 = 51.
+const MAX_WORDS: usize = 52;
 
 struct Words {
     buf: Vec<u8>,
     /// (start, end) of each word in `buf` (= where it starts in the line)
     w: Vec<(usize, usize)>,
+    /// words past MAX_WORDS were left over
+    more: bool,
 }
 
 impl Words {
@@ -2005,7 +2180,11 @@ impl Words {
                 p += 1;
             }
         }
-        Words { buf, w }
+        while p < buf.len() && buf[p] == b' ' {
+            p += 1;
+        }
+        let more = p < buf.len();
+        Words { buf, w, more }
     }
 
     fn n(&self) -> usize {
@@ -2255,20 +2434,135 @@ fn build_payload(
         }
         B::ChanAdd => fmtb(&[a(0), b"|", if na > 1 { a(1) } else { b"" }]),
         B::ChanSet => {
-            if a(1)
-                .iter()
-                .any(|&ch| !ch.is_ascii_lowercase() && ch != b'_')
-            {
+            // <#chan|default> then tokens: +opt / -opt, <name> <value> as
+            // name=value, flood <type> <value> as "flood type=value".  Names
+            // and values are lowercased; the hub validates them.
+            let mut o = a(0).to_vec();
+            let mut i = 1;
+            while i < na {
+                let tok: Vec<u8>;
+                if (a(i)[0] == b'+' || a(i)[0] == b'-') && a(i).len() > 1 {
+                    tok = c_cut(a(i), 96).to_vec();
+                    i += 1;
+                } else if eq_ic(a(i), "flood") {
+                    if i + 2 >= na {
+                        return bad(
+                            "flood takes a type and a value",
+                            Some(
+                                "channel set <#chan|default> flood <chan|ctcp|join|nick|deop|kick|ban> <N:S|off|default>",
+                            ),
+                        );
+                    }
+                    tok = c_cut(&fmtb(&[b"flood ", a(i + 1), b"=", a(i + 2)]), 96).to_vec();
+                    i += 3;
+                } else {
+                    if i + 1 >= na {
+                        let m = fmtb(&[
+                            b"say a value for ",
+                            &a(i)[..uprec(a(i), 40)],
+                            b" (or default)",
+                        ]);
+                        return Err((
+                            c_cut(&m, 96).to_vec(),
+                            Some("channel set <#chan|default> <name> <value|default>"),
+                        ));
+                    }
+                    tok = c_cut(&fmtb(&[a(i), b"=", a(i + 1)]), 96).to_vec();
+                    i += 2;
+                }
+                o.push(b'|');
+                o.extend_from_slice(&tok.to_ascii_lowercase());
+            }
+            if o.len() >= CAP {
+                return too_long();
+            }
+            b.payload = o;
+            return Ok(b);
+        }
+        B::ChanModes => {
+            let mut o = Vec::new();
+            for i in 0..na {
+                if i > 0 {
+                    o.push(b'|');
+                }
+                o.extend_from_slice(a(i));
+            }
+            if o.len() >= CAP {
+                return too_long();
+            }
+            b.payload = o;
+            return Ok(b);
+        }
+        B::Ban => {
+            if c.sub == Some("list") {
+                fmtb(&[b"list|", if na > 0 { a(0) } else { b"" }])
+            } else if c.sub == Some("del") {
+                fmtb(&[b"del|", a(0), b"|", a(1)])
+            } else {
+                // add <#chan|*> <mask> [<min>|perm] [sticky] [reason...]: the
+                // reason is the rest of the line as typed
+                let mut i = 2;
+                let mut dur: Vec<u8> = b"perm".to_vec();
+                let mut sticky = false;
+                if i < na && (eq_ic(a(i), "perm") || all_digits(a(i))) {
+                    if all_digits(a(i)) {
+                        let m = fmt::strtoull(a(i), 10);
+                        if a(i).len() > 7 || !(1..=5_256_000).contains(&m) {
+                            return bad(
+                                "a ban lasts 1 to 5256000 minutes (10 years), or perm",
+                                hint,
+                            );
+                        }
+                        dur = m.to_string().into_bytes();
+                    }
+                    i += 1;
+                }
+                if i < na && eq_ic(a(i), "sticky") {
+                    sticky = true;
+                    i += 1;
+                }
+                let mut reason: Vec<u8> = Vec::new();
+                if i < na {
+                    let start = ws.w[argi + i].0;
+                    reason = c_cut(&ws.buf[start..], 256).to_vec();
+                    while reason.last() == Some(&b' ') {
+                        reason.pop();
+                    }
+                    if reason.len() > 120 || reason.contains(&b'|') {
+                        return bad("a ban reason is at most 120 bytes and has no '|'", hint);
+                    }
+                }
+                fmtb(&[
+                    b"add|",
+                    a(0),
+                    b"|",
+                    a(1),
+                    b"|",
+                    &dur,
+                    b"|",
+                    if sticky { b"1" } else { b"0" },
+                    b"|",
+                    &reason,
+                ])
+            }
+        }
+        B::NetSet => {
+            if na == 0 {
+                return Ok(b);
+            }
+            let o = if eq_ic(a(0), "flood") && na == 3 {
+                fmtb(&[b"flood|", a(1), b"|", a(2)])
+            } else if eq_ic(a(0), "ignoretime") && na == 2 {
+                fmtb(&[b"ignoretime|", a(1)])
+            } else if eq_ic(a(0), "sendq") && na == 2 {
+                fmtb(&[b"sendq|", a(1)])
+            } else {
                 return bad(
-                    "a setting name is lowercase letters and _",
-                    Some("settings: key"),
+                    "network set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, or sendq <B:I|default>",
+                    hint,
                 );
-            }
-            if a(2).len() > 128 {
-                return bad("a setting value is at most 128 bytes", hint);
-            }
-            let v: &[u8] = if a(2) == b"-" { b"" } else { a(2) };
-            fmtb(&[b"set|", a(0), b"|", a(1), b"|", v])
+            };
+            o.to_ascii_lowercase()
         }
         B::ChanOp => fmtb(&[a(1), b"|", a(0)]), // the hub takes nick|chan
         B::OptSet => {
@@ -2343,6 +2637,33 @@ fn build_payload(
                 b.mode = fmt::FMT_MODE_HUB_SETTINGS;
                 return Ok(b);
             }
+            if eq_ic(a(0), "ssh") || eq_ic(a(0), "conn") {
+                let conn = eq_ic(a(0), "conn");
+                b.op = CMD_ADMIN_SET_SSH;
+                if na == 1 {
+                    b.mode = fmt::FMT_MODE_LIMITS;
+                    b.payload = if conn { b"conn".to_vec() } else { Vec::new() };
+                    return Ok(b);
+                }
+                if na != 3 {
+                    return bad(
+                        if conn {
+                            "usage: hub set conn <perip|churn|authfail> <value|default>"
+                        } else {
+                            "usage: hub set ssh <name> <value|default>"
+                        },
+                        hint,
+                    );
+                }
+                let mut o = if conn { b"conn|".to_vec() } else { Vec::new() };
+                o.extend_from_slice(&fmtb(&[a(1), b"|", a(2)]));
+                o.make_ascii_lowercase();
+                b.payload = o;
+                return Ok(b);
+            }
+            if na > 2 {
+                return bad("hub set takes a setting and one value", hint);
+            }
             const HS: [(&str, u8); 5] = [
                 ("name", CMD_ADMIN_SET_HUB_NAME),
                 ("bindip", CMD_ADMIN_SET_BIND_IP),
@@ -2354,7 +2675,7 @@ fn build_payload(
                 let m = fmtb(&[b"unknown hub setting \"", &a(0)[..uprec(a(0), 40)], b"\""]);
                 return Err((
                     c_cut(&m, 96).to_vec(),
-                    Some("name, bindip, port, pubkey, autopurge"),
+                    Some("name, bindip, port, pubkey, autopurge, ssh, conn"),
                 ));
             };
             if na < 2 {
@@ -2380,7 +2701,17 @@ fn build_payload(
             } else {
                 return bad("say which list", hint);
             }
-            a(1).to_vec()
+            if na > 3 || (na == 3 && !eq_ic(a(2), "console")) {
+                return bad(
+                    "the only scope word is console",
+                    Some("acl add allow|deny <ip[/n]> [console]"),
+                );
+            }
+            if na == 3 {
+                fmtb(&[a(1), b"|console"])
+            } else {
+                a(1).to_vec()
+            }
         }
         B::UserList => {
             if na == 0 {
@@ -3500,13 +3831,31 @@ impl Ui {
         if line.is_empty() {
             return;
         }
-        if self.user_busy || self.confirming != Confirm::None {
+        // Held lines (busy, confirming, or waiting for a rate token) go first.
+        let mut held_for_rate = false;
+        if self.user_busy
+            || self.confirming != Confirm::None
+            || (!self.from_queue && !self.queued.is_empty())
+            || (!self.from_queue && {
+                held_for_rate = !self.rate_take();
+                held_for_rate
+            })
+        {
             if self.queued.len() < MAX_QUEUED_LINES {
                 self.queued.push(line.to_vec());
             } else {
                 self.note(b"busy: line dropped", RL_ERR);
             }
+            if held_for_rate && !self.line_mode && self.queued.len() == 1 {
+                self.note(
+                    b"too many commands: held until the next window (hub set ssh cmdrate)",
+                    RL_DIM,
+                );
+            }
             return;
+        }
+        if self.from_queue {
+            let _ = self.rate_take();
         }
         let l: Vec<u8> = if line[0] == b'/' {
             line[1..].to_vec()
@@ -3524,6 +3873,11 @@ impl Ui {
         if !self.line_mode {
             let echo = fmtb(&[b"> ", &l]);
             self.fs_timestamped(V_CONSOLE, c_cut(&echo, CONSOLE_INPUT_MAX + 4), RL_CMD);
+        }
+        if ws.more {
+            // never act on a line cut short
+            self.refuse(seq, "cmd.usage", b"too many words on one line", None);
+            return;
         }
         let Some((c, argi)) = find_cmd(&ws) else {
             let w0 = ws.get(0);
@@ -3544,7 +3898,8 @@ impl Ui {
         };
         let words = c_cut(&cmd_words(c), 32).to_vec();
         let na = ws.n() - argi;
-        let rest_arg = c.build == B::Local && c.sub == Some("filter");
+        let rest_arg = (c.build == B::Local && c.sub == Some("filter"))
+            || (c.build == B::Ban && c.sub == Some("add"));
         if na < c.nargs || (!rest_arg && na > c.nargs + c.optargs) {
             let m = format!("usage: {}", c.usage);
             self.refuse(seq, "cmd.usage", c_cut(m.as_bytes(), 160), None);
@@ -3866,7 +4221,14 @@ impl Ui {
     /// it (the first without its '/').  Arguments only complete where a
     /// command takes a known kind of value: never a bot or hub name in place
     /// of an ip, a pubkey or an admin name.
-    fn completions(&self, word_idx: usize, w: &mut [Vec<u8>; 3], prefix: &[u8]) -> Vec<Vec<u8>> {
+    fn completions(
+        &self,
+        word_idx: usize,
+        w: &mut [Vec<u8>; 3],
+        prefix: &[u8],
+        p1: &[u8],
+        p2: &[u8],
+    ) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut pooln = 0usize;
         let starts =
@@ -3947,7 +4309,13 @@ impl Ui {
                 }
                 return out;
             }
-            Ck::Words(words) => {
+            Ck::Words(_) | Ck::ChSet | Ck::NetSet | Ck::HubSet => {
+                let words = match ac.3 {
+                    Ck::Words(words) => words,
+                    Ck::ChSet => chset_words(prefix, p1, p2),
+                    Ck::HubSet => hubset_words(pos, p1, p2),
+                    _ => netset_words(p1, p2),
+                };
                 let mut p = words.as_bytes();
                 while !p.is_empty() && pooln < 128 {
                     let l = p.iter().position(|&b| b == b' ').unwrap_or(p.len());
@@ -4022,6 +4390,8 @@ impl Ui {
         let prefix_full = c_cut(&self.input[ws..self.in_cur], CONSOLE_INPUT_MAX).to_vec();
         // the words before this one (the first without its '/')
         let mut w: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        // the two words just before this one
+        let (mut prev1, mut prev2): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
         let mut idx = 0;
         let mut i = 0;
         while i < ws {
@@ -4039,6 +4409,8 @@ impl Ui {
                 let skip = usize::from(idx == 0 && self.input[s] == b'/');
                 w[idx] = c_cut(&self.input[s + skip..i], 64).to_vec();
             }
+            prev2 = std::mem::take(&mut prev1);
+            prev1 = c_cut(&self.input[s..i], 64).to_vec();
             idx += 1;
         }
         let pfx: &[u8] = if idx == 0 && prefix_full.first() == Some(&b'/') {
@@ -4046,7 +4418,7 @@ impl Ui {
         } else {
             &prefix_full
         };
-        let out = self.completions(idx, &mut w, pfx);
+        let out = self.completions(idx, &mut w, pfx, &prev1, &prev2);
         if out.is_empty() {
             return;
         }
@@ -4113,13 +4485,11 @@ impl Ui {
             self.hist_pos = self.hist.len(); // after the add: Up must land on this line
             self.run_line(&line);
         }
-        if self.line_mode && !self.closing {
-            if !self.user_busy && self.confirming == Confirm::None {
+        if self.line_mode && !self.closing && !self.user_busy && self.queued.is_empty() {
+            if self.confirming == Confirm::None {
                 self.flush_held();
             }
-            if !self.user_busy {
-                self.lm_prompt();
-            }
+            self.lm_prompt();
         }
         self.dirty = true;
     }
@@ -4136,7 +4506,7 @@ impl Ui {
         } else if self.confirming != Confirm::None {
             self.confirm_answer(b"", true);
         }
-        if self.line_mode && !self.user_busy {
+        if self.line_mode && !self.line_pending() {
             self.flush_held();
             self.lm_prompt();
         }
@@ -5121,7 +5491,7 @@ impl Ui {
                 push(&mut s, 5, SGR_STATUS, format!("[Act: {act}]").into_bytes());
             }
         }
-        let idle_left = CONSOLE_IDLE_TIMEOUT - (now_ms - self.last_input_ms) / 1000;
+        let idle_left = self.idle_s - (now_ms - self.last_input_ms) / 1000;
         if idle_left <= 60 {
             push(
                 &mut s,
@@ -5445,6 +5815,12 @@ impl Ui {
             user_busy: false,
             rq: Vec::new(),
             queued: Vec::new(),
+            idle_s: CONSOLE_IDLE_TIMEOUT,
+            cmd_n: SSH_DEF_CMDRATE_N,
+            cmd_s: SSH_DEF_CMDRATE_S,
+            rate_start_ms: 0,
+            rate_used: 0,
+            from_queue: false,
             confirming: Confirm::None,
             confirm_seq: 0,
             confirm_want: Vec::new(),
@@ -5515,6 +5891,19 @@ impl Ui {
         }
     }
 
+    /// The session's `hub set ssh` limits: idle close (seconds) and commands
+    /// per window (cmd_n per cmd_s seconds; over it, lines queue, they are
+    /// not dropped).
+    pub fn set_limits(&mut self, idle_s: i32, cmd_n: i32, cmd_s: i32) {
+        if idle_s >= 60 {
+            self.idle_s = i64::from(idle_s);
+        }
+        if cmd_n >= 1 && cmd_s >= 1 {
+            self.cmd_n = cmd_n;
+            self.cmd_s = cmd_s;
+        }
+    }
+
     /// Greeting, first draw, subscriptions.
     pub fn start(&mut self, now_ms: i64) {
         self.last_input_ms = now_ms;
@@ -5577,10 +5966,25 @@ impl Ui {
             }
             self.esc.clear();
         }
-        if now_ms - self.last_input_ms >= CONSOLE_IDLE_TIMEOUT * 1000 && !self.closing {
+        if now_ms - self.last_input_ms >= self.idle_s * 1000 && !self.closing {
             self.closing = true;
             self.close_why = "idle timeout".to_string();
             return;
+        }
+        // lines held by the command rate go out as the window turns over
+        if !self.queued.is_empty()
+            && !self.user_busy
+            && self.confirming == Confirm::None
+            && !self.closing
+            && self.rate_ready()
+        {
+            let before = self.queued.len();
+            self.command_done(false);
+            if self.line_mode && self.queued.len() < before && !self.line_pending() && !self.closing
+            {
+                self.flush_held();
+                self.lm_prompt();
+            }
         }
         if self.dropped > 0 && self.term.len() + self.backlog < CONSOLE_TERM_OUTQ_MAX / 2 {
             let n = self.dropped;
@@ -5606,7 +6010,7 @@ impl Ui {
             self.request_view(Rq::ViewStats, now_ms);
         }
         // the clock, and the idle countdown in its last minute
-        let idle_left = CONSOLE_IDLE_TIMEOUT - (now_ms - self.last_input_ms) / 1000;
+        let idle_left = self.idle_s - (now_ms - self.last_input_ms) / 1000;
         let tick = if idle_left <= 60 { 1000 } else { 60000 };
         if now_ms / tick != self.last_clock_ms / tick {
             self.last_clock_ms = now_ms;

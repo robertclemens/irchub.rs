@@ -185,9 +185,13 @@ pub fn watch_listener(l: &TcpListener) -> Watch<'_> {
 /// peers and admins ignore the field entirely and keep the host order the
 /// original protocol shipped with.  CMD_BOT_TREE joined the bot list late —
 /// without it the bot computed a garbage length, failed its bounds check and
-/// silently dropped every tree push.
+/// silently dropped every tree push.  CMD_CHAN_DO is queued behind a config
+/// push (`client::send_cmd_to_bot_after_config`).
 pub fn inner_len_is_network_order(cmd: u8) -> bool {
-    matches!(cmd, CMD_CONFIG_DATA | CMD_BOT_TREE | CMD_ACTIVITY_REPLY)
+    matches!(
+        cmd,
+        CMD_CONFIG_DATA | CMD_BOT_TREE | CMD_ACTIVITY_REPLY | CMD_CHAN_DO
+    )
 }
 
 /// Build `cmd || inner_len || payload`.  `network_order` picks how the length

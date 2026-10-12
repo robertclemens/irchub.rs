@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use crate::consts::*;
 use crate::cstr::now;
 use crate::state::{ClientType, HubClient, HubState, UpgradeNodeState};
-use crate::{auth, crypto, presence, ratelimit, upgrade};
+use crate::{auth, connlimits, crypto, presence, ratelimit, upgrade};
 
 // ---------------------------------------------------------------------------
 // What the two threads share
@@ -49,6 +49,9 @@ pub struct Published {
     /// Bumped on every host key change; 0 = none published yet.
     pub host_gen: u32,
     pub hubname: String,
+    /// `hub set ssh` as of the last publish (console_publish_limits); the
+    /// built-ins until the core publishes.
+    pub limits: crate::connlimits::ConnCfg,
 }
 
 pub type Shared = Arc<Mutex<Published>>;
@@ -346,6 +349,23 @@ pub fn hostkey_changed(state: &mut HubState) {
     state.console = core;
 }
 
+/// Publish `state.conn_cfg` to the console thread (start, and after each
+/// change): a connection takes a copy when it arrives, so a change applies to
+/// the next one.  Mirrors `hub_console_limits_changed`.
+pub fn limits_changed(state: &mut HubState) {
+    if let Some(core) = state.console.as_ref() {
+        let mut p = core.shared.lock().unwrap_or_else(|e| e.into_inner());
+        p.limits = state.conn_cfg;
+    }
+}
+
+/// console_limits_get(): a copy of the published limits, made coherent.
+pub(crate) fn limits_get(shared: &Shared) -> crate::connlimits::ConnCfg {
+    let mut c = shared.lock().unwrap_or_else(|e| e.into_inner()).limits;
+    c.fix();
+    c
+}
+
 fn publish_hostkey(state: &HubState, core: &mut Core) {
     if !state.hub_keys_loaded {
         return;
@@ -439,6 +459,7 @@ pub fn start(state: &mut HubState) -> bool {
         host_pub: [0u8; 32],
         host_gen: 0,
         hubname: String::new(),
+        limits: state.conn_cfg,
     }));
     let (to_tx, to_rx) = tokio::sync::mpsc::unbounded_channel();
     let (from_tx, from_rx) = std::sync::mpsc::channel();
@@ -495,18 +516,25 @@ pub fn stop(state: &mut HubState) {
 /// console thread and drop the client from the core.
 pub fn handoff(state: &mut HubState, ci: usize) {
     let ip = state.clients[ci].ip.clone();
-    let sock = state.clients[ci].sock.take();
-    let sent = match (sock, state.console.as_ref()) {
-        (Some(s), Some(core)) => core.to.send(ToConsole::New(s, ip.clone())).is_ok(),
-        _ => false,
-    };
+    // Only now that the stream says SSH do the console scope of the ACL and
+    // the SSH block / connect window apply (bots and peers never reach this).
+    let admitted = state.console.is_some() && ratelimit::ssh_admit(state, &ip);
+    let mut sent = false;
+    if admitted {
+        let sock = state.clients[ci].sock.take();
+        sent = match (sock, state.console.as_ref()) {
+            (Some(s), Some(core)) => core.to.send(ToConsole::New(s, ip.clone())).is_ok(),
+            _ => false,
+        };
+        // fd -1: the socket left with the console (or was dropped with the
+        // failed send), not a disconnect.
+        state.clients[ci].fd = -1;
+    }
     if sent {
         crate::hlog_debug!("[CONSOLE] SSH connection from {ip} handed to the console\n");
-    } else {
+    } else if state.console.is_none() {
         crate::hlog_warning!("[CONSOLE] SSH connection from {ip} refused: console not running\n");
     }
-    // fd -1: a socket handed to the SSH console, not a disconnect.
-    state.clients[ci].fd = -1;
     auth::disconnect_client(state, ci);
 }
 
@@ -575,6 +603,9 @@ fn open_console(state: &mut HubState, stream: UnixStream, name: String, ip: Stri
         "[HUB] Admin Login (SSH console, key {}): {ip} as '{name}'\n",
         crypto::key_fingerprint(&pk)
     );
+    if !ratelimit::trusted_loopback(state, &ip) {
+        connlimits::ssh_table_success(&mut state.ssh_ips, &ip, now());
+    }
     if let Some(ui) = admin_by_name(state, &name) {
         // Activity, not a config change: no peer sync, no bot push.
         crate::activity::stamp_user(state, ui, now());
@@ -603,7 +634,7 @@ pub fn on_wake(state: &mut HubState) {
             FromConsole::Open { stream, name, ip } => open_console(state, stream, name, ip),
             FromConsole::Fail { ip, name, reason } => {
                 crate::hlog_warning!("[CONSOLE] Refused SSH login '{name}' from {ip}: {reason}\n");
-                ratelimit::record_failed_auth(state, &ip);
+                ratelimit::ssh_failed(state, &ip);
             }
             FromConsole::Log { level, text } => match level {
                 LOG_ERROR => crate::hlog_error!("{text}\n"),

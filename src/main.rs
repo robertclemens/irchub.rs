@@ -394,6 +394,9 @@ fn maintenance(state: &mut HubState) {
     // Channel-request elections: probe windows and hand-off timeouts.
     irchub::elect::tick(state, t);
 
+    // Expired bans: one `del` per ban, self-throttled to BAN_SWEEP_INTERVAL.
+    irchub::modes::bans_sweep(state, t);
+
     // The full config push owed to the bots, coalesced across a burst.
     client::flush_bot_config(state, t);
 

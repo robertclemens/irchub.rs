@@ -8,14 +8,18 @@
 //! write debounce in `maintenance` flush them, rather than paying
 //! PBKDF2(100k) per command.
 
+use crate::connlimits::{self, Group, SetResult};
 use crate::consts::*;
 use crate::cstr::{now, split_fields, trunc_string};
 use crate::reply::Reply;
 use crate::state::{
-    BotConfig, BotRoster, ClientType, HubState, IpAcl, IpAclAdd, MaskRecord, PeerConfig,
-    UserRecord, lww_next_ts, name_valid, parse_uint,
+    BotConfig, BotRoster, ClientType, HubState, IpAcl, IpAclAdd, MaskRecord, ModesStatus,
+    PeerConfig, UserRecord, lww_next_ts, name_valid, parse_uint,
 };
-use crate::{auth, client, crypto, mesh, opflow, presence, queue, ratelimit, storage, upgrade};
+use crate::{
+    auth, client, console, crypto, mesh, modes, opflow, presence, queue, ratelimit, storage,
+    upgrade,
+};
 
 fn resp(state: &mut HubState, ci: usize, msg: &str) -> bool {
     client::send_response(state, ci, msg)
@@ -502,7 +506,7 @@ fn chan_entry(state: &HubState, chan: &str) -> Option<usize> {
     state.global_entries.iter().position(|e| {
         e.key == "c"
             && mesh::parse_global_channel_value(&e.value)
-                .is_some_and(|(name, _, _, _)| trunc_string(&name, 128) == chan)
+                .is_some_and(|(name, _, _, _)| storage::ascii_ieq(&trunc_string(&name, 128), chan))
     })
 }
 
@@ -691,14 +695,28 @@ fn ip_acl_change(state: &mut HubState, ci: usize, list: char, add: bool, payload
             ci,
             "acl.usage",
             "say which address",
-            Some("acl add|del allow|deny <ip[/n]>"),
+            Some("acl add|del allow|deny <ip[/n]> [console]"),
         );
     }
-    let Some(mut e) = ratelimit::ip_acl_parse(payload) else {
-        let msg = format!(
-            "{} is not an IPv4 address or CIDR",
-            trunc_string(payload, 41)
-        );
+    // "<pattern>" or "<pattern>|console" (D27: the entry applies only once the
+    // first bytes say SSH).  Anything else after the pattern is refused.
+    let (pat, console_scope) = match payload.find('|') {
+        Some(bar) => {
+            if &payload[bar + 1..] != "console" || bar >= IP_ACL_PATTERN_MAX + 2 {
+                return admin_err(
+                    state,
+                    ci,
+                    "acl.bad_scope",
+                    "the only scope word is console",
+                    Some("acl add allow <ip[/n]> console"),
+                );
+            }
+            (&payload[..bar], true)
+        }
+        None => (payload, false),
+    };
+    let Some(mut e) = ratelimit::ip_acl_parse(pat) else {
+        let msg = format!("{} is not an IPv4 address or CIDR", trunc_string(pat, 41));
         return admin_err(
             state,
             ci,
@@ -707,6 +725,7 @@ fn ip_acl_change(state: &mut HubState, ci: usize, list: char, add: bool, payload
             Some("1.2.3.4 or 1.2.3.0/24"),
         );
     };
+    e.console = console_scope;
 
     let saved_allow = state.ip_allow.clone();
     let saved_deny = state.ip_deny.clone();
@@ -716,7 +735,15 @@ fn ip_acl_change(state: &mut HubState, ci: usize, list: char, add: bool, payload
         match ratelimit::ip_acl_add(state, list, &e) {
             IpAclAdd::Added => {}
             IpAclAdd::Duplicate => {
-                let msg = format!("{} is already on the {name} list", e.pattern());
+                let msg = format!(
+                    "{} is already on the {name} list{}",
+                    e.pattern(),
+                    if console_scope {
+                        " (console scope)"
+                    } else {
+                        ""
+                    }
+                );
                 return admin_err(state, ci, "acl.exists", &msg, Some("acl list"));
             }
             _ => {
@@ -725,12 +752,23 @@ fn ip_acl_change(state: &mut HubState, ci: usize, list: char, add: bool, payload
             }
         }
     } else if !ratelimit::ip_acl_remove(state, list, &e) {
-        let msg = format!("{} is not on the {name} list", e.pattern());
+        let msg = format!(
+            "{} is not on the {name} list{}",
+            e.pattern(),
+            if console_scope {
+                " with the console scope"
+            } else {
+                ""
+            }
+        );
         return admin_err(state, ci, "acl.not_found", &msg, Some("acl list"));
     }
 
     let admin_ip = state.clients[ci].ip.clone();
-    if !ratelimit::ip_acl_permits(state, &admin_ip) {
+    // The admin is on an SSH console: both scopes must let this address in.
+    if !ratelimit::ip_acl_permits(state, &admin_ip)
+        || !ratelimit::ip_acl_permits_console(state, &admin_ip)
+    {
         state.ip_allow = saved_allow;
         state.ip_deny = saved_deny;
         let msg = format!("refused: this would lock out your own address {admin_ip}");
@@ -757,20 +795,26 @@ fn ip_acl_change(state: &mut HubState, ci: usize, list: char, add: bool, payload
         if add { "added to" } else { "removed from" },
         state.clients[ci].id
     );
-    let count = if list == 'w' {
-        state.ip_allow.len()
-    } else {
-        state.ip_deny.len()
-    };
+    let in_scope = ratelimit::ip_acl_scope_count(
+        if list == 'w' {
+            &state.ip_allow
+        } else {
+            &state.ip_deny
+        },
+        console_scope,
+    );
     let mut r = Reply::new();
     r.ok(if add { "acl.added" } else { "acl.removed" });
     r.kv("list", name);
     r.kv("pattern", e.pattern());
     r.kvu("size", acl_size(&e));
-    if list == 'w' && add && count == 1 {
+    if console_scope {
+        r.kv("scope", "console");
+    }
+    if list == 'w' && add && in_scope == 1 {
         r.kvb("first", true);
     }
-    if list == 'w' && !add && count == 0 {
+    if list == 'w' && !add && in_scope == 0 {
         r.kvb("empty", true);
     }
     r.kvi("closing", closing as i64);
@@ -788,7 +832,9 @@ fn list_acl(state: &mut HubState, ci: usize) -> bool {
         "self",
         if state.ip_allow.is_empty() && state.ip_deny.is_empty() {
             "open"
-        } else if ratelimit::ip_acl_permits(state, &ip) {
+        } else if ratelimit::ip_acl_permits(state, &ip)
+            && ratelimit::ip_acl_permits_console(state, &ip)
+        {
             "allowed"
         } else {
             "denied"
@@ -801,6 +847,9 @@ fn list_acl(state: &mut HubState, ci: usize) -> bool {
             r.kvi("n", i as i64 + 1);
             r.kv("pattern", e.pattern());
             r.kvu("size", acl_size(e));
+            if e.console {
+                r.kv("scope", "console");
+            }
             if e.added > 0 {
                 r.kvi("ts", e.added);
             }
@@ -1884,6 +1933,38 @@ fn list_channels(state: &mut HubState, ci: usize, payload: &str) -> bool {
         };
         r.ok("channel.show");
         r.kvi("bots_online", network_bots_online(state));
+        // modes.md §5.1: the stored modes and where they come from, the
+        // settings the channel overrides, and its ban count
+        {
+            let cn = storage::chan_live(state, payload).unwrap_or_default();
+            let cs = if cn.is_empty() {
+                None
+            } else {
+                modes::chanset_get(state, &cn)
+            };
+            let ns = modes::netset_get(state);
+            let (mut eff, mut src) = ("+nt".to_string(), "built-in");
+            match (&cs, &ns) {
+                (Some(c), _) if !c.modes.is_empty() => {
+                    eff = c.modes.clone();
+                    src = "chan";
+                }
+                (_, Some(n)) if !n.modes.is_empty() => {
+                    eff = n.modes.clone();
+                    src = "net";
+                }
+                _ => {}
+            }
+            r.kv("want", &eff);
+            r.kv("want_src", src);
+            r.kv("overrides", cs.as_ref().map_or("", |c| c.settings.as_str()));
+            let nb = if cn.is_empty() {
+                0
+            } else {
+                modes::ban_list(state, Some(&cn), MF_BANS_CHAN_MAX).len()
+            };
+            r.kvi("bans", nb as i64);
+        }
         let (v, ts) = (
             state.global_entries[i].value.clone(),
             state.global_entries[i].timestamp,
@@ -1910,9 +1991,8 @@ fn list_channels(state: &mut HubState, ci: usize, payload: &str) -> bool {
 }
 
 fn add_channel(state: &mut HubState, ci: usize, payload: &str) -> bool {
-    // "<#chan>|<key>" adds (or re-adds) a channel; "set|<#chan>|<setting>|
-    // <value>" changes one setting of a managed one (channel set).  A
-    // channel name never starts with "set", so the two cannot collide.
+    // "<#chan>|<key>" adds (or re-adds) a channel.  (The key as a setting
+    // moved to channel mode +k; channel set is CMD_ADMIN_CHAN_SET.)
     if payload.is_empty() {
         return admin_err(
             state,
@@ -1922,20 +2002,8 @@ fn add_channel(state: &mut HubState, ci: usize, payload: &str) -> bool {
             Some("channel add <#chan> [key]"),
         );
     }
-    let set = payload.starts_with("set|");
-    let (chan, setting, key) = if set {
-        (
-            wire_field(payload, 1, 128).unwrap_or_default(),
-            wire_field(payload, 2, 32).unwrap_or_default(),
-            wire_tail(payload, 3, 64).unwrap_or_default(),
-        )
-    } else {
-        (
-            wire_field(payload, 0, 128).unwrap_or_default(),
-            String::new(),
-            wire_tail(payload, 1, 64).unwrap_or_default(),
-        )
-    };
+    let chan = wire_field(payload, 0, 128).unwrap_or_default();
+    let key = wire_tail(payload, 1, 64).unwrap_or_default();
     if !chan_name_valid(&chan) {
         return admin_err(
             state,
@@ -1957,40 +2025,18 @@ fn add_channel(state: &mut HubState, ci: usize, payload: &str) -> bool {
     let old = chan_active_key(state, &chan);
     let existed = old.is_some();
     let old_key = old.unwrap_or_default();
-    if set {
-        if !existed {
-            let m = format!("{} is not a managed channel", trunc_string(&chan, 65));
-            return admin_err(state, ci, "channel.not_found", &m, Some("channel add"));
-        }
-        if setting != "key" {
-            let m = format!("unknown channel setting \"{}\"", trunc_string(&setting, 32));
-            return admin_err(
-                state,
-                ci,
-                "channel.unknown_setting",
-                &m,
-                Some("settings: key"),
-            );
-        }
-    }
     chan_store(state, &chan, &key);
     let mut r = Reply::new();
-    r.ok(if set { "channel.set" } else { "channel.added" });
+    r.ok("channel.added");
     r.kv("name", &chan);
-    if set {
-        r.kv("setting", "key");
-        opt(&mut r, "old", &old_key);
-        opt(&mut r, "value", &key);
-    } else {
-        opt(&mut r, "key", &key);
-        opt(&mut r, "old_key", &old_key);
-        r.kvb("existed", existed);
-        opt(
-            &mut r,
-            "modes",
-            &chan_modes_letters(mesh::global_channel_modes(state, &chan)),
-        );
-    }
+    opt(&mut r, "key", &key);
+    opt(&mut r, "old_key", &old_key);
+    r.kvb("existed", existed);
+    opt(
+        &mut r,
+        "modes",
+        &chan_modes_letters(mesh::global_channel_modes(state, &chan)),
+    );
     r.kvi("bots", local_bot_count(state));
     r.kvi("peers", linked_peer_count(state));
     send_reply(state, ci, &mut r)
@@ -2007,7 +2053,10 @@ fn del_channel(state: &mut HubState, ci: usize, payload: &str) -> bool {
         );
     }
     let existed = chan_active_key(state, payload).is_some();
-    let t = lww_next_ts(storage::global_ts(state, "c", payload));
+    // One stamp past the channel's c|, C| and every B| line, so the delete
+    // beats all of them: the settings and bans go with the channel.
+    let t = storage::chan_del_stamp(state, payload);
+    storage::chan_cascade_del(state, payload, t, true);
     storage::update_global_entry(state, "c", payload, "", "del", t);
     state.config_dirty = true;
     let sync_msg = format!("c|{payload}||del|{t}\n");
@@ -2021,6 +2070,1122 @@ fn del_channel(state: &mut HubState, ci: usize, payload: &str) -> bool {
     r.kvi("peers", linked_peer_count(state));
     r.kvi("purge_days", i64::from(state.purge_days_setting));
     send_reply(state, ci, &mut r)
+}
+
+// ---------------------------------------------------------------------------
+// Modes, channel settings, network defaults, bans (docs/modes.md §5.1)
+//
+// channel mode / channel set / ban / network set.  The store functions are
+// modes.rs's; this is the console's side: parse the (hostile) payload, call
+// them, answer in records.  Mirrors the mf_* block of hub_logic.c.
+// ---------------------------------------------------------------------------
+const MF_MAX_TOKENS: usize = 16;
+const MF_BANS_LIST_MAX: usize = 600;
+/// >= MAX_BANS_PER_CHAN and MAX_GLOBAL_BANS.
+const MF_BANS_CHAN_MAX: usize = 128;
+/// 10 years, the store's own ceiling.
+const MF_BAN_MINUTES_MAX: u64 = 5_256_000;
+
+fn mf_field_count(s: &str) -> usize {
+    1 + s.bytes().filter(|&c| c == b'|').count()
+}
+
+/// The name a console session logs in as ("ADMIN:robert" -> "robert").
+fn mf_admin_name(state: &HubState, ci: usize) -> String {
+    let id = &state.clients[ci].id;
+    id.strip_prefix("ADMIN:").unwrap_or(id).to_string()
+}
+
+/// D38: names of the peer hubs older than 2.4.5, sorted, comma-joined, as
+/// old_hubs=; nothing when there are none.  A command that wrote C|/D|/B|
+/// calls this on its reply.
+pub(crate) fn mf_reply_old_hubs(state: &HubState, r: &mut Reply) {
+    let mut names: Vec<String> = modes::old_hubs(state, 16)
+        .iter()
+        .map(|n| crate::cstr::trunc(n, 64).to_string())
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    names.sort();
+    const CAP: usize = 16 * 65 + 1;
+    let mut joined = String::new();
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 {
+            joined.push(',');
+        }
+        for c in n.chars() {
+            if joined.len() + c.len_utf8() + 2 >= CAP {
+                break;
+            }
+            joined.push(if c == ',' || (c as u32) < 0x20 || c == '\x7f' {
+                '_'
+            } else {
+                c
+            });
+        }
+    }
+    r.kv("old_hubs", &joined);
+}
+
+fn mf_status_err(state: &mut HubState, ci: usize, st: ModesStatus, what: Option<&str>) -> bool {
+    let (code, msg, hint): (&str, String, Option<&str>) = match st {
+        ModesStatus::Frozen => (
+            "config.frozen",
+            "the config is frozen while an upgrade runs".into(),
+            Some("upgrade status; a stale freeze is lifted with option set"),
+        ),
+        ModesStatus::BadChan => (
+            "channel.bad_name",
+            "a channel name starts with # or & and has no spaces, commas or control characters"
+                .into(),
+            None,
+        ),
+        ModesStatus::NotManaged => (
+            "channel.not_found",
+            format!(
+                "{} is not a managed channel",
+                crate::cstr::trunc(what.unwrap_or("?"), 65)
+            ),
+            Some("channel add <#chan>"),
+        ),
+        ModesStatus::BadModes => (
+            "channel.bad_mode",
+            "that is not a valid mode string".into(),
+            Some("channel mode <#chan> <+modes> [args]"),
+        ),
+        ModesStatus::TooLong => (
+            "channel.too_long",
+            "the settings would not fit the record (512 bytes)".into(),
+            Some("reset some with <name> default"),
+        ),
+        ModesStatus::BadSetting => (
+            "channel.bad_value",
+            "that setting value is not valid".into(),
+            None,
+        ),
+        ModesStatus::BadMask => (
+            "ban.bad_mask",
+            "a ban mask is 1-120 printable characters with no spaces, commas or |".into(),
+            Some("ban add <#chan|*> nick!user@host"),
+        ),
+        ModesStatus::BadReason => (
+            "ban.bad_reason",
+            "a ban reason is at most 120 bytes with no control characters".into(),
+            None,
+        ),
+        ModesStatus::BadExpiry => (
+            "ban.bad_time",
+            "a ban lasts 1 minute to 10 years, or perm".into(),
+            Some("ban add <#chan|*> <mask> [<min>|perm]"),
+        ),
+        ModesStatus::NotFound => (
+            "ban.not_found",
+            "no such ban".into(),
+            Some("ban list [#chan|*]"),
+        ),
+        ModesStatus::Full => (
+            "ban.full",
+            "the record or ban table is full (100 bans per channel, 100 global)".into(),
+            Some("ban del <#chan|*> <mask>"),
+        ),
+        ModesStatus::Protected | ModesStatus::Ok => {
+            ("modes.failed", "the change was refused".into(), None)
+        }
+    };
+    admin_err(state, ci, code, &msg, hint)
+}
+
+/// Whether a stored mode string ("+stnkl 20", "-i+t") sets `letter` on.
+fn mf_modes_plus(modes: &str, letter: u8) -> bool {
+    let mut sign = 0u8;
+    for c in modes.bytes() {
+        if c == b' ' {
+            break;
+        }
+        if c == b'+' || c == b'-' {
+            sign = c;
+        } else if c == letter && sign == b'+' {
+            return true;
+        }
+    }
+    false
+}
+
+/// The channel's mode card: stored string (""= network default), the string
+/// in force and where it comes from, the modes a bot last reported live,
+/// whether a key is set, and whether +l fights +dynamiclimit.  `cname` must
+/// be a live channel.
+pub(crate) fn mf_mode_card_extra(state: &HubState, r: &mut Reply, cname: &str) {
+    let cs = modes::chanset_get(state, cname);
+    let ns = modes::netset_get(state);
+    let (mut eff, mut src) = ("+nt".to_string(), "built-in");
+    match (&cs, &ns) {
+        (Some(c), _) if !c.modes.is_empty() => {
+            eff = c.modes.clone();
+            src = "chan";
+        }
+        (_, Some(n)) if !n.modes.is_empty() => {
+            eff = n.modes.clone();
+            src = "net";
+        }
+        _ => {}
+    }
+    r.kv("modes", cs.as_ref().map_or("", |c| c.modes.as_str()));
+    r.kv("effective", &eff);
+    r.kv("source", src);
+    let key = zeroize::Zeroizing::new(chan_active_key(state, cname).unwrap_or_default());
+    r.kvb("key_set", !key.is_empty());
+    r.kv(
+        "live",
+        &chan_modes_letters(mesh::global_channel_modes(state, cname)),
+    );
+    let (_, dyn_v) = modes::setting_effective(state, Some(cname), "dynamiclimit");
+    r.kvb("dynlimit", mf_modes_plus(&eff, b'l') && dyn_v == "1");
+}
+
+fn mf_mode_card(state: &HubState, r: &mut Reply, cname: &str) {
+    r.kv("chan", cname);
+    mf_mode_card_extra(state, r, cname);
+}
+
+/// Parsed channel modes: the stored form, the +k key op and the key.
+struct MfModes {
+    stored: String,
+    key_op: i32,
+    key: zeroize::Zeroizing<String>,
+}
+
+/// Channel mode strings the console sends: "<+modes>|<arg>|<arg>".  Fills the
+/// stored form (letters, then the limit) and the key to set / clear.
+fn mf_parse_modes(modes: &str, args: &[String]) -> Result<MfModes, &'static str> {
+    let mut sign = 0u8;
+    let mut limit = String::new();
+    let mut seen = [false; 256];
+    let mut ai = 0usize;
+    let (mut plus_s, mut plus_p) = (false, false);
+    let mut key_op = 0;
+    let mut key = zeroize::Zeroizing::new(String::new());
+    if modes.is_empty() {
+        return Err("say the modes, e.g. +nt");
+    }
+    for c in modes.bytes() {
+        if c == b'+' || c == b'-' {
+            sign = c;
+            continue;
+        }
+        if !b"imnpstkl".contains(&c) {
+            return Err("modes are i m n p s t k l");
+        }
+        if sign == 0 {
+            return Err("start the modes with + or -");
+        }
+        if seen[usize::from(c)] {
+            return Err("a mode letter may appear only once");
+        }
+        seen[usize::from(c)] = true;
+        if sign == b'+' && c == b's' {
+            plus_s = true;
+        }
+        if sign == b'+' && c == b'p' {
+            plus_p = true;
+        }
+        if c == b'k' {
+            if sign == b'+' {
+                if ai >= args.len() {
+                    return Err("+k needs a key");
+                }
+                let k = &args[ai];
+                ai += 1;
+                if k.is_empty() || k.len() > 30 {
+                    return Err("a key is 1-30 bytes");
+                }
+                if k.bytes().any(|b| b <= 0x20 || b == b',' || b == 0x7f) {
+                    return Err("a key has no spaces, commas or control characters");
+                }
+                *key = k.clone();
+                key_op = 1;
+            } else {
+                key_op = -1;
+            }
+        } else if c == b'l' && sign == b'+' {
+            if ai >= args.len() {
+                return Err("+l needs a limit");
+            }
+            let l = &args[ai];
+            ai += 1;
+            if l.is_empty() || l.len() > 5 || !l.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("the limit is 1-99999");
+            }
+            let v: i64 = l.parse().map_err(|_| "the limit is 1-99999")?;
+            if !(1..=99999).contains(&v) {
+                return Err("the limit is 1-99999");
+            }
+            limit = v.to_string();
+        }
+    }
+    if ai != args.len() {
+        return Err("more arguments than +k and +l take");
+    }
+    if plus_s && plus_p {
+        return Err("+s and +p cannot both be set");
+    }
+    let stored = format!("{modes}{}{limit}", if limit.is_empty() { "" } else { " " });
+    if stored.len() > C_MODES_MAX {
+        return Err("the mode string is too long");
+    }
+    if modes::modes_check(&stored) != ModesStatus::Ok {
+        return Err("that is not a valid mode string");
+    }
+    Ok(MfModes {
+        stored,
+        key_op,
+        key,
+    })
+}
+
+/// channel mode: #chan | #chan|<modes>|<arg>... | #chan|-
+fn admin_chan_mode(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    let chan = if payload.is_empty() {
+        None
+    } else {
+        wire_field(payload, 0, MAX_CHAN)
+    };
+    let Some(chan) = chan else {
+        return admin_err(
+            state,
+            ci,
+            "channel.usage",
+            "say which channel",
+            Some("channel mode <#chan> [<+modes> [args]]"),
+        );
+    };
+    if !chan_name_valid(&chan) {
+        return mf_status_err(state, ci, ModesStatus::BadChan, Some(&chan));
+    }
+    let Some(cname) = storage::chan_live(state, &chan) else {
+        return mf_status_err(state, ci, ModesStatus::NotManaged, Some(&chan));
+    };
+    let nf = mf_field_count(payload);
+    if nf == 1 {
+        let mut r = Reply::new();
+        r.ok("channel.mode");
+        r.kvb("view", true);
+        mf_mode_card(state, &mut r, &cname);
+        return send_reply(state, ci, &mut r);
+    }
+    if nf > 5 {
+        return admin_err(
+            state,
+            ci,
+            "channel.bad_mode",
+            "too many arguments",
+            Some("channel mode <#chan> <+modes> [key] [limit]"),
+        );
+    }
+    let Some(modes_f) = wire_field(payload, 1, C_MODES_MAX + 2) else {
+        return admin_err(
+            state,
+            ci,
+            "channel.bad_mode",
+            "the mode string is too long",
+            None,
+        );
+    };
+    let nargs = nf - 2;
+    let mut args: Vec<String> = Vec::new();
+    for i in 0..nargs {
+        match wire_field(payload, 2 + i, 64) {
+            Some(a) => args.push(a),
+            None => {
+                args.iter_mut().for_each(zeroize::Zeroize::zeroize);
+                return admin_err(
+                    state,
+                    ci,
+                    "channel.bad_mode",
+                    "an argument is too long",
+                    None,
+                );
+            }
+        }
+    }
+    let parsed = if modes_f == "-" && nargs == 0 {
+        Ok(MfModes {
+            stored: String::new(),
+            key_op: 0,
+            key: zeroize::Zeroizing::new(String::new()),
+        })
+    } else {
+        mf_parse_modes(&modes_f, &args)
+    };
+    args.iter_mut().for_each(zeroize::Zeroize::zeroize);
+    let m = match parsed {
+        Ok(m) => m,
+        Err(why) => {
+            return admin_err(
+                state,
+                ci,
+                "channel.bad_mode",
+                why,
+                Some("channel mode <#chan> <+modes> [key] [limit]  (- = network default)"),
+            );
+        }
+    };
+    let settings = modes::chanset_get(state, &cname)
+        .map(|c| c.settings)
+        .unwrap_or_default();
+    let st = modes::chanset_put(state, &cname, &m.stored, &settings);
+    if st == ModesStatus::Ok && m.key_op != 0 {
+        let cur = zeroize::Zeroizing::new(chan_active_key(state, &cname).unwrap_or_default());
+        let want: &str = if m.key_op > 0 { &m.key } else { "" };
+        if *cur != want {
+            chan_store(state, &cname, want);
+        }
+    }
+    if st != ModesStatus::Ok {
+        return mf_status_err(state, ci, st, Some(&cname));
+    }
+    // Apply once: the answer (channel.mode with who did it, or channel.nobody)
+    // comes when the election ends.
+    let admin = Some((state.clients[ci].fd, state.clients[ci].conn_serial));
+    if !crate::elect::chan_mode_apply(state, &cname, admin) {
+        return admin_err(
+            state,
+            ci,
+            "channel.busy",
+            "the modes are stored, but too many channel requests are in flight to apply them now",
+            Some("channel mode <#chan> again in a few seconds"),
+        );
+    }
+    true
+}
+
+/// Effective value of `name` as seen from `work` (a settings string being
+/// edited) with the network level below it; src 'c' / 'n' / 'b'.
+fn mf_eff(state: &HubState, work: &str, net_target: bool, name: &str) -> (char, String) {
+    if let Some(v) = modes::settings_get(work, name) {
+        return (if net_target { 'n' } else { 'c' }, v);
+    }
+    modes::setting_effective(state, None, name)
+}
+
+fn mf_src_word(s: char) -> &'static str {
+    match s {
+        'c' => "chan",
+        'n' => "net",
+        _ => "built-in",
+    }
+}
+
+/// Canonical text of a validated value: numbers without leading zeros, floods
+/// as N:S or off.
+fn mf_canon(kind: &str, value: &mut String) {
+    let num = |s: &str| s.parse::<i64>().ok();
+    if kind == "num" {
+        if let Some(a) = num(value) {
+            *value = a.to_string();
+        }
+    } else if (kind == "flood" && value != "off" || kind == "sendq")
+        && let Some((a, b)) = value.split_once(':')
+        && let (Some(a), Some(b)) = (num(a), num(b))
+    {
+        *value = format!("{a}:{b}");
+    }
+}
+
+fn mf_value_hint(name: &str, kind: &str) -> String {
+    match modes::setting_range(name) {
+        Some((lo, hi)) if kind == "num" => {
+            format!("{name} is a whole number from {lo} to {hi}")
+        }
+        _ if kind == "sendq" => format!("{name} takes B:I (B 1-100 lines, I 0-10000 ms)"),
+        _ if kind == "flood" => {
+            format!("{name} takes N:S (N 1-1000 events in S 1-3600 seconds), off or default")
+        }
+        _ => format!("{name} is an on/off option: use +{name} or -{name}"),
+    }
+}
+
+/// One setting change: the pieces of a `chg` record.
+struct MfChg {
+    name: String,
+    kind: String,
+    old: String,
+    val: String,
+    old_src: char,
+    src: char,
+    reset: bool,
+}
+
+/// One edit of a settings string.  tok: "+name", "-name" or "name=value"
+/// (value may be "default").  net: the target is D| (channel set default).
+/// The change goes to `work`.  Err is (code, message).
+fn mf_edit(
+    state: &HubState,
+    work: &mut String,
+    cap: usize,
+    net: bool,
+    tok: &str,
+) -> Result<MfChg, (&'static str, String)> {
+    let eq = tok.find('=');
+    let signed_form = tok.starts_with('+') || tok.starts_with('-');
+    let (name, mut value): (String, String);
+    if signed_form {
+        name = crate::cstr::trunc(&tok[1..], 48).to_string();
+        value = if tok.starts_with('+') { "1" } else { "0" }.to_string();
+        if tok.len() > 48 || eq.is_some() {
+            return Err((
+                "channel.unknown_setting",
+                "that is not a setting name".into(),
+            ));
+        }
+    } else {
+        let nl = eq.unwrap_or(0);
+        if eq.is_none() || nl == 0 || nl >= 48 || tok.len() - nl > 48 {
+            return Err(("channel.usage", "say a value after the setting name".into()));
+        }
+        name = tok[..nl].to_string();
+        value = tok[nl + 1..].to_string();
+    }
+    let unknown = || {
+        (
+            "channel.unknown_setting",
+            format!("unknown setting \"{}\"", crate::cstr::trunc(&name, 41)),
+        )
+    };
+    if !name.bytes().all(|c| c.is_ascii_lowercase() || c == b' ') {
+        return Err(unknown());
+    }
+    if name == "key" {
+        return Err((
+            "channel.moved",
+            "the channel key is a mode now: use channel mode <#chan> +k <key>".into(),
+        ));
+    }
+    let Some(kind) = modes::setting_kind(&name) else {
+        return Err(unknown());
+    };
+    if modes::setting_net_only(&name) {
+        return Err(unknown());
+    }
+    let reset = value == "default";
+    if !reset {
+        let flag = kind == "flag";
+        if flag != signed_form || modes::setting_check(&name, &value, net) != ModesStatus::Ok {
+            return Err(("channel.bad_value", mf_value_hint(&name, kind)));
+        }
+        mf_canon(kind, &mut value);
+    }
+    let (old_src, old) = mf_eff(state, work, net, &name);
+    if modes::settings_set(work, cap, &name, if reset { None } else { Some(&value) })
+        != ModesStatus::Ok
+    {
+        return Err((
+            "channel.too_long",
+            "the settings would not fit the record (512 bytes)".into(),
+        ));
+    }
+    let (src, val) = mf_eff(state, work, net, &name);
+    Ok(MfChg {
+        name,
+        kind: kind.to_string(),
+        old: crate::cstr::trunc(&old, 24).to_string(),
+        val: crate::cstr::trunc(&val, 24).to_string(),
+        old_src,
+        src,
+        reset,
+    })
+}
+
+fn mf_chg_rec(r: &mut Reply, c: &MfChg, shown: &str) {
+    r.rec("chg");
+    r.kv("setting", shown);
+    r.kv("kind", &c.kind);
+    r.kv("old", &c.old);
+    r.kv("old_src", mf_src_word(c.old_src));
+    r.kv("value", &c.val);
+    r.kv("src", mf_src_word(c.src));
+    r.kvb("reset", c.reset);
+}
+
+/// One `setting` row per table entry of the wanted class, with the value in
+/// force and where it comes from.
+fn mf_setting_rows(state: &HubState, r: &mut Reply, cname: Option<&str>, net_rows: bool) {
+    for i in 0..modes::setting_count() {
+        let Some(n) = modes::setting_name(i) else {
+            break;
+        };
+        if modes::setting_net_only(n) != net_rows {
+            continue;
+        }
+        let (s, v) = modes::setting_effective(state, cname, n);
+        let v = crate::cstr::trunc(&v, 24);
+        let shown = match n.strip_prefix("bflood ") {
+            Some(t) => format!("flood {t}"),
+            None => n.to_string(),
+        };
+        r.rec("setting");
+        r.kv("name", &shown);
+        r.kv("kind", modes::setting_kind(n).unwrap_or(""));
+        r.kv("value", v);
+        r.kv("src", mf_src_word(s));
+    }
+}
+
+/// channel set <#chan|default> [tokens...]
+fn admin_chan_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    let target = if payload.is_empty() {
+        None
+    } else {
+        wire_field(payload, 0, MAX_CHAN)
+    };
+    let Some(target) = target else {
+        return admin_err(
+            state,
+            ci,
+            "channel.usage",
+            "say which channel, or default",
+            Some("channel set <#chan|default> [+opt|-opt|<name> <value>]"),
+        );
+    };
+    let net = target == "default";
+    let mut cname = String::new();
+    let cur = if net {
+        modes::netset_get(state).unwrap_or_default()
+    } else {
+        if !chan_name_valid(&target) {
+            return mf_status_err(state, ci, ModesStatus::BadChan, Some(&target));
+        }
+        let Some(cn) = storage::chan_live(state, &target) else {
+            return mf_status_err(state, ci, ModesStatus::NotManaged, Some(&target));
+        };
+        cname = cn;
+        modes::chanset_get(state, &cname).unwrap_or_default()
+    };
+    let nf = mf_field_count(payload);
+    let mut r = Reply::new();
+    if nf == 1 {
+        // the view
+        r.ok("channel.settings");
+        r.kv("name", if net { "default" } else { &cname });
+        let (mut eff, mut src) = ("+nt".to_string(), "built-in");
+        if !cur.modes.is_empty() {
+            eff = cur.modes.clone();
+            src = if net { "net" } else { "chan" };
+        } else if !net
+            && let Some(ns) = modes::netset_get(state)
+            && !ns.modes.is_empty()
+        {
+            eff = ns.modes;
+            src = "net";
+        }
+        r.kv("modes", &cur.modes);
+        r.kv("effective", &eff);
+        r.kv("source", src);
+        r.kvi("ts", cur.ts);
+        mf_setting_rows(state, &mut r, if net { None } else { Some(&cname) }, false);
+        return send_reply(state, ci, &mut r);
+    }
+    if nf - 1 > MF_MAX_TOKENS {
+        return admin_err(
+            state,
+            ci,
+            "channel.usage",
+            "too many settings in one line",
+            None,
+        );
+    }
+    let mut work = cur.settings.clone();
+    let mut chg: Vec<MfChg> = Vec::new();
+    for i in 1..nf {
+        let tok = match wire_field(payload, i, 96) {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                return admin_err(
+                    state,
+                    ci,
+                    "channel.bad_value",
+                    "a setting is too long or empty",
+                    None,
+                );
+            }
+        };
+        match mf_edit(state, &mut work, C_SETTINGS_MAX + 1, net, &tok) {
+            Ok(c) => chg.push(c),
+            Err((code, why)) => {
+                let hint = if code == "channel.moved" {
+                    "channel mode <#chan> +k <key>"
+                } else {
+                    "channel set <#chan|default> shows the settings"
+                };
+                return admin_err(state, ci, code, &why, Some(hint));
+            }
+        }
+    }
+    let written = work != cur.settings;
+    if written {
+        let st = if net {
+            modes::netset_put(state, &cur.modes, &work)
+        } else {
+            modes::chanset_put(state, &cname, &cur.modes, &work)
+        };
+        if st != ModesStatus::Ok {
+            return mf_status_err(state, ci, st, Some(&cname));
+        }
+    }
+    r.ok("channel.set");
+    r.kv("name", if net { "default" } else { &cname });
+    r.kvi("changes", chg.len() as i64);
+    r.kvb("written", written);
+    r.kvi("bots", local_bot_count(state));
+    r.kvi("peers", linked_peer_count(state));
+    if written {
+        mf_reply_old_hubs(state, &mut r);
+    }
+    for c in &chg {
+        mf_chg_rec(&mut r, c, &c.name);
+    }
+    send_reply(state, ci, &mut r)
+}
+
+/// network set: "" | flood|<cmd|msg|ctcp>|<N:S|off|default> | ignoretime|<min|default> | sendq|<B:I|default>
+fn admin_net_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    let cur = modes::netset_get(state).unwrap_or_default();
+    let mut r = Reply::new();
+    if payload.is_empty() {
+        r.ok("network.settings");
+        r.kvi("ts", cur.ts);
+        mf_setting_rows(state, &mut r, None, true);
+        return send_reply(state, ci, &mut r);
+    }
+    let nf = mf_field_count(payload);
+    let Some(sub) = wire_field(payload, 0, 16) else {
+        return admin_err(state, ci, "network.usage", "unknown network setting", None);
+    };
+    let (name, shown, mut value);
+    if sub == "flood" && nf == 3 {
+        let (t, v) = (wire_field(payload, 1, 8), wire_field(payload, 2, 48));
+        let (Some(t), Some(v)) = (t, v) else {
+            return admin_err(
+                state,
+                ci,
+                "network.unknown_setting",
+                "flood types are cmd, msg and ctcp",
+                Some("network set flood <cmd|msg|ctcp> <N:S|off|default>"),
+            );
+        };
+        if t != "cmd" && t != "msg" && t != "ctcp" {
+            return admin_err(
+                state,
+                ci,
+                "network.unknown_setting",
+                "flood types are cmd, msg and ctcp",
+                Some("network set flood <cmd|msg|ctcp> <N:S|off|default>"),
+            );
+        }
+        name = format!("bflood {t}");
+        shown = format!("flood {t}");
+        value = v;
+    } else if sub == "ignoretime" && nf == 2 {
+        let Some(v) = wire_field(payload, 1, 48) else {
+            return admin_err(
+                state,
+                ci,
+                "network.bad_value",
+                "that value is too long",
+                None,
+            );
+        };
+        name = "ignoretime".to_string();
+        shown = "ignoretime".to_string();
+        value = v;
+    } else if sub == "sendq" && nf == 2 {
+        let Some(v) = wire_field(payload, 1, 48) else {
+            return admin_err(
+                state,
+                ci,
+                "network.bad_value",
+                "that value is too long",
+                None,
+            );
+        };
+        name = "sendq".to_string();
+        shown = "sendq".to_string();
+        value = v;
+    } else {
+        return admin_err(
+            state,
+            ci,
+            "network.unknown_setting",
+            "network settings are flood <cmd|msg|ctcp>, ignoretime and sendq",
+            Some("network set shows them"),
+        );
+    }
+    let kind = modes::setting_kind(&name).unwrap_or("");
+    let reset = value == "default";
+    if !reset {
+        if modes::setting_check(&name, &value, true) != ModesStatus::Ok {
+            return admin_err(
+                state,
+                ci,
+                "network.bad_value",
+                &mf_value_hint(&shown, kind),
+                Some(if sub == "flood" {
+                    "network set flood cmd 10:30"
+                } else if sub == "sendq" {
+                    "network set sendq 10:100"
+                } else {
+                    "network set ignoretime 10"
+                }),
+            );
+        }
+        mf_canon(kind, &mut value);
+    }
+    let mut work = cur.settings.clone();
+    let (old_src, old) = mf_eff(state, &work, true, &name);
+    if modes::settings_set(
+        &mut work,
+        D_SETTINGS_MAX + 1,
+        &name,
+        if reset { None } else { Some(&value) },
+    ) != ModesStatus::Ok
+    {
+        return mf_status_err(state, ci, ModesStatus::TooLong, None);
+    }
+    let (src, val) = mf_eff(state, &work, true, &name);
+    let written = work != cur.settings;
+    if written {
+        let st = modes::netset_put(state, &cur.modes, &work);
+        if st != ModesStatus::Ok {
+            return mf_status_err(state, ci, st, None);
+        }
+    }
+    r.ok("network.set");
+    r.kv("setting", &shown);
+    r.kv("kind", kind);
+    r.kv("old", crate::cstr::trunc(&old, 24));
+    r.kv("old_src", mf_src_word(old_src));
+    r.kv("value", crate::cstr::trunc(&val, 24));
+    r.kv("src", mf_src_word(src));
+    r.kvb("reset", reset);
+    r.kvb("written", written);
+    r.kvi("bots", local_bot_count(state));
+    r.kvi("peers", linked_peer_count(state));
+    if written {
+        mf_reply_old_hubs(state, &mut r);
+    }
+    send_reply(state, ci, &mut r)
+}
+
+/// hub set ssh | hub set conn (CMD_ADMIN_SET_SSH, docs/modes.md §9.3, D35):
+///   "" | conn                       view of the ssh / conn group (ok|hub.show)
+///   <name>|<value|default>          ssh setting
+///   conn|<name>|<value|default>     shared connection limit
+/// Local to this hub (.irchub.cnf, never synced).  A change reaches the console
+/// thread as a fresh snapshot and applies to the next connection.
+fn admin_set_ssh(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    let nf = if payload.is_empty() {
+        0
+    } else {
+        mf_field_count(payload)
+    };
+    let f0 = if nf > 0 {
+        wire_field(payload, 0, 40)
+    } else {
+        None
+    };
+    let f1 = if nf > 1 {
+        wire_field(payload, 1, 40)
+    } else {
+        None
+    };
+    let f2 = if nf > 2 {
+        wire_field(payload, 2, 64)
+    } else {
+        None
+    };
+    if nf > 3 || (nf > 0 && f0.is_none()) || (nf > 1 && f1.is_none()) || (nf > 2 && f2.is_none()) {
+        return admin_err(
+            state,
+            ci,
+            "hub.bad_value",
+            "that setting line is malformed",
+            Some("hub set ssh <name> <value|default>"),
+        );
+    }
+    let (f0, f1, f2) = (
+        f0.unwrap_or_default(),
+        f1.unwrap_or_default(),
+        f2.unwrap_or_default(),
+    );
+    let conn = nf >= 1 && f0 == "conn";
+    let group = if conn { Group::Conn } else { Group::Ssh };
+    let gname = group.name();
+    let mut r = Reply::new();
+
+    if nf == 0 || (conn && nf == 1) {
+        r.ok("hub.show");
+        r.kv("group", gname);
+        for i in 0..connlimits::count(group) {
+            let Some(nm) = connlimits::name(group, i) else {
+                continue;
+            };
+            let v = state.conn_cfg.get(group, nm).unwrap_or_default();
+            let d = connlimits::default_text(group, nm).unwrap_or_default();
+            r.kv(nm, &v);
+            r.kv(&format!("{nm}_def"), &d);
+        }
+        return send_reply(state, ci, &mut r);
+    }
+
+    let (name, value) = if conn { (&f1, &f2) } else { (&f0, &f1) };
+    if (conn && nf != 3) || (!conn && nf != 2) {
+        return admin_err(
+            state,
+            ci,
+            "hub.bad_value",
+            "say a setting and its value",
+            Some(if conn {
+                "hub set conn <perip|churn|authfail> <value|default>"
+            } else {
+                "hub set ssh <name> <value|default>"
+            }),
+        );
+    }
+    let Some(old) = state.conn_cfg.get(group, name) else {
+        let why = format!("unknown {gname} setting \"{}\"", trunc_string(name, 31));
+        return admin_err(
+            state,
+            ci,
+            "hub.unknown_setting",
+            &why,
+            Some(if conn {
+                "perip, churn, authfail"
+            } else {
+                "preauth, preauthip, sessions, grace, authtries, idle, authfail, connect, block, cmdrate"
+            }),
+        );
+    };
+    let reset = value == "default";
+    let mut next = state.conn_cfg;
+    match next.set(group, name, if reset { None } else { Some(value) }) {
+        SetResult::Ok => {}
+        SetResult::Bad(why) => {
+            return admin_err(
+                state,
+                ci,
+                "hub.bad_value",
+                &why,
+                Some("hub set ssh shows the settings"),
+            );
+        }
+        // find above already matched the name
+        SetResult::Unknown => return admin_err(state, ci, "hub.unknown_setting", "?", None),
+    }
+    // A new connect / churn limit the issuing admin's own address is already
+    // over would lock the console out: refuse it.
+    {
+        let t = crate::cstr::now();
+        let ip = state.clients[ci].ip.clone();
+        let lo = crate::ratelimit::trusted_loopback(state, &ip);
+        let (mut seen, mut win) = (0, 0);
+        if !lo && !conn && name == "connect" {
+            win = next.connect_s;
+            if let Some(e) = connlimits::ssh_table_peek(&state.ssh_ips, &ip)
+                && t - e.win_start < i64::from(win)
+                && e.conn_n > next.connect_n
+            {
+                seen = e.conn_n;
+            }
+        } else if !lo && conn && name == "churn" {
+            win = next.churn_s;
+            for e in &state.ip_limits {
+                if e.ip == ip
+                    && t - e.churn_window_start < i64::from(win)
+                    && e.churn_count > next.churn_n
+                {
+                    seen = e.churn_count;
+                }
+            }
+        }
+        if seen > 0 {
+            let why = format!(
+                "your own address made {seen} connections in the last {win} s, over that limit"
+            );
+            return admin_err(
+                state,
+                ci,
+                "hub.bad_value",
+                &why,
+                Some("raise it, or wait for the window to pass"),
+            );
+        }
+    }
+    let now_v = next.get(group, name).unwrap_or_default();
+    let written = old != now_v;
+    if written {
+        state.conn_cfg = next;
+        state.config_dirty = true;
+        console::limits_changed(state);
+        crate::hlog_info!(
+            "[CONFIG] {gname} {name} {old} -> {now_v} by {}\n",
+            state.clients[ci].id
+        );
+    }
+    r.ok("hub.set");
+    r.kv("setting", &format!("{gname} {name}"));
+    r.kv("old", &old);
+    r.kv("value", &now_v);
+    r.kv("group", gname);
+    r.kvb("reset", reset);
+    r.kvb("written", written);
+    r.kvb("restart", false);
+    send_reply(state, ci, &mut r)
+}
+
+/// ban: list|<#c|*|""> | add|<#c|*>|<mask>|<min|perm>|<sticky 0/1>|<reason> | del|<#c|*>|<mask>
+fn admin_ban(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    let Some(sub) = wire_field(payload, 0, 8) else {
+        return admin_err(
+            state,
+            ci,
+            "ban.usage",
+            "ban list, add or del",
+            Some("help ban"),
+        );
+    };
+    let nf = mf_field_count(payload);
+    let (list, add, del) = (sub == "list", sub == "add", sub == "del");
+    if !(list && nf <= 2) && !(add && nf >= 6) && !(del && nf == 3) {
+        return admin_err(
+            state,
+            ci,
+            "ban.usage",
+            "ban list, add or del",
+            Some("help ban"),
+        );
+    }
+    let mut chan = String::new();
+    let mut cname = "*".to_string();
+    if nf > 1 {
+        match wire_field(payload, 1, MAX_CHAN) {
+            Some(c) => chan = c,
+            None => return mf_status_err(state, ci, ModesStatus::BadChan, Some("")),
+        }
+    }
+    let global = chan == "*";
+    if !(list && chan.is_empty()) && !global {
+        if !chan_name_valid(&chan) {
+            return mf_status_err(state, ci, ModesStatus::BadChan, Some(&chan));
+        }
+        if !list {
+            match storage::chan_live(state, &chan) {
+                Some(c) => cname = c,
+                None => return mf_status_err(state, ci, ModesStatus::NotManaged, Some(&chan)),
+            }
+        }
+        if list {
+            cname = chan.clone();
+        }
+    }
+    let mut r = Reply::new();
+    if list {
+        let b = modes::ban_list(
+            state,
+            if chan.is_empty() { None } else { Some(&cname) },
+            MF_BANS_LIST_MAX,
+        );
+        r.ok("ban.list");
+        r.kv("chan", if chan.is_empty() { "" } else { &cname });
+        r.kvi("count", b.len() as i64);
+        r.kvb("truncated", b.len() >= MF_BANS_LIST_MAX);
+        for x in &b {
+            r.rec("ban");
+            r.kv("chan", &x.chan);
+            r.kv("mask", &x.mask);
+            r.kvi("expires", x.expires);
+            r.kvb("sticky", x.flags.contains('s'));
+            r.kv("setter", &x.setter);
+            r.kv("reason", &x.reason);
+            r.kvi("ts", x.ts);
+        }
+        return send_reply(state, ci, &mut r);
+    }
+    let Some(mask) = wire_field(payload, 2, BAN_MASK_MAX + 8) else {
+        return mf_status_err(state, ci, ModesStatus::BadMask, None);
+    };
+    let bchan = if global { "*" } else { cname.as_str() };
+    if del {
+        let st = modes::ban_del(state, bchan, &mask);
+        if st != ModesStatus::Ok {
+            return mf_status_err(state, ci, st, Some(&chan));
+        }
+        r.ok("ban.removed");
+        r.kv("chan", bchan);
+        r.kv("mask", &mask);
+        r.kvi("bots", local_bot_count(state));
+        r.kvi("peers", linked_peer_count(state));
+        mf_reply_old_hubs(state, &mut r);
+        return send_reply(state, ci, &mut r);
+    }
+    // add
+    let (dur, sticky) = (wire_field(payload, 3, 16), wire_field(payload, 4, 4));
+    let (Some(dur), Some(sticky)) = (dur, sticky) else {
+        return mf_status_err(state, ci, ModesStatus::BadExpiry, None);
+    };
+    let reason = wire_tail(payload, 5, BAN_REASON_MAX + 8).unwrap_or_default();
+    if reason.contains('|') {
+        return mf_status_err(state, ci, ModesStatus::BadReason, None);
+    }
+    let mut expires = 0i64;
+    if dur != "perm" {
+        match parse_uint(&dur, MF_BAN_MINUTES_MAX) {
+            Some(m) if m >= 1 => expires = now() + (m as i64) * 60,
+            _ => return mf_status_err(state, ci, ModesStatus::BadExpiry, None),
+        }
+    }
+    // Whether this mask is already banned there (an update, not a new ban).
+    let existed = modes::ban_list(state, Some(bchan), MF_BANS_CHAN_MAX)
+        .iter()
+        .any(|b| storage::ascii_ieq(&b.mask, &mask));
+    let admin = mf_admin_name(state, ci);
+    let (st, who) = modes::ban_add(state, bchan, &mask, expires, sticky == "1", &admin, &reason);
+    if st == ModesStatus::Protected {
+        let msg = format!(
+            "{} would also ban {}, who must never be banned",
+            crate::cstr::trunc(&mask, 121),
+            crate::cstr::trunc(&who, 81)
+        );
+        r.err("ban.protected", Some(&msg), Some("use a narrower mask"));
+        r.kv("mask", &mask);
+        r.kv("who", &who);
+        return send_reply(state, ci, &mut r);
+    }
+    if st != ModesStatus::Ok {
+        return mf_status_err(state, ci, st, Some(&chan));
+    }
+    r.ok("ban.added");
+    r.kv("chan", bchan);
+    r.kv("mask", &mask);
+    r.kvi("expires", expires);
+    r.kvb("sticky", sticky == "1");
+    r.kv("reason", &reason);
+    r.kvb("existed", existed);
+    r.kvi("bots", local_bot_count(state));
+    r.kvi("peers", linked_peer_count(state));
+    mf_reply_old_hubs(state, &mut r);
+    send_reply(state, ci, &mut r)
+}
+
+/// While an upgrade holds the config still, only the changing forms of the
+/// four modes opcodes are refused; their views stay readable.
+fn mf_payload_mutates(cmd: u8, payload: &str) -> bool {
+    match cmd {
+        CMD_ADMIN_CHAN_MODE | CMD_ADMIN_CHAN_SET => payload.contains('|'),
+        CMD_ADMIN_BAN => !payload.starts_with("list"),
+        CMD_ADMIN_NET_SET => !payload.is_empty(),
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2083,6 +3248,11 @@ pub fn console_admin_op(cmd: u8) -> bool {
             | CMD_ADMIN_DEL_CHANNEL
             | CMD_ADMIN_OP_USER
             | CMD_ADMIN_INVITE_USER
+            | CMD_ADMIN_CHAN_MODE
+            | CMD_ADMIN_CHAN_SET
+            | CMD_ADMIN_BAN
+            | CMD_ADMIN_NET_SET
+            | CMD_ADMIN_SET_SSH
             | CMD_ADMIN_UPGRADE_NET
             | CMD_ADMIN_UPGRADE_STATUS
     )
@@ -2203,7 +3373,10 @@ pub fn handle_admin_command(
     // every mutator rather than a check inside each; queries and the opt-flag
     // command itself stay available (the latter is how a stuck freeze is
     // lifted by hand).
-    if upgrade::config_frozen(state) && upgrade::admin_cmd_mutates_config(cmd) {
+    if upgrade::config_frozen(state)
+        && upgrade::admin_cmd_mutates_config(cmd)
+        && mf_payload_mutates(cmd, payload)
+    {
         crate::hlog_warning!(
             "[UPGRADE] Refused admin command 0x{:02x}: config frozen\n",
             cmd
@@ -2592,6 +3765,11 @@ pub fn handle_admin_command(
         CMD_ADMIN_LIST_CHANNELS => list_channels(state, ci, payload),
         CMD_ADMIN_ADD_CHANNEL => add_channel(state, ci, payload),
         CMD_ADMIN_DEL_CHANNEL => del_channel(state, ci, payload),
+        CMD_ADMIN_CHAN_MODE => admin_chan_mode(state, ci, payload),
+        CMD_ADMIN_CHAN_SET => admin_chan_set(state, ci, payload),
+        CMD_ADMIN_BAN => admin_ban(state, ci, payload),
+        CMD_ADMIN_NET_SET => admin_net_set(state, ci, payload),
+        CMD_ADMIN_SET_SSH => admin_set_ssh(state, ci, payload),
 
         CMD_ADMIN_OP_USER => {
             // sscanf("%63[^|]|%63s") != 2
@@ -3021,5 +4199,27 @@ pub fn handle_admin_command(
         CMD_ADMIN_SET_USERKEY => set_userkey(state, ci, payload),
 
         _ => admin_err(state, ci, "admin.unknown", "unknown admin command", None),
+    }
+}
+
+#[cfg(test)]
+mod sendq_tests {
+    use super::*;
+
+    #[test]
+    fn sendq_canon_and_hint() {
+        let mut v = String::from("05:0100");
+        mf_canon("sendq", &mut v);
+        assert_eq!(v, "5:100");
+        let mut v = String::from("010:00");
+        mf_canon("sendq", &mut v);
+        assert_eq!(v, "10:0");
+        let mut v = String::from("off");
+        mf_canon("flood", &mut v);
+        assert_eq!(v, "off");
+        assert_eq!(
+            mf_value_hint("sendq", "sendq"),
+            "sendq takes B:I (B 1-100 lines, I 0-10000 ms)"
+        );
     }
 }

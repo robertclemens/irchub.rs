@@ -537,49 +537,60 @@ pub fn generate_sync_packet(state: &HubState) -> String {
 // ---------------------------------------------------------------------------
 
 fn is_global_key(key: &str) -> bool {
-    matches!(key, "c" | "m" | "o" | "a" | "p")
+    matches!(
+        key,
+        "c" | "m" | "o" | "a" | "p"
+        // 2.4.5: channel settings, network defaults, bans
+        | "C" | "D" | "B"
+    )
 }
 
 /// Store a global entry directly, without re-formatting: the value that
 /// arrived over the wire is already combined.
 fn store_global_entry_raw(state: &mut HubState, key: &str, value: &str, ts: i64) -> bool {
-    let is_singleton = key == "a" || key == "p";
-    let incoming_first = match value.find('|') {
-        Some(i) => &value[..i],
-        None => value,
-    };
-    let found = state.global_entries.iter().position(|e| {
-        if is_singleton {
-            e.key == key
-        } else {
-            let stored_first = match e.value.find('|') {
-                Some(i) => &e.value[..i],
-                None => e.value.as_str(),
-            };
-            e.key == key && stored_first == incoming_first
-        }
-    });
+    // C|, D|, B|: one validator, one LWW, one set of ceilings.
+    if matches!(key, "C" | "D" | "B") {
+        return storage::put_record(state, key, value, ts);
+    }
 
-    if let Some(i) = found {
+    if let Some(i) = storage::global_find(state, key, value) {
+        let g = &state.global_entries[i];
+        // A channel keeps the spelling of its first writer (D39).
+        let mut norm = value.to_string();
+        if key == "c" {
+            let sl = g.value.find('|').unwrap_or(g.value.len());
+            if let Some(bar) = value.find('|')
+                && sl + value[bar..].len() < 1024
+            {
+                norm = format!("{}{}", &g.value[..sl], &value[bar..]);
+            }
+        }
         if lww_accepts(
             ts,
-            global_value_active(value),
-            state.global_entries[i].timestamp,
-            global_value_active(&state.global_entries[i].value),
+            global_value_active(&norm),
+            g.timestamp,
+            global_value_active(&g.value),
         ) {
-            state.global_entries[i].value = trunc_string(value, 1024);
+            let norm = trunc_string(&norm, 1024);
+            let removed = key == "c" && !global_value_active(&norm);
+            state.global_entries[i].value = norm.clone();
             state.global_entries[i].timestamp = ts;
+            if removed {
+                let chan = trunc_string(norm.split('|').next().unwrap_or(""), MAX_CHAN);
+                storage::chan_cascade_del(state, &chan, ts, false);
+            }
             return true;
         }
         return false;
     }
 
-    if state.global_entries.len() < MAX_BOT_ENTRIES {
+    if storage::global_room(state, key) {
         state.global_entries.push(ConfigEntry {
             key: trunc_string(key, 32),
             value: trunc_string(value, 1024),
             timestamp: ts,
         });
+        storage::global_note_new(state, state.global_entries.len() - 1);
         return true;
     }
     false
@@ -626,11 +637,12 @@ pub fn parse_global_channel_value(value: &str) -> Option<(String, String, i32, S
 /// bot reporting a live MODE change — so a re-add must carry forward what is
 /// already stored.  Global entries are overwritten wholesale once the
 /// timestamp wins, so not carrying them forward erases them.  Matched
-/// case-sensitively on the channel name, same as the storage layer.
+/// ASCII case-insensitively on the channel name (D39), same as the storage
+/// layer.
 pub fn global_channel_modes(state: &HubState, chan: &str) -> i32 {
     for e in state.global_entries.iter().filter(|e| e.key == "c") {
         if let Some((stored_chan, _, modes, _)) = parse_global_channel_value(&e.value)
-            && trunc_string(&stored_chan, 128) == chan
+            && trunc_string(&stored_chan, 128).eq_ignore_ascii_case(chan)
         {
             return modes;
         }
@@ -1078,10 +1090,11 @@ pub fn execute_purge(
         }
     };
 
-    // --- Tombstoned global entries (channels, admin masks, oper masks) ---
+    // --- Tombstoned global entries (channels, admin masks, oper masks,
+    //     channel settings, bans), compacted in place ---
     let mut kept: Vec<ConfigEntry> = Vec::new();
     for e in std::mem::take(&mut state.global_entries) {
-        let is_tombstone = matches!(e.key.as_str(), "c" | "m" | "o")
+        let is_tombstone = matches!(e.key.as_str(), "c" | "m" | "o" | "C" | "B")
             && e.value.rsplit_once('|').is_some_and(|(_, l)| l == "del");
         if is_tombstone && (cutoff == 0 || e.timestamp < cutoff) {
             purged_count += 1;
@@ -1089,14 +1102,17 @@ pub fn execute_purge(
             let kind = match e.key.as_str() {
                 "c" => "channel",
                 "m" => "mask",
+                "C" => "chanset",
+                "B" => "ban",
                 _ => "oper",
             };
             note(kind, "", &trunc_string(name, 256), e.timestamp);
-        } else if kept.len() < MAX_BOT_ENTRIES {
+        } else {
             kept.push(e);
         }
     }
     state.global_entries = kept;
+    storage::global_reindex(state);
 
     // --- Tombstoned user_records (admins/opers) ---
     let mut kept_users: Vec<UserRecord> = Vec::new();
@@ -1375,6 +1391,7 @@ mod tests {
             value: "10.0.0.0/8".into(),
             timestamp: 100,
         });
+        storage::global_reindex(&mut s);
         s.opt_flags = "h".into();
         s.opt_flags_ts = 500;
         storage::update_entry(&mut s, "bot-1", "h", "n!u@h", "", "", 100);

@@ -11,7 +11,6 @@
 //! the core as `FromConsole::Fail` / `Log` and are logged there.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -27,17 +26,43 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::ui::Ui;
 use super::{FromConsole, Shared, ToConsole};
+use crate::connlimits::{self, ConnCfg};
 use crate::consts::*;
 
 // ---------------------------------------------------------------------------
 // Thread-wide context
 // ---------------------------------------------------------------------------
 
+/// One SSH login in progress (no shell yet): what eviction chooses among.
+struct Pre {
+    id: u64,
+    ip: String,
+    start_ms: i64,
+    /// Set when a newer connection replaced it (hub_ssh_evict_pick); it no
+    /// longer counts and its task ends at once.
+    dropped: bool,
+    kill: Arc<tokio::sync::Notify>,
+}
+
 #[derive(Default)]
 struct Counts {
-    /// SSH connections not yet in a shell, per address.
-    preauth: HashMap<String, usize>,
+    /// SSH connections not yet in a shell.
+    pre: Vec<Pre>,
+    next_id: u64,
     consoles: usize,
+}
+
+impl Counts {
+    /// count_preauth(): logins in progress (a dropped one is about to go),
+    /// and those from `ip`.
+    fn count_pre(&self, ip: &str) -> (usize, usize) {
+        let live = self.pre.iter().filter(|p| !p.dropped);
+        (live.clone().count(), live.filter(|p| p.ip == ip).count())
+    }
+
+    fn unregister(&mut self, id: u64) {
+        self.pre.retain(|p| p.id != id);
+    }
 }
 
 struct Ctx {
@@ -166,6 +191,10 @@ struct Info {
 struct H {
     ctx: Arc<Ctx>,
     ip: String,
+    /// `hub set ssh` as of this connection.
+    lim: ConnCfg,
+    /// This login's entry in `Counts::pre`.
+    pre_id: u64,
     info: Arc<Mutex<Info>>,
     channel: Option<ChannelId>,
     have_pty: bool,
@@ -224,7 +253,7 @@ impl H {
             i.refused += 1;
             i.refused
         };
-        if n >= CONSOLE_MAX_AUTH_TRIES {
+        if i64::from(n) >= i64::from(self.lim.authtries) {
             self.report_fail("too many refused keys");
             return Err(violation(&self.info, "authentication failed"));
         }
@@ -486,15 +515,13 @@ impl Handler for H {
             let Ok(mut c) = self.ctx.counts.lock() else {
                 return Err(russh::Error::Disconnect);
             };
-            if c.consoles >= CONSOLE_MAX_SESSIONS {
+            if c.consoles as i64 >= i64::from(super::limits_get(&self.ctx.shared).sessions) {
                 session.channel_failure(channel)?;
                 return Err(violation(&self.info, "too many consoles"));
             }
             c.consoles += 1;
             // no longer pre-auth
-            if let Some(n) = c.preauth.get_mut(&self.ip) {
-                *n = n.saturating_sub(1);
-            }
+            c.unregister(self.pre_id);
         }
         let Ok((ours, theirs)) = UnixStream::pair() else {
             return Err(violation(&self.info, "no socketpair"));
@@ -529,6 +556,7 @@ impl Handler for H {
             &self.ip,
             &hub,
         );
+        ui.set_limits(self.lim.idle, self.lim.cmdrate_n, self.lim.cmdrate_s);
         ui.start(now_ms());
         let (tx, rx) = unbounded_channel();
         self.events = Some(tx);
@@ -662,104 +690,166 @@ async fn console_task(
 }
 
 async fn connection(ctx: Arc<Ctx>, sock: std::net::TcpStream, ip: String) {
-    {
+    let lim = super::limits_get(&ctx.shared);
+    let evict = Arc::new(tokio::sync::Notify::new());
+    let pre_id = {
         let Ok(mut c) = ctx.counts.lock() else { return };
-        let total: usize = c.preauth.values().sum();
-        let per_ip = c.preauth.get(&ip).copied().unwrap_or(0);
-        if total >= CONSOLE_MAX_PREAUTH || per_ip >= CONSOLE_MAX_PREAUTH_PER_IP {
+        let (total, per_ip) = c.count_pre(&ip);
+        if per_ip >= lim.preauthip() as usize {
             drop(c);
             ctx.log(
                 LOG_WARNING,
-                format!("[CONSOLE] Too many SSH logins in progress; dropped {ip}"),
+                format!("[CONSOLE] Too many SSH logins in progress from {ip}; dropped it"),
             );
             return;
         }
-        *c.preauth.entry(ip.clone()).or_insert(0) += 1;
-    }
-    let info = Arc::new(Mutex::new(Info::default()));
-    let run =
-        async {
-            let Some(cfg) = ctx.server_config() else {
+        if total >= lim.preauth as usize {
+            // Every slot is taken: the newcomer replaces the oldest login in
+            // progress of the address holding the most slots, so a few
+            // addresses cannot keep the admin out.
+            const EV_MAX: usize = 128;
+            let live: Vec<usize> = (0..c.pre.len())
+                .filter(|&i| !c.pre[i].dropped)
+                .take(EV_MAX)
+                .collect();
+            let logins: Vec<(&str, i64)> = live
+                .iter()
+                .map(|&i| (c.pre[i].ip.as_str(), c.pre[i].start_ms))
+                .collect();
+            let Some(v) = connlimits::evict_pick(&logins, &ip) else {
+                drop(c);
+                ctx.log(
+                    LOG_WARNING,
+                    format!("[CONSOLE] Too many SSH logins in progress; dropped {ip}"),
+                );
                 return;
             };
-            if sock.set_nonblocking(true).is_err() {
+            let victim = live[v];
+            let vip = c.pre[victim].ip.clone();
+            c.pre[victim].dropped = true;
+            c.pre[victim].kill.notify_one();
+            ctx.log(
+                LOG_WARNING,
+                format!(
+                    "[CONSOLE] SSH logins full: dropped the oldest login of {vip} for a new one from {ip}"
+                ),
+            );
+        }
+        c.next_id += 1;
+        let id = c.next_id;
+        c.pre.push(Pre {
+            id,
+            ip: ip.clone(),
+            start_ms: now_ms(),
+            dropped: false,
+            kill: evict.clone(),
+        });
+        id
+    };
+    let info = Arc::new(Mutex::new(Info::default()));
+    let run = async {
+        let Some(cfg) = ctx.server_config() else {
+            return;
+        };
+        if sock.set_nonblocking(true).is_err() {
+            return;
+        }
+        // russh runs the session in a task of its own, which dropping
+        // the RunningSession does not stop: ending a session early means
+        // shutting its socket down through this second handle.
+        let Ok(kill) = sock.try_clone() else {
+            return;
+        };
+        let Ok(stream) = tokio::net::TcpStream::from_std(sock) else {
+            return;
+        };
+        let h = H {
+            ctx: ctx.clone(),
+            ip: ip.clone(),
+            lim,
+            pre_id,
+            info: info.clone(),
+            channel: None,
+            have_pty: false,
+            term: String::new(),
+            cols: 80,
+            rows: 24,
+            events: None,
+        };
+        // Login grace: connect -> running shell within CONSOLE_LOGIN_GRACE,
+        // counted from the connect.  run_stream itself waits for the client's
+        // identification and key exchange, so it is inside the deadline too:
+        // a client that stalls there would otherwise hold its pre-auth slot
+        // for good (the C hub times the whole session the same way).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(lim.grace as u64);
+        // Eviction (a newer connection took this login slot) ends it at
+        // any point, handshake included.
+        let handshake = async {
+            tokio::select! {
+                r = russh::server::run_stream(cfg, stream, h) => Some(r),
+                _ = evict.notified() => None,
+            }
+        };
+        let running = match tokio::time::timeout_at(deadline, handshake).await {
+            Ok(Some(Ok(r))) => r,
+            Ok(Some(Err(_))) => return,
+            Ok(None) => {
+                if let Ok(mut i) = info.lock()
+                    && i.drop_why.is_none()
+                {
+                    i.drop_why = Some("replaced by a newer connection".into());
+                }
                 return;
             }
-            // russh runs the session in a task of its own, which dropping
-            // the RunningSession does not stop: ending a session early means
-            // shutting its socket down through this second handle.
-            let Ok(kill) = sock.try_clone() else {
-                return;
-            };
-            let Ok(stream) = tokio::net::TcpStream::from_std(sock) else {
-                return;
-            };
-            let h = H {
-                ctx: ctx.clone(),
-                ip: ip.clone(),
-                info: info.clone(),
-                channel: None,
-                have_pty: false,
-                term: String::new(),
-                cols: 80,
-                rows: 24,
-                events: None,
-            };
-            // Login grace: connect -> running shell within CONSOLE_LOGIN_GRACE,
-            // counted from the connect.  run_stream itself waits for the client's
-            // identification and key exchange, so it is inside the deadline too:
-            // a client that stalls there would otherwise hold its pre-auth slot
-            // for good (the C hub times the whole session the same way).
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(CONSOLE_LOGIN_GRACE);
-            let running =
-                match tokio::time::timeout_at(deadline, russh::server::run_stream(cfg, stream, h))
-                    .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(_)) => return,
-                    Err(_) => {
-                        if let Ok(mut i) = info.lock()
-                            && i.drop_why.is_none()
-                        {
-                            i.drop_why = Some("login grace expired".into());
-                        }
-                        return;
-                    }
-                };
-            let handle = running.handle();
-            tokio::pin!(running);
-            // At the deadline a session without a shell ends: its socket is
-            // shut down even while it still waits for the client's key
-            // exchange, where a disconnect request alone is never acted on.
-            let info2 = info.clone();
-            let grace = async move {
-                tokio::time::sleep_until(deadline).await;
-                if info2.lock().map(|i| i.shell).unwrap_or(false) {
-                    std::future::pending::<()>().await;
-                }
-                if let Ok(mut i) = info2.lock()
+            Err(_) => {
+                if let Ok(mut i) = info.lock()
                     && i.drop_why.is_none()
                 {
                     i.drop_why = Some("login grace expired".into());
                 }
-            };
-            let mut shutdown = ctx.shutdown.clone();
-            tokio::select! {
-                _ = &mut running => {}
-                _ = shutdown.changed() => {}
-                _ = grace => {
-                    // say goodbye where the protocol allows it, then drop
-                    let bye = handle.disconnect(
-                        russh::Disconnect::ByApplication,
-                        String::new(),
-                        String::new(),
-                    );
-                    let _ = tokio::time::timeout(Duration::from_secs(1), bye).await;
-                    let _ = kill.shutdown(std::net::Shutdown::Both);
-                    let _ = tokio::time::timeout(Duration::from_secs(1), &mut running).await;
-                }
+                return;
             }
         };
+        let handle = running.handle();
+        tokio::pin!(running);
+        // At the deadline a session without a shell ends: its socket is
+        // shut down even while it still waits for the client's key
+        // exchange, where a disconnect request alone is never acted on.
+        let info2 = info.clone();
+        let evict2 = evict.clone();
+        let grace = async move {
+            let why = tokio::select! {
+                _ = async {
+                    tokio::time::sleep_until(deadline).await;
+                    if info2.lock().map(|i| i.shell).unwrap_or(false) {
+                        std::future::pending::<()>().await;
+                    }
+                } => "login grace expired",
+                _ = evict2.notified() => "replaced by a newer connection",
+            };
+            if let Ok(mut i) = info2.lock()
+                && i.drop_why.is_none()
+            {
+                i.drop_why = Some(why.into());
+            }
+        };
+        let mut shutdown = ctx.shutdown.clone();
+        tokio::select! {
+            _ = &mut running => {}
+            _ = shutdown.changed() => {}
+            _ = grace => {
+                // say goodbye where the protocol allows it, then drop
+                let bye = handle.disconnect(
+                    russh::Disconnect::ByApplication,
+                    String::new(),
+                    String::new(),
+                );
+                let _ = tokio::time::timeout(Duration::from_secs(1), bye).await;
+                let _ = kill.shutdown(std::net::Shutdown::Both);
+                let _ = tokio::time::timeout(Duration::from_secs(1), &mut running).await;
+            }
+        }
+    };
     run.await;
     let (authed, refused, shell, user, why) = match info.lock() {
         Ok(i) => (
@@ -771,19 +861,15 @@ async fn connection(ctx: Arc<Ctx>, sock: std::net::TcpStream, ip: String) {
         ),
         Err(_) => return,
     };
-    if let Ok(mut c) = ctx.counts.lock()
-        && !shell
-        && let Some(n) = c.preauth.get_mut(&ip)
-    {
-        *n = n.saturating_sub(1);
-        if *n == 0 {
-            c.preauth.remove(&ip);
-        }
+    if let Ok(mut c) = ctx.counts.lock() {
+        c.unregister(pre_id);
     }
     if !authed && refused > 0 {
         let h = H {
             ctx: ctx.clone(),
             ip: ip.clone(),
+            lim,
+            pre_id,
             info: info.clone(),
             channel: None,
             have_pty: false,
