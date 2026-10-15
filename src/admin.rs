@@ -1935,8 +1935,8 @@ fn list_channels(state: &mut HubState, ci: usize, payload: &str) -> bool {
         r.kvi("bots_online", network_bots_online(state));
         // modes.md §5.1: the stored modes and where they come from, the
         // settings the channel overrides, and its ban count
+        let cn = storage::chan_live(state, payload).unwrap_or_default();
         {
-            let cn = storage::chan_live(state, payload).unwrap_or_default();
             let cs = if cn.is_empty() {
                 None
             } else {
@@ -1970,6 +1970,14 @@ fn list_channels(state: &mut HubState, ci: usize, payload: &str) -> bool {
             state.global_entries[i].timestamp,
         );
         reply_chan(&mut r, &v, ts);
+        // every setting's effective value, so the view need not say only
+        // "all default"
+        mf_setting_rows(
+            state,
+            &mut r,
+            (!cn.is_empty()).then_some(cn.as_str()),
+            false,
+        );
         return send_reply(state, ci, &mut r);
     }
     let count = state

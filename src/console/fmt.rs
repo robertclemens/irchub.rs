@@ -3636,14 +3636,16 @@ fn render_channel_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             None => b"not reported".to_vec(),
         };
         card(out, L, "live modes", &v, RL_NORMAL);
-        let ov = overrides_phrase(res.rv("overrides"), 512);
-        card(
-            out,
-            L,
-            "settings",
-            if ov.is_empty() { b"all default" } else { &ov },
-            RL_NORMAL,
-        );
+        if !settings_card(ctx, rep, out, L) {
+            let ov = overrides_phrase(res.rv("overrides"), 512);
+            card(
+                out,
+                L,
+                "settings",
+                if ov.is_empty() { b"all default" } else { &ov },
+                RL_NORMAL,
+            );
+        }
         let v = snp(160, num(res.rvi("bans", 0)));
         card(out, L, "bans", &v, RL_NORMAL);
     } else {
@@ -3847,6 +3849,196 @@ const FLAG_SETTINGS: &[&str] = &[
 
 fn is_flag_setting(name: &[u8]) -> bool {
     FLAG_SETTINGS.iter().any(|f| f.as_bytes() == name)
+}
+
+/// What each setting does and its built-in value, as people read them: help
+/// channel set / help network set, the settings tables, channel show.  Names
+/// as those show them; the bot floods (net) are flood cmd|msg|ctcp, the words
+/// network set takes.  docs/modes.md §4, §8.1, §9.1.  (name, def, what, net)
+const SET_INFO: &[(&str, &str, &str, bool)] = &[
+    (
+        "enforcemodes",
+        "off",
+        "put back any change away from the stored modes",
+        false,
+    ),
+    (
+        "bitch",
+        "off",
+        "only authorised users and bots may hold ops",
+        false,
+    ),
+    (
+        "protectops",
+        "on",
+        "re-op an authorised member someone deopped; lift bans on one",
+        false,
+    ),
+    (
+        "revenge",
+        "off",
+        "deop whoever deops, kicks or bans an authorised member; again: kick + ban",
+        false,
+    ),
+    (
+        "stopnethack",
+        "off",
+        "take back ops a netsplit rejoin gave to unauthorised members",
+        false,
+    ),
+    (
+        "enforcebans",
+        "off",
+        "kick the unauthorised members a new ban matches",
+        false,
+    ),
+    (
+        "dynamicbans",
+        "on",
+        "set a listed ban only while someone it matches is in the channel",
+        false,
+    ),
+    (
+        "dontkickops",
+        "on",
+        "ops are never acted on for chan, ctcp, join and nick floods",
+        false,
+    ),
+    (
+        "cycle",
+        "on",
+        "a bot alone in a channel with no ops parts and rejoins for ops",
+        false,
+    ),
+    (
+        "dynamiclimit",
+        "off",
+        "keep +l at the member count plus limitgap",
+        false,
+    ),
+    (
+        "bantime",
+        "120 min",
+        "how long an automatic ban (flood, revenge) lasts; 0 = permanent",
+        false,
+    ),
+    (
+        "bantype",
+        "2",
+        "ban mask shape 0-9: 2 = *!*@host, 4 = *!*@*.host, 7 = nick!*@host",
+        false,
+    ),
+    (
+        "banidle",
+        "60 min",
+        "dynamicbans: a listed ban with no match this long is lifted",
+        false,
+    ),
+    (
+        "limitgap",
+        "5",
+        "dynamiclimit: free places above the member count",
+        false,
+    ),
+    (
+        "limitdelay",
+        "60 s",
+        "dynamiclimit: time between limit changes",
+        false,
+    ),
+    (
+        "flood chan",
+        "15:60",
+        "messages to the channel per host: kick, again: ban",
+        false,
+    ),
+    (
+        "flood ctcp",
+        "3:60",
+        "CTCPs to the channel per host: kick, again: ban",
+        false,
+    ),
+    (
+        "flood join",
+        "5:60",
+        "joins per host (join/part cycling): ban + kick",
+        false,
+    ),
+    (
+        "flood nick",
+        "5:60",
+        "nick changes per host: kick, again: ban",
+        false,
+    ),
+    (
+        "flood deop",
+        "3:10",
+        "deops by an unauthorised op: deop them, re-op the victims",
+        false,
+    ),
+    (
+        "flood kick",
+        "3:10",
+        "kicks by an unauthorised op: deop them, again: kick + ban",
+        false,
+    ),
+    (
+        "flood ban",
+        "3:10",
+        "bans by an unauthorised op: deop them, lift bans on authorised",
+        false,
+    ),
+    (
+        "flood cmd",
+        "10:30",
+        "commands per user: extras dropped; 3x the rate ignores the user",
+        true,
+    ),
+    (
+        "flood msg",
+        "5:60",
+        "other messages to a bot per host: the host is ignored",
+        true,
+    ),
+    (
+        "flood ctcp",
+        "3:60",
+        "CTCPs to a bot per host: the host is ignored",
+        true,
+    ),
+    (
+        "ignoretime",
+        "10 min",
+        "how long a flooding host or user stays ignored",
+        true,
+    ),
+    (
+        "sendq",
+        "10:100",
+        "a bot's IRC output: B lines at once, then one every I ms",
+        true,
+    ),
+];
+
+/// fmt_setting_info(): the i-th channel (net false) or bot network (net
+/// true) setting as (name, built-in value, what it does); None past the last.
+pub fn setting_info(i: usize, net: bool) -> Option<(&'static str, &'static str, &'static str)> {
+    SET_INFO
+        .iter()
+        .filter(|s| s.3 == net)
+        .nth(i)
+        .map(|s| (s.0, s.1, s.2))
+}
+
+/// (what it does, built-in value) of a setting by its shown name.
+fn setting_what(name: &[u8], net: bool) -> (Option<&'static [u8]>, Option<&'static [u8]>) {
+    match SET_INFO
+        .iter()
+        .find(|s| s.3 == net && s.0.as_bytes() == name)
+    {
+        Some(s) => (Some(s.2.as_bytes()), Some(s.1.as_bytes())),
+        None => (None, None),
+    }
 }
 
 /// A setting's value as a person reads it: on / off, minutes, seconds,
@@ -4081,17 +4273,25 @@ fn render_settings_table(ctx: &Ctx, rep: &Creply, out: &mut Flines, network: boo
         )
     };
     title(ctx, out, &title_s, Some(&right));
-    const COLS: [Col; 3] = [
+    const COLS: [Col; 5] = [
         col("SETTING", b'L', 1),
         col("VALUE", b'L', 1),
         col("FROM", b'L', 1),
+        col("DEFAULT", b'L', 1),
+        col("WHAT IT DOES", b'L', 2),
     ];
-    let mut t = Tbl::new(&COLS, -1, 0, 0);
+    let mut t = Tbl::new(&COLS, -1, 0, 1);
     for c in rep.r.iter().filter(|c| c.is("setting")) {
         let name = c.rv("name").unwrap_or(b"?");
+        let (what, def) = setting_what(name, network);
         let val = setting_value(name, c.rv("kind"), c.rv("value"), 48);
         let from = src_phrase(c.rv("src"));
-        t.row(ctx, RL_NORMAL, None, &[Some(name), Some(&val), Some(from)]);
+        t.row(
+            ctx,
+            RL_NORMAL,
+            None,
+            &[Some(name), Some(&val), Some(from), def, what],
+        );
     }
     if rows == 0 {
         empty_note(out, "no settings", None);
@@ -4357,6 +4557,67 @@ fn render_ban_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
 
 /// The settings a channel overrides ("bitch=1,flood join=5:60") as a person
 /// would type them: +bitch, flood join 5:60.
+/// channel show: every setting's value from its setting records, on lines
+/// (options on, options off, values, message floods, op floods), the
+/// channel's own marked '*',
+/// then whether it is all default.  False: no setting records (an older hub).
+fn settings_card(ctx: &Ctx, rep: &Creply, out: &mut Flines, l: i32) -> bool {
+    let mut ln: [Vec<u8>; 5] = Default::default();
+    let (mut own, mut rows) = (0, 0);
+    let dot = glyph(ctx, G_DOT);
+    for c in rep.r.iter().filter(|c| c.is("setting")) {
+        let name = c.rv("name").unwrap_or(b"?");
+        let mark: &[u8] = if c.rv("src") == Some(b"chan") {
+            own += 1;
+            b"*"
+        } else {
+            b""
+        };
+        rows += 1;
+        let val = setting_value(name, c.rv("kind"), c.rv("value"), 48);
+        if is_flag_setting(name) {
+            let on = val == b"on";
+            let b = &mut ln[if on { 0 } else { 1 }];
+            if !b.is_empty() {
+                b.push(b' ');
+            }
+            b.push(if on { b'+' } else { b'-' });
+            b.extend_from_slice(name);
+            b.extend_from_slice(mark);
+        } else if let Some(kind) = name.strip_prefix(b"flood ") {
+            // the message floods, then the op floods (deop kick ban)
+            let op = matches!(kind, b"deop" | b"kick" | b"ban");
+            let b = &mut ln[if op { 4 } else { 3 }];
+            if b.is_empty() {
+                b.extend_from_slice(b"flood ");
+            } else {
+                b.extend_from_slice(&cat(&[b" ", dot, b" "]));
+            }
+            b.extend_from_slice(&cat(&[kind, b" ", &val, mark]));
+        } else {
+            let b = &mut ln[2];
+            if !b.is_empty() {
+                b.extend_from_slice(&cat(&[b" ", dot, b" "]));
+            }
+            b.extend_from_slice(&cat(&[name, b" ", &val, mark]));
+        }
+    }
+    if rows > 0 {
+        let mut label = "settings";
+        for b in ln.iter().filter(|b| !b.is_empty()) {
+            card(out, l, label, b, RL_NORMAL);
+            label = "";
+        }
+        let tail: &[u8] = if own > 0 {
+            b"(* set on this channel, the rest default settings)"
+        } else {
+            b"(default settings)"
+        };
+        card(out, l, "", tail, RL_DIM);
+    }
+    rows > 0
+}
+
 fn overrides_phrase(ov: Option<&[u8]>, cap: usize) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut p = ov.unwrap_or(b"");
@@ -4597,10 +4858,63 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     }
 }
 
+/// Version order for the releases list: a leading v is ignored, digit runs
+/// compare as numbers, anything else byte by byte ("2.4.10" > "2.4.9").
+fn ver_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let strip = |x: &[u8]| -> usize { usize::from(matches!(x.first(), Some(b'v' | b'V'))) };
+    let (mut i, mut j) = (strip(a), strip(b));
+    while i < a.len() || j < b.len() {
+        let (ca, cb) = (a.get(i).copied(), b.get(j).copied());
+        if ca.is_some_and(|c| c.is_ascii_digit()) && cb.is_some_and(|c| c.is_ascii_digit()) {
+            while a.get(i) == Some(&b'0') {
+                i += 1;
+            }
+            while b.get(j) == Some(&b'0') {
+                j += 1;
+            }
+            let la = a[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+            let lb = b[j..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if la != lb {
+                return la.cmp(&lb);
+            }
+            let o = a[i..i + la].cmp(&b[j..j + lb]);
+            if o != Ordering::Equal {
+                return o;
+            }
+            i += la;
+            j += lb;
+        } else {
+            // C compares the terminating NUL as 0
+            let (x, y) = (ca.unwrap_or(0), cb.unwrap_or(0));
+            if x != y {
+                return x.cmp(&y);
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Only the releases newer than the oldest version a node of that product
+/// runs: those are the ones a run can still move a node to.  The nodes list
+/// below shows what each node runs.
 fn render_upg_releases(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     for prod in 0..2 {
         let p: &[u8] = if prod == 0 { b"bot" } else { b"hub" };
         let base = rep.res.rv(if prod == 0 { "bot_base" } else { "hub_base" });
+        let mut oldest: Option<&[u8]> = None;
+        for nd in &rep.r {
+            let kind = nd.rv("kind").unwrap_or(b"");
+            let Some(v) = nd.rvs("ver") else { continue };
+            if !nd.is("node") || (prod == 0) != (kind == b"bot") {
+                continue;
+            }
+            if oldest.is_none_or(|o| ver_cmp(v, o).is_lt()) {
+                oldest = Some(v);
+            }
+        }
         let right: &[u8] = match base {
             Some(b) if !b.is_empty() => b,
             _ if prod == 0 => b"ircbot-releases (default base)",
@@ -4616,29 +4930,22 @@ fn render_upg_releases(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             },
             Some(right),
         );
-        const COLS: [Col; 4] = [
+        const COLS: [Col; 3] = [
             col("VERSION", b'L', 1),
             col("DATE", b'L', 1),
             col("CODE", b'L', 1),
-            col("NODES ON IT", b'R', 1),
         ];
         let mut t = Tbl::new(&COLS, -1, 0, 0);
+        let mut listed = 0usize;
         for r in &rep.r {
             if !r.is("rel") || r.rv("product") != Some(p) {
                 continue;
             }
-            let mut on = 0;
-            for nd in &rep.r {
-                let (Some(nv), Some(rvv)) = (nd.rv("ver"), r.rv("ver")) else {
-                    continue;
-                };
-                if !nd.is("node") || nv != rvv {
-                    continue;
-                }
-                let kind = nd.rv("kind").unwrap_or(b"");
-                if (prod == 0) == (kind == b"bot") {
-                    on += 1;
-                }
+            listed += 1;
+            if let (Some(o), Some(v)) = (oldest, r.rv("ver"))
+                && ver_cmp(v, o).is_le()
+            {
+                continue;
             }
             let bases = snp(32, r.rv("bases").unwrap_or(b"").to_vec());
             let mut bb = Sb::default();
@@ -4649,19 +4956,45 @@ fn render_upg_releases(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                     bb.a(&[q]);
                 }
             }
-            let cnt = num(on);
-            let cells = [
-                r.rv("ver"),
-                r.rv("date"),
-                Some(bb.opt().unwrap_or(b"")),
-                Some(if on != 0 { cnt.as_slice() } else { b"" }),
-            ];
+            let cells = [r.rv("ver"), r.rv("date"), Some(bb.opt().unwrap_or(b""))];
             t.row(ctx, RL_NORMAL, None, &cells);
         }
-        if t.nr() > 0 {
+        let shown = t.nr();
+        let old = oldest.unwrap_or(b"");
+        if shown > 0 {
             t.render(ctx, out);
+        } else if listed > 0 {
+            line(
+                out,
+                RL_DIM,
+                &[
+                    b"  (none newer than ",
+                    old,
+                    b", the oldest ",
+                    p,
+                    b" version running)",
+                ],
+            );
         } else {
             line(out, RL_DIM, &[b"  (no releases listed)"]);
+        }
+        if shown > 0 && listed > shown {
+            let n = listed - shown;
+            line(
+                out,
+                RL_DIM,
+                &[
+                    b"  ",
+                    &num(n),
+                    b" older release",
+                    if n == 1 { b"" } else { b"s" },
+                    b" not shown (every ",
+                    p,
+                    b" runs ",
+                    old,
+                    b" or later)",
+                ],
+            );
         }
         for r in &rep.r {
             if !r.is("relerr") || r.rv("product") != Some(p) {
@@ -4741,7 +5074,7 @@ fn render_upg_releases(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     line(
         out,
         RL_DIM,
-        &[b"  start a run: upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>]"],
+        &[b"  start a run: upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>]"],
     );
 }
 

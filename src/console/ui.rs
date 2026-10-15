@@ -819,7 +819,7 @@ const CMDS: &[CmdDef] = &[
     cmd!("ban", Some("del"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban del <#chan|*> <mask>", "remove a listed ban", None),
     cmd!("upgrade", Some("status"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::None, Pre::None, "", "upgrade status", "the upgrade run on this hub", None),
     cmd!("upgrade", Some("releases"), CMD_ADMIN_UPGRADE_STATUS, B::UpgReleases, 0, 2, Cf::None, Pre::None, "", "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", None),
-    cmd!("upgrade", Some("start"), CMD_ADMIN_UPGRADE_NET, B::UpgStart, 1, 4, Cf::Type, Pre::UpgStart, "", "upgrade start <botver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade", None),
+    cmd!("upgrade", Some("start"), CMD_ADMIN_UPGRADE_NET, B::UpgStart, 1, 4, Cf::Yn, Pre::UpgStart, "", "upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade (shows the plan, asks y/N)", None),
     cmd!("upgrade", Some("abort"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, Pre::None, "abort", "upgrade abort", "stop the run and roll back", None),
     cmd!("upgrade", Some("forget"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, Pre::None, "forget", "upgrade forget", "drop the roll-up plan on every hub", None),
     cmd!("display", Some("show"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "display show", "this session's display settings", None),
@@ -921,14 +921,14 @@ const CMD_HELP: &[CmdHelp] = &[
     ("network", Some("tree"), None, "network tree"),
     ("network", Some("status"), None, "network status"),
     ("network", Some("set"),
-     Some("flood\tbot flood limits: cmd = commands per user, msg = other messages per host, \
-           ctcp = CTCP per host\n\
-           N:S|off|default\tmore than N events in S seconds trips it (N 1-1000, S 1-3600); off \
-           disables it; default returns to the built-in\n\
-           ignoretime\tminutes a flooding host stays ignored (1-1440); alone the command shows all\n\
-           sendq\thow fast a bot may send lines to IRC: B:I lets B lines (1-100) out at once, then \
-           one every I ms (0-10000, 0 = no delay); default is 10:100"),
-     "network set\nnetwork set flood cmd 10:30\nnetwork set flood msg off\nnetwork set ignoretime 20\nnetwork set sendq 5:250"),
+     Some("(none)\tshows every bot network setting: its value, where it comes from, its default\n\
+           flood <type>\tcmd, msg or ctcp (below), then N:S = more than N in S seconds trips it \
+           (N 1-1000, S 1-3600), off = no limit, default = back to the built-in\n\
+           ignoretime\tminutes (1-1440), or default\n\
+           sendq\tB:I = B lines (1-100) at once, then one every I ms (0-10000, 0 = no delay), or \
+           default\n\
+           (scope)\tevery bot on every hub gets the same values; there is no per-bot setting"),
+     "network set\nnetwork set flood cmd 10:30\nnetwork set flood msg off\nnetwork set ignoretime 20\nnetwork set sendq 5:250\nnetwork set sendq default"),
     ("hub", Some("show"), None, "hub show"),
     ("hub", Some("set"),
      Some("setting\tname, bindip, port, pubkey or autopurge; alone it shows them all. ssh and conn \
@@ -1016,15 +1016,16 @@ const CMD_HELP: &[CmdHelp] = &[
       channel mode #ops -"),
     ("channel", Some("set"),
      Some("#chan|default\tthe channel, or default for the network default every channel inherits; \
-           alone it lists every setting and where its value comes from\n\
-           +opt -opt\tturn an on/off option on or off: enforcemodes bitch protectops revenge \
-           stopnethack enforcebans dynamicbans dontkickops cycle dynamiclimit\n\
-           name value\tbantime (minutes, 0 = permanent), bantype (0-9), banidle (minutes), limitgap, \
-           limitdelay (seconds); default removes the channel's own value\n\
-           flood type\tchan ctcp join nick deop kick ban, then N:S (more than N in S seconds), off \
-           or default"),
+           alone it lists every setting, its value, where it comes from and its default\n\
+           +name -name\tturn an on/off option (below) on or off; several in one line\n\
+           name value\ta valued setting (below) and its new value, or default to drop the \
+           channel's own value and inherit again\n\
+           flood type\tone of the channel floods (below), then N:S = more than N in S seconds from \
+           one host trips it, off = no limit here, default = inherit\n\
+           (who)\tonly unauthorised members are acted on, and only by an opped bot"),
      "channel set #ops\nchannel set #ops +bitch +enforcemodes\nchannel set #ops bantime 60\n\
-      channel set #ops flood join 10:60\nchannel set default -dynamicbans"),
+      channel set #ops bantime default\nchannel set #ops flood join 10:60\n\
+      channel set #ops flood chan off\nchannel set default -dynamicbans"),
     ("channel", Some("op"), Some("#chan\tthe channel\nnick\tthe user's current nick on IRC"),
      "channel op #ops alice"),
     ("channel", Some("invite"), Some("#chan\tthe channel\nnick\tthe user's current nick on IRC"),
@@ -1047,14 +1048,15 @@ const CMD_HELP: &[CmdHelp] = &[
            hub=<base>\ta different release site for the hub builds (a URL)"),
      "upgrade releases\nupgrade releases bot=https://example.net/ircbot"),
     ("upgrade", Some("start"),
-     Some("botver\tthe bot version to move to, as upgrade releases lists it\n\
-           hub=<ver>\talso move the hubs to this version (- = leave them)\n\
+     Some("bot=<ver>\tthe bot version to move to, as upgrade releases lists it (required)\n\
+           hub=<ver>\talso move the hubs to this version (- or left out = leave them)\n\
            nodes=<sel>\tonly these nodes: names or uuids, comma-separated; name=c or name=rs \
            also switches that node's build (default: the whole network)\n\
            botbase=<url>\ta different release site for the bot builds\n\
            hubbase=<url>\ta different release site for the hub builds\n\
-           (confirm)\tit shows the plan, then you type the bot version to start"),
-     "upgrade start 2.4.5\nupgrade start 2.4.5 hub=2.4.4\nupgrade start 2.4.5 nodes=alpha,beta=rs"),
+           (confirm)\tit shows the plan, then asks y/N to start"),
+     "upgrade start bot=2.4.5\nupgrade start bot=2.4.5 hub=2.4.4\n\
+      upgrade start bot=2.4.5 nodes=alpha,beta=rs"),
     ("upgrade", Some("abort"), None, "upgrade abort"),
     ("upgrade", Some("forget"), None, "upgrade forget"),
     ("display", Some("show"), None, "display show"),
@@ -1136,7 +1138,7 @@ const ARG_COMP: &[ArgComp] = &[
         "upgrade",
         Some("start"),
         None,
-        Ck::Words("hub= nodes= botbase= hubbase="),
+        Ck::Words("bot= hub= nodes= botbase= hubbase="),
     ),
     ("display", Some("view"), Some(0), Ck::Words("1 2 3 4 5")),
     ("display", Some("format"), Some(0), Ck::Words("pretty raw")),
@@ -2313,6 +2315,23 @@ fn help_command(c: &Ctx, f: &mut Flines, d: &CmdDef) {
     } else {
         fmt::flines_add(f, RL_DIM, b"   (no arguments)");
     }
+    // channel set / network set: every setting, its built-in default and what
+    // it does (one table, fmt.rs, also behind the settings views)
+    let net_set = d.cmd == "network" && d.sub == Some("set");
+    if net_set || (d.cmd == "channel" && d.sub == Some("set")) {
+        fmt::flines_add(f, RL_NORMAL, b"");
+        fmt::flines_add(
+            f,
+            RL_HEAD,
+            b" Settings: name, built-in default, what it does",
+        );
+        let mut i = 0;
+        while let Some((n, def, what)) = fmt::setting_info(i, net_set) {
+            let l = format!("   {n:<13} {def:<8} {what}");
+            fmt::flines_add(f, RL_NORMAL, c_cut(l.as_bytes(), 1024));
+            i += 1;
+        }
+    }
     if let Some(ex) = ex {
         fmt::flines_add(f, RL_NORMAL, b"");
         fmt::flines_add(
@@ -2773,10 +2792,13 @@ fn build_payload(
             }
         }
         B::UpgStart => {
+            let mut botv: &[u8] = b"";
             let (mut hubv, mut nodes, mut bb, mut hb): (&[u8], &[u8], &[u8], &[u8]) =
                 (b"", b"", b"", b"");
-            for i in 1..na {
-                if let Some(v) = kv_opt(a(i), "hub") {
+            for i in 0..na {
+                if let Some(v) = kv_opt(a(i), "bot") {
+                    botv = v;
+                } else if let Some(v) = kv_opt(a(i), "hub") {
                     hubv = if v == b"-" { b"" } else { v };
                 } else if let Some(v) = kv_opt(a(i), "nodes") {
                     nodes = v;
@@ -2786,15 +2808,21 @@ fn build_payload(
                     hb = v;
                 } else {
                     return bad(
-                        "options: hub=<ver> nodes=<list> botbase=<url> hubbase=<url>",
+                        "options: bot=<ver> hub=<ver> nodes=<list> botbase=<url> hubbase=<url>",
                         hint,
                     );
                 }
             }
+            if botv.is_empty() {
+                return bad(
+                    "say which bot version: bot=<ver> (upgrade releases lists them)",
+                    hint,
+                );
+            }
             // ver|variant|kind|min_from|base|hub_ver|hub_base|sel — variant,
             // kind and min_from are left to each node, as hub_admin always did.
             let hbv: &[u8] = if hubv.is_empty() { b"" } else { hb };
-            fmtb(&[a(0), b"||||", bb, b"|", hubv, b"|", hbv, b"|", nodes])
+            fmtb(&[botv, b"||||", bb, b"|", hubv, b"|", hbv, b"|", nodes])
         }
     };
     if w.len() >= CAP {
@@ -3789,9 +3817,7 @@ impl Ui {
                     }
                     self.emit_flines(f);
                 }
-                kind = Confirm::Type;
-                want = c_cut(bv, 128).to_vec();
-                q = fmtb(&[b"Type ", bv, b" to start the upgrade:"]);
+                q = b"Start the upgrade? (y/N)".to_vec();
             }
             Pre::None => q = b"Go ahead? (y/N)".to_vec(),
         }
@@ -3968,9 +3994,11 @@ impl Ui {
                 Pre::UserDel | Pre::UserKey => (CMD_ADMIN_MATCH, c_cut(&a1, 600).to_vec()),
                 Pre::UpgStart => {
                     let (mut bb, mut hb): (&[u8], &[u8]) = (b"", b"");
-                    for i in argi + 1..ws.n() {
+                    for i in argi..ws.n() {
                         let w = ws.get(i);
-                        if let Some(v) = kv_opt(w, "hub") {
+                        if let Some(v) = kv_opt(w, "bot") {
+                            pc.arg = c_cut(v, 256).to_vec();
+                        } else if let Some(v) = kv_opt(w, "hub") {
                             pc.extra[0] = c_cut(if v == b"-" { b"" } else { v }, 256).to_vec();
                         } else if let Some(v) = kv_opt(w, "nodes") {
                             pc.extra[1] = c_cut(v, 256).to_vec();

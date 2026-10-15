@@ -425,6 +425,17 @@ fn parse_push_channel(data: &str) -> Option<(String, String, i32, String, i64)> 
 }
 
 /// process_bot_config_push().
+/// One accepted record of a bot's config push, onto the batch forwarded to
+/// peer hubs.  A line that would not fit sends the batch first, so nothing
+/// accepted is dropped (C: `config_push_sync`).
+fn push_sync(state: &mut HubState, s: &mut String, fd: i32, line: &str) {
+    if !s.is_empty() && s.len() + line.len() >= MAX_BUFFER {
+        mesh::broadcast_sync_to_peers(state, s, fd);
+        s.clear();
+    }
+    s.push_str(line);
+}
+
 fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     if state.clients[ci].typ != ClientType::Bot || !state.clients[ci].authenticated {
         crate::hlog_warning!("[HUB] Rejected config push from non-bot client\n");
@@ -473,12 +484,6 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     let mut proto_upgraded = false;
     let mut saw_proto = false;
     let mut sync_buffer = String::new();
-
-    let push_sync = |s: &mut String, line: &str| {
-        if s.len() + line.len() < MAX_BUFFER {
-            s.push_str(line);
-        }
-    };
 
     for line in work_buf.split('\n') {
         if line.len() < 2 || line.starts_with('#') {
@@ -551,7 +556,9 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                     updates += 1;
                     // Sync buffer: include modes for peer hubs.
                     push_sync(
+                        state,
                         &mut sync_buffer,
+                        fd,
                         &format!("b|{id}|c|{chan}|{key}|{modes_val}|{op}|{ts}\n"),
                     );
                 }
@@ -568,7 +575,7 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 let bts = atoll(&data[p + 1..]);
                 if crate::modes::ban_bot_write(state, &id, bval, bts) {
                     updates += 1;
-                    push_sync(&mut sync_buffer, &format!("B|{bval}|{bts}\n"));
+                    push_sync(state, &mut sync_buffer, fd, &format!("B|{bval}|{bts}\n"));
                 }
             }
             'C' | 'D' => {
@@ -624,7 +631,9 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 state.config_dirty = true;
                 updates += 1;
                 push_sync(
+                    state,
                     &mut sync_buffer,
+                    fd,
                     &format!("m|{uuid}|{mask_s}|{act}|{last_used}|{ts}\n"),
                 );
             }
@@ -685,7 +694,7 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 updates += 1;
                 let uline = crate::config::format_user_record(&state.user_records[ui], false);
                 if uline.len() < USER_LINE_MAX {
-                    push_sync(&mut sync_buffer, &uline);
+                    push_sync(state, &mut sync_buffer, fd, &uline);
                 }
             }
             'h' => {
@@ -703,7 +712,12 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 );
                 if accepted {
                     updates += 1;
-                    push_sync(&mut sync_buffer, &format!("b|{id}|h|{hostmask}|{ts}\n"));
+                    push_sync(
+                        state,
+                        &mut sync_buffer,
+                        fd,
+                        &format!("b|{id}|h|{hostmask}|{ts}\n"),
+                    );
                 }
             }
             'n' => {
@@ -723,7 +737,12 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 );
                 if accepted {
                     updates += 1;
-                    push_sync(&mut sync_buffer, &format!("b|{id}|n|{nick}|{ts}\n"));
+                    push_sync(
+                        state,
+                        &mut sync_buffer,
+                        fd,
+                        &format!("b|{id}|n|{nick}|{ts}\n"),
+                    );
                 }
             }
             _ => {}
@@ -1457,6 +1476,17 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
                     state.clients[ci].last_pong_sent = t;
                 }
             } else {
+                // Every sender frames [cmd][len:4][payload]: a shorter frame
+                // is malformed, and the C hub drops the client for it.
+                if plain.len() < 5 {
+                    let ip = state.clients[ci].ip.clone();
+                    crate::hlog_warning!(
+                        "[HUB] Short frame ({} bytes, cmd 0x{cmd:02x}) from {ip} — disconnecting\n",
+                        plain.len()
+                    );
+                    auth::disconnect_client(state, ci);
+                    return false;
+                }
                 let payload = if plain.len() > 5 {
                     String::from_utf8_lossy(crate::cstr::until_nul_bytes(&plain[5..])).into_owned()
                 } else {

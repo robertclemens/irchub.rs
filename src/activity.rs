@@ -80,7 +80,7 @@ pub fn stamp_user(state: &mut HubState, ui: usize, t: i64) {
         "[ACTIVITY] {} last seen {t}{}\n",
         state.user_records[ui].name,
         if new_bucket {
-            " (first this hour: flooded to peers)"
+            " (first this hour: sent to peers)"
         } else {
             ""
         }

@@ -308,7 +308,12 @@ pub fn write(state: &mut HubState) {
         if b.uuid.is_empty() {
             continue;
         }
-        buf.push_str(&format!("b|{}|t|{}\n", b.uuid, b.last_sync_time));
+        // t is the authorization stamp (bot approve / bot authorize); for a
+        // uuid authorized before it first connects it is the only line that
+        // keeps the record.  A bot added with its key never has one: no t|0.
+        if b.last_sync_time > 0 {
+            buf.push_str(&format!("b|{}|t|{}\n", b.uuid, b.last_sync_time));
+        }
         for e in &b.entries {
             // "seen" and "t" carry no value field.
             if e.key == "seen" || e.key == "t" {
