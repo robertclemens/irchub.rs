@@ -6,7 +6,7 @@
 //! `Vec` bounded by the same constant: the caps are enforced at every insert
 //! exactly as the C `< MAX_*` guards did, and the sizing argument behind the
 //! bulk-payload ceilings in `consts` is unchanged.  The ring buffers
-//! (`recent_purges`, `seen_forwards`, `pending`) keep their ring indices.
+//! (`recent_purges`, `seen_forwards`) keep their ring indices.
 //!
 //! `HubClient::fd` is the raw descriptor number, kept only as an identity
 //! token: peers record `fd` to say which connection they are on, forwarded
@@ -167,6 +167,8 @@ pub struct Ban {
     pub setter: String,
     pub reason: String,
     pub ts: i64,
+    /// Last match a bot reported, 0 = never.
+    pub last_used: i64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -174,6 +176,8 @@ pub struct ConfigEntry {
     pub key: String,
     pub value: String,
     pub timestamp: i64,
+    /// B| only: last ban match, max-merged outside LWW.
+    pub last_used: i64,
 }
 
 /// An admin ('a') or oper ('o') record.
@@ -204,6 +208,24 @@ pub struct MaskRecord {
     pub timestamp: i64,
 }
 
+/// Admin flags, `uf|<user_uuid>|<flags>|<ts>` (C `hub_uflag_record_t`).
+#[derive(Clone, Debug, Default)]
+pub struct UflagRecord {
+    pub uuid: String,
+    pub flags: String,
+    pub timestamp: i64,
+}
+
+/// Oper channel binding, `uc|<user_uuid>|<#chan|*>|add/del|<ts>` (C
+/// `hub_uchan_record_t`).
+#[derive(Clone, Debug, Default)]
+pub struct UchanRecord {
+    pub uuid: String,
+    pub chan: String,
+    pub is_active: bool,
+    pub timestamp: i64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BotConfig {
     pub uuid: String,
@@ -219,14 +241,18 @@ impl BotConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct PendingBot {
+/// One revoked bot (hub_revoked_t):
+/// `rv|<uuid>|<pub>|<pub_ts>|<nick>|<wiped_ts>|<del_ts>`.  Union-merged
+/// across hubs (`revoke::merge`), never purged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Revoked {
     pub uuid: String,
+    pub pub_key: String,
+    pub pub_ts: i64,
     pub nick: String,
-    pub ip: String,
-    pub last_attempt: i64,
-    /// Connection attempts while pending (console).
-    pub attempts: i32,
+    /// Last time it connected and wiped itself (0 = never).
+    pub wiped_ts: i64,
+    pub del_ts: i64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -301,6 +327,11 @@ pub struct ChanElect {
     pub hubs: Vec<ChanElectHub>,
     /// Bot (LocalDo) or hub uuid (MeshDo) being tried.
     pub doing: String,
+    /// A person's request from a bot (CMD_USER_CHAN_REQUEST): the answer
+    /// goes back to that connection as CMD_USER_CHAN_RESULT; -1 = none.
+    pub reply_fd: i32,
+    pub reply_serial: u64,
+    pub reply_rid: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -564,6 +595,8 @@ pub struct UpgradeNode {
     pub via: String,
     /// The connection it was reached on, -1 once gone.
     pub fd: i32,
+    /// What it ran when the run found it (status "from"; never moved to the
+    /// target).
     pub cur_version: String,
     /// "c" / "rs".
     pub variant: String,
@@ -858,6 +891,8 @@ pub enum BotAuthState {
     ChallengeSent,
     SignatureReceived,
     Complete,
+    /// Revoked bot proved its key, told to retire.
+    Quarantine,
 }
 
 /// Connection serials start at 1 and only grow: at one connection per
@@ -884,6 +919,14 @@ pub struct HubClient {
     pub connected_at: i64,
     /// Accepted on the listener (subject to the IP lists).
     pub inbound: bool,
+    /// bot del of this connected bot: CMD_BOT_RETIRE sent at `retire_sent`;
+    /// every other frame from it is dropped, and it is closed on
+    /// CMD_BOT_RETIRE_ACK or after RETIRE_GRACE_SEC.
+    pub retiring: bool,
+    pub retire_sent: i64,
+    /// Its uuid is on the revoke list: the handshake checks the revoke list's
+    /// key and ends in `BotAuthState::Quarantine` (CMD_BOT_RETIRE as the ACK).
+    pub quarantine: bool,
     /// An SSH console's socketpair end (docs/console.md): an admin
     /// connection the console thread already authenticated.  Plaintext
     /// frames, no pings, no CLIENT_TIMEOUT (the console has its own idle
@@ -911,6 +954,9 @@ pub struct HubClient {
     pub chan_ev_window: i64,
     pub chan_ev_count: i32,
     pub chan_ev_dropped: i32,
+    /// CMD_USER_CHAN_REQUEST rate limit for this connection.
+    pub uchan_req_window: i64,
+    pub uchan_req_count: i32,
     /// D2: PREAUTH_BUF_SIZE, then the per-type bulk size on auth.  `len()` is
     /// the C `recv_len`.
     pub recv_buf: Vec<u8>,
@@ -983,6 +1029,9 @@ impl HubClient {
             last_pong_sent: 0,
             connected_at: t,
             inbound: false,
+            retiring: false,
+            retire_sent: 0,
+            quarantine: false,
             internal: false,
             conn_serial: next_conn_serial(),
             console: None,
@@ -992,6 +1041,8 @@ impl HubClient {
             chan_ev_window: 0,
             chan_ev_count: 0,
             chan_ev_dropped: 0,
+            uchan_req_window: 0,
+            uchan_req_count: 0,
             recv_buf: Vec::with_capacity(size.min(PREAUTH_BUF_SIZE)),
             recv_cap: size,
             bot_auth_state: BotAuthState::Idle,
@@ -1098,7 +1149,6 @@ pub struct MaintTimers {
     pub last_client_scan: i64,
     pub last_ip_cleanup: i64,
     pub last_purge: i64,
-    pub last_status_dump: i64,
     pub last_peer_check: i64,
 }
 
@@ -1140,11 +1190,14 @@ pub struct HubState {
     /// Named admin/oper records and their usermasks.
     pub user_records: Vec<UserRecord>,
     pub mask_records: Vec<MaskRecord>,
+    /// Admin flags and oper channel bindings (access.rs).
+    pub uflag_records: Vec<UflagRecord>,
+    pub uchan_records: Vec<UchanRecord>,
 
     pub peers: Vec<PeerConfig>,
 
-    pub pending: Vec<PendingBot>,
-    pub pending_head: usize,
+    /// Permanent: never purged (`revoke`).
+    pub revoked: Vec<Revoked>,
 
     pub pending_op_requests: Vec<PendingOpRequest>,
     pub pending_chan_requests: Vec<PendingChanRequest>,
@@ -1176,6 +1229,11 @@ pub struct HubState {
     pub follow_hub_base: String,
     /// Whether this hub itself can take the followed run.
     pub follow_self_ready: bool,
+    /// UPGRADE_PASS_REWRITE_SECS: when the deferred pass rewrite is due (0 =
+    /// none), and whether this process saved HUB_PASS_PREV_FILE —
+    /// update::rollback() restores it only then, never a stale copy.
+    pub pass_rewrite_due: i64,
+    pub pass_prev_saved: bool,
     pub follow_prepared: i64,
     /// Nodes below this hub in the followed run's fan-out tree (its own
     /// peers' subtrees).  Rebuilt for every run; see [`UpgradeRoute`].
@@ -1200,6 +1258,8 @@ pub struct HubState {
 
     /// Days threshold for the tombstone purge (0 = disabled).
     pub purge_days_setting: i32,
+    /// hs|autopurge stamp (LWW across hubs).
+    pub purge_days_ts: i64,
     /// D3: if true, 127.0.0.1/::1 bypass rate limiting (default false —
     /// secure by default).
     pub trust_loopback: bool,
@@ -1231,7 +1291,7 @@ pub struct HubState {
 
     /// Debounced config write: set the dirty flag instead of writing
     /// immediately.  `maintenance` flushes at most once every
-    /// CONFIG_WRITE_DEBOUNCE_S seconds.  This prevents N PBKDF2(100k) calls
+    /// CONFIG_WRITE_DEBOUNCE_S seconds.  This prevents N PBKDF2 calls
     /// when N peer syncs arrive in a burst.
     pub config_dirty: bool,
     /// A full config push to every local bot is owed
@@ -1312,9 +1372,10 @@ impl HubState {
             global_idx: Default::default(),
             user_records: Vec::new(),
             mask_records: Vec::new(),
+            uflag_records: Vec::new(),
+            uchan_records: Vec::new(),
             peers: Vec::new(),
-            pending: Vec::new(),
-            pending_head: 0,
+            revoked: Vec::new(),
             pending_op_requests: vec![PendingOpRequest::default(); MAX_PENDING_OP_REQUESTS],
             pending_chan_requests: vec![PendingChanRequest::default(); MAX_PENDING_CHAN_REQUESTS],
             chan_elections: vec![ChanElect::default(); MAX_CHAN_ELECTIONS],
@@ -1328,6 +1389,8 @@ impl HubState {
             follow_hub_target: String::new(),
             follow_hub_base: String::new(),
             follow_self_ready: false,
+            pass_rewrite_due: 0,
+            pass_prev_saved: false,
             follow_prepared: 0,
             follow_routes: Vec::new(),
             rollup: PendingRollup::default(),
@@ -1339,6 +1402,7 @@ impl HubState {
             conn_cfg: crate::connlimits::ConnCfg::default(),
             ssh_ips: Vec::new(),
             purge_days_setting: 0,
+            purge_days_ts: 0,
             trust_loopback: false,
             pid_file: None,
             running: true,

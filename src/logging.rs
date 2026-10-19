@@ -347,20 +347,6 @@ macro_rules! hlog_debug {
     };
 }
 
-/// Periodic runtime counters.  Carries its own [STATUS] tag but is gated at
-/// LOG_INFO, so it disappears together with the rest of the INFO traffic.
-#[macro_export]
-macro_rules! hlog_status {
-    ($($arg:tt)*) => {
-        if $crate::logging::level() >= $crate::consts::LOG_INFO {
-            $crate::logging::hub_log_at(
-                $crate::consts::LOG_INFO,
-                &format!("[STATUS] {}", format!($($arg)*)),
-            );
-        }
-    };
-}
-
 /// Record a fatal panic in HUB_LOG_FILE before the process goes down — the
 /// job the C hub's crash left to the core dump it deliberately disabled.
 pub fn install_panic_hook() {

@@ -304,7 +304,7 @@ pub fn creply_parse(text: &[u8]) -> Creply {
     while end > 0 && (text[end - 1] == b'\n' || text[end - 1] == b'\r') {
         end -= 1;
     }
-    let (mut first, mut rows, mut status) = (true, false, false);
+    let (mut first, mut rows) = (true, false);
     let mut i = 0;
     while i < end {
         let mut j = i;
@@ -328,19 +328,9 @@ pub fn creply_parse(text: &[u8]) -> Creply {
                     out.code = std::mem::take(&mut out.res.k[0]);
                 }
                 rows = out.code == b"network.tree";
-                status = out.code == b"network.status";
                 i = j + 1;
                 continue;
             }
-        }
-        if status {
-            // key=value lines become fields of the result record
-            if let Some(eq) = line.iter().position(|&b| b == b'=') {
-                out.res
-                    .add(clean_dup(&line[..eq]), clean_dup(&line[eq + 1..]));
-            }
-            i = j + 1;
-            continue;
         }
         out.r.push(parse_rec(line, !rows));
         i = j + 1;
@@ -657,7 +647,7 @@ fn pl(n: i64) -> &'static [u8] {
     if n == 1 { b"" } else { b"s" }
 }
 
-/// "1 peer hub" / "3 peer hubs"
+/// "1 hub link" / "3 hub links"
 fn plural(n: i64, one: &str, many: &str) -> Vec<u8> {
     cat(&[&num(n), b" ", s(if n == 1 { one } else { many })])
 }
@@ -1019,17 +1009,17 @@ impl Tbl {
 // ===========================================================================
 fn peers_phrase(peers: i64) -> Vec<u8> {
     if peers <= 0 {
-        b"no peer hub is linked now; peers catch up on their next sync".to_vec()
+        b"no other hub is linked now; they catch up on their next sync".to_vec()
     } else {
-        cat(&[b"synced to ", &num(peers), b" peer hub", pl(peers)])
+        cat(&[b"synced to ", &num(peers), b" other hub", pl(peers)])
     }
 }
 
 fn sync_push_phrase(cap: usize, peers: i64, bots: i64) -> Vec<u8> {
     let p = if peers <= 0 {
-        b"no peer hub linked".to_vec()
+        b"no other hub linked".to_vec()
     } else {
-        cat(&[b"synced to ", &num(peers), b" peer hub", pl(peers)])
+        cat(&[b"synced to ", &num(peers), b" other hub", pl(peers)])
     };
     snp(
         cap,
@@ -1154,7 +1144,7 @@ fn render_bot_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         empty_note(
             out,
             "no bots registered",
-            Some("bot add <nick> <uuid> <key>, or approve one from bot pending"),
+            Some("bot add <nick> <uuid> <key>"),
         );
         return;
     }
@@ -1266,7 +1256,7 @@ fn render_bot_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         &num(here),
         b" ",
         dot,
-        b" via peers ",
+        b" via other hubs ",
         &num(via),
     ]));
     for i in 0..vers.len() {
@@ -1443,37 +1433,40 @@ fn render_bot_summary(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     }
 }
 
-fn render_bot_pending(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
-    let right = snp(48, cat(&[&num(rep.res.rvi("count", 0)), b" waiting"]));
-    title(ctx, out, b"Pending bots", Some(&right));
-    const COLS: [Col; 5] = [
-        col("#", b'R', 1),
+fn render_bot_revoked(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let right = snp(
+        48,
+        cat(&[
+            &num(rep.res.rvi("count", 0)),
+            b" of ",
+            &num(rep.res.rvi("max", 0)),
+        ]),
+    );
+    title(ctx, out, b"Revoked bots", Some(&right));
+    const COLS: [Col; 4] = [
+        col("NICK", b'L', 1),
         col("UUID", b'L', 1),
-        col("FROM", b'L', 1),
-        col("TRIES", b'R', 1),
-        col("LAST TRY", b'L', 1),
+        col("DELETED", b'L', 1),
+        col("WIPED", b'L', 1),
     ];
     let mut t = Tbl::new(&COLS, -1, 1, 1);
-    for r in rep.r.iter().filter(|r| r.is("pending")) {
-        let nn = snp(16, num(r.rvi("n", 0)));
-        let tries = snp(16, num(r.rvi("tries", 0)));
-        let ts = r.rvi("last", 0);
-        let last = if ts > 0 {
-            cat(&[&span(ctx.now.wrapping_sub(ts)), b" ago"])
+    for r in rep.r.iter().filter(|r| r.is("revoked")) {
+        let del = snp(48, when(r.rvi("deleted", 0), ctx.now));
+        let wiped = if r.rvi("wiped", 0) > 0 {
+            snp(48, when(r.rvi("wiped", 0), ctx.now))
         } else {
             glyph(ctx, G_DASH).to_vec()
         };
         let cells = [
-            Some(nn.as_slice()),
+            Some(r.rvs("nick").unwrap_or(glyph(ctx, G_DASH))),
             r.rv("uuid"),
-            r.rv("ip"),
-            Some(&tries),
-            Some(&last),
+            Some(del.as_slice()),
+            Some(wiped.as_slice()),
         ];
         t.row(ctx, RL_NORMAL, None, &cells);
     }
     if t.nr() == 0 {
-        empty_note(out, "no bots waiting for approval", None);
+        empty_note(out, "no deleted bots", None);
         return;
     }
     t.render(ctx, out);
@@ -1481,11 +1474,7 @@ fn render_bot_pending(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     line(
         out,
         RL_DIM,
-        &[
-            b"  approve one: bot approve <#|uuid>   (the # changes as bots come and go ",
-            glyph(ctx, G_DASH),
-            b" the uuid does not)",
-        ],
+        &[b"  one that ever connects to any hub is told to wipe its config and exit"],
     );
 }
 
@@ -1530,14 +1519,25 @@ fn peer_link(ctx: &Ctx, r: &Crec) -> Vec<u8> {
 }
 
 /// A hub's short name for a matrix column: the first 5 characters.
-fn short5(name: &[u8]) -> Vec<u8> {
+/// A mesh column head: the first `head` and the last `tail` characters of
+/// `name`, or all of it when it has no more than head + tail.
+fn mesh_head(name: &[u8], head: usize, tail: usize, cap: usize) -> Vec<u8> {
+    let mut nc = 0;
+    let mut i = 0;
+    while i < name.len() {
+        i += next_char(&name[i..]).0;
+        nc += 1;
+    }
+    let head = if nc <= head + tail { nc } else { head };
     let mut out = Vec::new();
-    let (mut i, mut chars) = (0usize, 0);
-    while i < name.len() && chars < 5 && out.len() + 4 < 32 {
-        let (l, _, _) = next_char(&name[i..]);
-        out.extend_from_slice(&name[i..i + l]);
+    let (mut i, mut c) = (0usize, 0usize);
+    while i < name.len() {
+        let l = next_char(&name[i..]).0;
+        if (c < head || c + tail >= nc) && out.len() + l < cap {
+            out.extend_from_slice(&name[i..i + l]);
+        }
         i += l;
-        chars += 1;
+        c += 1;
     }
     out
 }
@@ -1600,23 +1600,69 @@ fn render_mesh(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     if nn < 2 {
         return;
     }
-    for i in 0..nn {
-        // a leading "hub-" says nothing in a column head
-        let mut nm = nodes[i].name;
-        if nm.len() > 4 && nm[..4].eq_ignore_ascii_case(b"hub-") {
-            nm = &nm[4..];
-        }
-        let mut sh = short5(nm);
-        let dup = (0..i).filter(|&k| nodes[k].shrt == sh).count();
-        if dup > 0 {
-            let l = sh.len();
-            if l > 0 && l + 2 < 32 {
-                sh.truncate(l - usize::from(l >= 5));
-                let l2 = sh.len();
-                sh.extend_from_slice(&snp(32 - l2, num(dup + 1)));
+    // Column heads: the first 5 characters of each name ("hub-" dropped: it
+    // says nothing).  Names whose heads clash get their start plus their end,
+    // with the shortest end that tells that group apart ("tnhub1".."tnhub5"
+    // -> "tnhu1".."tnhu5"); if no end does, the group is numbered in list
+    // order.
+    let nm: Vec<&[u8]> = nodes
+        .iter()
+        .map(|n| {
+            if n.name.len() > 4 && n.name[..4].eq_ignore_ascii_case(b"hub-") {
+                &n.name[4..]
+            } else {
+                n.name
             }
+        })
+        .collect();
+    let base: Vec<Vec<u8>> = nm.iter().map(|n| mesh_head(n, 5, 0, 32)).collect();
+    let clash: Vec<bool> = (0..nn)
+        .map(|i| (0..nn).any(|j| j != i && base[i] == base[j]))
+        .collect();
+    for i in 0..nn {
+        nodes[i].shrt = base[i].clone();
+    }
+    let mut done = vec![false; nn];
+    for i in 0..nn {
+        if !clash[i] || done[i] {
+            continue;
         }
-        nodes[i].shrt = sh;
+        // the group of names whose heads are base[i]
+        let grp: Vec<bool> = (0..nn).map(|j| clash[j] && base[j] == base[i]).collect();
+        let pick = (1..=4).find_map(|k| {
+            let cand: Vec<Vec<u8>> = (0..nn)
+                .map(|j| {
+                    if grp[j] {
+                        mesh_head(nm[j], 5 - k, k, 32)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+            let ok = (0..nn).filter(|&j| grp[j]).all(|j| {
+                (0..nn).filter(|&m| m != j).all(|m| {
+                    if grp[m] {
+                        cand[j] != cand[m]
+                    } else {
+                        clash[m] || cand[j] != base[m]
+                    }
+                })
+            });
+            ok.then_some(cand)
+        });
+        let mut ord = 0;
+        for j in (0..nn).filter(|&j| grp[j]) {
+            done[j] = true;
+            ord += 1;
+            nodes[j].shrt = match &pick {
+                Some(cand) => cand[j].clone(),
+                None => {
+                    let mut h = mesh_head(&base[j], if ord < 10 { 4 } else { 3 }, 0, 20);
+                    h.extend_from_slice(&num(ord as i64));
+                    h
+                }
+            };
+        }
     }
     // cell[a][b]: 0 unknown, 1 up, 2 down
     let mut cell = vec![vec![0u8; nn]; nn];
@@ -1635,13 +1681,17 @@ fn render_mesh(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         .max()
         .unwrap_or(0)
         .max(0);
-    let cw = 6;
+    // Whole names head the columns when they fit (each glyph centred under
+    // its name); the short heads only when the terminal is too narrow.
+    let fw = (nw + 2).max(6);
+    let full = 3 + nw + 2 + fw * nn as i32 <= ctx.width;
+    let cw = if full { fw } else { 6 };
     let mut b = Sb::default();
     if 3 + nw + 2 + cw * nn as i32 <= ctx.width {
         b.pad(3 + nw + 2);
         for n in &nodes {
             let x = b.w;
-            b.a(&n.shrt);
+            b.a(if full { n.name } else { &n.shrt });
             b.pad(x + cw);
         }
         b.emit(out, RL_HEAD);
@@ -1651,7 +1701,8 @@ fn render_mesh(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             b.pad(3 + nw + 2);
             for c in 0..nn {
                 let x = b.w;
-                b.pad(x + 2);
+                let w = str_width(nodes[c].name);
+                b.pad(x + if full && w > 0 { (w - 1) / 2 } else { 2 });
                 let g = if a == c {
                     G_DOT
                 } else if cell[a][c] == 1 {
@@ -1736,7 +1787,7 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             b" down",
         ]),
     );
-    title(ctx, out, b"Peer hubs", Some(&right));
+    title(ctx, out, b"Linked hubs", Some(&right));
     const COLS: [Col; 11] = [
         col("#", b'R', 1),
         col("NAME", b'L', 1),
@@ -1797,8 +1848,8 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     if t.nr() == 0 {
         empty_note(
             out,
-            "no peer hubs configured: this hub runs alone",
-            Some("peer add <ip> <port> <uuid> <name|-> <key>"),
+            "no other hubs linked: this hub runs alone",
+            Some("hub add <ip> <port> <uuid> <name|-> <key>"),
         );
     } else {
         t.render(ctx, out);
@@ -1911,12 +1962,296 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     }
 }
 
+/// The pieces of a comma list as C's `for (p = ol; *p;)` walk sees them: a
+/// trailing empty piece is not one.
+fn comma_pieces(ol: &[u8]) -> Vec<&[u8]> {
+    let mut v: Vec<&[u8]> = ol.split(|&b| b == b',').collect();
+    if ol.is_empty() || ol.ends_with(b",") {
+        v.pop();
+    }
+    v
+}
+
+/// hub del's preview (peer.refs): the hub, the hubs that link to it, the bots
+/// whose hub list holds it, and what to run where.  ui.rs asks the question
+/// after it.
+fn render_peer_refs(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let Some(t) = rep.r.iter().find(|x| x.is("peer")) else {
+        return;
+    };
+    let tn = peer_name(t);
+    let up = t.rvb("up");
+    let ttl = snp(160, cat(&[b"Hub ", tn]));
+    let v = snp(
+        160,
+        cat(&[
+            glyph(ctx, if up { G_ON } else { G_ERR }),
+            b" link ",
+            if up { b"up" } else { b"down" },
+        ]),
+    );
+    title(ctx, out, &ttl, Some(&v));
+    const L: i32 = 8;
+    card(
+        out,
+        L,
+        "uuid",
+        t.rvs("uuid").unwrap_or(glyph(ctx, G_DASH)),
+        RL_NORMAL,
+    );
+    card(out, L, "address", &addr_of(t, 160), RL_NORMAL);
+    card(out, L, "key", t.rvs("fp").unwrap_or(b"(no key)"), RL_NORMAL);
+
+    let (mut hrefs, mut hunrep, mut brefs, mut bunrep) = (0i64, 0i64, 0i64, 0i64);
+    for r in &rep.r {
+        if r.is("hubref") && !r.rvb("self") {
+            hrefs += 1;
+        } else if r.is("hubunrep") {
+            hunrep += 1;
+        } else if r.is("botref") {
+            brefs += 1;
+        } else if r.is("botunrep") {
+            bunrep += 1;
+        }
+    }
+    line(out, RL_NORMAL, &[b""]);
+    if hrefs == 0 && hunrep == 0 && brefs == 0 && bunrep == 0 {
+        line(
+            out,
+            RL_NORMAL,
+            &[b"  No other hub links to ", tn, b" and no bot lists it."],
+        );
+        return;
+    }
+    let dot = glyph(ctx, G_DOT);
+
+    // hubs
+    let ttl = snp(160, cat(&[b"Hubs that link to ", tn]));
+    let mut v = format!("{} of {} hubs", hrefs + 1, rep.res.rvi("hubs", 0)).into_bytes();
+    if hunrep > 0 {
+        v = cat(&[&v, b" ", dot, format!(" {hunrep} not reported").as_bytes()]);
+    }
+    let v = snp(160, v);
+    title(ctx, out, &ttl, Some(&v));
+    const HCOLS: [Col; 3] = [
+        col("HUB", b'L', 1),
+        col("LINK", b'L', 1),
+        col("TO DO", b'L', 2),
+    ];
+    let mut ht = Tbl::new(&HCOLS, -1, 0, 2);
+    for r in rep.r.iter().filter(|r| r.is("hubref")) {
+        let up = r.rvs("state") == Some(b"up");
+        let lk = snp(
+            32,
+            cat(&[
+                glyph(ctx, if up { G_ON } else { G_ERR }),
+                b" ",
+                if up { b"up" } else { b"down" },
+            ]),
+        );
+        let todo = if r.rvb("self") {
+            snp(256, b"this hub: unlinked when you answer y".to_vec())
+        } else {
+            snp(
+                256,
+                cat(&[
+                    b"hub del ",
+                    tn,
+                    b" on ",
+                    r.rv("name").unwrap_or(b"?"),
+                    if up {
+                        b""
+                    } else {
+                        b" (link configured, down now)"
+                    },
+                ]),
+            )
+        };
+        let cells = [r.rv("name"), Some(lk.as_slice()), Some(todo.as_slice())];
+        ht.row(ctx, if up { RL_NORMAL } else { RL_WARN }, None, &cells);
+    }
+    ht.render(ctx, out);
+    if hunrep > 0 {
+        let mut o: Vec<u8> = Vec::new();
+        for r in rep.r.iter().filter(|r| r.is("hubunrep")) {
+            if !o.is_empty() {
+                o.extend_from_slice(b", ");
+            }
+            o.extend_from_slice(r.rv("name").unwrap_or(b"?"));
+        }
+        line(
+            out,
+            RL_DIM,
+            &[
+                b"  not reported: ",
+                &o,
+                b" (their links never reached this hub)",
+            ],
+        );
+    }
+
+    // bots
+    line(out, RL_NORMAL, &[b""]);
+    let ttl = snp(160, cat(&[b"Bots that list ", tn]));
+    let mut v = format!("{brefs} of {} bots", rep.res.rvi("bots", 0)).into_bytes();
+    if bunrep > 0 {
+        v = cat(&[&v, b" ", dot, format!(" {bunrep} not reported").as_bytes()]);
+    }
+    let v = snp(160, v);
+    title(ctx, out, &ttl, Some(&v));
+    const BCOLS: [Col; 4] = [
+        col("BOT", b'L', 1),
+        col("NOW", b'L', 1),
+        col("ITS OTHER HUBS", b'L', 2),
+        col("TO DO", b'L', 2),
+    ];
+    let mut bt = Tbl::new(&BCOLS, -1, 0, 2);
+    let mut unknown = false;
+    for r in rep.r.iter().filter(|r| r.is("botref")) {
+        let now = if r.rvs("on").is_some() {
+            snp(
+                96,
+                cat(&[glyph(ctx, G_ON), b" on ", r.rv("on_name").unwrap_or(b"?")]),
+            )
+        } else if r.rvi("seen", 0) > 0 {
+            let sp = snp(32, span(ctx.now - r.rvi("seen", 0)));
+            snp(96, cat(&[glyph(ctx, G_OFF), b" offline ", &sp]))
+        } else {
+            snp(96, cat(&[glyph(ctx, G_OFF), b" offline"]))
+        };
+        let ol = r.rvs("others").unwrap_or(b"");
+        let mut o: Vec<u8> = Vec::new();
+        for p in comma_pieces(ol) {
+            if !o.is_empty() {
+                o.push(b' ');
+            }
+            if p.first() == Some(&b'?') {
+                o.extend_from_slice(&p[1..]);
+                o.extend_from_slice(b" (?)");
+                unknown = true;
+            } else {
+                o.extend_from_slice(p);
+            }
+        }
+        let stranded = ol.is_empty();
+        let todo = if stranded {
+            snp(
+                160,
+                cat(&[glyph(ctx, G_ERR), b" add another hub first (+hub)"]),
+            )
+        } else {
+            snp(
+                160,
+                cat(&[b"-hub ", r.rvs("addr").unwrap_or(b"<its address for it>")]),
+            )
+        };
+        let nk = r.rvs("nick").or_else(|| r.rv("uuid"));
+        let others: &[u8] = if stranded { b"none" } else { &o };
+        let cells = [
+            nk,
+            Some(now.as_slice()),
+            Some(others),
+            Some(todo.as_slice()),
+        ];
+        bt.row(
+            ctx,
+            if stranded { RL_WARN } else { RL_NORMAL },
+            None,
+            &cells,
+        );
+    }
+    if bt.nr() > 0 {
+        bt.render(ctx, out);
+    } else {
+        line(out, RL_NORMAL, &[b"  (no bot lists it)"]);
+    }
+    if bunrep > 0 {
+        let mut o: Vec<u8> = Vec::new();
+        for r in rep.r.iter().filter(|r| r.is("botunrep")) {
+            if !o.is_empty() {
+                o.extend_from_slice(b", ");
+            }
+            o.extend_from_slice(r.rvs("nick").or_else(|| r.rv("uuid")).unwrap_or(b"?"));
+        }
+        line(
+            out,
+            RL_DIM,
+            &[
+                b"  not reported: ",
+                &o,
+                b" (no hub list from them: an older build, or not connected since)",
+            ],
+        );
+    }
+    let warn = glyph(ctx, G_WARN);
+    for r in rep.r.iter().filter(|r| r.is("botref")) {
+        let nk = r.rvs("nick").or_else(|| r.rv("uuid")).unwrap_or(b"?");
+        match r.rvs("others") {
+            None => line(
+                out,
+                RL_WARN,
+                &[
+                    b"  ",
+                    warn,
+                    b" ",
+                    nk,
+                    b" lists no other hub: without ",
+                    tn,
+                    b" it cannot connect at all.",
+                ],
+            ),
+            Some(ol)
+                if r.rvs("on_uuid").is_some()
+                    && t.rvs("uuid").is_some()
+                    && r.rv("on_uuid") == t.rv("uuid") =>
+            {
+                let cnt = ol.iter().filter(|&&b| b == b',').count() + 1;
+                let mut o: Vec<u8> = Vec::new();
+                for (i, p) in comma_pieces(ol).into_iter().enumerate() {
+                    let k = i + 1;
+                    o.extend_from_slice(if k == 1 {
+                        b"".as_slice()
+                    } else if k == cnt {
+                        b" or "
+                    } else {
+                        b", "
+                    });
+                    o.extend_from_slice(if p.first() == Some(&b'?') { &p[1..] } else { p });
+                }
+                line(
+                    out,
+                    RL_WARN,
+                    &[
+                        b"  ",
+                        warn,
+                        b" ",
+                        nk,
+                        b" is on ",
+                        tn,
+                        b" now: after its -hub it moves to ",
+                        &o,
+                        b".",
+                    ],
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    if unknown {
+        line(
+            out,
+            RL_DIM,
+            &[b"  (?) a hub this hub has no key for, shown by the address the bot uses"],
+        );
+    }
+}
+
 fn render_peer_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let Some(r) = rep.r.iter().find(|x| x.is("peer")) else {
         return;
     };
     let dot = glyph(ctx, G_DOT);
-    let t = snp(96, cat(&[b"Peer ", peer_name(r)]));
+    let t = snp(96, cat(&[b"Hub ", peer_name(r)]));
     let link = peer_link(ctx, r);
     title(ctx, out, &t, Some(&link));
     const L: i32 = 12;
@@ -2001,7 +2336,7 @@ fn render_peer_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     } else {
         &sb.p
     };
-    card(out, L, "its peers", its, RL_NORMAL);
+    card(out, L, "its links", its, RL_NORMAL);
     const KNOWN: &[&str] = &[
         "n",
         "uuid",
@@ -2097,7 +2432,7 @@ fn render_hub_show(ctx: &Ctx, h: &Crec, out: &mut Flines) {
         &num(h.rvi("peers", 0)),
         b" up",
     ]);
-    card(out, L, "peers", &v, RL_NORMAL);
+    card(out, L, "hubs", &v, RL_NORMAL);
     let v = cat(&[
         &num(h.rvi("bots_here", 0)),
         b" here ",
@@ -2129,7 +2464,7 @@ fn render_hub_show(ctx: &Ctx, h: &Crec, out: &mut Flines) {
     ]);
     card(out, L, "log", &v, RL_NORMAL);
     let v = cat(&[
-        b"peers: peer add ",
+        b"hubs: hub add ",
         glyph(ctx, G_ELL),
         b" <key>   ",
         dot,
@@ -2269,7 +2604,7 @@ const LIMIT_ROWS: [(&str, &str, &str); 13] = [
     (
         "conn",
         "perip",
-        "connections at once from one address, bots, peers and SSH (2-64)",
+        "connections at once from one address, bots, hubs and SSH (2-64)",
     ),
     (
         "conn",
@@ -2445,7 +2780,14 @@ fn render_hub_set(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         effect(
             ctx,
             out,
-            b"peers learn the new name with the next mesh gossip (now)",
+            b"other hubs learn the new name with the next mesh gossip (now)",
+        );
+    }
+    if setting == b"autopurge" {
+        effect(
+            ctx,
+            out,
+            b"every hub uses it; the hub with the lowest uuid runs the purge",
         );
     }
     if r.rvb("restart") {
@@ -2461,7 +2803,7 @@ fn render_hub_set(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             let ph = cat(&[
                 b"after the restart, admins connect with ssh -p ",
                 val,
-                b"; peers and bots must use :",
+                b"; other hubs and bots must use :",
                 val,
             ]);
             effect(ctx, out, &snp(160, ph));
@@ -2505,7 +2847,7 @@ fn render_hub_rekeyed(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             RL_WARN
         },
     );
-    let p = snp(48, plural(r.rvi("peers", 0), "peer link", "peer links"));
+    let p = snp(48, plural(r.rvi("peers", 0), "hub link", "hub links"));
     let b = snp(48, plural(r.rvi("bots", 0), "bot", "bots"));
     card(out, L, "dropped", &cat(&[&p, b", ", &b]), RL_NORMAL);
     line(out, RL_HEAD, &[b" Next steps"]);
@@ -2513,7 +2855,7 @@ fn render_hub_rekeyed(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         out,
         RL_NORMAL,
         &[
-            b"  1. on each peer hub:   peer set ",
+            b"  1. on each other hub:  hub set ",
             r.rvs("uuid").unwrap_or(b"<this hub's uuid>"),
             b" key <new key>",
         ],
@@ -2594,12 +2936,12 @@ fn render_tomb_purged(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         cat(&[
             b"purge sent to ",
             &num(peers),
-            b" peer hub",
+            b" other hub",
             pl(peers),
             b" (they purge on their own)",
         ])
     } else {
-        b"no peer hub is linked now to send the purge to".to_vec()
+        b"no other hub is linked now to send the purge to".to_vec()
     };
     effect(ctx, out, &p);
 }
@@ -2726,6 +3068,12 @@ fn opname(op: u64) -> Option<&'static str> {
         0x79 => "CMD_ADMIN_NET_SET",
         0x7A => "CMD_ADMIN_SET_SSH",
         0x7B => "CMD_CHAN_EVENT",
+        0x7C => "CMD_ADMIN_USER_ACCESS",
+        0x7D => "CMD_USER_CHAN_REQUEST",
+        0x7E => "CMD_USER_CHAN_RESULT",
+        0x7F => "CMD_BOT_RETIRE",
+        0x80 => "CMD_BOT_RETIRE_ACK",
+        0x81 => "CMD_ADMIN_LIST_REVOKED",
         _ => return None,
     })
 }
@@ -2734,6 +3082,56 @@ fn count_kv(b: &mut Sb, label: &str, n: u64, colx: i32) {
     let c = count(n);
     b.pad(colx);
     b.a(&cat(&[s(label), b"  ", &c]));
+}
+
+/// The maintenance countdowns of a stats reply ("timer" records).
+fn render_timers(ctx: &Ctx, rep: &Creply, ld: Option<&Crec>, out: &mut Flines) {
+    const NAMES: [(&str, &str); 6] = [
+        ("gossip", "mesh gossip"),
+        ("entropy", "anti-entropy sync"),
+        ("scan", "client scan"),
+        ("ipclean", "ip limit cleanup"),
+        ("peers", "hub reconnect"),
+        ("purge", "tombstone purge"),
+    ];
+    const COLS: [Col; 3] = [
+        col("JOB", b'L', 1),
+        col("EVERY", b'R', 1),
+        col("NEXT RUN", b'R', 1),
+    ];
+    let mut t = Tbl::new(&COLS, -1, 1, 1);
+    for r in rep.r.iter().filter(|x| x.is("timer")) {
+        let k = r.rv("name").unwrap_or(b"?");
+        let label = NAMES
+            .iter()
+            .find(|(n, _)| n.as_bytes() == k)
+            .map_or(k, |(_, l)| l.as_bytes());
+        let every = snp(48, dur3(r.rvi("every", 0)));
+        let next = if r.rv("in") == Some(b"off".as_slice()) {
+            b"off".to_vec()
+        } else {
+            snp(48, dur3(r.rvi("in", 0)))
+        };
+        t.row(
+            ctx,
+            RL_NORMAL,
+            None,
+            &[Some(label), Some(&every), Some(&next)],
+        );
+    }
+    if t.cells.is_empty() {
+        return;
+    }
+    flines_add(out, RL_NORMAL, b"");
+    let right: Option<&[u8]> = ld.map(|l| {
+        if l.rvi("dirty", 0) != 0 {
+            b"config unsaved".as_slice()
+        } else {
+            b"config saved".as_slice()
+        }
+    });
+    title(ctx, out, b"Maintenance timers", right);
+    t.render(ctx, out);
 }
 
 fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
@@ -2747,6 +3145,7 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     title(ctx, out, b"Hub statistics", Some(&right));
     let cfg = rep.r.iter().rfind(|x| x.is("cfg"));
     let sy = rep.r.iter().rfind(|x| x.is("sync"));
+    let ld = rep.r.iter().rfind(|x| x.is("load"));
     let mut b = Sb::default();
     if let Some(cfg) = cfg {
         line(out, RL_HEAD, &[b" Config pushes to bots"]);
@@ -2756,13 +3155,22 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         b.emit(out, RL_NORMAL);
     }
     if let Some(sy) = sy {
-        line(out, RL_HEAD, &[b" Sync frames from peers"]);
+        line(out, RL_HEAD, &[b" Sync frames from other hubs"]);
         count_kv(&mut b, "  frames", sy.rvu("frames"), 0);
         count_kv(&mut b, "no-op", sy.rvu("noop"), 24);
         count_kv(&mut b, "records", sy.rvu("records"), 40);
         count_kv(&mut b, "applied", sy.rvu("applied"), 60);
         b.emit(out, RL_NORMAL);
     }
+    if let Some(ld) = ld {
+        line(out, RL_HEAD, &[b" Connections"]);
+        count_kv(&mut b, "  total", ld.rvu("clients"), 0);
+        count_kv(&mut b, "bots", ld.rvu("bots"), 24);
+        count_kv(&mut b, "hubs", ld.rvu("peers"), 40);
+        count_kv(&mut b, "authing", ld.rvu("authing"), 60);
+        b.emit(out, RL_NORMAL);
+    }
+    render_timers(ctx, rep, ld, out);
     flines_add(out, RL_NORMAL, b"");
     title(ctx, out, b"Traffic by message", Some(b"sorted by bytes"));
     let mut ix: Vec<usize> = (0..rep.r.len()).filter(|&i| rep.r[i].is("op")).collect();
@@ -3150,7 +3558,7 @@ fn render_acl_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         effect(
             ctx,
             out,
-            b"console scope: applies to SSH logins only, bots and peers are not affected",
+            b"console scope: applies to SSH logins only, bots and other hubs are not affected",
         );
     }
     if r.rvb("first") {
@@ -3274,6 +3682,65 @@ fn user_seen(ctx: &Ctx, u: &Crec, with_ip: bool, cap: usize) -> Vec<u8> {
     when_ago(ctx, u.rvi("seen", 0), cap)
 }
 
+/// An admin's flags or an oper's channels for the user tables (plan U9).
+fn user_access(ctx: &Ctx, u: &Crec) -> Vec<u8> {
+    if u.rv("flags").is_some() {
+        match u.rvs("flags") {
+            Some(f) => snp(512, cat(&[b"+", f])),
+            None => b"(none)".to_vec(),
+        }
+    } else if u.rv("chans").is_some() {
+        snp(512, u.rvs("chans").unwrap_or(b"(none)").to_vec())
+    } else {
+        glyph(ctx, G_DASH).to_vec()
+    }
+}
+
+/// old_hubs= on a user change: hubs that do not know flags / channels.
+fn user_old_hubs_warn(ctx: &Ctx, r: &Crec, out: &mut Flines) {
+    let Some(h) = r.rvs("old_hubs") else {
+        return;
+    };
+    let m = snp(
+        512,
+        cat(&[
+            b"older hubs do not know flags or channels: ",
+            h,
+            b" ",
+            glyph(ctx, G_DASH),
+            b" they and their bots do not get this user until upgraded to 2.4.7",
+        ]),
+    );
+    warn(ctx, out, &m);
+}
+
+/// "chu" -> "channels, opers, upgrades"; "a" -> "full admin".  C
+/// `flags_words` (cap bytes with the NUL).
+fn flags_words(flags: Option<&[u8]>, cap: usize) -> Vec<u8> {
+    const W: [(u8, &str); 6] = [
+        (b'a', "full admin"),
+        (b'b', "bots"),
+        (b'c', "channels"),
+        (b'h', "hub"),
+        (b'o', "opers"),
+        (b'u', "upgrades"),
+    ];
+    let mut out: Vec<u8> = Vec::new();
+    for &p in flags.unwrap_or(b"") {
+        for (f, w) in W {
+            if f == p && out.len() + 1 < cap {
+                let piece = cat(&[if out.is_empty() { b"" } else { b", " }, w.as_bytes()]);
+                let room = cap - out.len() - 1;
+                out.extend_from_slice(&piece[..piece.len().min(room)]);
+            }
+        }
+    }
+    if out.is_empty() {
+        out = b"no flags: views only".to_vec();
+    }
+    out
+}
+
 fn render_user_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let r = &rep.res;
     let dot = glyph(ctx, G_DOT);
@@ -3300,9 +3767,10 @@ fn render_user_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         pl(m),
     ]);
     title(ctx, out, &t, Some(&snp(96, right)));
-    const COLS: [Col; 6] = [
+    const COLS: [Col; 7] = [
         col("ROLE", b'L', 1),
         col("NAME", b'L', 1),
+        col("ACCESS", b'L', 1),
         col("KEY", b'L', 1),
         col("LAST SEEN", b'L', 1),
         col("MASKS", b'R', 1),
@@ -3310,6 +3778,7 @@ fn render_user_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     ];
     let mut tb = Tbl::new(&COLS, -1, 1, 1);
     for u in rep.r.iter().filter(|u| u.is("user")) {
+        let acc = user_access(ctx, u);
         let seen = user_seen(ctx, u, false, 96);
         let masks = snp(16, num(u.rvi("masks", 0)));
         let cons = if u.rv("sessions").is_some() {
@@ -3325,6 +3794,7 @@ fn render_user_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         let cells = [
             u.rv("role"),
             u.rv("name"),
+            Some(acc.as_slice()),
             Some(fp),
             Some(&seen),
             Some(&masks),
@@ -3341,7 +3811,11 @@ fn render_user_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     line(
         out,
         RL_DIM,
-        &[b"  user show <name> for masks and their last use"],
+        &[
+            b"  user show <name> for masks and their last use ",
+            glyph(ctx, G_DOT),
+            b" ACCESS: an admin's flags, an oper's channels",
+        ],
     );
 }
 
@@ -3359,6 +3833,38 @@ fn render_user_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         let t = snp(96, cat(&[b"User ", u.rv("name").unwrap_or(b"?")]));
         title(ctx, out, &t, u.rv("role"));
         const L: i32 = 10;
+        if u.rv("flags").is_some() {
+            let fw = flags_words(u.rv("flags"), 96);
+            let v = snp(
+                160,
+                cat(&[
+                    if u.rvs("flags").is_some() { b"+" } else { b"" },
+                    u.rvs("flags").unwrap_or(b"(none)"),
+                    b"  (",
+                    &fw,
+                    b")",
+                ]),
+            );
+            let lv = if u.rvs("flags").is_some() {
+                RL_NORMAL
+            } else {
+                RL_WARN
+            };
+            card(out, L, "flags", &v, lv);
+        } else if u.rv("chans").is_some() {
+            let v: &[u8] = match u.rvs("chans") {
+                None => b"(none: no channel access)",
+                Some(b"*") => b"* (every channel)",
+                Some(c) => c,
+            };
+            let v = snp(160, v.to_vec());
+            let lv = if u.rvs("chans").is_some() {
+                RL_NORMAL
+            } else {
+                RL_WARN
+            };
+            card(out, L, "channels", &v, lv);
+        }
         card(out, L, "key", u.rvs("fp").unwrap_or(b"(no key)"), RL_NORMAL);
         let v = user_seen(ctx, u, true, 160);
         card(out, L, "last seen", &v, RL_NORMAL);
@@ -3367,7 +3873,9 @@ fn render_user_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             let v = cat(&[&num(sn), b" open session", pl(sn)]);
             card(out, L, "console", &v, RL_NORMAL);
         }
-        const KNOWN: &[&str] = &["name", "role", "fp", "seen", "masks", "sessions"];
+        const KNOWN: &[&str] = &[
+            "name", "role", "fp", "seen", "masks", "sessions", "flags", "chans",
+        ];
         unknown_keys(ctx, out, u, KNOWN, L);
         const COLS: [Col; 2] = [col("MASK", b'L', 1), col("LAST USED", b'L', 1)];
         let mut t = Tbl::new(&COLS, -1, 0, 0);
@@ -3406,7 +3914,23 @@ fn render_user_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         ok(ctx, b"User added", Some(&subj), out);
         res_kv(out, "key", r.rvs("fp").unwrap_or(b"?"));
         res_kv(out, "mask", r.rvs("mask").unwrap_or(b"?"));
+        if r.rv("flags").is_some() {
+            let fw = flags_words(r.rv("flags"), 160);
+            let subj = snp(
+                256,
+                cat(&[b"+", r.rv("flags").unwrap_or(b""), b"  (", &fw, b")"]),
+            );
+            res_kv(out, "flags", &subj);
+        }
+        if let Some(c) = r.rvs("chans") {
+            res_kv(
+                out,
+                "channels",
+                if c == b"*" { b"* (every channel)" } else { c },
+            );
+        }
         effect(ctx, out, &ph);
+        user_old_hubs_warn(ctx, r, out);
         let subj = if r.rv("role") == Some(b"admin") {
             cat(&[
                 name,
@@ -3462,6 +3986,56 @@ fn render_user_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             let subj = cat(&[&num(sn), b" open console session", pl(sn), b" closed"]);
             effect(ctx, out, &subj);
         }
+    } else if code == b"user.flags" {
+        let what = snp(96, cat(&[b"User ", name]));
+        let subj = cat(&[
+            b"flags   +",
+            r.rvs("old").unwrap_or(b""),
+            b" ",
+            glyph(ctx, G_ARROW),
+            b" +",
+            r.rvs("flags").unwrap_or(b""),
+        ]);
+        ok(ctx, &what, Some(&snp(256, subj)), out);
+        let fw = flags_words(r.rv("flags"), 160);
+        res_kv(out, "can", &snp(256, cat(&[b"now: ", &fw])));
+        if !r.rvb("written") {
+            effect(ctx, out, b"no change: they already had those flags");
+        } else {
+            effect(ctx, out, &ph);
+        }
+        user_old_hubs_warn(ctx, r, out);
+    } else if code == b"user.chan" {
+        let what = snp(96, cat(&[b"User ", name]));
+        let add = r.rv("action") == Some(b"add");
+        let ch = r.rv("chan").unwrap_or(b"?");
+        let subj = if ch == b"*" {
+            if add {
+                b"every channel (*)".to_vec()
+            } else {
+                b"every channel removed".to_vec()
+            }
+        } else {
+            cat(&[
+                b"channel ",
+                if add { b"added" } else { b"removed" },
+                b"   ",
+                ch,
+            ])
+        };
+        ok(ctx, &what, Some(&snp(256, subj)), out);
+        let chans: &[u8] = match r.rvs("chans") {
+            None => b"(none: no channel access)",
+            Some(b"*") => b"* (every channel)",
+            Some(c) => c,
+        };
+        res_kv(out, "channels", chans);
+        if !r.rvb("written") {
+            effect(ctx, out, b"no change: they already had that");
+        } else {
+            effect(ctx, out, &ph);
+        }
+        user_old_hubs_warn(ctx, r, out);
     } else {
         let add = code == b"user.mask_added";
         let m = r.rvi("masks", 0);
@@ -3680,9 +4254,9 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let bots = r.rvi("bots", 0);
     let peers = r.rvi("peers", 0);
     let pp = if peers > 0 {
-        cat(&[b"synced to ", &num(peers), b" peer hub", pl(peers)])
+        cat(&[b"synced to ", &num(peers), b" other hub", pl(peers)])
     } else {
-        b"no peer hub linked".to_vec()
+        b"no other hub linked".to_vec()
     };
     if code == b"channel.added" {
         if r.rvb("existed") {
@@ -3804,14 +4378,14 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 pl(local),
                 b" on this hub asked; forwarded to ",
                 &num(peers),
-                b" peer hub",
+                b" other hub",
                 pl(peers),
             ])
         } else {
             cat(&[
                 b"no bots on this hub; forwarded to ",
                 &num(peers),
-                b" peer hub",
+                b" other hub",
                 pl(peers),
             ])
         };
@@ -4105,10 +4679,10 @@ fn push_effects(ctx: &Ctx, r: &Crec, out: &mut Flines) {
     let pp = if peers > 0 {
         snp(
             96,
-            cat(&[b"synced to ", &num(peers), b" peer hub", pl(peers)]),
+            cat(&[b"synced to ", &num(peers), b" other hub", pl(peers)]),
         )
     } else {
-        b"no peer hub linked".to_vec()
+        b"no other hub linked".to_vec()
     };
     let ph = snp(
         160,
@@ -4243,7 +4817,7 @@ fn render_settings_table(ctx: &Ctx, rep: &Creply, out: &mut Flines, network: boo
     }
     let (title_s, right) = if network {
         (
-            b"Bot floods".to_vec(),
+            b"Bot settings".to_vec(),
             snp(
                 160,
                 cat(&[
@@ -4312,7 +4886,7 @@ fn render_settings_table(ctx: &Ctx, rep: &Creply, out: &mut Flines, network: boo
         );
         hint(
             out,
-            b"network set flood <cmd|msg|ctcp> <N:S|off|default> \xc2\xb7 network set ignoretime <min|default> \xc2\xb7 network set sendq <B:I|default>",
+            b"bot set flood <cmd|msg|ctcp> <N:S|off|default> \xc2\xb7 bot set ignoretime <min|default> \xc2\xb7 bot set sendq <B:I|default>",
         );
     } else {
         let eff = r.rv("effective");
@@ -4350,7 +4924,7 @@ fn render_settings_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         let a = setting_value(st, r.rv("kind"), r.rv("old"), 48);
         let b = setting_value(st, r.rv("kind"), r.rv("value"), 48);
         let subj = snp(160, cat(&[st, b"   ", &a, b" ", arrow, b" ", &b]));
-        ok(ctx, b"Bot floods", Some(&subj), out);
+        ok(ctx, b"Bot settings", Some(&subj), out);
         if !r.rvb("written") {
             effect(ctx, out, b"no change: it already had that value");
         } else {
@@ -4472,10 +5046,11 @@ fn render_ban_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         return;
     }
     rows.sort_by(ban_row_cmp);
-    const COLS: [Col; 7] = [
+    const COLS: [Col; 8] = [
         col("CHANNEL", b'L', 1),
         col("MASK", b'L', 1),
         col("EXPIRES", b'L', 1),
+        col("LAST USED", b'L', 1),
         col("STICKY", b'L', 2),
         col("BY", b'L', 2),
         col("REASON", b'L', 2),
@@ -4486,6 +5061,12 @@ fn render_ban_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         let ex = ban_expiry(ctx, c.rvi("expires", 0), 96);
         let when_s = when_ago(ctx, c.rvi("ts", 0), 64);
         let sticky: &[u8] = if c.rvb("sticky") { b"yes" } else { b"no" };
+        // a sticky ban is always on the channel: no match is ever seen
+        let used = if c.rvb("sticky") {
+            b"always".to_vec()
+        } else {
+            when_ago(ctx, c.rvi("used", 0), 64)
+        };
         t.row(
             ctx,
             RL_NORMAL,
@@ -4494,6 +5075,7 @@ fn render_ban_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 c.rv("chan"),
                 c.rv("mask"),
                 Some(&ex),
+                Some(&used),
                 Some(sticky),
                 c.rv("setter"),
                 c.rv("reason"),
@@ -5118,7 +5700,7 @@ fn render_upg_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 pl(b),
                 b" and ",
                 &num(p),
-                b" peer hub",
+                b" other hub",
                 pl(p),
                 b" asked to prepare, this hub last; progress: upgrade status, or Alt+4",
             ])
@@ -5138,7 +5720,7 @@ fn render_upg_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         let ph = cat(&[
             b"told ",
             &num(peers),
-            b" peer hub",
+            b" other hub",
             pl(peers),
             b" to drop theirs",
         ]);
@@ -5263,66 +5845,6 @@ fn render_network_tree(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     d.render(ctx, out);
 }
 
-fn render_network_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
-    let r = &rep.res;
-    let right = snp(96, cat(&[b"seen from ", r.rv("name").unwrap_or(b"?")]));
-    title(ctx, out, b"Network status", Some(&right));
-    const L: i32 = 8;
-    let v = snp(96, cat(&[r.rv("peers").unwrap_or(b"?"), b" up"]));
-    card(out, L, "peers", &v, RL_NORMAL);
-    let v = snp(96, cat(&[r.rv("bots").unwrap_or(b"?"), b" online"]));
-    card(out, L, "bots", &v, RL_NORMAL);
-    let upg = r.rv("upg");
-    let run = matches!(upg, Some(u) if u != b"-" && !u.is_empty());
-    card(
-        out,
-        L,
-        "upgrade",
-        if run {
-            upg.unwrap_or(b"")
-        } else {
-            glyph(ctx, G_DASH)
-        },
-        if run { RL_WARN } else { RL_NORMAL },
-    );
-    let fz = r.rvb("frozen");
-    card(
-        out,
-        L,
-        "frozen",
-        if fz { b"yes" } else { b"no" },
-        if fz { RL_WARN } else { RL_NORMAL },
-    );
-    card(
-        out,
-        L,
-        "roll-up",
-        if r.rvb("rollup") { b"yes" } else { b"no" },
-        RL_NORMAL,
-    );
-    let sp = r.rvb("split");
-    card(
-        out,
-        L,
-        "split",
-        if sp {
-            b"yes (a hub is unreachable)"
-        } else {
-            b"no (the mesh is one piece)"
-        },
-        if sp { RL_WARN } else { RL_NORMAL },
-    );
-    let v = cat(&[
-        b"file ",
-        level_name(r.rvi("loglevel", 0)),
-        b" ",
-        glyph(ctx, G_DOT),
-        b" console ",
-        level_name(r.rvi("consolelevel", 0)),
-    ]);
-    card(out, L, "log", &v, RL_NORMAL);
-}
-
 // ===========================================================================
 // Results of bot / peer changes
 // ===========================================================================
@@ -5330,45 +5852,14 @@ fn render_bot_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let r = &rep.res;
     let code = rep.code.as_slice();
     let uuid = r.rv("uuid").unwrap_or(b"?");
-    let ph = snp(256, peers_phrase(r.rvi("peers", 0)));
-    if code == b"bot.approved" {
-        let subj = match r.rvs("ip") {
-            Some(ip) => cat(&[
-                uuid,
-                b"  (was pending #",
-                &num(r.rvi("n", 0)),
-                b", from ",
-                ip,
-                b")",
-            ]),
-            None => uuid.to_vec(),
-        };
-        ok(ctx, b"Bot approved", Some(&snp(256, subj)), out);
-        let p2 = snp(300, cat(&[b"authorization ", &ph]));
-        effect(ctx, out, if r.rvi("peers", 0) > 0 { &p2 } else { &ph });
-        effect(
-            ctx,
-            out,
-            b"the bot is let in on its next connection attempt",
-        );
-    } else if code == b"bot.authorized" {
-        ok(ctx, b"Bot authorized", Some(uuid), out);
-        effect(ctx, out, &ph);
-        if !r.rvb("registered") {
-            effect(
-                ctx,
-                out,
-                b"not yet registered: it still needs bot add, or it registers itself on first connect",
-            );
-        }
-    } else if code == b"bot.added" {
+    if code == b"bot.added" {
         let subj = cat(&[r.rv("nick").unwrap_or(b"?"), b"  ", uuid]);
         ok(ctx, b"Bot registered", Some(&snp(256, subj)), out);
         res_kv(out, "key", r.rvs("fp").unwrap_or(b"?"));
         effect(
             ctx,
             out,
-            b"saved to this hub's config; peers learn it on the next sync",
+            b"saved to this hub's config; other hubs learn it on the next sync",
         );
         res_kv(
             out,
@@ -5382,32 +5873,30 @@ fn render_bot_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         };
         ok(ctx, b"Bot deleted", Some(&snp(256, subj)), out);
         if r.rvb("was_online") {
-            effect(ctx, out, b"disconnected from this hub");
+            effect(
+                ctx,
+                out,
+                b"connected here: told to wipe its config and exit",
+            );
         }
         let (peers, bots) = (r.rvi("peers", 0), r.rvi("bots", 0));
         let ph = cat(&[
-            b"tombstone synced to ",
+            b"synced to ",
             &num(peers),
-            b" peer hub",
+            b" other hub",
             pl(peers),
-            b"; ",
+            b" (one it is connected to does the same); ",
             &num(bots),
             b" bot",
             pl(bots),
             b" told to drop it from their trusted list",
         ]);
         effect(ctx, out, &snp(256, ph));
-        let d = r.rvi("purge_days", 0);
-        let ph = if d > 0 {
-            cat(&[
-                b"the tombstone is kept ",
-                &num(d),
-                b" days (hub set autopurge), then purged",
-            ])
-        } else {
-            b"the tombstone stays until hub purge (autopurge is off)".to_vec()
-        };
-        effect(ctx, out, &ph);
+        effect(
+            ctx,
+            out,
+            b"revoked for good: if it ever connects to any hub it is told to wipe its config and exit (bot revoked)",
+        );
     } else if code == b"bot.kicked" {
         let sp = snp(32, span(ctx.now.wrapping_sub(r.rvi("since", ctx.now))));
         let subj = cat(&[
@@ -5471,7 +5960,7 @@ fn render_bot_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             out,
             RL_NORMAL,
             &[
-                b"   3. peers pick up the new key with the next sync ",
+                b"   3. other hubs pick up the new key with the next sync ",
                 glyph(ctx, G_DASH),
                 b" nothing else to do",
             ],
@@ -5498,18 +5987,18 @@ fn render_peer_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             &num(r.rvi("n", 0)),
             b")",
         ]);
-        ok(ctx, b"Peer added", Some(&snp(256, subj)), out);
+        ok(ctx, b"Hub added", Some(&snp(256, subj)), out);
         res_kv(out, "uuid", r.rvs("uuid").unwrap_or(glyph(ctx, G_DASH)));
         res_kv(out, "key", r.rvs("fp").unwrap_or(b"?"));
         let subj = cat(&[
-            b"this hub dials it now; peer list shows the link once ",
+            b"this hub dials it now; hub list shows the link once ",
             peer_name(r),
             b" has added this hub too",
         ]);
         effect(ctx, out, &snp(256, subj));
     } else if rep.code == b"peer.removed" {
         let subj = cat(&[peer_name(r), b"  ", &addr]);
-        ok(ctx, b"Peer removed", Some(&snp(256, subj)), out);
+        ok(ctx, b"Hub unlinked", Some(&snp(256, subj)), out);
         effect(
             ctx,
             out,
@@ -5522,10 +6011,15 @@ fn render_peer_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         effect(
             ctx,
             out,
-            b"bots and peers it carried reach the mesh through the other hubs",
+            b"bots and hubs it carried reach the mesh through the other hubs",
+        );
+        effect(
+            ctx,
+            out,
+            b"on this hub only: run hub del on the other hubs, -hub on the bots that list it",
         );
     } else if rep.code == b"peer.set" {
-        let what = snp(96, cat(&[b"Peer ", peer_name(r)]));
+        let what = snp(96, cat(&[b"Hub ", peer_name(r)]));
         let subj = cat(&[
             r.rv("setting").unwrap_or(b"?"),
             b"   ",
@@ -5562,7 +6056,7 @@ fn render_peer_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         }
         let what = snp(
             96,
-            cat(&[b"Full sync sent to ", &num(peers), b" peer hub", pl(peers)]),
+            cat(&[b"Full sync sent to ", &num(peers), b" other hub", pl(peers)]),
         );
         ok(ctx, &what, names.opt(), out);
         let sz = bytes(r.rvi("bytes", 0) as u64);
@@ -5733,14 +6227,16 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
         render_bot_show(ctx, rep, out);
     } else if c == b"bot.summary" {
         render_bot_summary(ctx, rep, out);
-    } else if c == b"bot.pending" {
-        render_bot_pending(ctx, rep, out);
+    } else if c == b"bot.revoked" {
+        render_bot_revoked(ctx, rep, out);
     } else if has(b"bot.") {
         render_bot_change(ctx, rep, out);
     } else if c == b"peer.list" {
         render_peer_list(ctx, rep, out);
     } else if c == b"peer.show" {
         render_peer_show(ctx, rep, out);
+    } else if c == b"peer.refs" {
+        render_peer_refs(ctx, rep, out);
     } else if has(b"peer.") || c == b"mesh.synced" {
         render_peer_change(ctx, rep, out);
     } else if c == b"hub.show" {
@@ -5799,8 +6295,6 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
         render_upg_change(ctx, rep, out);
     } else if c == b"network.tree" {
         render_network_tree(ctx, rep, out);
-    } else if c == b"network.status" {
-        render_network_status(ctx, rep, out);
     } else {
         render_generic(ctx, rep, out);
     }

@@ -316,6 +316,7 @@ pub fn update_global_entry(
             key: trunc_string(key, 32),
             value: combined,
             timestamp: ts,
+            last_used: 0,
         });
         global_note_new(state, state.global_entries.len() - 1);
         return true;
@@ -343,7 +344,76 @@ fn hostmask_literal(h: &str) -> bool {
 }
 
 /// hub_storage_update_entry(): the single choke point for per-bot state.
+/// A revoked uuid never comes back: no record is created for it but its
+/// tombstone, and one that exists stays deleted.  A bot that becomes deleted
+/// with a key on file joins the revoke list (`revoke`).
 pub fn update_entry(
+    state: &mut HubState,
+    uuid: &str,
+    key: &str,
+    value: &str,
+    extra: &str,
+    op: &str,
+    ts: i64,
+) -> bool {
+    let per_bot = matches!(key, "d" | "pub" | "n" | "h" | "t" | "seen");
+    if per_bot
+        && crate::revoke::is_revoked(state, uuid)
+        && key != "d"
+        && !state.bots.iter().any(|b| b.uuid == uuid)
+    {
+        return false;
+    }
+    let ok = update_entry_inner(state, uuid, key, value, extra, op, ts);
+    if !ok || !per_bot {
+        return ok;
+    }
+    let Some(i) = state.bots.iter().position(|b| b.uuid == uuid) else {
+        return ok;
+    };
+    if crate::revoke::is_revoked(state, uuid) {
+        state.bots[i].is_active = false;
+    }
+    if !state.bots[i].is_active && matches!(key, "d" | "pub" | "n") {
+        let b = state.bots[i].clone();
+        crate::revoke::from_bot(state, &b);
+    }
+    ok
+}
+
+/// hub_hublist_valid(): a bot's hl| value: up to HL_ENTRIES_MAX
+/// comma-separated "<addr>/<fp>", <addr> empty or 1..HL_ADDR_MAX bytes of
+/// [A-Za-z0-9.:_[]-], <fp> exactly HL_FP_LEN lowercase hex.  "" (a bot with
+/// no keyed hub) is valid.
+pub fn hublist_valid(v: &str) -> bool {
+    if v.is_empty() {
+        return true;
+    }
+    let mut n = 0;
+    for ent in v.split(',') {
+        n += 1;
+        if n > HL_ENTRIES_MAX {
+            return false;
+        }
+        let Some((addr, fp)) = ent.split_once('/') else {
+            return false;
+        };
+        if addr.len() > HL_ADDR_MAX
+            || fp.len() != HL_FP_LEN
+            || !addr
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b".:_[]-".contains(&c))
+            || !fp
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn update_entry_inner(
     state: &mut HubState,
     uuid: &str,
     key: &str,
@@ -396,7 +466,7 @@ pub fn update_entry(
     // The bound is on entries, not on the registration above: a refused key
     // still leaves an (empty) bot record, exactly as in the C hub, so the two
     // trees converge on the same config from the same input.
-    if !matches!(key, "t" | "n" | "h" | "pub" | "seen" | "d") {
+    if !matches!(key, "t" | "n" | "h" | "pub" | "seen" | "d" | "hl") {
         crate::hlog_warning!(
             "[STORAGE] REJECTED per-bot key '{key}' for {uuid} (not in whitelist)\n"
         );
@@ -407,6 +477,7 @@ pub fn update_entry(
             "h" => MAX_MASK_LEN - 1,
             "n" => MAX_NICK - 1,
             "pub" => COMBINED_KEY_B64,
+            "hl" => HL_VALUE_MAX,
             _ => 31, // seen/d/t: short numerics
         };
         let vlen = value.len();
@@ -414,6 +485,10 @@ pub fn update_entry(
             crate::hlog_warning!(
                 "[STORAGE] REJECTED per-bot '{key}' for {uuid}: value too long ({vlen} > {cap})\n"
             );
+            return false;
+        }
+        if key == "hl" && !hublist_valid(value) {
+            crate::hlog_warning!("[STORAGE] REJECTED per-bot 'hl' for {uuid}: not a hub list\n");
             return false;
         }
     }
@@ -494,6 +569,7 @@ pub fn update_entry(
             key: trunc_string(key, 32),
             value: combined,
             timestamp: ts,
+            last_used: 0,
         });
         if key == "d" {
             state.bots[bi].is_active = value != "1";
@@ -538,9 +614,15 @@ pub fn delete(state: &mut HubState, uuid: &str) -> Option<i64> {
 /// Global items carry no "b|uuid|" prefix, preserving protocol
 /// compatibility.
 ///
-/// `proto_v2` means the receiving connection advertised v|2 (new a|/o|/b|
-/// shapes); false sends the fail-closed legacy shapes.
-pub fn generate_bot_payload(state: &HubState, uuid: &str, proto_v2: bool) -> String {
+/// `bot_proto` is what the receiving connection advertised: v|2 or more gets
+/// the new a|/o|/b| shapes, less the fail-closed legacy shapes.  Below
+/// `BOT_PROTO_USER_FLAGS` the bot does not know uf| / uc| (plan §3.2): users
+/// are re-stamped, a restricted one is a tombstone (a v2 bot) or left out (an
+/// older or not-yet-known one), and its masks and the access lines are not
+/// sent.
+pub fn generate_bot_payload(state: &HubState, uuid: &str, bot_proto: i32) -> String {
+    let proto_v2 = bot_proto >= BOT_PROTO_PASSWORDLESS;
+    let flags_ok = bot_proto >= BOT_PROTO_USER_FLAGS;
     let mut out = String::with_capacity(4096);
 
     // 1. Global entries (channels; skip h/n/a/m/o — now in typed arrays — and
@@ -557,11 +639,20 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str, proto_v2: bool) -> Str
     //     shape with an EMPTY password slot, so an old bot refuses every
     //     admin command instead of reading the public key as a password.
     for u in &state.user_records {
-        out.push_str(&config::format_user_record(u, !proto_v2));
+        if flags_ok {
+            out.push_str(&config::format_user_record(u, !proto_v2));
+        } else {
+            out.push_str(&crate::access::format_user_for_old(
+                state, u, !proto_v2, proto_v2,
+            ));
+        }
     }
 
     // 1b. Usermask records (m| lines).
     for m in &state.mask_records {
+        if !flags_ok && !crate::access::from_old_ok(state, &m.uuid) {
+            continue;
+        }
         out.push_str(&format!(
             "m|{}|{}|{}|{}|{}\n",
             m.uuid,
@@ -570,6 +661,11 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str, proto_v2: bool) -> Str
             m.last_used,
             m.timestamp
         ));
+    }
+
+    // 1b. Admin flags and oper channel bindings, after the users they name.
+    if flags_ok {
+        crate::access::append(state, &mut out, None);
     }
 
     // 1b. purge_days setting, so bots can validate purge policies.
@@ -944,6 +1040,7 @@ pub fn put_record(state: &mut HubState, key: &str, value: &str, ts: i64) -> bool
         key: key.to_string(),
         value: value.to_string(),
         timestamp: ts,
+        last_used: 0,
     });
     global_note_new(state, state.global_entries.len() - 1);
     true
@@ -1011,6 +1108,33 @@ pub fn chan_cascade_del(state: &mut HubState, chan: &str, ts: i64, announce: boo
         }
         out.push_str(&line);
     }
+    // Oper bindings to the channel go too (user_flags plan U6), same stamp:
+    // every hub and bot applies the same cascade to the same c| del.  "*" is
+    // not a channel and stays.
+    let hits: Vec<(String, String)> = state
+        .uchan_records
+        .iter()
+        .filter(|r| r.is_active && r.chan != "*" && r.chan.eq_ignore_ascii_case(chan))
+        .map(|r| (r.uuid.clone(), r.chan.clone()))
+        .collect();
+    for (uuid, c) in hits {
+        if !crate::access::uchan_put(state, &uuid, &c, false, ts) {
+            continue;
+        }
+        changed += 1;
+        if !announce {
+            continue;
+        }
+        let Some(ri) = crate::access::uchan_find(state, &uuid, &c) else {
+            continue;
+        };
+        let line = crate::access::format_uchan(&state.uchan_records[ri]);
+        if out.len() + line.len() >= 8192 {
+            mesh::broadcast_sync_to_peers(state, &out, -1);
+            out.clear();
+        }
+        out.push_str(&line);
+    }
     if !out.is_empty() {
         mesh::broadcast_sync_to_peers(state, &out, -1);
     }
@@ -1025,6 +1149,30 @@ pub fn chan_cascade_del(state: &mut HubState, chan: &str, ts: i64, announce: boo
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hublist_valid_bounds() {
+        let fp = "0123456789abcdef";
+        assert!(hublist_valid(""));
+        assert!(hublist_valid(&format!("127.0.0.1:7000/{fp}")));
+        assert!(hublist_valid(&format!("/{fp},[::1]:7000/{fp}")));
+        assert!(!hublist_valid(&format!("a b:1/{fp}")));
+        assert!(!hublist_valid(&format!("h:1/{}", &fp[..15])));
+        assert!(!hublist_valid(&format!("h:1/{}", fp.to_uppercase())));
+        assert!(!hublist_valid(&format!("h|x:1/{fp}")));
+        assert!(!hublist_valid(&format!(
+            "{}/{fp}",
+            "a".repeat(HL_ADDR_MAX + 1)
+        )));
+        assert!(!hublist_valid(
+            &vec![format!("h:1/{fp}"); HL_ENTRIES_MAX + 1].join(",")
+        ));
+        assert!(hublist_valid(
+            &vec![format!("h:1/{fp}"); HL_ENTRIES_MAX].join(",")
+        ));
+        assert!(!hublist_valid(&format!("h:1/{fp},")));
+    }
+
     use super::*;
 
     fn st() -> HubState {
@@ -1149,7 +1297,9 @@ mod tests {
         update_entry(&mut s, "other", "h", "otherbot!u@h", "", "", 100);
         update_entry(&mut s, "other", "pub", &k, "", "", 300);
 
-        let v2 = generate_bot_payload(&s, "me", true);
+        // Before flags: the admin is a full admin (access::migrate).
+        crate::access::migrate(&mut s);
+        let v2 = generate_bot_payload(&s, "me", BOT_PROTO_USER_FLAGS);
         assert!(v2.contains("c|#chan|key|0|add|100\n"));
         assert!(v2.contains(&format!(
             "a|11111111-2222-3333-4444-555555555555|rob|{k}|add|10|20|\n"
@@ -1164,7 +1314,7 @@ mod tests {
         assert!(!v2.contains("\nh|"));
         assert!(!v2.contains("\nn|"));
 
-        let legacy = generate_bot_payload(&s, "me", false);
+        let legacy = generate_bot_payload(&s, "me", 0);
         // Field 3 EMPTY so an old bot refuses every admin command; the key
         // still rides in field 7.
         assert!(legacy.contains(&format!(
@@ -1181,7 +1331,7 @@ mod tests {
     fn bot_payload_never_trusts_the_bot_itself() {
         let mut s = st();
         update_entry(&mut s, "me", "h", "mybot!u@h", "", "", 100);
-        let p = generate_bot_payload(&s, "me", true);
+        let p = generate_bot_payload(&s, "me", BOT_PROTO_USER_FLAGS);
         assert!(!p.contains("b|mybot!u@h|me"));
         assert!(p.ends_with("T|0\n"));
     }

@@ -19,7 +19,7 @@
 
 use crate::consts::*;
 use crate::cstr::{now, trunc_string};
-use crate::state::{BotAuthState, BotConfig, ClientType, HubState, PendingBot};
+use crate::state::{BotAuthState, BotConfig, ClientType, HubState, Lane};
 use crate::{crypto, net, presence, ratelimit, storage};
 
 /// Load a bot's combined 64-byte public key from the hub config.
@@ -33,6 +33,82 @@ fn load_bot_combined_pub(state: &HubState, uuid: &str) -> Option<[u8; COMBINED_K
     let mut out = [0u8; COMBINED_KEY_LEN];
     out.copy_from_slice(&dec);
     Some(out)
+}
+
+/// The key a revoked bot must prove (`revoke`).
+fn load_revoked_pub(state: &HubState, uuid: &str) -> Option<[u8; COMBINED_KEY_LEN]> {
+    let r = crate::revoke::find(state, uuid)?;
+    let dec = crypto::b64_decode(&r.pub_key)?;
+    if dec.len() != COMBINED_KEY_LEN {
+        return None;
+    }
+    let mut out = [0u8; COMBINED_KEY_LEN];
+    out.copy_from_slice(&dec);
+    Some(out)
+}
+
+/// retire_ack_apply(): a revoked bot's CMD_BOT_RETIRE_ACK (quarantine or in
+/// session): stamp it wiped and tell the mesh.  The caller closes the
+/// connection.
+pub fn retire_ack_apply(state: &mut HubState, ci: usize, payload: &[u8]) {
+    let id = state.clients[ci].id.clone();
+    if let Some(line) = crate::revoke::mark_wiped(state, &id, now()) {
+        crate::mesh::broadcast_sync_to_peers(state, &line, -1);
+    }
+    if payload.first() == Some(&b'1') {
+        crate::hlog_info!("[REVOKE] Revoked bot {id} wiped its config and is exiting\n");
+    } else {
+        crate::hlog_warning!(
+            "[REVOKE] Revoked bot {id} could not wipe its config; it exits, and is told again \
+             if it ever connects\n"
+        );
+    }
+}
+
+/// hub_retire_revoked_bots(): bot del, here or on another hub: every
+/// connected bot this hub holds that is on the revoke list is told
+/// CMD_BOT_RETIRE.  The maintenance scan closes the ones that never answer
+/// after RETIRE_GRACE_SEC.  Returns how many were told.
+pub fn retire_revoked_bots(state: &mut HubState) -> usize {
+    let t = now();
+    let mut n = 0;
+    for i in 0..state.clients.len() {
+        let c = &state.clients[i];
+        if c.typ != ClientType::Bot
+            || !c.authenticated
+            || c.retiring
+            || !crate::revoke::is_revoked(state, &c.id)
+        {
+            continue;
+        }
+        let c = &mut state.clients[i];
+        let Some(m) = crate::state::QueuedMsg::new(CMD_BOT_RETIRE, Lane::Urgent, &[]) else {
+            continue;
+        };
+        if !crate::queue::enqueue(c, m) {
+            crate::hlog_warning!("[REVOKE] Could not queue CMD_BOT_RETIRE for {}\n", c.id);
+            continue;
+        }
+        c.retiring = true;
+        c.retire_sent = t;
+        crate::hlog_info!(
+            "[REVOKE] Deleted bot {} is connected here: told to wipe its config\n",
+            c.id
+        );
+        n += 1;
+    }
+    // Its row in the tree goes now, on every hub, rather than when the gossip
+    // TTL runs out: roster_upsert refuses to bring it back.
+    let mut i = 0;
+    while i < state.roster.len() {
+        if crate::revoke::is_revoked(state, &state.roster[i].bot_uuid) {
+            state.roster.swap_remove(i);
+            state.tree_dirty = true;
+            continue;
+        }
+        i += 1;
+    }
+    n
 }
 
 /// The transcript the hub signs in phase 2.
@@ -62,6 +138,29 @@ fn bot_transcript(uuid: &str, eph_pub: &[u8; 32], challenge: &[u8; 32]) -> Vec<u
 pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -> bool {
     let packet_len = data.len();
 
+    // QUARANTINE: a revoked bot was sent CMD_BOT_RETIRE as its ACK; the only
+    // frame it may send is CMD_BOT_RETIRE_ACK.  Either way it is closed
+    // (false) — never as a failed login.
+    if state.clients[ci].bot_auth_state == BotAuthState::Quarantine {
+        let mut plain = None;
+        if packet_len > GCM_IV_LEN + GCM_TAG_LEN && packet_len <= 64 {
+            let (body, tag) = data.split_at(packet_len - GCM_TAG_LEN);
+            plain = crypto::aes_gcm_decrypt(body, state.clients[ci].session_key.as_ref(), tag);
+        }
+        match plain {
+            Some(p) if p.len() >= 5 && p[0] == CMD_BOT_RETIRE_ACK => {
+                let st = if p.len() > 5 { p[5] } else { b'0' };
+                retire_ack_apply(state, ci, &[st]);
+            }
+            _ => crate::hlog_info!(
+                "[REVOKE] Revoked bot {} did not answer the wipe (an older build?); closed\n",
+                state.clients[ci].id
+            ),
+        }
+        crypto::wipe(state.clients[ci].session_key.as_mut());
+        return false;
+    }
+
     // PHASE 1: receive the UUID (plaintext).
     if !state.clients[ci].authenticated && state.clients[ci].bot_auth_state == BotAuthState::Idle {
         if packet_len == 0 || packet_len > 63 {
@@ -80,7 +179,12 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             "\n",
         );
 
-        let authorized = state.bots.iter().any(|b| b.uuid == uuid && b.is_active);
+        // A revoked bot goes through the whole handshake (it must prove its
+        // key) and is then told to wipe itself: never a failed login, so a
+        // host that brings an old bot back is not blocked for its other bots.
+        let quarantine = crate::revoke::is_revoked(state, &uuid);
+        state.clients[ci].quarantine = quarantine;
+        let authorized = quarantine || state.bots.iter().any(|b| b.uuid == uuid && b.is_active);
         if !authorized {
             crate::logging::hub_log_with_raw(
                 LOG_WARNING,
@@ -88,9 +192,13 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
                 data,
                 &format!(" from {ip}\n"),
             );
-            add_pending_bot(state, &uuid, &ip);
             ratelimit::record_failed_auth(state, &ip);
             return false;
+        }
+        if quarantine {
+            crate::hlog_info!(
+                "[REVOKE] Revoked bot {uuid} connecting from {ip}: checking its key\n"
+            );
         }
 
         let mut challenge = [0u8; 32];
@@ -148,7 +256,12 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             return false;
         }
 
-        let Some(bot_combined) = load_bot_combined_pub(state, &id) else {
+        let key = if state.clients[ci].quarantine {
+            load_revoked_pub(state, &id)
+        } else {
+            load_bot_combined_pub(state, &id)
+        };
+        let Some(bot_combined) = key else {
             crate::hlog_warning!("[HUB] No public key for bot {id}\n");
             return false;
         };
@@ -191,9 +304,13 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         }
         state.clients[ci].session_key = session_key;
 
-        // The ACK: iv(12) || ciphertext(1) || tag(16) = 29 bytes.
+        // The ACK: iv(12) || ciphertext(1) || tag(16) = 29 bytes.  A revoked
+        // bot gets CMD_BOT_RETIRE in the ACK's place: it wipes its config,
+        // answers CMD_BOT_RETIRE_ACK, and is never a ClientType::Bot here.
+        let quarantine = state.clients[ci].quarantine;
+        let ack_plain = if quarantine { CMD_BOT_RETIRE } else { 0x01 };
         let Some((body, tag)) =
-            crypto::aes_gcm_encrypt(&[0x01], state.clients[ci].session_key.as_ref())
+            crypto::aes_gcm_encrypt(&[ack_plain], state.clients[ci].session_key.as_ref())
         else {
             crate::hlog_error!("[HUB] ACK encrypt failed for {id}\n");
             return false;
@@ -209,6 +326,13 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             if !net::write_framed(sock, &ack) {
                 crate::hlog_warning!("[HUB] Failed to send v2 ACK to {id}\n");
                 return false;
+            }
+            if quarantine {
+                c.bot_auth_state = BotAuthState::Quarantine;
+                crate::hlog_info!(
+                    "[REVOKE] Revoked bot {id} proved its key: told to wipe its config\n"
+                );
+                return true;
             }
             c.typ = ClientType::Bot;
             c.authenticated = true;
@@ -231,37 +355,6 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
     }
 
     false
-}
-
-/// add_pending_bot(): a ring of the last MAX_PENDING_BOTS unauthorized UUIDs,
-/// for the admin console's "pending authorization" list.
-pub fn add_pending_bot(state: &mut HubState, uuid: &str, ip: &str) {
-    if let Some(p) = state.pending.iter_mut().find(|p| p.uuid == uuid) {
-        p.last_attempt = now();
-        p.attempts += 1;
-        p.ip = trunc_string(ip, 64);
-        return;
-    }
-    let entry = PendingBot {
-        uuid: trunc_string(uuid, 64),
-        nick: "Unknown".to_string(),
-        ip: trunc_string(ip, 64),
-        last_attempt: now(),
-        attempts: 1,
-    };
-    if state.pending.len() < MAX_PENDING_BOTS {
-        state.pending.push(entry);
-    } else {
-        let idx = state.pending_head;
-        state.pending[idx] = entry;
-        state.pending_head = (state.pending_head + 1) % MAX_PENDING_BOTS;
-    }
-}
-
-pub fn remove_pending_bot(state: &mut HubState, uuid: &str) {
-    if let Some(i) = state.pending.iter().position(|p| p.uuid == uuid) {
-        state.pending.remove(i);
-    }
 }
 
 /// hub_state_add_bot_memory(): register a bot the admin just created.
@@ -361,27 +454,6 @@ mod tests {
         assert_ne!(h, b);
         assert_eq!(h.len(), 19 + 1 + 1 + 64);
         assert_eq!(b.len(), 24 + 1 + 1 + 64);
-    }
-
-    #[test]
-    fn pending_bots_ring_and_dedupe() {
-        let mut s = HubState::new();
-        for i in 0..MAX_PENDING_BOTS {
-            add_pending_bot(&mut s, &format!("uuid-{i}"), "10.0.0.1");
-        }
-        assert_eq!(s.pending.len(), MAX_PENDING_BOTS);
-        // A repeat refreshes in place rather than growing the ring.
-        add_pending_bot(&mut s, "uuid-0", "10.0.0.2");
-        assert_eq!(s.pending.len(), MAX_PENDING_BOTS);
-        assert_eq!(s.pending[0].ip, "10.0.0.2");
-        // A new one past the cap overwrites the ring head.
-        add_pending_bot(&mut s, "uuid-new", "10.0.0.3");
-        assert_eq!(s.pending.len(), MAX_PENDING_BOTS);
-        assert_eq!(s.pending[0].uuid, "uuid-new");
-        assert_eq!(s.pending_head, 1);
-
-        remove_pending_bot(&mut s, "uuid-new");
-        assert_eq!(s.pending.len(), MAX_PENDING_BOTS - 1);
     }
 
     #[test]

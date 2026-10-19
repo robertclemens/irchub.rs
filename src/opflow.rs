@@ -644,7 +644,7 @@ pub(crate) fn broadcast_chan_action(
 /// `origin_fd` is the peer fd to route a reply back to, or -1 when the
 /// requester is one of our own bots.
 #[allow(clippy::too_many_arguments)]
-fn chan_request_dispatch(
+pub(crate) fn chan_request_dispatch(
     state: &mut HubState,
     request_id: &str,
     requester_uuid: &str,
@@ -729,7 +729,7 @@ pub fn process_chan_request(state: &mut HubState, ci: usize, payload: &str) {
     crate::hlog_info!("[HUB] CHAN_REQUEST {kind} from {id} for {channel}\n");
     // One bot answers it (CMD_CHAN_PROBE) unless an older hub is in the mesh.
     if crate::elect::mesh_ready(state) {
-        if !crate::elect::start(state, &kind, &channel, &id, &nick, &hostmask, None) {
+        if crate::elect::start(state, &kind, &channel, &id, &nick, &hostmask, None).is_none() {
             crate::hlog_warning!("[CHANREQ] Election table full — dropping {kind} for {channel}\n");
         }
         return;

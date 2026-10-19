@@ -18,7 +18,7 @@ use crate::connlimits::Group;
 use crate::consts::*;
 use crate::cstr::{atoll, now, split_fields, trunc_string};
 use crate::state::{HubState, IpAclAdd, MaskRecord, UserRecord, lww_next_ts, parse_uint};
-use crate::{crypto, ratelimit, storage};
+use crate::{access, crypto, ratelimit, storage};
 
 // ---------------------------------------------------------------------------
 // a|/o| user record codec (docs/passwordless.md §3.1)
@@ -178,9 +178,19 @@ pub fn write(state: &mut HubState) {
     // only for values that differ from the built-ins.
     buf.push_str(&state.conn_cfg.lines());
 
+    // purge_days| stays for a hub rolled back to before hs|; hs|autopurge
+    // carries the stamp the mesh merges on, and wins at load.
     if state.purge_days_setting > 0 {
         buf.push_str(&format!("purge_days|{}\n", state.purge_days_setting));
     }
+    crate::revoke::gsetting_append(state, &mut buf);
+    // When the leader last ran the scheduled purge: a restart does not push
+    // it another day out.
+    if state.timers.last_purge > 0 {
+        buf.push_str(&format!("purge_last|{}\n", state.timers.last_purge));
+    }
+    // The revoke list: permanent, never purged.
+    crate::revoke::append(state, &mut buf);
 
     // D3: persist the loopback-trust flag.  Always written so the security
     // posture is explicit in the config file rather than implied by absence.
@@ -260,6 +270,13 @@ pub fn write(state: &mut HubState) {
             continue;
         }
         buf.push_str(&format!("{}|{}|{}\n", e.key, e.value, e.timestamp));
+        // A ban's last use (activity, outside the B| record): bu|chan|mask|ts
+        if e.key == "B" && e.last_used > 0 {
+            let id: Vec<&str> = e.value.splitn(3, '|').collect();
+            if id.len() == 3 {
+                buf.push_str(&format!("bu|{}|{}|{}\n", id[0], id[1], e.last_used));
+            }
+        }
     }
 
     // Local IP access lists: w|<pattern>|<added> (allow), x|... (deny).
@@ -304,6 +321,10 @@ pub fn write(state: &mut HubState) {
         ));
     }
 
+    // Admin flags (uf|) and oper channel bindings (uc|), after the users
+    // they name; access::prune keeps them owned.
+    access::append(state, &mut buf, None);
+
     for b in &state.bots {
         if b.uuid.is_empty() {
             continue;
@@ -344,7 +365,7 @@ pub fn write(state: &mut HubState) {
     }
 
     let pass = state.get_config_pass();
-    let key = crypto::derive_config_key(pass.as_bytes(), &salt);
+    let key = crypto::derive_config_key(pass.as_bytes(), &salt, PBKDF2_ITERATIONS);
     drop(pass);
 
     let Some((ct, tag)) = crypto::gcm_encrypt_detached(key.as_ref(), &iv, &[], buf.as_bytes())
@@ -643,6 +664,11 @@ fn dedup_records(state: &mut HubState) -> bool {
         }
     }
 
+    // Flags and channel bindings follow the surviving uuid.
+    for (from, to) in &remap {
+        access::remap_uuid(state, from, to);
+    }
+
     let mut masks: Vec<MaskRecord> = Vec::new();
     for m in &state.mask_records {
         let mut m = m.clone();
@@ -723,15 +749,30 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
     let tag = &file[SALT_SIZE + GCM_IV_LEN..hdr];
     let ct = &file[hdr..];
 
-    let key = crypto::derive_config_key(password.as_bytes(), salt);
-    let Some(plain) = crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag) else {
-        crate::hlog_error!("[HUB] Config decryption failed (wrong password or corrupted file)\n");
-        return false;
+    // Current PBKDF2 count first, then the pre-2.5.0 count for a one-time
+    // migration: a legacy hit is rewritten under the current count below
+    // (never under -selftest, which must not touch the running build's file).
+    let open = |iterations| {
+        let key = crypto::derive_config_key(password.as_bytes(), salt, iterations);
+        crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag)
+    };
+    let (plain, kdf_legacy) = match open(PBKDF2_ITERATIONS) {
+        Some(p) => (p, false),
+        None => match open(PBKDF2_ITERATIONS_LEGACY) {
+            Some(p) => (p, true),
+            None => {
+                crate::hlog_error!(
+                    "[HUB] Config decryption failed (wrong password or corrupted file)\n"
+                );
+                return false;
+            }
+        },
     };
     let text = Zeroizing::new(String::from_utf8_lossy(&plain).into_owned());
 
     state.bots.clear();
     state.peers.clear();
+    state.revoked.clear();
 
     for line in text.split('\n') {
         if line.is_empty() {
@@ -771,9 +812,27 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                     .unwrap_or(0)
                     .clamp(HUB_LOG_SIZE_MIN, HUB_LOG_SIZE_MAX);
             }
+            // Pre-hs| layout; an hs|autopurge line (stamped) wins over it.
             "purge_days" => {
-                state.purge_days_setting = crate::cstr::atoi(v).max(0);
+                if state.purge_days_ts == 0 {
+                    state.purge_days_setting = crate::cstr::atoi(v).max(0);
+                }
             }
+            "hs" => {
+                if crate::revoke::gsetting_ingest(state, v).is_none() {
+                    crate::hlog_warning!("[CONFIG] Ignoring an hs| line this hub does not know\n");
+                }
+            }
+            "purge_last" => {
+                let pl = crate::cstr::atoll(v);
+                state.timers.last_purge = if pl > 0 { pl } else { 0 };
+            }
+            "rv" => match crate::revoke::parse(v) {
+                Some(rv) => {
+                    crate::revoke::merge(state, &rv);
+                }
+                None => crate::hlog_warning!("[CONFIG] Ignoring a malformed rv| line\n"),
+            },
             // D3: exempt 127.0.0.1/::1 from rate limiting only when
             // explicitly set.  An absent key leaves the secure default.
             "trust_loopback" => {
@@ -874,6 +933,13 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                 }
             }
             "m" => load_mask_line(state, v),
+            // Admin flags / oper channel bindings (access.rs).  Records of a
+            // user that never loads go with access::prune below.
+            "uf" | "uc" => {
+                if access::ingest(state, k.as_bytes()[1] as char, v, false).is_none() {
+                    crate::hlog_warning!("[CONFIG] Ignoring invalid {} line\n", k);
+                }
+            }
             "c" => load_channel_line(state, v),
             // 2.4.5 records: key|value|ts.  The same ingest point as the wire,
             // so a hand-edited or damaged line is dropped, not trusted.  Case
@@ -882,6 +948,20 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
             "C" | "D" | "B" => {
                 if let Some(p) = v.rfind('|') {
                     storage::put_record(state, k, &v[..p], atoll(&v[p + 1..]));
+                }
+            }
+            // bu|<#chan|*>|<mask>|<last_used>: a ban's last use, written right
+            // after its B| line (activity, outside LWW).  No live ban: dropped.
+            "bu" => {
+                let f: Vec<&str> = v.split('|').collect();
+                if f.len() == 3
+                    && let Some(i) = crate::modes::ban_used_slot(state, f[0], f[1])
+                {
+                    let lu = atoll(f[2]);
+                    let slot = &mut state.global_entries[i].last_used;
+                    if lu > *slot {
+                        *slot = lu;
+                    }
                 }
             }
             // Retired shared bot password: dropped (bots use public keys).
@@ -909,10 +989,34 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
 
     if dedup_records(state) {
         write(state);
-    } else if cfg_legacy_users > 0 || cfg_acl_fixed > 0 {
-        // Rewrite once so the passwords / p| line, and IP-list lines that
-        // were dropped or canonicalised, leave the file for good.
+    }
+    // Drop flag / binding records with no user, then give every user that
+    // has none what they could do before flags (admins +a, opers *).
+    let access_before = state.uflag_records.len() + state.uchan_records.len();
+    access::prune(state);
+    let mut access_changed = state.uflag_records.len() + state.uchan_records.len() != access_before;
+    access_changed |= access::migrate(state) > 0;
+    // Deleted bots from before the revoke list join it.
+    let rv_new = crate::revoke::migrate(state);
+    if rv_new > 0 {
+        crate::hlog_info!("[REVOKE] {rv_new} deleted bot(s) added to the revoke list\n");
+        access_changed = true;
+    }
+    if access_changed {
         write(state);
+    } else if cfg_legacy_users > 0 || cfg_acl_fixed > 0 || kdf_legacy {
+        // Rewrite once so the passwords / p| line, IP-list lines that were
+        // dropped or canonicalised, and a pre-2.5.0 PBKDF2 count leave the
+        // file for good.
+        write(state);
+    }
+
+    if kdf_legacy && !READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::hlog_info!(
+            "[HUB] Config re-encrypted with PBKDF2 {}k (was {}k)\n",
+            PBKDF2_ITERATIONS / 1000,
+            PBKDF2_ITERATIONS_LEGACY / 1000
+        );
     }
 
     if cfg_legacy_users > 0 {

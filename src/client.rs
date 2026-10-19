@@ -16,7 +16,9 @@ use zeroize::Zeroizing;
 use crate::consts::*;
 use crate::cstr::{Fmt, Tok, atoll, now, sscanf, trunc_string};
 use crate::state::{BotAuthState, ClientType, HubClient, HubState, Lane, QueuedMsg};
-use crate::{admin, auth, crypto, mesh, net, opflow, presence, queue, ratelimit, storage, upgrade};
+use crate::{
+    access, admin, auth, crypto, mesh, net, opflow, presence, queue, ratelimit, storage, upgrade,
+};
 
 const PEER_INFO: &[u8] = b"irchub-peer-session-v1";
 
@@ -199,8 +201,8 @@ fn bot_config_hash(payload: &str) -> [u8; 32] {
 /// re-shape).
 pub fn send_config_to_bot(state: &mut HubState, ci: usize, force: bool) {
     let id = state.clients[ci].id.clone();
-    let proto_v2 = state.clients[ci].bot_proto >= BOT_PROTO_PASSWORDLESS;
-    let payload = Zeroizing::new(storage::generate_bot_payload(state, &id, proto_v2));
+    let bot_proto = state.clients[ci].bot_proto;
+    let payload = Zeroizing::new(storage::generate_bot_payload(state, &id, bot_proto));
     if payload.is_empty() {
         crate::hlog_warning!("[HUB] No config to send to {id}\n");
         return;
@@ -489,6 +491,64 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
         if line.len() < 2 || line.starts_with('#') {
             continue;
         }
+        // uf| / uc|: admin flags and oper channel bindings (access.rs).  A bot
+        // pushes them for its own chattr / chanoper / +admin / +oper; they are
+        // hub-authoritative records exactly like a| / o| / m|.
+        if let Some(body) = line
+            .strip_prefix("uf|")
+            .or_else(|| line.strip_prefix("uc|"))
+        {
+            let kind = line.as_bytes()[1] as char;
+            if hub_only_mutations {
+                crate::hlog_warning!(
+                    "[HUB] opt 'h' active: REJECTED bot-pushed '{}' record from {} (hub-authoritative)\n",
+                    &line[..2],
+                    id
+                );
+            } else {
+                match access::ingest(state, kind, body, true) {
+                    None => crate::hlog_warning!(
+                        "[HUB] Ignored invalid '{}' record from {}\n",
+                        &line[..2],
+                        id
+                    ),
+                    Some(true) => {
+                        updates += 1;
+                        push_sync(state, &mut sync_buffer, fd, &format!("{line}\n"));
+                    }
+                    Some(false) => {}
+                }
+            }
+            continue;
+        }
+        // hl|<addr>/<fp>,...: the hubs this bot dials (the console's hub del
+        // preview).  Only the bot knows it, so it is taken under every opt
+        // and stamped here when it changed.
+        if let Some(v) = line.strip_prefix("hl|") {
+            let cur = state.bots.iter().find(|b| b.uuid == id).map(|b| {
+                b.entries
+                    .iter()
+                    .find(|e| e.key == "hl")
+                    .map(|e| (e.value.clone(), e.timestamp))
+            });
+            if !storage::hublist_valid(v) {
+                crate::hlog_warning!("[HUB] Ignored invalid hub list from {id}\n");
+            } else if let Some(cur) = cur
+                && cur.as_ref().is_none_or(|(cv, _)| cv != v)
+            {
+                let ts = crate::state::lww_next_ts(cur.map_or(0, |(_, t)| t));
+                if storage::update_entry(state, &id, "hl", v, "", "", ts) {
+                    updates += 1;
+                    push_sync(
+                        state,
+                        &mut sync_buffer,
+                        fd,
+                        &format!("b|{id}|hl|{v}|{ts}\n"),
+                    );
+                }
+            }
+            continue;
+        }
         let typ = line.as_bytes()[0] as char;
         if line.as_bytes()[1] != b'|' {
             continue;
@@ -599,6 +659,13 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 let last_used = atoll(f[3]);
                 let ts = atoll(f[4]);
                 let is_active = act.starts_with("add");
+                // An older bot may hold a tombstone of a restricted user (plan
+                // §3.2): nothing it pushes about that user is taken in.
+                if state.clients[ci].bot_proto < BOT_PROTO_USER_FLAGS
+                    && !access::from_old_ok(state, &uuid)
+                {
+                    continue;
+                }
 
                 let found = state
                     .mask_records
@@ -643,7 +710,12 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 // timestamp.  Outside opt 'h' the network lets bots
                 // create/re-key users (+admin/+oper/chkey); a keyless push
                 // never erases a key the hub already holds.
-                let Some((incoming, _)) = crate::config::parse_user_record(data, typ) else {
+                let Some((incoming, _)) =
+                    crate::config::parse_user_record(data, typ).filter(|(u, _)| {
+                        state.clients[ci].bot_proto >= BOT_PROTO_USER_FLAGS
+                            || access::from_old_ok(state, &u.uuid)
+                    })
+                else {
                     continue;
                 };
                 let found = state
@@ -747,6 +819,12 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
             }
             _ => {}
         }
+    }
+
+    // A user this push created without uf| / uc| (an older bot's +admin /
+    // +oper) gets what it could do before flags (access::migrate).
+    if access::migrate(state) > 0 {
+        updates += 1;
     }
 
     // Every passwordless bot puts v| in each push, so its absence marks an
@@ -1082,6 +1160,7 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
         CMD_BOT_DELTA => process_bot_delta(state, ci, payload),
         CMD_OP_REQUEST => opflow::process_op_request(state, ci, payload),
         CMD_CHAN_REQUEST => opflow::process_chan_request(state, ci, payload),
+        CMD_USER_CHAN_REQUEST => crate::elect::process_user_chan_request(state, ci, payload),
         CMD_CHAN_REPLY => opflow::process_chan_reply(state, ci, payload),
         CMD_CHAN_PROBE_ACK => crate::elect::process_probe_ack(state, ci, payload),
         CMD_CHAN_DONE => crate::elect::process_done(state, ci, payload),
@@ -1215,11 +1294,8 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
 
     // Initial full-state sync to the newly authenticated peer.
     let init_sync = mesh::generate_sync_packet(state);
-    if !init_sync.is_empty()
-        && let Some(m) = QueuedMsg::new(CMD_PEER_SYNC, Lane::Bulk, init_sync.as_bytes())
-    {
-        queue::enqueue(&mut state.clients[ci], m);
-    }
+    mesh::peer_enqueue_sync(state, ci, CMD_PEER_SYNC, Lane::Bulk, &init_sync, None);
+    crate::activity::send_bans(state, ci);
     true
 }
 
@@ -1343,11 +1419,7 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
                 state.clients[ci].ip
             );
             let reply_sync = mesh::generate_sync_packet(state);
-            if !reply_sync.is_empty()
-                && let Some(m) = QueuedMsg::new(CMD_PEER_SYNC, Lane::Bulk, reply_sync.as_bytes())
-            {
-                queue::enqueue(&mut state.clients[ci], m);
-            }
+            mesh::peer_enqueue_sync(state, ci, CMD_PEER_SYNC, Lane::Bulk, &reply_sync, None);
         }
         // v3: independent per-hub keypairs.  A peer must NEVER push its
         // private key to us.
@@ -1503,6 +1575,14 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
                             &plain[5.min(plain.len())..],
                             body_len,
                         ) {
+                            return false;
+                        }
+                    }
+                    ClientType::Bot if state.clients[ci].retiring => {
+                        // Deleted: only its CMD_BOT_RETIRE_ACK counts, then it goes.
+                        if cmd == CMD_BOT_RETIRE_ACK {
+                            auth::retire_ack_apply(state, ci, payload.as_bytes());
+                            auth::disconnect_client(state, ci);
                             return false;
                         }
                     }

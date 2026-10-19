@@ -9,7 +9,7 @@
 //!   public half Ed25519 (32) || X25519 (32).
 //! * Sealed box (admin login, peer handshake): eph_pub(32) || iv(12) || ct ||
 //!   tag(16), key = HKDF-SHA256(X25519(eph, R), salt = eph_pub, info = label).
-//! * PBKDF2-HMAC-SHA256 (100k) for the config file and the pass file.
+//! * PBKDF2-HMAC-SHA256 (600k; 100k still read, pre-2.5.0) for the config file and the pass file.
 //!
 //! Secrets live in `Zeroizing` buffers and are wiped on drop.
 
@@ -70,11 +70,12 @@ pub fn random_hex(n: usize) -> Option<String> {
     Some(r.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// PKCS5_PBKDF2_HMAC(SHA-256, PBKDF2_ITERATIONS): the config-file and
-/// pass-file key.
-pub fn derive_config_key(password: &[u8], salt: &[u8]) -> Key32 {
+/// PKCS5_PBKDF2_HMAC(SHA-256, iterations): the config-file and pass-file
+/// key.  `iterations` is PBKDF2_ITERATIONS, or PBKDF2_ITERATIONS_LEGACY to
+/// read a pre-2.5.0 file.
+pub fn derive_config_key(password: &[u8], salt: &[u8], iterations: u32) -> Key32 {
     let mut key = Zeroizing::new([0u8; 32]);
-    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, PBKDF2_ITERATIONS, key.as_mut());
+    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, key.as_mut());
     key
 }
 
@@ -350,6 +351,16 @@ pub fn key_fingerprint(pub_key: &[u8; COMBINED_KEY_LEN]) -> String {
         "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
         h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
     )
+}
+
+/// hub_crypto_hl_fp: a bot's hl| fingerprint of a hub, hex of SHA-256 over its
+/// 32-byte Ed25519 key, first 8 bytes (ircbot computes the same).
+pub fn hl_fp(ed_pub: &[u8]) -> String {
+    let h = Sha256::digest(ed_pub);
+    h[..HL_FP_LEN / 2]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// hub_crypto_key_fingerprint_b64: fingerprint of an 88-char key string, or

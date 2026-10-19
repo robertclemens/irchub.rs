@@ -114,7 +114,7 @@ You will be prompted for:
 | **Config Password** | Password used to encrypt the config file (hidden input) |
 | **First admin** | Name, then the admin's **public** key — paste the 88 characters or give the path of the `.public.b64` (a `.private.b64` is refused); confirm by fingerprint; then one or more usermasks |
 
-Setup generates this hub's own Curve25519 keypair (the private key stays inside the encrypted config), prints the hub's UUID and public key and saves the public key to `hub_public.b64`, writes the encrypted config file (`.irchub.cnf`) and exits. The hub does not start automatically.
+Setup generates this hub's own Curve25519 keypair (the private key stays inside the encrypted config), prints the hub's UUID and public key and saves the public key to `hub_public.b64` (`./irchub -id` prints the UUID, key, SSH host-key fingerprint and ready `hub add` / `+hub` lines again at any time, read-only), writes the encrypted config file (`.irchub.cnf`) and exits. The hub does not start automatically.
 
 ### 2. Start the hub
 
@@ -143,6 +143,8 @@ By default a password must be typed each time irchub starts. To allow unattended
 This prompts for the config password (with confirmation), then writes `.irchub.pass` — an AES-256-GCM encrypted file readable only by the current user (`0600`). The encryption key is derived from stable properties of this machine and user account, so the file cannot be decrypted if copied to another host.
 
 When `.irchub.pass` is present and passes validation (correct ownership, `0600` permissions, GCM tag intact), irchub reads the password from it automatically and no interactive input is required. If the file is absent, has wrong permissions, or fails decryption, irchub falls back to the stdin prompt.
+
+Since 2.5.0 the `.irchub.cnf` and `.irchub.pass` keys use PBKDF2-HMAC-SHA256 with 600,000 rounds (was 100,000). A 2.5.0+ hub still reads older files and rewrites them once: the config on its first start, the pass file at once on an ordinary start, or 120 s after a start made by a hub-driven upgrade (once the old build's 20 s watchdog can no longer put that build back). That later rewrite keeps the old file as `.irchub.pass.prev`, which a hub-ordered rollback of that same run restores, and the next ordinary start deletes. After that an older build cannot read them, so do not copy a pre-2.5.0 binary over a migrated hub.
 
 ### 4. Auto-start (optional — requires password file)
 
@@ -177,7 +179,7 @@ The console has an output pane, a live network tree, a status bar and an input l
 
 ### Adding a Bot
 
-1. On the bot's machine run `./ircbot -setup`; the bot generates its own keypair and prints its UUID, public key and key fingerprint.
+1. On the bot's machine run `./ircbot -setup`; the bot generates its own keypair and prints its UUID, public key and key fingerprint. Lost that output? `./ircbot -id` in the bot's directory prints them again, with the ready `bot add` line.
 2. In the console: `bot add <nick> <uuid> <88-char-pubkey>`.
 
 The hub never sees a bot's private key. Every bot receives the other bots' public keys (`b|` lines), which it uses to seal bot-to-bot requests (OPME, INVITE, SETNICK) when no hub is reachable.
@@ -188,13 +190,17 @@ Rekeying is bot-local: only the bot holds its private key. `bot rekey <uuid>` sh
 
 ### Admins and Opers
 
-- `admin add <name> <pubkey> <mask>` / `oper add <name> <pubkey> <mask>` — the user runs `keygen <name>` and sends you the `.public.b64`; each key may belong to one user only.
-- `userkey <name> <pubkey>` — replaces a key (rotation, a lost key, or a legacy user with no key). UUID and usermasks are kept; the old key stops working on the hub and on every bot as soon as it syncs.
-- `admin list`, `oper list`, `match <name|*>` — show each key's fingerprint; `mask add|del <name> <mask>` manages usermasks.
+- `user add admin <name> <pubkey> <mask> <+a|flags>` / `user add oper <name> <pubkey> <mask> <*|#a,#b>` — the user runs `keygen <name>` and sends you the `.public.b64`; each key may belong to one user only.
+- Admin flags: `+a` is a full admin; otherwise the letters of what they may change — `b` bots, `c` channels, `h` hub, `o` opers, `u` upgrades (e.g. `+chu`). Every admin may log in to the console and see everything; `help <group>` marks what each command needs (`[+c]`). `user set <name> flags +b-u` changes them; the last `+a` admin cannot lose `+a`.
+- Oper channels: `*` (every channel) or a list; on each, an oper may `op`, `invite`, `unban` and get the `key` from any bot. `user chan add|del <name> <#chan|*>` changes them (`*` and channels exclude each other); deleting a channel removes it from every oper.
+- `user set <name> key <pubkey>` — replaces a key (rotation, a lost key, or a legacy user with no key). UUID and usermasks are kept; the old key stops working on the hub and on every bot as soon as it syncs.
+- `user list`, `user show <name|*>` — each user's flags or channels, key fingerprint and masks; `user mask add|del <name> <mask>` manages usermasks.
+- On IRC (outside opt `h`): `+admin <name> <pubkey> <mask> <+a|flags>`, `+oper <name> <pubkey> <mask> <*|#a,#b>`, `chattr <name> <+x-y>`, `chanoper add|del <#chan|*> <oper>`.
+- Older bots (before `v|3`) and hubs (before 2.4.7) never receive a restricted admin or a channel-bound oper: they would over-trust them.
 
 ### Opt flags
 
-`opt set h` (hub-only mutations) makes every bot refuse local `+admin`/`-admin`, `+oper`/`-oper`, `+usermask`/`-usermask`, `+bot`/`-bot`, `join`/`part` and `chkey`, so users, masks, keys and channels change only through the hub console. `opt set -` clears it.
+`opt set h` (hub-only mutations) makes every bot refuse local `+admin`/`-admin`, `chattr`, `+oper`/`-oper`, `chanoper`, `+usermask`/`-usermask`, `+bot`/`-bot`, `join`/`part` and `chkey`, so users, masks, keys and channels change only through the hub console. `opt set -` clears it.
 
 ### The hub's own key
 
@@ -202,7 +208,7 @@ The hub's private key lives only inside the encrypted `.irchub.cnf`; no command 
 
 ## Peer Mesh
 
-Multiple hub instances can be linked to share configuration and bot state. Add a peer with `peer add <ip> <port> <uuid> <name> <pubkey>` (the pubkey is the peer's `hub_public.b64`). Peers authenticate each other with Ed25519 signatures (`HUBv3`); a pre-passwordless hub (`HUBv2`) is refused, so upgrade all hubs together.
+Multiple hub instances can be linked to share configuration and bot state. Link another hub with `hub add <ip> <port> <uuid> <name> <pubkey>` (on that hub, `./irchub -id` prints its uuid and pubkey — and this whole `hub add` line — from the config; `hub show` in its console shows the same; `hub_public.b64` is only `-setup`'s copy and goes stale after a `hub rekey`); `hub list` shows the links. Peers authenticate each other with Ed25519 signatures (`HUBv3`); a pre-passwordless hub (`HUBv2`) is refused, so upgrade all hubs together.
 
 Connected peers:
 - Synchronize bot config and global config entries

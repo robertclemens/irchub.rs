@@ -32,6 +32,7 @@ pub fn raise(state: &mut HubState, slot: Slot, ts: i64) -> bool {
     let cur = match slot {
         Slot::User(i) => &mut state.user_records[i].last_seen,
         Slot::Mask(i) => &mut state.mask_records[i].last_used,
+        Slot::Ban(i) => &mut state.global_entries[i].last_used,
     };
     if ts <= *cur {
         return false;
@@ -46,6 +47,8 @@ pub fn raise(state: &mut HubState, slot: Slot, ts: i64) -> bool {
 pub enum Slot {
     User(usize),
     Mask(usize),
+    /// A B| entry in `global_entries` (a ban's last use).
+    Ban(usize),
 }
 
 /// Send CMD_ACTIVITY lines to every authenticated peer except `exclude_fd`.
@@ -93,9 +96,25 @@ pub fn stamp_user(state: &mut HubState, ui: usize, t: i64) {
 
 /// One validated CMD_ACTIVITY line: the record it names and its time.
 /// `a|uuid|ts` or `m|uuid|mask|ts`; the time is always the last field, so a
-/// mask may hold a '|' of its own.
+/// mask may hold a '|' of its own.  `B|chan|mask|ts`: a ban mask never holds
+/// one (it is a field of the B| record).
 fn parse_line(state: &HubState, line: &str) -> Option<(Slot, i64, String)> {
     let b = line.as_bytes();
+    if b.first() == Some(&b'B') {
+        let f: Vec<&str> = line.split('|').collect();
+        if f.len() != 4
+            || f[0] != "B"
+            || f[1].is_empty()
+            || f[1].len() >= MAX_CHAN
+            || f[2].is_empty()
+            || f[2].len() > BAN_MASK_MAX
+        {
+            return None;
+        }
+        let ts: i64 = f[3].parse().ok()?;
+        let bi = crate::modes::ban_used_slot(state, f[1], f[2])?;
+        return Some((Slot::Ban(bi), ts, format!("B|{}|{}|{ts}\n", f[1], f[2])));
+    }
     if b.len() < 2 + 36 + 2 || b[1] != b'|' || !matches!(b[0], b'a' | b'm') {
         return None;
     }
@@ -140,7 +159,7 @@ pub fn process(state: &mut HubState, ci: usize, payload: &str) {
     for line in payload
         .split('\n')
         .filter(|l| !l.is_empty())
-        .take(MAX_HUB_USER_RECORDS + MAX_HUB_USER_MASKS)
+        .take(MAX_HUB_USER_RECORDS + MAX_HUB_USER_MASKS + MAX_BANS_TOTAL)
     {
         let Some((slot, ts, canon)) = parse_line(state, line) else {
             crate::hlog_debug!("[ACTIVITY] malformed or unknown line from {from_id}\n");
@@ -160,6 +179,54 @@ pub fn process(state: &mut HubState, ci: usize, payload: &str) {
     if raised > 0 {
         crate::hlog_debug!("[ACTIVITY] {raised} record(s) raised by {from_id}\n");
         flood(state, &fwd, exclude_fd);
+    }
+}
+
+/// hub_activity_send_bans(): queue every known ban last-use to the freshly
+/// linked peer `ci` as CMD_ACTIVITY B| lines, on the bulk lane behind the
+/// initial sync (repair path).
+pub fn send_bans(state: &mut HubState, ci: usize) {
+    if state.clients[ci].typ != ClientType::Hub || !state.clients[ci].authenticated {
+        return;
+    }
+    let cap = MAX_BUFFER - 64;
+    let mut chunks: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut lines = 0;
+    for e in &state.global_entries {
+        if e.key != "B" || e.last_used <= 0 || !crate::state::global_value_active(&e.value) {
+            continue;
+        }
+        let f: Vec<&str> = e.value.splitn(3, '|').collect();
+        if f.len() < 3 || f[0].len() >= MAX_CHAN || f[1].len() > BAN_MASK_MAX {
+            continue;
+        }
+        let line = format!("B|{}|{}|{}\n", f[0], f[1], e.last_used);
+        if !buf.is_empty() && buf.len() + line.len() > cap {
+            chunks.push(std::mem::take(&mut buf));
+        }
+        buf.push_str(&line);
+        lines += 1;
+    }
+    if !buf.is_empty() {
+        chunks.push(buf);
+    }
+    for chunk in chunks {
+        let ok = QueuedMsg::new(CMD_ACTIVITY, Lane::Bulk, chunk.as_bytes())
+            .is_some_and(|m| queue::enqueue(&mut state.clients[ci], m));
+        if !ok {
+            crate::hlog_warning!(
+                "[ACTIVITY] ban last-use enqueue failed for peer {}\n",
+                state.clients[ci].ip
+            );
+            return;
+        }
+    }
+    if lines > 0 {
+        crate::hlog_debug!(
+            "[ACTIVITY] {lines} ban last-use line(s) sent to {}\n",
+            state.clients[ci].id
+        );
     }
 }
 

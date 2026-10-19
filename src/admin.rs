@@ -6,7 +6,7 @@
 //! here formats for a screen.  Returning false means the connection is gone (a
 //! failed write already dropped it).  Mutations set `config_dirty` and let the
 //! write debounce in `maintenance` flush them, rather than paying
-//! PBKDF2(100k) per command.
+//! PBKDF2 per command.
 
 use crate::connlimits::{self, Group, SetResult};
 use crate::consts::*;
@@ -17,8 +17,8 @@ use crate::state::{
     PeerConfig, UserRecord, lww_next_ts, name_valid, parse_uint,
 };
 use crate::{
-    auth, client, console, crypto, mesh, modes, opflow, presence, queue, ratelimit, storage,
-    upgrade,
+    access, auth, client, console, crypto, mesh, modes, opflow, presence, queue, ratelimit,
+    storage, upgrade,
 };
 
 fn resp(state: &mut HubState, ci: usize, msg: &str) -> bool {
@@ -365,15 +365,223 @@ fn reply_links_of(state: &HubState, r: &mut Reply, uuid: &str) {
     }
 }
 
+/// A hub's name as the hub del preview shows it: its friendly name, else the
+/// first 8 characters of its uuid.
+fn refs_hub_name(name: &str, uuid: &str) -> String {
+    if name.is_empty() {
+        trunc_string(uuid, 9)
+    } else {
+        name.to_string()
+    }
+}
+
+/// admin_peer_refs(): hub del's preview (CMD_ADMIN_PEER_REFS): who still
+/// knows hub `sel` once this hub unlinks it.  ok|peer.refs|hubs|bots, the
+/// target's peer record, then hubref|uuid|name|state|self for every hub whose
+/// links name it (this hub first), hubunrep|uuid|name for hubs whose links
+/// never reached us, botref|uuid|nick|on|on_uuid|on_name|seen|addr|others for
+/// every bot whose hl| list holds its key (others: the bot's other hubs, by
+/// name, or ?<addr> for one this hub has no key for) and botunrep|uuid|nick
+/// for bots that sent no list.  Read only.
+fn peer_refs(state: &mut HubState, ci: usize, sel: &str) -> bool {
+    let Some(ti) = (if sel.is_empty() {
+        None
+    } else {
+        peer_find(state, sel)
+    }) else {
+        let m = format!(
+            "no hub {}: none with that uuid or name",
+            trunc_string(sel, 61)
+        );
+        return admin_err(state, ci, "peer.not_found", &m, Some("hub list"));
+    };
+    let t = &state.peers[ti];
+    let tuuid = t.uuid.clone();
+    let tfp = if t.has_pubkey {
+        crypto::hl_fp(&t.ed_pub)
+    } else {
+        String::new()
+    };
+
+    // The hubs other than the target this hub knows: itself, its peers, and
+    // the ones only gossip names.
+    let mut hubs = 1i64;
+    for (i, p) in state.peers.iter().enumerate() {
+        if i != ti && (p.uuid.is_empty() || p.uuid != tuuid) {
+            hubs += 1;
+        }
+    }
+    for m in &state.mesh_hubs {
+        if m.uuid.is_empty()
+            || m.uuid == state.hub_uuid
+            || (!tuuid.is_empty() && m.uuid == tuuid)
+            || configured_peer_uuid(state, &m.uuid)
+        {
+            continue;
+        }
+        hubs += 1;
+    }
+    let bots = state.bots.iter().filter(|b| b.is_active).count() as i64;
+
+    let mut r = Reply::new();
+    r.ok("peer.refs");
+    r.kvi("hubs", hubs);
+    r.kvi("bots", bots);
+    reply_peer(state, &mut r, ti, false);
+
+    r.rec("hubref");
+    opt(&mut r, "uuid", &state.hub_uuid);
+    r.kv("name", hub_display_name(state));
+    r.kv(
+        "state",
+        if peer_client(state, &state.peers[ti]).is_some() {
+            "up"
+        } else {
+            "down"
+        },
+    );
+    r.kvb("self", true);
+    // every other hub whose gossiped links name the target
+    let mut cand: Vec<(String, String)> = Vec::new();
+    for (i, p) in state.peers.iter().enumerate() {
+        if i != ti {
+            cand.push((p.uuid.clone(), p.friendly_name.clone()));
+        }
+    }
+    for m in &state.mesh_hubs {
+        if !configured_peer_uuid(state, &m.uuid) {
+            cand.push((m.uuid.clone(), m.name.clone()));
+        }
+    }
+    for (uuid, name) in cand {
+        if uuid.is_empty() || uuid == state.hub_uuid || (!tuuid.is_empty() && uuid == tuuid) {
+            continue;
+        }
+        let m = presence::mesh_hub_find(state, &uuid).map(|mi| &state.mesh_hubs[mi]);
+        let name = match m {
+            Some(m) if !m.name.is_empty() => m.name.clone(),
+            _ => name,
+        };
+        let nm = refs_hub_name(&name, &uuid);
+        let Some(m) = m.filter(|m| m.have_links) else {
+            r.rec("hubunrep");
+            r.kv("uuid", &uuid);
+            r.kv("name", &nm);
+            continue;
+        };
+        if tuuid.is_empty() {
+            continue;
+        }
+        if let Some(l) = m.links.iter().find(|l| l.uuid == tuuid) {
+            r.rec("hubref");
+            r.kv("uuid", &uuid);
+            r.kv("name", &nm);
+            r.kv("state", if l.online { "up" } else { "down" });
+        }
+    }
+
+    // Hubs a bot's fingerprints can name: this one and its keyed peers.
+    let self_fp = crypto::hl_fp(&state.hub_ed25519_pub);
+    let peer_fp: Vec<String> = state
+        .peers
+        .iter()
+        .map(|p| {
+            if p.has_pubkey {
+                crypto::hl_fp(&p.ed_pub)
+            } else {
+                String::new()
+            }
+        })
+        .collect();
+
+    for b in state.bots.iter().filter(|b| b.is_active) {
+        let nick = presence::bot_nick_from_config(state, &b.uuid);
+        let Some(hl) = b.entry("hl") else {
+            r.rec("botunrep");
+            r.kv("uuid", &b.uuid);
+            opt(&mut r, "nick", &nick);
+            continue;
+        };
+        if tfp.is_empty() || !storage::hublist_valid(&hl.value) || hl.value.is_empty() {
+            continue;
+        }
+        // the entry for the target, and the bot's other hubs
+        let mut addr: Option<String> = None;
+        let mut others: Vec<String> = Vec::new();
+        for ent in hl.value.split(',') {
+            let (ea, ef) = ent.split_once('/').unwrap_or((ent, ""));
+            if ef == tfp {
+                if addr.is_none() {
+                    addr = Some(ea.to_string());
+                }
+            } else if ef == self_fp {
+                others.push(hub_display_name(state).to_string());
+            } else if let Some(pk) = peer_fp.iter().position(|f| !f.is_empty() && f == ef) {
+                let p = &state.peers[pk];
+                let m = if p.uuid.is_empty() {
+                    None
+                } else {
+                    presence::mesh_hub_find(state, &p.uuid).map(|mi| &state.mesh_hubs[mi])
+                };
+                let name = if !p.friendly_name.is_empty() {
+                    p.friendly_name.as_str()
+                } else {
+                    m.map_or("", |m| m.name.as_str())
+                };
+                let id = if p.uuid.is_empty() { &p.ip } else { &p.uuid };
+                others.push(refs_hub_name(name, id));
+            } else {
+                others.push(format!("?{ea}"));
+            }
+        }
+        let Some(addr) = addr else { continue };
+        let c = local_bot_client(state, &b.uuid).map(|i| &state.clients[i]);
+        let e = if c.is_some() {
+            None
+        } else {
+            roster_best(state, &b.uuid)
+        };
+        let mut seen = b.last_sync_time;
+        if let Some(s) = b.entry("seen")
+            && s.timestamp > seen
+        {
+            seen = s.timestamp;
+        }
+        if let Some(c) = c
+            && c.last_seen > seen
+        {
+            seen = c.last_seen;
+        }
+        r.rec("botref");
+        r.kv("uuid", &b.uuid);
+        opt(&mut r, "nick", &nick);
+        if c.is_some() {
+            r.kv("on", "local");
+            opt(&mut r, "on_uuid", &state.hub_uuid);
+            r.kv("on_name", hub_display_name(state));
+        } else if let Some(e) = e {
+            r.kv("on", "peer");
+            r.kv("on_uuid", &e.hub_uuid);
+            r.kv("on_name", &refs_hub_name(&e.hub_name, &e.hub_uuid));
+        }
+        if seen > 0 {
+            r.kvi("seen", seen);
+        }
+        opt(&mut r, "addr", &addr);
+        opt(&mut r, "others", &others.join(","));
+    }
+    send_reply(state, ci, &mut r)
+}
+
 fn list_peers(state: &mut HubState, ci: usize, sel: &str) -> bool {
     let mut r = Reply::new();
     if !sel.is_empty() {
         let Some(i) = peer_find(state, sel) else {
             let m = format!(
-                "no peer #{}, and none with that uuid or name",
+                "no hub #{}, and none with that uuid or name",
                 trunc_string(sel, 41)
             );
-            return admin_err(state, ci, "peer.not_found", &m, Some("peer list"));
+            return admin_err(state, ci, "peer.not_found", &m, Some("hub list"));
         };
         r.ok("peer.show");
         reply_peer(state, &mut r, i, true);
@@ -613,6 +821,12 @@ fn reply_user(state: &HubState, r: &mut Reply, u: &UserRecord) {
     r.kvi("masks", user_mask_count(state, &u.uuid));
     if u.typ == 'a' {
         r.kvi("sessions", admin_console_sessions(state, &u.name));
+    }
+    // user_flags plan U9: an admin's flags, an oper's channels ("*" = all)
+    if u.typ == 'a' {
+        r.kv("flags", access::user_flags(state, &u.uuid));
+    } else {
+        r.kv("chans", &access::user_chans(state, &u.uuid));
     }
     for m in state
         .mask_records
@@ -1236,6 +1450,15 @@ fn create_bot(state: &mut HubState, ci: usize, payload: &str) -> bool {
             Some("the public key the bot's -setup printed"),
         );
     }
+    if crate::revoke::is_revoked(state, &uuid_in) {
+        return admin_err(
+            state,
+            ci,
+            "bot.revoked",
+            "that uuid was deleted; run -setup on the bot's host for a new one",
+            Some("bot revoked"),
+        );
+    }
     if let Some(i) = bot_by_uuid(state, &uuid_in) {
         if !state.bots[i].is_active {
             return admin_err(
@@ -1283,8 +1506,8 @@ fn add_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
             state,
             ci,
             "peer.usage",
-            "peer add needs an address and a port",
-            Some("peer add <ip> <port> <uuid> <name|-> <key>"),
+            "hub add needs an address and a port",
+            Some("hub add <ip> <port> <uuid> <name|-> <key>"),
         );
     }
     let ip = trunc_string(f[0], 256);
@@ -1307,7 +1530,7 @@ fn add_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
     {
         let p = &state.peers[i];
         let m = format!(
-            "a peer with that uuid already exists (#{} {})",
+            "a hub with that uuid is already linked (#{} {})",
             i + 1,
             trunc_string(
                 if p.friendly_name.is_empty() {
@@ -1318,18 +1541,18 @@ fn add_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
                 64
             )
         );
-        return admin_err(state, ci, "peer.exists", &m, Some("peer list"));
+        return admin_err(state, ci, "peer.exists", &m, Some("hub list"));
     }
     if state.peers.len() >= MAX_PEERS {
-        let m = format!("peer table full (MAX_PEERS = {MAX_PEERS})");
-        return admin_err(state, ci, "peer.full", &m, Some("peer del to make room"));
+        let m = format!("hub table full (MAX_PEERS = {MAX_PEERS})");
+        return admin_err(state, ci, "peer.full", &m, Some("hub del to make room"));
     }
     if pubkey_b64.is_empty() {
         return admin_err(
             state,
             ci,
             "peer.no_key",
-            "a peer needs its public key",
+            "a hub needs its public key",
             Some("the 88-character key from that hub's hub show"),
         );
     }
@@ -1375,28 +1598,24 @@ fn add_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
 }
 
 fn del_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
-    // The payload is the peer's number in peer list (1..n).  Anything that
-    // is not a plain number is refused outright rather than read as some
-    // index.
+    // The payload names the peer: its uuid or its name (the console sends
+    // the uuid hub del's preview resolved), or its number in hub list.
     if payload.is_empty() {
         return admin_err(
             state,
             ci,
             "peer.usage",
-            "say which peer",
-            Some("peer del <#>"),
+            "say which hub",
+            Some("hub del <uuid|name>"),
         );
     }
-    let idx = parse_uint(payload, MAX_PEERS as u64).unwrap_or(0) as usize;
-    if idx < 1 || idx > state.peers.len() {
+    let Some(target) = peer_find(state, payload) else {
         let m = format!(
-            "no peer #{} ({} configured)",
-            trunc_string(payload, 9),
-            state.peers.len()
+            "no hub {}: none with that uuid or name",
+            trunc_string(payload, 61)
         );
-        return admin_err(state, ci, "peer.not_found", &m, Some("peer list"));
-    }
-    let target = idx - 1;
+        return admin_err(state, ci, "peer.not_found", &m, Some("hub list"));
+    };
     let gone = state.peers[target].clone();
     let was_up = peer_client(state, &gone).is_some();
     let admin_fd = state.clients[ci].fd;
@@ -1412,7 +1631,7 @@ fn del_peer(state: &mut HubState, ci: usize, payload: &str) -> bool {
     };
     let mut r = Reply::new();
     r.ok("peer.removed");
-    r.kvi("n", idx as i64);
+    r.kvi("n", target as i64 + 1);
     opt(&mut r, "uuid", &gone.uuid);
     opt(&mut r, "name", &gone.friendly_name);
     r.kv("ip", &gone.ip);
@@ -1433,16 +1652,16 @@ fn set_peer_pubkey(state: &mut HubState, ci: usize, payload: &str) -> bool {
             state,
             ci,
             "peer.usage",
-            "say which peer and the key",
-            Some("peer set <#|uuid|name> key <key>"),
+            "say which hub and the key",
+            Some("hub set <#|uuid|name> key <key>"),
         );
     }
     let Some(pi) = peer_find(state, &sel) else {
         let m = format!(
-            "no peer #{}, and none with that uuid or name",
+            "no hub #{}, and none with that uuid or name",
             trunc_string(&sel, 41)
         );
-        return admin_err(state, ci, "peer.not_found", &m, Some("peer list"));
+        return admin_err(state, ci, "peer.not_found", &m, Some("hub list"));
     };
     let dec = match crypto::b64_decode(&pubkey_b64) {
         Some(d) if d.len() == COMBINED_KEY_LEN => d,
@@ -1501,14 +1720,21 @@ fn set_peer_pubkey(state: &mut HubState, ci: usize, payload: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn add_user_record(state: &mut HubState, ci: usize, payload: &str, typ: char) -> bool {
-    // Payload: name|pubkey_b64|mask.  The user generated their own keypair
-    // (keygen) and only the public half arrives: the hub never mints or
-    // delivers a user's private key.
-    let usage = "user add admin|oper <name> <key> <mask>";
-    // sscanf("%63[^|]|%89[^|]|%255s") < 3
-    let f = split_fields(payload, 3);
-    let mask = f.get(2).and_then(|m| scan_word(m, MAX_MASK_LEN - 1));
-    if f.len() < 3 || !scan_ok(f[0], 63) || !scan_ok(f[1], COMBINED_KEY_B64 + 1) || mask.is_none() {
+    // Payload: name|pubkey_b64|mask|access.  The user generated their own
+    // keypair (keygen) and only the public half arrives: the hub never mints
+    // or delivers a user's private key.  access (user_flags plan U4/U5): an
+    // admin's flags (+a, or letters from bchou), an oper's channels (* or
+    // #a,#b) -- required, there is no default.
+    let is_admin = typ == 'a';
+    let usage = if is_admin {
+        "user add admin <name> <key> <mask> <+a|flags>"
+    } else {
+        "user add oper <name> <key> <mask> <*|#chan,#chan>"
+    };
+    // sscanf("%63[^|]|%89[^|]|%255[^|]|%511[^|]") < 3
+    let f = split_fields(payload, 4);
+    if f.len() < 3 || !scan_ok(f[0], 63) || !scan_ok(f[1], COMBINED_KEY_B64 + 1) || f[2].is_empty()
+    {
         return admin_err(
             state,
             ci,
@@ -1519,7 +1745,65 @@ fn add_user_record(state: &mut HubState, ci: usize, payload: &str, typ: char) ->
     }
     let pname = f[0].to_string();
     let ppub = f[1].to_string();
-    let pmask = mask.unwrap_or_default();
+    let pmask = trunc_string(f[2], MAX_MASK_LEN);
+    // a mask past 255 bytes stops the scan there: no access field read
+    let pacc = if f[2].len() >= MAX_MASK_LEN {
+        String::new()
+    } else {
+        trunc_string(f.get(3).copied().unwrap_or(""), 512)
+    };
+    if pacc.is_empty() {
+        return admin_err(
+            state,
+            ci,
+            "user.usage",
+            if is_admin {
+                "say the admin's flags: +a for a full admin, or letters from bchou (b bots, c channels, h hub, o opers, u upgrades)"
+            } else {
+                "say the oper's channels: * for every channel, or #a,#b"
+            },
+            Some(usage),
+        );
+    }
+    let mut flags = String::new();
+    let mut chans: Vec<String> = Vec::new();
+    if is_admin {
+        match access::uflags_edit("", &pacc) {
+            Some(fl) if !fl.is_empty() => flags = fl,
+            _ => {
+                return admin_err(
+                    state,
+                    ci,
+                    "user.bad_flags",
+                    "flags are +a (full admin) or letters from bchou",
+                    Some("+a, +chu, +b"),
+                );
+            }
+        }
+    } else {
+        let bad = |state: &mut HubState| {
+            admin_err(
+                state,
+                ci,
+                "user.bad_chans",
+                "channels are * (every channel) or up to 16 of #a,#b",
+                Some(usage),
+            )
+        };
+        for t in pacc.split(',').filter(|t| !t.is_empty()) {
+            if chans.iter().any(|c| c.eq_ignore_ascii_case(t)) {
+                continue;
+            }
+            if !access::uchan_name_ok(t) || chans.len() >= 16 {
+                return bad(state);
+            }
+            chans.push(t.to_string());
+        }
+        let star = chans.iter().any(|c| c == "*");
+        if chans.is_empty() || (star && chans.len() > 1) {
+            return bad(state);
+        }
+    }
     if pname.is_empty() || pname.contains('|') || pname.contains(' ') {
         return admin_err(
             state,
@@ -1577,6 +1861,17 @@ fn add_user_record(state: &mut HubState, ci: usize, payload: &str, typ: char) ->
             Some("hub purge removes old tombstones"),
         );
     }
+    if (is_admin && state.uflag_records.len() >= MAX_HUB_USER_FLAGS)
+        || (!is_admin && state.uchan_records.len() + chans.len() + 1 > MAX_HUB_CHAN_BINDS)
+    {
+        return admin_err(
+            state,
+            ci,
+            "user.full",
+            "the flag / channel table is full",
+            Some("hub purge removes old tombstones"),
+        );
+    }
     let t = now();
     let Some(new_uuid) = crypto::gen_uuid_v4() else {
         return admin_err(state, ci, "internal.entropy", "out of entropy", None);
@@ -1592,31 +1887,53 @@ fn add_user_record(state: &mut HubState, ci: usize, payload: &str, typ: char) ->
         timestamp: t,
     });
     state.mask_records.push(MaskRecord {
-        uuid: new_uuid,
+        uuid: new_uuid.clone(),
         mask: pmask.clone(),
         is_active: true,
         last_used: 0,
         timestamp: t,
     });
+    // Flags / bindings at the user's own stamp; a channel-bound oper also
+    // gets its "*" del (access::migrate must never make it global).
+    if is_admin {
+        access::uflag_put(state, &new_uuid, &flags, t);
+    } else {
+        for c in &chans {
+            access::uchan_put(state, &new_uuid, c, true, t);
+        }
+        if chans[0] != "*" {
+            access::uchan_put(state, &new_uuid, "*", false, t);
+        }
+    }
     state.config_dirty = true;
     // Bots get fresh per-connection payloads (the right shape per bot
-    // version); peers get the canonical record line.
+    // version); peers get ONE sync: the record, its mask, its flags /
+    // bindings, in the order a peer needs them (mesh::peer_enqueue_sync
+    // downgrades it for an older peer).
     let u = state.user_records.last().unwrap().clone();
     let m = state.mask_records.last().unwrap().clone();
-    let sync = crate::config::format_user_record(&u, false);
+    let mut sync = crate::config::format_user_record(&u, false);
+    sync.push_str(&format!("m|{}|{}|add|0|{t}\n", m.uuid, m.mask));
+    access::append(state, &mut sync, Some(&|uu: &str| uu == new_uuid));
     client::broadcast_config_to_bots(state, &sync);
     mesh::broadcast_sync_to_peers(state, &sync, -1);
-    let msync = format!("m|{}|{}|add|0|{t}\n", m.uuid, m.mask);
-    mesh::broadcast_sync_to_peers(state, &msync, -1);
     let mut r = Reply::new();
     r.ok("user.added");
     r.kv("name", &pname);
     r.kv("role", role_name(typ));
     r.kv("fp", &crypto::key_fingerprint(&praw));
     r.kv("mask", &pmask);
+    if is_admin {
+        r.kv("flags", &flags);
+    } else {
+        r.kv("chans", &access::user_chans(state, &new_uuid));
+    }
     r.kvi("peers", linked_peer_count(state));
     r.kvi("bots", local_bot_count(state));
     r.kvi("port", i64::from(listen_port(state)));
+    if access::user_restricted(state, &u) {
+        reply_old_hubs_for(state, &mut r, USER_FLAGS_MIN_HUB);
+    }
     send_reply(state, ci, &mut r)
 }
 
@@ -1635,6 +1952,15 @@ fn del_user_record(state: &mut HubState, ci: usize, payload: &str) -> bool {
         let m = format!("no user called \"{}\"", trunc_string(payload, 65));
         return admin_err(state, ci, "user.not_found", &m, Some("user list"));
     };
+    if state.user_records[ui].typ == 'a' && last_full_admin(state, &state.user_records[ui].uuid) {
+        return admin_err(
+            state,
+            ci,
+            "user.last_admin",
+            "that is the last full admin (+a); the network needs one",
+            Some("make another admin +a first"),
+        );
+    }
     // Peers get ONE sync payload: the user tombstone, then a tombstone for
     // every mask the user owned.  No peer or bot cascades a user delete to
     // its masks, so a mask tombstone that is not sent leaves the mask live
@@ -2094,7 +2420,7 @@ const MF_BANS_CHAN_MAX: usize = 128;
 /// 10 years, the store's own ceiling.
 const MF_BAN_MINUTES_MAX: u64 = 5_256_000;
 
-fn mf_field_count(s: &str) -> usize {
+pub(crate) fn mf_field_count(s: &str) -> usize {
     1 + s.bytes().filter(|&c| c == b'|').count()
 }
 
@@ -2108,7 +2434,13 @@ fn mf_admin_name(state: &HubState, ci: usize) -> String {
 /// old_hubs=; nothing when there are none.  A command that wrote C|/D|/B|
 /// calls this on its reply.
 pub(crate) fn mf_reply_old_hubs(state: &HubState, r: &mut Reply) {
-    let mut names: Vec<String> = modes::old_hubs(state, 16)
+    reply_old_hubs_for(state, r, MODES_MIN_HUB);
+}
+
+/// old_hubs= for the hubs older than `min_ver` (user_flags:
+/// USER_FLAGS_MIN_HUB).  C `reply_old_hubs_for`.
+fn reply_old_hubs_for(state: &HubState, r: &mut Reply, min_ver: &str) {
+    let mut names: Vec<String> = modes::old_hubs_for(state, 16, min_ver)
         .iter()
         .map(|n| crate::cstr::trunc(n, 64).to_string())
         .collect();
@@ -2756,7 +3088,7 @@ fn admin_chan_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
     send_reply(state, ci, &mut r)
 }
 
-/// network set: "" | flood|<cmd|msg|ctcp>|<N:S|off|default> | ignoretime|<min|default> | sendq|<B:I|default>
+/// bot set (CMD_ADMIN_NET_SET): "" | flood|<cmd|msg|ctcp>|<N:S|off|default> | ignoretime|<min|default> | sendq|<B:I|default>
 fn admin_net_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
     let cur = modes::netset_get(state).unwrap_or_default();
     let mut r = Reply::new();
@@ -2768,7 +3100,7 @@ fn admin_net_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
     }
     let nf = mf_field_count(payload);
     let Some(sub) = wire_field(payload, 0, 16) else {
-        return admin_err(state, ci, "network.usage", "unknown network setting", None);
+        return admin_err(state, ci, "network.usage", "unknown bot setting", None);
     };
     let (name, shown, mut value);
     if sub == "flood" && nf == 3 {
@@ -2779,7 +3111,7 @@ fn admin_net_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
                 ci,
                 "network.unknown_setting",
                 "flood types are cmd, msg and ctcp",
-                Some("network set flood <cmd|msg|ctcp> <N:S|off|default>"),
+                Some("bot set flood <cmd|msg|ctcp> <N:S|off|default>"),
             );
         };
         if t != "cmd" && t != "msg" && t != "ctcp" {
@@ -2788,7 +3120,7 @@ fn admin_net_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
                 ci,
                 "network.unknown_setting",
                 "flood types are cmd, msg and ctcp",
-                Some("network set flood <cmd|msg|ctcp> <N:S|off|default>"),
+                Some("bot set flood <cmd|msg|ctcp> <N:S|off|default>"),
             );
         }
         name = format!("bflood {t}");
@@ -2825,8 +3157,8 @@ fn admin_net_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
             state,
             ci,
             "network.unknown_setting",
-            "network settings are flood <cmd|msg|ctcp>, ignoretime and sendq",
-            Some("network set shows them"),
+            "bot settings are flood <cmd|msg|ctcp>, ignoretime and sendq",
+            Some("bot set shows them"),
         );
     }
     let kind = modes::setting_kind(&name).unwrap_or("");
@@ -2839,11 +3171,11 @@ fn admin_net_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
                 "network.bad_value",
                 &mf_value_hint(&shown, kind),
                 Some(if sub == "flood" {
-                    "network set flood cmd 10:30"
+                    "bot set flood cmd 10:30"
                 } else if sub == "sendq" {
-                    "network set sendq 10:100"
+                    "bot set sendq 10:100"
                 } else {
-                    "network set ignoretime 10"
+                    "bot set ignoretime 10"
                 }),
             );
         }
@@ -3116,6 +3448,7 @@ fn admin_ban(state: &mut HubState, ci: usize, payload: &str) -> bool {
             r.kv("setter", &x.setter);
             r.kv("reason", &x.reason);
             r.kvi("ts", x.ts);
+            r.kvi("used", x.last_used);
         }
         return send_reply(state, ci, &mut r);
     }
@@ -3197,6 +3530,305 @@ fn mf_payload_mutates(cmd: u8, payload: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Admin flags (irchub docs/plans/2026-10-16_user_flags_plan.md §2, R4)
+// ---------------------------------------------------------------------------
+
+/// The admin a console connection belongs to (its id is "ADMIN:<name>"), or
+/// None when that record is gone or is not a live admin.
+fn admin_of_client(state: &HubState, ci: usize) -> Option<usize> {
+    let name = state.clients[ci].id.strip_prefix("ADMIN:")?;
+    user_by_name(state, name).filter(|&i| state.user_records[i].typ == 'a')
+}
+
+/// C `sscanf(payload, "%63[^|]", name)`: the first field, at most 63 bytes;
+/// None when it is empty.
+fn first_field63(payload: &str) -> Option<&str> {
+    let f = payload.split('|').next().unwrap_or("");
+    if f.is_empty() {
+        return None;
+    }
+    let mut end = f.len().min(63);
+    while !f.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(&f[..end])
+}
+
+/// The flag a user-record command needs for the user it names: 'a' for an
+/// admin, 'o' for an oper (plan R1, U13); None when it names nobody.
+fn user_target_flag(state: &HubState, payload: &str) -> Option<char> {
+    let i = user_by_name(state, first_field63(payload)?)?;
+    Some(if state.user_records[i].typ == 'a' {
+        'a'
+    } else {
+        'o'
+    })
+}
+
+/// The admin flag an admin opcode needs (plan §2), or None for a view any
+/// admin may run.  C `admin_flag_needed`.
+fn admin_flag_needed(state: &HubState, me: Option<usize>, cmd: u8, payload: &str) -> Option<char> {
+    match cmd {
+        CMD_ADMIN_CREATE_BOT | CMD_ADMIN_DEL | CMD_ADMIN_DISCONNECT_BOT | CMD_ADMIN_REKEY_BOT => {
+            Some('b')
+        }
+        CMD_ADMIN_NET_SET => mf_payload_mutates(cmd, payload).then_some('b'),
+        CMD_ADMIN_ADD_PEER
+        | CMD_ADMIN_DEL_PEER
+        | CMD_ADMIN_SET_PEER_PUBKEY
+        | CMD_ADMIN_SYNC_MESH
+        | CMD_ADMIN_SET_PUBKEY
+        | CMD_ADMIN_REGEN_KEYS
+        | CMD_ADMIN_SET_HUB_NAME
+        | CMD_ADMIN_SET_BIND_IP
+        | CMD_ADMIN_SET_BIND_PORT
+        | CMD_ADMIN_SET_LOG_SIZE
+        | CMD_ADMIN_SET_LOG_LEVEL
+        | CMD_ADMIN_PURGE_TOMBSTONES
+        | CMD_ADMIN_SET_PURGE_DAYS
+        | CMD_ADMIN_ADD_ALLOWLIST
+        | CMD_ADMIN_DEL_ALLOWLIST
+        | CMD_ADMIN_ADD_DENYLIST
+        | CMD_ADMIN_DEL_DENYLIST => Some('h'),
+        // "" and "conn" show the tables; a name and a value change one
+        CMD_ADMIN_SET_SSH => (!payload.is_empty() && mf_field_count(payload) > 1).then_some('h'),
+        // R5: opt h / F decide the security model
+        CMD_ADMIN_SET_OPT_FLAGS => Some('a'),
+        CMD_ADMIN_ADD_CHANNEL
+        | CMD_ADMIN_DEL_CHANNEL
+        | CMD_ADMIN_OP_USER
+        | CMD_ADMIN_INVITE_USER => Some('c'),
+        CMD_ADMIN_CHAN_MODE | CMD_ADMIN_CHAN_SET | CMD_ADMIN_BAN => {
+            mf_payload_mutates(cmd, payload).then_some('c')
+        }
+        CMD_ADMIN_UPGRADE_NET => Some('u'),
+        CMD_ADMIN_UPGRADE_STATUS => (payload == "abort" || payload == "forget").then_some('u'),
+        CMD_ADMIN_ADD_ADMIN => Some('a'),
+        CMD_ADMIN_ADD_OPER_RECORD => Some('o'),
+        // flags|… changes an admin, chan|… an oper
+        CMD_ADMIN_USER_ACCESS => Some(if payload.starts_with("flags|") {
+            'a'
+        } else {
+            'o'
+        }),
+        // either role
+        CMD_ADMIN_DEL_ADMIN
+        | CMD_ADMIN_DEL_OPER_RECORD
+        | CMD_ADMIN_ADD_USERMASK
+        | CMD_ADMIN_DEL_USERMASK => user_target_flag(state, payload),
+        CMD_ADMIN_SET_USERKEY => {
+            // your own key: any admin
+            if let (Some(m), Some(name)) = (me, first_field63(payload))
+                && name.eq_ignore_ascii_case(&state.user_records[m].name)
+            {
+                return None;
+            }
+            user_target_flag(state, payload)
+        }
+        _ => None,
+    }
+}
+
+/// Plan R2: whether `uuid` is the last live admin holding +a.
+fn last_full_admin(state: &HubState, uuid: &str) -> bool {
+    if !access::user_flags(state, uuid).contains('a') {
+        return false;
+    }
+    !state.user_records.iter().any(|u| {
+        u.is_active
+            && u.typ == 'a'
+            && u.uuid != uuid
+            && access::user_flags(state, &u.uuid).contains('a')
+    })
+}
+
+/// CMD_ADMIN_USER_ACCESS (user_flags plan §4.1): `flags|<name>|<spec>`,
+/// `chan|add|<name>|<#chan|*>`, `chan|del|<name>|<#chan|*>`.  C
+/// `admin_user_access`.
+fn user_access(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    let usage_hint = "user set <name> flags <+x-y> | user chan add|del <name> <#chan|*>";
+    let nf = if payload.is_empty() {
+        0
+    } else {
+        mf_field_count(payload)
+    };
+    let kind = wire_field(payload, 0, 8);
+    let f1 = wire_field(payload, 1, 64);
+    let f2 = wire_field(payload, 2, 64);
+    let f3 = if nf > 3 {
+        wire_field(payload, 3, MAX_CHAN)
+    } else {
+        Some(String::new())
+    };
+    let (Some(kind), Some(f1), Some(f2), Some(f3)) = (kind, f1, f2, f3) else {
+        return admin_err(
+            state,
+            ci,
+            "user.usage",
+            "say which user and what to change",
+            Some(usage_hint),
+        );
+    };
+    if nf < 3 {
+        return admin_err(
+            state,
+            ci,
+            "user.usage",
+            "say which user and what to change",
+            Some(usage_hint),
+        );
+    }
+    let flags_cmd = kind == "flags" && nf == 3;
+    let chan_cmd = kind == "chan" && nf == 4 && (f1 == "add" || f1 == "del");
+    if !flags_cmd && !chan_cmd {
+        return admin_err(
+            state,
+            ci,
+            "user.usage",
+            "say which user and what to change",
+            Some(usage_hint),
+        );
+    }
+    let name = if flags_cmd { &f1 } else { &f2 };
+    let Some(ti) = user_by_name(state, name) else {
+        let m = format!("no user called \"{}\"", trunc_string(name, 64));
+        return admin_err(state, ci, "user.not_found", &m, Some("user list"));
+    };
+    let t = state.user_records[ti].clone();
+    let mut sync = String::new();
+    let mut r = Reply::new();
+    if flags_cmd {
+        if t.typ != 'a' {
+            return admin_err(
+                state,
+                ci,
+                "user.not_admin",
+                "flags are for admins; an oper has channels",
+                Some("user chan add|del"),
+            );
+        }
+        let old = access::user_flags(state, &t.uuid).to_string();
+        let nw = match access::uflags_edit(&old, &f2) {
+            Some(n) if !n.is_empty() => n,
+            _ => {
+                return admin_err(
+                    state,
+                    ci,
+                    "user.bad_flags",
+                    "flags are +a (full admin) or letters from bchou; +x-y changes some",
+                    Some("+a, +chu, +b-u"),
+                );
+            }
+        };
+        if !nw.contains('a') && last_full_admin(state, &t.uuid) {
+            return admin_err(
+                state,
+                ci,
+                "user.last_admin",
+                "that is the last full admin (+a); the network needs one",
+                Some("make another admin +a first"),
+            );
+        }
+        let written = old != nw;
+        if written {
+            let ts = access::next_ts(state, &t.uuid);
+            if !access::uflag_put(state, &t.uuid, &nw, ts) {
+                return admin_err(
+                    state,
+                    ci,
+                    "user.full",
+                    "the flag table is full",
+                    Some("hub purge removes old tombstones"),
+                );
+            }
+            access::append(state, &mut sync, Some(&|u: &str| u == t.uuid));
+        }
+        r.ok("user.flags");
+        r.kv("name", &t.name);
+        r.kv("old", &old);
+        r.kv("flags", &nw);
+        r.kvb("written", written);
+    } else {
+        if t.typ != 'o' {
+            return admin_err(
+                state,
+                ci,
+                "user.not_oper",
+                "channels are for opers; an admin has flags",
+                Some("user set <name> flags"),
+            );
+        }
+        let add = f1 == "add";
+        if !access::uchan_name_ok(&f3) {
+            return admin_err(
+                state,
+                ci,
+                "user.bad_chans",
+                "a channel is #name, or * for every channel",
+                None,
+            );
+        }
+        let live = access::uchan_find(state, &t.uuid, &f3)
+            .is_some_and(|i| state.uchan_records[i].is_active);
+        let any_live = access::user_chan_count(state, &t.uuid).0 > 0;
+        let missing = if f3 == "*" { !any_live } else { !live };
+        if !add && missing {
+            let m = format!(
+                "{} has no {}",
+                trunc_string(&t.name, 64),
+                if f3 == "*" { "channels" } else { f3.as_str() }
+            );
+            return admin_err(
+                state,
+                ci,
+                "user.chan_not_found",
+                &m,
+                Some("user show <name>"),
+            );
+        }
+        let written = !(add && live && (f3 == "*" || !access::user_chan_ok(state, &t.uuid, None)));
+        if written && access::chan_change(state, &t.uuid, add, &f3, &mut sync).is_none() {
+            return admin_err(
+                state,
+                ci,
+                "user.full",
+                "the channel binding table is full",
+                Some("hub purge removes old tombstones"),
+            );
+        }
+        r.ok("user.chan");
+        r.kv("name", &t.name);
+        r.kv("action", &f1);
+        r.kv("chan", &f3);
+        r.kv("chans", &access::user_chans(state, &t.uuid));
+        r.kvb("written", written);
+    }
+    if !sync.is_empty() {
+        state.config_dirty = true;
+        client::broadcast_config_to_bots(state, &sync);
+        mesh::broadcast_sync_to_peers(state, &sync, -1);
+    }
+    r.kvi("peers", linked_peer_count(state));
+    r.kvi("bots", local_bot_count(state));
+    if !sync.is_empty() {
+        reply_old_hubs_for(state, &mut r, USER_FLAGS_MIN_HUB);
+    }
+    send_reply(state, ci, &mut r)
+}
+
+fn admin_flag_word(f: char) -> &'static str {
+    match f {
+        'a' => "full admin",
+        'b' => "bots",
+        'c' => "channels",
+        'h' => "hub",
+        'o' => "opers",
+        'u' => "upgrades",
+        _ => "?",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -3210,9 +3842,7 @@ pub fn console_admin_op(cmd: u8) -> bool {
         cmd,
         CMD_ADMIN_LIST_FULL
             | CMD_ADMIN_LIST_SUMMARY
-            | CMD_ADMIN_GET_PENDING
-            | CMD_ADMIN_APPROVE
-            | CMD_ADMIN_ADD
+            | CMD_ADMIN_LIST_REVOKED
             | CMD_ADMIN_CREATE_BOT
             | CMD_ADMIN_DEL
             | CMD_ADMIN_DISCONNECT_BOT
@@ -3220,6 +3850,7 @@ pub fn console_admin_op(cmd: u8) -> bool {
             | CMD_ADMIN_LIST_PEERS
             | CMD_ADMIN_ADD_PEER
             | CMD_ADMIN_DEL_PEER
+            | CMD_ADMIN_PEER_REFS
             | CMD_ADMIN_SET_PEER_PUBKEY
             | CMD_ADMIN_SYNC_MESH
             | CMD_ADMIN_GET_PUBKEY
@@ -3251,6 +3882,7 @@ pub fn console_admin_op(cmd: u8) -> bool {
             | CMD_ADMIN_DEL_USERMASK
             | CMD_ADMIN_SET_USERKEY
             | CMD_ADMIN_MATCH
+            | CMD_ADMIN_USER_ACCESS
             | CMD_ADMIN_LIST_CHANNELS
             | CMD_ADMIN_ADD_CHANNEL
             | CMD_ADMIN_DEL_CHANNEL
@@ -3363,6 +3995,58 @@ fn upgrade_status_cmd(state: &mut HubState, ci: usize, payload: &str) -> bool {
     send_reply(state, ci, &mut r)
 }
 
+/// Client load and the maintenance countdowns of CMD_ADMIN_STATS
+/// (hub_maintenance), between the sync counters and the opcode rows.
+fn stats_load(state: &HubState, r: &mut Reply) {
+    let t = now();
+    let (mut bots, mut peers, mut authing) = (0i64, 0i64, 0i64);
+    for c in &state.clients {
+        match (c.typ, c.authenticated) {
+            (ClientType::Bot, true) => bots += 1,
+            (ClientType::Hub, true) => peers += 1,
+            _ => authing += 1,
+        }
+    }
+    r.rec("load");
+    r.kvi("clients", state.clients.len() as i64);
+    r.kvi("bots", bots);
+    r.kvi("peers", peers);
+    r.kvi("authing", authing);
+    r.kvi("dirty", i64::from(state.config_dirty));
+    let tm = &state.timers;
+    stats_timer(r, "gossip", 300, tm.last_mesh_gossip, t);
+    stats_timer(
+        r,
+        "entropy",
+        MESH_ANTI_ENTROPY_INTERVAL,
+        tm.last_anti_entropy,
+        t,
+    );
+    stats_timer(r, "scan", 5, tm.last_client_scan, t);
+    stats_timer(r, "ipclean", 300, tm.last_ip_cleanup, t);
+    stats_timer(r, "peers", PEER_RECONNECT_INTERVAL, tm.last_peer_check, t);
+    let purge = if state.purge_days_setting > 0 && tm.last_purge > 0 {
+        tm.last_purge
+    } else {
+        -1
+    };
+    stats_timer(r, "purge", 86400, purge, t);
+}
+
+/// One "timer" record: seconds until the next run of a job that runs every
+/// `every` s and last ran at `last` (-1 = off).
+fn stats_timer(r: &mut Reply, name: &str, every: i64, last: i64, t: i64) {
+    r.rec("timer");
+    r.kv("name", name);
+    r.kvi("every", every);
+    if last < 0 {
+        r.kv("in", "off");
+        return;
+    }
+    let left = if last > 0 { every - (t - last) } else { every };
+    r.kvi("in", left.max(0));
+}
+
 /// handle_admin_command().
 ///
 /// `payload` is the NUL-terminated text for the text opcodes; `raw` and
@@ -3395,6 +4079,32 @@ pub fn handle_admin_command(
             "config.frozen",
             "the config is frozen while an upgrade runs",
             Some("upgrade status; a stale freeze is lifted with option set"),
+        );
+    }
+
+    // Admin flags (plan R4): checked here for every opcode, whatever the
+    // console already checked.  An admin whose record is gone runs views only.
+    let me = admin_of_client(state, ci);
+    if let Some(need) = admin_flag_needed(state, me, cmd, payload)
+        && !me.is_some_and(|m| access::user_has_flag(state, &state.user_records[m].uuid, need))
+    {
+        crate::hlog_warning!(
+            "[ADMIN] {} refused 0x{:02x}: needs +{}\n",
+            state.clients[ci].id,
+            cmd,
+            need
+        );
+        let msg = format!("this needs +{need} ({})", admin_flag_word(need));
+        return admin_err(
+            state,
+            ci,
+            "user.no_flag",
+            &msg,
+            Some(if need == 'a' {
+                "ask a full admin (+a)"
+            } else {
+                "ask a full admin (+a) for the flag"
+            }),
         );
     }
 
@@ -3489,17 +4199,18 @@ pub fn handle_admin_command(
             send_reply(state, ci, &mut r)
         }
 
-        CMD_ADMIN_GET_PENDING => {
+        CMD_ADMIN_LIST_REVOKED => {
+            // bot revoked: every deleted bot that is wiped if it ever connects.
             let mut r = Reply::new();
-            r.ok("bot.pending");
-            r.kvi("count", state.pending.len() as i64);
-            for (i, p) in state.pending.iter().enumerate() {
-                r.rec("pending");
-                r.kvi("n", i as i64 + 1);
-                r.kv("uuid", &p.uuid);
-                r.kv("ip", &p.ip);
-                r.kvi("tries", i64::from(p.attempts));
-                r.kvi("last", p.last_attempt);
+            r.ok("bot.revoked");
+            r.kvi("count", state.revoked.len() as i64);
+            r.kvi("max", MAX_REVOKED as i64);
+            for rv in &state.revoked {
+                r.rec("revoked");
+                r.kv("uuid", &rv.uuid);
+                opt(&mut r, "nick", &rv.nick);
+                r.kvi("deleted", rv.del_ts);
+                r.kvi("wiped", rv.wiped_ts);
             }
             send_reply(state, ci, &mut r)
         }
@@ -3619,17 +4330,18 @@ pub fn handle_admin_command(
                     Some("bot list"),
                 );
             };
-            let mut was_online = false;
-            if let Some(bi) = local_bot_client(state, payload) {
-                crate::hlog_warning!("[ADMIN] Disconnecting deleted bot {payload}\n");
-                auth::disconnect_client(state, bi);
-                was_online = true;
-            }
+            // The tombstone put it on the revoke list (storage::update_entry).
+            // Connected here: told to wipe its config and exit; a hub that
+            // holds it does the same when this delete reaches it.
+            let was_online = auth::retire_revoked_bots(state) > 0;
             // Peers store the same tombstone (same stamp); every bot gets a
             // config that no longer lists the deleted bot and ends in the T|
             // marker, so it drops the bot from its trusted list (no more ~B2
             // or op grants).
-            let sync = format!("b|{payload}|d|1|{del_ts}\n");
+            let mut sync = format!("b|{payload}|d|1|{del_ts}\n");
+            if let Some(rv) = crate::revoke::find(state, payload) {
+                sync.push_str(&crate::revoke::format(rv));
+            }
             mesh::broadcast_sync_to_peers(state, &sync, -1);
             client::broadcast_config_to_bots(state, &sync);
             let Some(ci) = refind(state, admin_fd) else {
@@ -3642,102 +4354,6 @@ pub fn handle_admin_command(
             r.kvb("was_online", was_online);
             r.kvi("peers", linked_peer_count(state));
             r.kvi("bots", local_bot_count(state));
-            r.kvi("purge_days", i64::from(state.purge_days_setting));
-            send_reply(state, ci, &mut r)
-        }
-
-        CMD_ADMIN_APPROVE => {
-            if payload.is_empty() {
-                return admin_err(
-                    state,
-                    ci,
-                    "bot.usage",
-                    "say which bot to approve",
-                    Some("bot approve <#|uuid>"),
-                );
-            }
-            let mut n = 0usize;
-            let target_uuid = if payload.len() < 4 {
-                let idx = parse_uint(payload, 999).unwrap_or(0) as usize;
-                if idx == 0 || idx > state.pending.len() {
-                    let m = format!(
-                        "no pending bot #{} ({} waiting)",
-                        trunc_string(payload, 9),
-                        state.pending.len()
-                    );
-                    return admin_err(state, ci, "bot.no_pending", &m, Some("bot pending"));
-                }
-                n = idx;
-                state.pending[idx - 1].uuid.clone()
-            } else {
-                if !crate::cstr::is_uuid(payload) {
-                    return admin_err(
-                        state,
-                        ci,
-                        "bot.bad_uuid",
-                        "that is not a valid uuid",
-                        Some("8-4-4-4-12 hex digits"),
-                    );
-                }
-                payload.to_string()
-            };
-            let mut ip = String::new();
-            for (i, p) in state.pending.iter().enumerate() {
-                if p.uuid == target_uuid {
-                    ip = p.ip.clone();
-                    if n == 0 {
-                        n = i + 1;
-                    }
-                }
-            }
-            let t = now();
-            storage::update_entry(state, &target_uuid, "t", "", "", "", t);
-            state.config_dirty = true;
-            auth::remove_pending_bot(state, &target_uuid);
-            let sync = format!("{target_uuid}|t||{t}\n");
-            mesh::broadcast_sync_to_peers(state, &sync, -1);
-            let mut r = Reply::new();
-            r.ok("bot.approved");
-            r.kv("uuid", &target_uuid);
-            opt(&mut r, "ip", &ip);
-            if n > 0 {
-                r.kvi("n", n as i64);
-            }
-            r.kvi("peers", linked_peer_count(state));
-            send_reply(state, ci, &mut r)
-        }
-
-        CMD_ADMIN_ADD => {
-            if payload.is_empty() {
-                return admin_err(
-                    state,
-                    ci,
-                    "bot.usage",
-                    "say which uuid",
-                    Some("bot authorize <uuid>"),
-                );
-            }
-            if !crate::cstr::is_uuid(payload) {
-                return admin_err(
-                    state,
-                    ci,
-                    "bot.bad_uuid",
-                    "that is not a valid uuid",
-                    Some("8-4-4-4-12 hex digits"),
-                );
-            }
-            let registered = bot_by_uuid(state, payload)
-                .is_some_and(|i| state.bots[i].is_active && state.bots[i].entry("pub").is_some());
-            let t = now();
-            storage::update_entry(state, payload, "t", "", "", "", t);
-            state.config_dirty = true;
-            let sync = format!("{payload}|t||{t}\n");
-            mesh::broadcast_sync_to_peers(state, &sync, -1);
-            let mut r = Reply::new();
-            r.ok("bot.authorized");
-            r.kv("uuid", payload);
-            r.kvi("peers", linked_peer_count(state));
-            r.kvb("registered", registered);
             send_reply(state, ci, &mut r)
         }
 
@@ -3769,6 +4385,7 @@ pub fn handle_admin_command(
         CMD_ADMIN_DEL_PEER => del_peer(state, ci, payload),
         CMD_ADMIN_SET_PEER_PUBKEY => set_peer_pubkey(state, ci, payload),
         CMD_ADMIN_LIST_PEERS => list_peers(state, ci, payload),
+        CMD_ADMIN_PEER_REFS => peer_refs(state, ci, payload),
 
         CMD_ADMIN_LIST_CHANNELS => list_channels(state, ci, payload),
         CMD_ADMIN_ADD_CHANNEL => add_channel(state, ci, payload),
@@ -3806,7 +4423,9 @@ pub fn handle_admin_command(
                     &nick,
                     "",
                     Some((admin_fd, state.clients[ci].conn_serial)),
-                ) {
+                )
+                .is_some()
+                {
                     return true;
                 }
                 return admin_err(
@@ -3863,7 +4482,9 @@ pub fn handle_admin_command(
                     &nick,
                     "",
                     Some((admin_fd, state.clients[ci].conn_serial)),
-                ) {
+                )
+                .is_some()
+                {
                     return true;
                 }
                 return admin_err(
@@ -3969,10 +4590,15 @@ pub fn handle_admin_command(
                 );
             };
             let old = state.purge_days_setting.to_string();
-            state.purge_days_setting = udays as i32; // 0 = disabled
-            state.config_dirty = true;
+            // Mesh-wide (hs|autopurge): every hub purges on the same
+            // schedule, the elected leader runs it.
+            crate::revoke::gsetting_set(state, "autopurge", udays as i32); // 0 = disabled
+            if let Some(line) = crate::revoke::gsetting_format(state, "autopurge") {
+                mesh::broadcast_sync_to_peers(state, &line, -1);
+            }
             let val = state.purge_days_setting.to_string();
-            hub_set_reply(state, ci, "autopurge", Some(&old), &val, false, -1)
+            let peers = linked_peer_count(state);
+            hub_set_reply(state, ci, "autopurge", Some(&old), &val, false, peers)
         }
 
         CMD_ADMIN_SET_BIND_IP => {
@@ -4136,7 +4762,7 @@ pub fn handle_admin_command(
                 0
             };
             let mut r = Reply::new();
-            crate::stats::report(up, &mut r);
+            crate::stats::report(up, &mut r, |r| stats_load(state, r));
             send_reply(state, ci, &mut r)
         }
 
@@ -4205,6 +4831,7 @@ pub fn handle_admin_command(
         CMD_ADMIN_ADD_USERMASK => add_usermask(state, ci, payload),
         CMD_ADMIN_DEL_USERMASK => del_usermask(state, ci, payload),
         CMD_ADMIN_SET_USERKEY => set_userkey(state, ci, payload),
+        CMD_ADMIN_USER_ACCESS => user_access(state, ci, payload),
 
         _ => admin_err(state, ci, "admin.unknown", "unknown admin command", None),
     }

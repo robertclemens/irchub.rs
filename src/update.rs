@@ -837,10 +837,19 @@ pub fn rollback(state: &mut HubState, reason: &str) -> bool {
     crate::hlog_warning!("[UPGRADE] Rolling back to the retained build: {reason}\n");
     // Config first: if the restart races us, the old binary must not come up
     // against a config only the newer build understands.
-    if std::path::Path::new(&prev_cfg).exists()
-        && std::fs::rename(&prev_cfg, HUB_CONFIG_FILE).is_err()
-    {
-        crate::hlog_error!("[UPGRADE] Could not restore {prev_cfg}; keeping the current one\n");
+    let mut cfg_restored = false;
+    if std::path::Path::new(&prev_cfg).exists() {
+        cfg_restored = std::fs::rename(&prev_cfg, HUB_CONFIG_FILE).is_ok();
+        if !cfg_restored {
+            crate::hlog_error!("[UPGRADE] Could not restore {prev_cfg}; keeping the current one\n");
+        }
+    }
+    // The pre-2.5.0 pass file, only if this process rewrote it (the old build
+    // cannot read the new one).
+    if state.pass_prev_saved && std::fs::rename(HUB_PASS_PREV_FILE, HUB_PASS_FILE).is_err() {
+        crate::hlog_error!(
+            "[UPGRADE] Could not restore {HUB_PASS_PREV_FILE}; keeping the current one\n"
+        );
     }
     if std::fs::rename(&prev_exe, &exe).is_err() {
         crate::hlog_error!("[UPGRADE] Could not restore {prev_exe}\n");
@@ -848,7 +857,12 @@ pub fn rollback(state: &mut HubState, reason: &str) -> bool {
     }
     let _ = std::fs::remove_file(HUB_UPGRADE_MARKER_FILE);
 
-    config::write(state);
+    // Not over a restored config: it is the retained build's own file, and
+    // this build would write it in its format (2.5.0+: a PBKDF2 count older
+    // builds cannot read).  What changed since comes back from the peers.
+    if !cfg_restored {
+        config::write(state);
+    }
     state.pid_file = None;
     let _ = std::fs::remove_file(HUB_PID_FILE);
     std::thread::sleep(std::time::Duration::from_secs(1));

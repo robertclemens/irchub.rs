@@ -26,13 +26,23 @@ pub const SALT_SIZE: usize = 16;
 pub const GCM_IV_LEN: usize = 12;
 pub const GCM_TAG_LEN: usize = 16;
 pub const HEADER_SIZE: usize = 4;
-pub const MAX_PENDING_BOTS: usize = 10;
 pub const MAX_PENDING_OP_REQUESTS: usize = 500;
-pub const PBKDF2_ITERATIONS: u32 = 100_000;
+/// PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys.
+/// 2.5.0 raised them from 100k (PBKDF2_ITERATIONS_LEGACY); a file still under
+/// the legacy count is read and rewritten once (config::load, passfile_load).
+/// Releases after 2.5.0 carry min_from 2.5.0 so no node skips that rewrite.
+pub const PBKDF2_ITERATIONS: u32 = 600_000;
+pub const PBKDF2_ITERATIONS_LEGACY: u32 = 100_000;
 /// Passwordless (docs/passwordless.md): a bot advertises this as "v|2" in its
 /// CMD_CONFIG_PUSH; until it has, it is sent legacy record shapes with an
 /// empty password slot (old bots then fail closed).
 pub const BOT_PROTO_PASSWORDLESS: i32 = 2;
+/// A bot that knows admin flags and oper channel bindings (uf| / uc|) says
+/// "v|3"; below that it is an older node (user_flags plan §3.2).  Mirrored in
+/// ircbot/bot.h (BOT_PROTO_VERSION).
+pub const BOT_PROTO_USER_FLAGS: i32 = 3;
+/// Oldest hub that stores uf| / uc|; older peers get the downgraded sync.
+pub const USER_FLAGS_MIN_HUB: &str = "2.4.7";
 pub const KEY_FP_LEN: usize = 19; // "ab12:cd34:ef56:7890"
 pub const HUB_PID_FILE: &str = ".irchub.pid";
 pub const HUB_PASS_FILE: &str = ".irchub.pass";
@@ -108,7 +118,7 @@ pub const HIDEPINGPONG: bool = true;
 /// the bots tree and the one every upgrade comparison is made against.
 pub const HUB_VERSION: &str = match option_env!("IRCHUB_VERSION") {
     Some(v) => v,
-    None => "2.4.6",
+    None => "2.5.0",
 };
 
 /// Signed-release channel for the hub (irchub-releases).  Same Ed25519 key
@@ -135,6 +145,8 @@ pub const HUB_UPGRADE_MARKER_FILE: &str = ".irchub.upgrade";
 /// Retained previous binary/config, kept (not deleted) after an upgrade so
 /// CMD_UPGRADE_ABORT can put this hub back.
 pub const HUB_UPGRADE_PREV_SUFFIX: &str = ".prev";
+/// The pre-2.5.0 pass file kept for a rollback (HUB_PASS_FILE + HUB_UPGRADE_PREV_SUFFIX).
+pub const HUB_PASS_PREV_FILE: &str = ".irchub.pass.prev";
 /// The generated installer, written 0700 and exec'd once the old process has
 /// let go of its pid lock.
 pub const HUB_UPGRADE_SCRIPT: &str = "hub_upgrade.sh";
@@ -148,6 +160,16 @@ pub const HUB_UPDATE_QUICK_TIMEOUT: u64 = 8;
 /// The upgrade script's startup watchdog: how long the new build's daemon has
 /// to be up and alive before the script keeps it.
 pub const UPGRADE_WATCH_SECS: u32 = 20;
+/// A pre-2.5.0 HUB_PASS_FILE found on the start a hub-driven upgrade made is
+/// rewritten at PBKDF2_ITERATIONS this long after that start: past the old
+/// build's watchdog, which restores `<exe>.prev` and the config but not this
+/// file.  The old copy stays as HUB_PASS_PREV_FILE until the next ordinary
+/// start, for this process's own update::rollback() to put back (hub.h).
+pub const UPGRADE_PASS_REWRITE_SECS: i64 = 120;
+const _: () = assert!(
+    UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS as i64,
+    "the pass rewrite must wait out the old build's watchdog"
+);
 /// The bots' release tree ROOT (ircbot-releases), for the console's release
 /// list and for walking a bot up via the roll-up.  Mirrors
 /// HUB_BOT_RELEASE_BASE in hub.h.
@@ -180,6 +202,8 @@ pub const CMD_INVITE_REQUEST: u8 = 0x09;
 
 pub const CMD_ADMIN_AUTH: u8 = 0x10;
 pub const CMD_ADMIN_LIST_FULL: u8 = 0x11;
+/// 0x12 / 0x16 / 0x17 (ADD / GET_PENDING / APPROVE) are retired with bot
+/// pending/approve/authorize: bot add is the only way in.  Never reuse.
 pub const CMD_ADMIN_ADD: u8 = 0x12;
 pub const CMD_ADMIN_DEL: u8 = 0x13;
 pub const CMD_ADMIN_REGEN_KEYS: u8 = 0x14;
@@ -344,6 +368,40 @@ pub const CMD_ADMIN_BAN: u8 = 0x78;
 pub const CMD_ADMIN_NET_SET: u8 = 0x79;
 pub const CMD_ADMIN_SET_SSH: u8 = 0x7A;
 pub const CMD_CHAN_EVENT: u8 = 0x7B;
+/// Admin flags / oper channel bindings from the console (user_flags plan
+/// §4.1): `flags|<name>|<+x-y|letters>`, `chan|add|<name>|<#chan|*>`,
+/// `chan|del|<name>|<#chan|*>`.  Answers user.flags / user.chan.  Internal
+/// (console only), never on the network; reserved in ircbot/bot.h.
+pub const CMD_ADMIN_USER_ACCESS: u8 = 0x7C;
+/// A person's channel request from a bot (user_flags plan §5):
+/// `rid|kind|#chan|user_uuid|nick|nick!user@host` bot->hub, answered
+/// `rid|ok|detail` / `rid|fail|detail` hub->bot.  Mirrored in ircbot/bot.h.
+pub const CMD_USER_CHAN_REQUEST: u8 = 0x7D;
+pub const CMD_USER_CHAN_RESULT: u8 = 0x7E;
+/// Revoked bots (irchub docs/plans/2026-10-17_bot_revoke_plan.md).  A deleted
+/// bot's uuid and key stay on a permanent revoke list; when it connects it is
+/// told to wipe its config and exit.  CMD_BOT_RETIRE hub->bot is empty: in
+/// session a sealed frame, in the handshake the 1-byte sealed ACK is 0x7F.
+/// CMD_BOT_RETIRE_ACK bot->hub: "1" config wiped, "0" wipe failed.
+/// Mirrored in ircbot/bot.h.
+pub const CMD_BOT_RETIRE: u8 = 0x7F;
+pub const CMD_BOT_RETIRE_ACK: u8 = 0x80;
+/// bot revoked (console -> hub).
+pub const CMD_ADMIN_LIST_REVOKED: u8 = 0x81;
+/// hub del's preview (docs/plans/2026-10-18_hub_del_refs_plan.md): console ->
+/// hub "<uuid|name>"; the reply names the hubs that link to it and the bots
+/// whose hl| list holds it.
+pub const CMD_ADMIN_PEER_REFS: u8 = 0x82;
+/// Revoke list ceiling; the oldest is dropped past it.
+pub const MAX_REVOKED: usize = 1024;
+/// Seconds an online bot gets to answer CMD_BOT_RETIRE.
+pub const RETIRE_GRACE_SEC: i64 = 10;
+/// rid bytes, [A-Za-z0-9-].
+pub const USER_CHAN_RID_MAX: usize = 32;
+/// s, per bot connection.
+pub const USER_CHAN_REQ_WINDOW: i64 = 60;
+/// requests per window, the rest dropped.
+pub const USER_CHAN_REQ_MAX: i32 = 20;
 pub const CHAN_EVENT_TARGET_MAX: usize = 120;
 pub const CHAN_EVENT_DETAIL_MAX: usize = 160;
 pub const CHAN_EVENT_WINDOW: i64 = 60;
@@ -432,10 +490,16 @@ pub const CMD_ADMIN_STATS: u8 = 0x68;
 /// ACTIVITY_BUCKET (a clock hour), with that use's exact time.  A hub keeps
 /// max(stored, ts) and forwards to its other peers only the lines that raised
 /// its value.  PEER_SYNC / CONFIG_PUSH max-merge the same fields as repair.
+/// A ban's last use (a bot saw an unauthorised member match a listed,
+/// non-sticky ban) cannot ride its B| line: it lives beside the record
+/// (`ConfigEntry::last_used`), is saved as a bu| line in the cnf, and a hub
+/// repairs a peer by sending all of them as CMD_ACTIVITY right after the
+/// link's initial sync (`activity::send_bans`).
 ///
 ///   CMD_ACTIVITY        bot -> hub, hub <-> hub.  Lines:
 ///                         a|<user_uuid>|<ts>          (admin or oper)
 ///                         m|<user_uuid>|<mask>|<ts>
+///                         B|<#chan|*>|<mask>|<ts>     (a listed ban's last use)
 ///   CMD_ACTIVITY_QUERY  bot -> hub: <req_id>|users   or
 ///                                   <req_id>|masks|<user_uuid or *>
 ///                       ("masks" answers that user's a| line too)
@@ -462,7 +526,7 @@ pub const SYNC_RESYNC_AFTER_LINK_LOSS: i64 = 5;
 // connection that is already authenticated (HubClient::internal): plaintext
 // frames len(4, big-endian) || op(1) || payload.  CMD_CONSOLE is the one
 // opcode that exists only there -- console -> core "sub|<topics>" /
-// "get|tree" / "get|status", core -> console "<topic>|<data>" events.  It
+// "get|tree" / "get|log", core -> console "<topic>|<data>" events.  It
 // never appears on the network.  Mirrors irchub hub.h.
 pub const CMD_CONSOLE: u8 = 0x6C;
 /// core -> console: the reply to the request in flight.
@@ -597,6 +661,8 @@ pub const MAX_BANS_TOTAL: usize = MAX_CHANNELS * MAX_BANS_PER_CHAN + MAX_GLOBAL_
 pub const C_LINE_MAX: usize = 704;
 pub const D_LINE_MAX: usize = 640;
 pub const B_LINE_MAX: usize = 448;
+/// `bu|<#chan|*>|<mask>|<last_used>`: a ban's last use, cnf only (activity).
+pub const BU_LINE_MAX: usize = MAX_CHAN + BAN_MASK_MAX + 32;
 /// `global_entries`: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B.
 pub const MAX_GLOBAL_ENTRIES: usize = MAX_BOT_ENTRIES + MAX_CHANNELS + 1 + MAX_BANS_TOTAL;
 /// Oldest hub that stores and forwards C|/D|/B| (older ones drop them).
@@ -617,6 +683,17 @@ pub const MODES_RECORDS_MAX: usize =
 
 pub const MAX_HUB_USER_RECORDS: usize = 40;
 pub const MAX_HUB_USER_MASKS: usize = 200;
+/// Admin flags and oper channel bindings (user_flags plan §3.1).  The
+/// letters in their canonical order: a full, b bots, c channels, h hub,
+/// o opers, u upgrades.  Mirrored in ircbot/bot.h.
+pub const USER_FLAG_LETTERS: &str = "abchou";
+pub const USER_FLAGS_MAX: usize = 6;
+/// One uf| per user record.
+pub const MAX_HUB_USER_FLAGS: usize = MAX_HUB_USER_RECORDS;
+/// uc| records, live and tombstones.
+pub const MAX_HUB_CHAN_BINDS: usize = 400;
+/// The stamp `access::migrate` writes: older than any real record.
+pub const USER_ACCESS_MIGRATE_TS: i64 = 1;
 
 // ---- Bulk-payload ceilings (Change 5) --------------------------------------
 // Hard upper bounds on generated config / sync payloads, derived entirely
@@ -625,7 +702,7 @@ pub const MAX_HUB_USER_MASKS: usize = 200;
 // sent (payloads carry only real records at real sizes).
 //
 // They are true hard bounds because ingest is bounded: per-bot state is
-// restricted to the whitelist {t,n,h,pub,seen,d} with per-key value caps in
+// restricted to the whitelist {t,n,h,pub,seen,d,hl} with per-key value caps in
 // storage::update_entry, so a bot has at most BOT_SYNC_FIELDS entries whose
 // lines never approach value[1024].  Keep this shared contract identical with
 // ircbot/bot.h (MAX_CONFIG_PAYLOAD).
@@ -636,6 +713,31 @@ pub const USER_LINE_MAX: usize = 384;
 pub const MASK_LINE_MAX: usize = 352;
 pub const BLINE_MAX: usize = 448;
 pub const PEER_LINE_MAX: usize = 256;
+/// uf|<uuid>|<flags>|<ts>
+pub const UF_LINE_MAX: usize = 96;
+/// uc|<uuid>|<chan>|add/del|<ts>
+pub const UC_LINE_MAX: usize = 160;
+/// What uf| and uc| add to a bulk payload at their caps.
+pub const USER_ACCESS_RECORDS_MAX: usize =
+    MAX_HUB_USER_FLAGS * UF_LINE_MAX + MAX_HUB_CHAN_BINDS * UC_LINE_MAX;
+/// rv|uuid|pub|pub_ts|nick|wiped|del_ts
+pub const RV_LINE_MAX: usize = 256;
+/// hs|<name>|<value>|<ts>
+pub const HS_LINE_MAX: usize = 96;
+/// hs| settings the registry may hold.
+pub const HUB_GSETTINGS_MAX: usize = 8;
+/// hl|<addr>/<fp>,...: the hubs a bot dials, pushed by the bot, stored as its
+/// per-bot entry "hl" (never sent to bots).  <fp> = hex of SHA-256(the hub's
+/// Ed25519 key)[0..8].  Mirrors ircbot's bot.h.
+pub const HL_ADDR_MAX: usize = 80;
+pub const HL_FP_LEN: usize = 16;
+/// ircbot MAX_SERVERS.
+pub const HL_ENTRIES_MAX: usize = 10;
+pub const HL_VALUE_MAX: usize = HL_ENTRIES_MAX * (HL_ADDR_MAX + 1 + HL_FP_LEN + 1);
+/// b|<uuid>|hl|<value>|<ts>
+pub const HL_LINE_MAX: usize = HL_VALUE_MAX + 64;
+/// What rv| and hs| add to a bulk payload at their caps.
+pub const REVOKE_RECORDS_MAX: usize = MAX_REVOKED * RV_LINE_MAX + HUB_GSETTINGS_MAX * HS_LINE_MAX;
 pub const PAYLOAD_SLACK: usize = 8192;
 
 /// Bot config payload (`storage::generate_bot_payload`): globals + users +
@@ -643,6 +745,7 @@ pub const PAYLOAD_SLACK: usize = 8192;
 pub const MAX_CONFIG_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + MAX_HUB_USER_RECORDS * USER_LINE_MAX
     + MAX_HUB_USER_MASKS * MASK_LINE_MAX
+    + USER_ACCESS_RECORDS_MAX
     + BOT_SYNC_FIELDS * BOT_FIELD_LINE
     + MAX_BOTS * BLINE_MAX
     + MODES_RECORDS_MAX
@@ -653,9 +756,12 @@ pub const MAX_CONFIG_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
 pub const MAX_SYNC_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + MAX_HUB_USER_RECORDS * USER_LINE_MAX
     + MAX_HUB_USER_MASKS * MASK_LINE_MAX
+    + USER_ACCESS_RECORDS_MAX
     + MAX_BOTS * BOT_SYNC_FIELDS * BOT_FIELD_LINE
+    + MAX_BOTS * HL_LINE_MAX
     + MAX_PEERS * PEER_LINE_MAX
     + MODES_RECORDS_MAX
+    + REVOKE_RECORDS_MAX
     + PAYLOAD_SLACK;
 
 /// `config::write()` buffer: every serialized section at its bound, with the
@@ -669,7 +775,10 @@ pub const HUB_CONFIG_FIXED_MAX: usize = 8192
     + MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + MAX_HUB_USER_RECORDS * USER_LINE_MAX
     + MAX_HUB_USER_MASKS * MASK_LINE_MAX
+    + USER_ACCESS_RECORDS_MAX
     + MODES_RECORDS_MAX
+    + REVOKE_RECORDS_MAX
+    + MAX_BANS_TOTAL * BU_LINE_MAX
     + 2 * MAX_IP_ACL_ENTRIES * IP_ACL_LINE_MAX
     + MAX_PEERS * 512;
 pub const HUB_CONFIG_PER_BOT_MAX: usize = MAX_BOT_ENTRIES * 1100;

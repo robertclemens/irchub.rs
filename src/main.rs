@@ -15,10 +15,10 @@ use zeroize::Zeroizing;
 
 use irchub::consts::*;
 use irchub::cstr::{now, trunc_string};
+use irchub::state::Lane;
 use irchub::state::{ClientType, HubClient, HubState, MaskRecord, UserRecord, name_valid};
-use irchub::state::{Lane, QueuedMsg};
 use irchub::{
-    auth, client, config, crypto, hlog_debug, hlog_error, hlog_info, hlog_status, hlog_warning,
+    activity, auth, client, config, crypto, hlog_debug, hlog_error, hlog_info, hlog_warning,
     logging, mesh, net, presence, queue, ratelimit, storage, tool, upgrade,
 };
 
@@ -147,7 +147,10 @@ fn passfile_context() -> String {
 }
 
 /// File layout: `[SALT_SIZE][IV+ciphertext][GCM_TAG_LEN]`.
-fn passfile_load(path: &str) -> Option<Zeroizing<String>> {
+/// The password, and whether the file only opened under
+/// PBKDF2_ITERATIONS_LEGACY (written before 2.5.0); main() then rewrites it
+/// under the current count.
+fn passfile_load(path: &str) -> Option<(Zeroizing<String>, bool)> {
     let md = fs::metadata(path).ok()?;
     if md.uid() != nix::unistd::getuid().as_raw() {
         eprintln!("[WARN] {path}: wrong owner, ignoring.");
@@ -167,9 +170,20 @@ fn passfile_load(path: &str) -> Option<Zeroizing<String>> {
     let enc_blk = &buf[SALT_SIZE..SALT_SIZE + enc_len];
     let tag = &buf[SALT_SIZE + enc_len..];
 
-    let key = crypto::derive_config_key(passfile_context().as_bytes(), salt);
-    match crypto::aes_gcm_decrypt(enc_blk, key.as_ref(), tag) {
-        Some(plain) => Some(Zeroizing::new(String::from_utf8_lossy(&plain).into_owned())),
+    let ctx = passfile_context();
+    let open = |iterations| {
+        let key = crypto::derive_config_key(ctx.as_bytes(), salt, iterations);
+        crypto::aes_gcm_decrypt(enc_blk, key.as_ref(), tag)
+    };
+    let opened = match open(PBKDF2_ITERATIONS) {
+        Some(p) => Some((p, false)),
+        None => open(PBKDF2_ITERATIONS_LEGACY).map(|p| (p, true)),
+    };
+    match opened {
+        Some((plain, legacy)) => Some((
+            Zeroizing::new(String::from_utf8_lossy(&plain).into_owned()),
+            legacy,
+        )),
         None => {
             eprintln!(
                 "[WARN] {path}: decryption failed (wrong machine or tampered file), falling through."
@@ -185,17 +199,20 @@ fn passfile_create(path: &str, password: &str) -> bool {
         eprintln!("RNG failure.");
         return false;
     }
-    let key = crypto::derive_config_key(passfile_context().as_bytes(), &salt);
+    let key = crypto::derive_config_key(passfile_context().as_bytes(), &salt, PBKDF2_ITERATIONS);
     let Some((enc_buf, tag)) = crypto::aes_gcm_encrypt(password.as_bytes(), key.as_ref()) else {
         eprintln!("Encryption failed.");
         return false;
     };
+    // Written beside it and renamed over it, so a rewrite (-p, or the PBKDF2
+    // migration at start) never leaves a half-written pass file.
+    let tmp = format!("{path}.tmp");
     let f = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path);
+        .open(&tmp);
     let Ok(mut f) = f else {
         eprintln!("open {path} failed.");
         return false;
@@ -204,14 +221,56 @@ fn passfile_create(path: &str, password: &str) -> bool {
         .is_err()
     {
         eprintln!("chmod {path} failed.");
+        let _ = fs::remove_file(&tmp);
         return false;
     }
-    let ok =
+    let mut ok =
         f.write_all(&salt).is_ok() && f.write_all(&enc_buf).is_ok() && f.write_all(&tag).is_ok();
     if !ok {
         eprintln!("write {path} failed.");
     }
+    drop(f);
+    if ok && fs::rename(&tmp, path).is_err() {
+        eprintln!("rename {path} failed.");
+        ok = false;
+    }
+    if !ok {
+        let _ = fs::remove_file(&tmp);
+    }
     ok
+}
+
+/// The deferred rewrite of a pre-2.5.0 pass file on an upgrade start (see
+/// UPGRADE_PASS_REWRITE_SECS).  The old file is hard-linked to
+/// HUB_PASS_PREV_FILE first; passfile_create() renames a new one over
+/// HUB_PASS_FILE, so the link keeps the old bytes and mode.  One attempt: on
+/// failure the file stays readable as it is and the next ordinary start
+/// rewrites it.
+fn passfile_upgrade_tick(state: &mut HubState, t: i64) {
+    if state.pass_rewrite_due == 0 || t < state.pass_rewrite_due {
+        return;
+    }
+    state.pass_rewrite_due = 0;
+    let pass = state.get_config_pass();
+    let _ = fs::remove_file(HUB_PASS_PREV_FILE);
+    if pass.is_empty() || fs::hard_link(HUB_PASS_FILE, HUB_PASS_PREV_FILE).is_err() {
+        hlog_warning!(
+            "[HUB] {HUB_PASS_FILE} kept at PBKDF2 {}k: could not keep a copy for rollback\n",
+            PBKDF2_ITERATIONS_LEGACY / 1000
+        );
+    } else if passfile_create(HUB_PASS_FILE, &pass) {
+        state.pass_prev_saved = true;
+        hlog_info!(
+            "[HUB] {HUB_PASS_FILE} rewritten with PBKDF2 {}k (old copy in {HUB_PASS_PREV_FILE} until the next ordinary start)\n",
+            PBKDF2_ITERATIONS / 1000
+        );
+    } else {
+        let _ = fs::remove_file(HUB_PASS_PREV_FILE);
+        hlog_warning!(
+            "[HUB] {HUB_PASS_FILE} kept at PBKDF2 {}k: rewrite failed\n",
+            PBKDF2_ITERATIONS_LEGACY / 1000
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,21 +366,16 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
     // the poll cycle.  This replaces deferring the first sync to
     // anti-entropy (up to a 90 s wait).
     let full_sync = mesh::generate_sync_packet(state);
-    if full_sync.is_empty() {
-        return;
-    }
-    let Some(mut m) = QueuedMsg::new(CMD_PEER_SYNC, Lane::Bulk, full_sync.as_bytes()) else {
-        return;
-    };
     let seq = state.next_lamport_seq();
-    let hub_uuid = state.hub_uuid.clone();
-    m.set_coalesce(&hub_uuid, seq, "handshake_sync");
-    if !queue::enqueue(&mut state.clients[ci], m) {
-        hlog_warning!(
-            "[PEER] Could not queue initial sync to {}\n",
-            state.clients[ci].ip
-        );
-    }
+    mesh::peer_enqueue_sync(
+        state,
+        ci,
+        CMD_PEER_SYNC,
+        Lane::Bulk,
+        &full_sync,
+        Some(("handshake_sync", seq)),
+    );
+    activity::send_bans(state, ci);
 }
 
 /// hub_check_peers(): reconnect to any peer we are not linked to.
@@ -380,9 +434,6 @@ fn maintenance(state: &mut HubState) {
     if state.timers.last_ip_cleanup == 0 {
         state.timers.last_ip_cleanup = t;
     }
-    if state.timers.last_status_dump == 0 {
-        state.timers.last_status_dump = t;
-    }
 
     // Bot presence: gossip our own bots to the peers, expire entries nobody
     // refreshed, and push the tree to bots when it changed.  All volatile.
@@ -390,6 +441,7 @@ fn maintenance(state: &mut HubState) {
 
     // Rolling network upgrade: one step per tick (no-op unless running).
     upgrade::tick(state, t);
+    passfile_upgrade_tick(state, t);
 
     // Channel-request elections: probe windows and hand-off timeouts.
     irchub::elect::tick(state, t);
@@ -419,7 +471,6 @@ fn maintenance(state: &mut HubState) {
     if t - state.timers.last_anti_entropy > MESH_ANTI_ENTROPY_INTERVAL {
         state.timers.last_anti_entropy = t;
         if !state.peers.is_empty() {
-            hlog_debug!("[MESH] Running periodic anti-entropy sync...\n");
             let full_sync = mesh::generate_sync_packet(state);
             mesh::broadcast_sync_to_peers(state, &full_sync, -1);
         }
@@ -466,6 +517,7 @@ fn maintenance(state: &mut HubState) {
         }
         if t - state.timers.last_purge > 86400 {
             state.timers.last_purge = t;
+            state.config_dirty = true; // purge_last|: a restart keeps the day
             if mesh::should_initiate_scheduled_purge(state) {
                 hlog_info!(
                     "[HUB] Running scheduled purge (older than {} days)\n",
@@ -511,10 +563,27 @@ fn maintenance(state: &mut HubState) {
                 && c.typ != ClientType::Hub
                 && t - c.connected_at > PREAUTH_TIMEOUT_SEC
             {
-                hlog_warning!(
-                    "[HUB] Pre-auth timeout for {} ({}s, no handshake) — dropping\n",
-                    c.ip,
-                    t - c.connected_at
+                if c.bot_auth_state == irchub::state::BotAuthState::Quarantine {
+                    hlog_info!(
+                        "[REVOKE] Revoked bot {} did not answer the wipe (an older build?); \
+                         closed\n",
+                        c.id
+                    );
+                } else {
+                    hlog_warning!(
+                        "[HUB] Pre-auth timeout for {} ({}s, no handshake) — dropping\n",
+                        c.ip,
+                        t - c.connected_at
+                    );
+                }
+                auth::disconnect_client(state, i);
+                continue;
+            }
+            // A deleted bot told CMD_BOT_RETIRE that never answered.
+            if c.retiring && t - c.retire_sent > RETIRE_GRACE_SEC {
+                hlog_info!(
+                    "[REVOKE] Deleted bot {} did not answer the wipe; closed\n",
+                    c.id
                 );
                 auth::disconnect_client(state, i);
                 continue;
@@ -528,39 +597,6 @@ fn maintenance(state: &mut HubState) {
                 }
             }
             i += 1;
-        }
-    }
-
-    // Periodic status dump: every 60 s at INFO level.  One line showing every
-    // timer countdown and the current load, so idle churn is visible without
-    // having to stare at top/perf.
-    if t - state.timers.last_status_dump >= 60 {
-        state.timers.last_status_dump = t;
-        let mut bot_count = 0;
-        let mut peer_count = 0;
-        let mut authing_count = 0;
-        for c in &state.clients {
-            match (c.typ, c.authenticated) {
-                (ClientType::Bot, true) => bot_count += 1,
-                (ClientType::Hub, true) => peer_count += 1,
-                _ => authing_count += 1,
-            }
-        }
-        let gossip_in = (300 - (t - state.timers.last_mesh_gossip)).max(0);
-        let entropy_in = (MESH_ANTI_ENTROPY_INTERVAL - (t - state.timers.last_anti_entropy)).max(0);
-        let scan_in = (5 - (t - state.timers.last_client_scan)).max(0);
-        let ipcln_in = (300 - (t - state.timers.last_ip_cleanup)).max(0);
-        let peer_chk_in = PEER_RECONNECT_INTERVAL; // approximate
-        let head = format!(
-            "clients={}(bots={bot_count} peers={peer_count} authing={authing_count}) dirty={} gossip_in={gossip_in}s entropy_in={entropy_in}s scan_in={scan_in}s ipcln_in={ipcln_in}s peer_chk_in={peer_chk_in}s",
-            state.clients.len(),
-            i32::from(state.config_dirty)
-        );
-        if state.purge_days_setting > 0 && state.timers.last_purge > 0 {
-            let purge_in = 86400 - (t - state.timers.last_purge);
-            hlog_status!("{head} purge_in={purge_in}s\n");
-        } else {
-            hlog_status!("{head} purge=off\n");
         }
     }
 }
@@ -722,6 +758,7 @@ fn run_setup(state: &mut HubState) -> i32 {
     );
     println!("    Admins check it on first connect (keygen --ssh-fingerprint");
     println!("    hub_public.b64 prints the same line).");
+    println!("[+] ./irchub -id prints this hub's uuid and keys again at any time.");
 
     // Admin user setup — creates the first a| and m| records.  Admins have no
     // password: the operator generates the admin's keypair on the admin's own
@@ -1032,7 +1069,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     let peerless = state.peers.iter().filter(|p| !p.has_pubkey).count();
     if peerless > 0 {
         hlog_warning!(
-            "[HUB] {peerless} peer(s) lack a Curve25519 pubkey and will be refused on connect. Re-add them with their hub_public.b64 in the admin console (peer add / peer setkey).\n"
+            "[HUB] {peerless} peer(s) lack a Curve25519 pubkey and will be refused on connect. Re-add them with the key ./irchub -id prints on that hub (console: hub add / hub set <hub> key).\n"
         );
     }
 
@@ -1235,7 +1272,7 @@ fn selftest() -> i32 {
         return fail(&format!("no {HUB_CONFIG_FILE}"));
     }
     let password = match passfile_load(HUB_PASS_FILE) {
-        Some(p) if !p.is_empty() => p,
+        Some((p, _)) if !p.is_empty() => p,
         _ => return fail(&format!("{HUB_PASS_FILE} missing or unreadable")),
     };
     let mut state = HubState::new();
@@ -1252,6 +1289,78 @@ fn selftest() -> i32 {
         "selftest: OK irchub {HUB_VERSION} {}",
         irchub::update::host_variant()
     );
+    0
+}
+
+/// `irchub -id`: print this hub's name, uuid, public key and fingerprints —
+/// what another hub's `hub add` and a bot's -setup / +hub need — from the
+/// config (the key lives there; hub_public.b64 is only -setup's copy), and
+/// exit.  Read-only: no daemon, no PID lock, no config rewrite.
+fn identity(password: Zeroizing<String>) -> i32 {
+    let mut state = HubState::new();
+    state.log_level = HUB_DEFAULT_LOG_LEVEL;
+    state.log_max_size = HUB_LOG_FILE_SIZE;
+    config::READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+    state.set_config_pass(&password);
+    let ok = config::load(&mut state, &password);
+    drop(password);
+    state.config_pass.wipe();
+    // The public key is derived from the private key, not taken from the
+    // stored pub| copy: that is what peers and bots must pin.
+    let pub64 = (ok && state.hub_keys_loaded)
+        .then(|| crypto::combined_pub_from_priv(&state.hub_priv_combined()));
+    state.hub_ed25519_priv.wipe();
+    state.hub_x25519_priv.wipe();
+    if !ok {
+        eprintln!("Cannot load {HUB_CONFIG_FILE} (wrong password?).");
+        return 1;
+    }
+    let Some(pub64) = pub64.filter(|_| !state.hub_uuid.is_empty()) else {
+        eprintln!("{HUB_CONFIG_FILE} has no hub key or uuid; re-run -setup.");
+        return 1;
+    };
+    if pub64[..32] != state.hub_ed25519_pub || pub64[32..] != state.hub_x25519_pub {
+        eprintln!(
+            "Note: the stored public key does not match the private key; the key below is the right one (console: hub set pubkey)."
+        );
+    }
+    let pub_b64 = crypto::b64_encode(&pub64);
+    let mut ed = [0u8; 32];
+    ed.copy_from_slice(&pub64[..32]);
+    // bind_ip is what the mesh is told to dial; a wildcard tells nobody.
+    let wild = state.bind_ip.is_empty() || state.bind_ip == "0.0.0.0";
+    let ip = if wild {
+        "<this-hub's-address>"
+    } else {
+        state.bind_ip.as_str()
+    };
+    let name = if state.hub_friendly_name.is_empty() {
+        "-"
+    } else {
+        state.hub_friendly_name.as_str()
+    };
+    println!("Hub name:        {name}");
+    println!("Hub UUID:        {}", state.hub_uuid);
+    println!("Hub public key:  {pub_b64}");
+    println!("Key fingerprint: {}", crypto::key_fingerprint(&pub64));
+    println!(
+        "SSH host key:    ssh-ed25519 {}",
+        irchub::console::ssh_fingerprint(&ed)
+    );
+    println!(
+        "Listening:       {}:{}",
+        if wild {
+            "0.0.0.0"
+        } else {
+            state.bind_ip.as_str()
+        },
+        state.port
+    );
+    println!(
+        "Other hubs:      hub add {ip} {} {} {name} {pub_b64}",
+        state.port, state.hub_uuid
+    );
+    println!("Bots:            +hub {ip}:{} {pub_b64}", state.port);
     0
 }
 
@@ -1288,6 +1397,7 @@ fn main() {
     };
     let setup_mode = args.iter().skip(1).any(|a| a == "-setup");
     let passfile_mode = args.iter().skip(1).any(|a| a == "-p");
+    let identity_mode = args.iter().skip(1).any(|a| a == "-id");
 
     let mut state = HubState::new();
     state.log_level = HUB_DEFAULT_LOG_LEVEL;
@@ -1331,17 +1441,50 @@ fn main() {
     }
 
     // Password resolution: .irchub.pass, then the stdin prompt.
-    let password = match passfile_load(HUB_PASS_FILE) {
-        Some(p) if !p.is_empty() => p,
+    let (password, pass_legacy) = match passfile_load(HUB_PASS_FILE) {
+        Some((p, legacy)) if !p.is_empty() => (p, legacy),
         _ => {
             let p = tool::read_pass_hidden("Config Password: ", MAX_PASS);
             if p.is_empty() {
                 eprintln!("No password provided.");
                 std::process::exit(1);
             }
-            p
+            (p, false)
         }
     };
+
+    if identity_mode {
+        std::process::exit(identity(password));
+    }
+
+    // A pre-2.5.0 pass file moves to the current PBKDF2 count on an ordinary
+    // start.  On the start a hub-driven upgrade made (its marker is still
+    // here) it waits UPGRADE_PASS_REWRITE_SECS, until the old build's watchdog
+    // is done with this process, and keeps the old copy for a rollback (see
+    // passfile_upgrade_tick).  An ordinary start drops any such copy left by
+    // an earlier run: a rollback is only ever for the process that made it.
+    let upgrade_start = fs::metadata(HUB_UPGRADE_MARKER_FILE).is_ok();
+    if !upgrade_start {
+        let _ = fs::remove_file(HUB_PASS_PREV_FILE);
+    }
+    if pass_legacy {
+        if upgrade_start {
+            println!(
+                "{HUB_PASS_FILE}: rewritten with PBKDF2 {}k in {UPGRADE_PASS_REWRITE_SECS}s (upgrade in progress)",
+                PBKDF2_ITERATIONS / 1000
+            );
+        } else if passfile_create(HUB_PASS_FILE, &password) {
+            println!(
+                "{HUB_PASS_FILE}: rewritten with PBKDF2 {}k",
+                PBKDF2_ITERATIONS / 1000
+            );
+        } else {
+            eprintln!(
+                "{HUB_PASS_FILE}: could not rewrite with PBKDF2 {}k; still readable as it is",
+                PBKDF2_ITERATIONS / 1000
+            );
+        }
+    }
 
     daemonize();
 
@@ -1364,6 +1507,9 @@ fn main() {
         std::process::exit(1);
     };
     state.pid_file = Some(pid_file);
+    if pass_legacy && upgrade_start {
+        state.pass_rewrite_due = now() + UPGRADE_PASS_REWRITE_SECS;
+    }
 
     std::process::exit(run(state, password, &stop));
 }

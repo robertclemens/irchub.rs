@@ -117,6 +117,9 @@ pub struct ConsoleLink {
     status_last: String,
     upg_last: String,
     tree_hash: Option<[u8; 32]>,
+    /// The admin's flags as last sent in a "me" event (user_flags plan R4);
+    /// None = not sent since the last subscription.
+    me_last: Option<String>,
 }
 
 impl ConsoleLink {
@@ -588,6 +591,7 @@ fn open_console(state: &mut HubState, stream: UnixStream, name: String, ip: Stri
         status_last: String::new(),
         upg_last: String::new(),
         tree_hash: None,
+        me_last: None,
     };
     let mut c = HubClient::new_detached(fd, &ip, MAX_BUFFER);
     c.id = format!("ADMIN:{name}");
@@ -764,6 +768,7 @@ fn subscribe(l: &mut ConsoleLink, topics: &str) -> bool {
     l.status_last.clear();
     l.upg_last.clear();
     l.tree_hash = None;
+    l.me_last = None;
     if want_log >= 0 && l.log_level < 0 {
         let next = ring_next();
         l.log_next = if !replay {
@@ -790,24 +795,16 @@ pub fn frame(state: &mut HubState, ci: usize, payload: &str) -> bool {
             None => false,
         };
     }
-    // get|tree and get|status: the result line, then the rows / key=value
-    // lines exactly as the events carry them (docs/console.md §3.4).
-    let reply = if payload == "get|tree" || payload == "get|status" {
+    // get|tree: the result line, then the rows exactly as the tree event
+    // carries them (docs/console.md §3.4).
+    let reply = if payload == "get|tree" {
         let rows = presence::build_tree(state);
-        if payload == "get|tree" {
-            let rows = rows.trim_end_matches('\n');
-            format!(
-                "ok|network.tree{}{}",
-                if rows.is_empty() { "" } else { "\n" },
-                rows
-            )
-        } else {
-            // one key=value per line
-            format!(
-                "ok|network.status\n{}",
-                status_line(state, &rows).replace('|', "\n")
-            )
-        }
+        let rows = rows.trim_end_matches('\n');
+        format!(
+            "ok|network.tree{}{}",
+            if rows.is_empty() { "" } else { "\n" },
+            rows
+        )
     } else if payload == "get|log" {
         // the log settings and how full the file and the ring are
         let mut r = crate::reply::Reply::new();
@@ -948,8 +945,23 @@ pub fn tick(state: &mut HubState) {
         (None, String::new(), None)
     };
     let upg = if due { upg_line(state) } else { String::new() };
+    // Each console's admin flags, for the "me" event (looked up before the
+    // clients are borrowed mutably).
+    let flags_of: Vec<Option<String>> = state
+        .clients
+        .iter()
+        .map(|c| match (c.internal, &c.console) {
+            (true, Some(l)) => Some(
+                admin_by_name(state, &l.admin)
+                    .map(|i| crate::access::user_flags(state, &state.user_records[i].uuid))
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect();
 
-    for c in &mut state.clients {
+    for (ci, c) in state.clients.iter_mut().enumerate() {
         let (true, Some(l)) = (c.internal, c.console.as_mut()) else {
             continue;
         };
@@ -969,6 +981,15 @@ pub fn tick(state: &mut HubState) {
                 l.upg_last = upg.clone();
                 l.event("upg", upg.as_bytes());
             }
+        }
+        // "me|flags=<letters>": this admin's flags, once a subscription is in
+        // and whenever they change, so the console refuses early (R4)
+        if (l.sub_status || l.sub_tree || l.sub_upg)
+            && let Some(Some(f)) = flags_of.get(ci)
+            && l.me_last.as_deref() != Some(f.as_str())
+        {
+            l.event("me", format!("flags={f}").as_bytes());
+            l.me_last = Some(f.clone());
         }
         push_log(l);
         if l.drops > 0 && l.outq.len() - l.outq_off + 64 < CONSOLE_CORE_OUTQ_MAX {

@@ -114,6 +114,10 @@ pub fn peer_is_linked(state: &HubState, p: &PeerConfig) -> bool {
 /// briefly reported by two hubs mid-migration shows up once per hub rather
 /// than flapping — the stale one expires on its own.
 fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
+    // A deleted bot, reported by a hub that has not heard yet.
+    if crate::revoke::is_revoked(state, &incoming.bot_uuid) {
+        return;
+    }
     if let Some(i) = state
         .roster
         .iter()
@@ -406,6 +410,9 @@ fn gossip_bot_roster(state: &mut HubState) {
 
     for ci in state.bot_clients() {
         let c = &state.clients[ci];
+        if c.retiring {
+            continue;
+        }
         let nick = bot_nick_from_config(state, &c.id);
         let c = &state.clients[ci];
         let row = format!(

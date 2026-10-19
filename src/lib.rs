@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod activity;
 pub mod admin;
 pub mod auth;
@@ -45,6 +46,7 @@ pub mod presence;
 pub mod queue;
 pub mod ratelimit;
 pub mod reply;
+pub mod revoke;
 pub mod secret;
 pub mod state;
 pub mod stats;

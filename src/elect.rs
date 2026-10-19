@@ -29,6 +29,7 @@ fn alloc(state: &mut HubState) -> Option<usize> {
     state.chan_elections[i] = ChanElect {
         from_fd: -1,
         admin_fd: -1,
+        reply_fd: -1,
         created: t,
         phase_at: t,
         ..ChanElect::default()
@@ -297,6 +298,52 @@ fn finish(
         );
     }
 
+    // a person's request from a bot: the answer goes back to that bot
+    if e.reply_fd >= 0
+        && let Some(bi) = state.clients.iter().position(|c| {
+            c.typ == ClientType::Bot
+                && c.authenticated
+                && c.fd == e.reply_fd
+                && c.conn_serial == e.reply_serial
+        })
+    {
+        let res = if bitch {
+            format!(
+                "{}|fail|not authorised on {} and +bitch is on",
+                e.reply_rid,
+                crate::cstr::trunc(&e.channel, 65)
+            )
+        } else if ok {
+            format!(
+                "{}|ok|{} by {} on {}",
+                e.reply_rid,
+                kw,
+                crate::cstr::trunc(if by_nick.is_empty() { by_uuid } else { by_nick }, 32),
+                crate::cstr::trunc(hub_name, 64)
+            )
+        } else if leg {
+            format!(
+                "{}|ok|asked {legacy} older bot{}",
+                e.reply_rid,
+                if legacy == 1 { "" } else { "s" }
+            )
+        } else {
+            let why = reasons(&e, 160);
+            format!(
+                "{}|fail|no bot could: {asked} asked on {hubs} hub{}{}{}",
+                e.reply_rid,
+                if hubs == 1 { "" } else { "s" },
+                if why.is_empty() { "" } else { "; " },
+                crate::cstr::trunc(&why, 121)
+            )
+        };
+        client::send_cmd_to_bot(
+            &mut state.clients[bi],
+            CMD_USER_CHAN_RESULT,
+            &trunc_string(&res, 256),
+        );
+    }
+
     let admin = if e.admin_fd >= 0 {
         state
             .clients
@@ -517,8 +564,8 @@ fn local_exhausted(state: &mut HubState, ei: usize) {
 }
 
 /// Start an election on this hub (the origin).  admin: the console owed the
-/// answer as (fd, conn_serial), or None.  False when the table is full
-/// (nothing was sent).
+/// answer as (fd, conn_serial), or None.  Its slot, or None when the table is
+/// full (nothing was sent).
 pub fn start(
     state: &mut HubState,
     kind: &str,
@@ -527,13 +574,11 @@ pub fn start(
     nick: &str,
     hostmask: &str,
     admin: Option<(i32, u64)>,
-) -> bool {
-    let Some(ei) = alloc(state) else {
-        return false;
-    };
+) -> Option<usize> {
+    let ei = alloc(state)?;
     let id = crate::opflow::generate_request_id();
     if kind == "key" && !add_pending_chan_request(state, &id, requester, kind, channel, -1) {
-        return false;
+        return None;
     }
     forward_seen_check_and_add(state, &id);
     {
@@ -562,7 +607,7 @@ pub fn start(
         },
         e.bots.len()
     );
-    true
+    Some(ei)
 }
 
 /// A local bot's answer to PROBE: eid|1| or eid|0|reason.
@@ -848,7 +893,7 @@ pub fn chan_mode_apply(state: &mut HubState, channel: &str, admin: Option<(i32, 
     if !(channel.starts_with('#') || channel.starts_with('&')) {
         return false;
     }
-    start(state, "mode", channel, "ADMIN", "", "", admin)
+    start(state, "mode", channel, "ADMIN", "", "", admin).is_some()
 }
 
 /// A console disconnected: the elections it waits on still finish and log,
@@ -936,4 +981,133 @@ pub fn tick(state: &mut HubState, t: i64) {
             ChanElectPhase::Acked => {}
         }
     }
+}
+
+/// A field of a person's request: 1..max-1 bytes, no blank, '|' or control.
+fn uchan_field_ok(s: &str, max: usize) -> bool {
+    !s.is_empty() && s.len() < max && s.bytes().all(|c| c > 0x20 && c != 0x7f && c != b'|')
+}
+
+/// CMD_USER_CHAN_REQUEST (user_flags plan §5): `rid|kind|#chan|user_uuid|
+/// nick|nick!user@host` from a bot that could not act itself.  The user's
+/// rights are checked again here (an admin +c / +a, or an oper bound to the
+/// channel or *).  C `process_user_chan_request`.
+pub fn process_user_chan_request(state: &mut HubState, ci: usize, payload: &str) {
+    let t = now();
+    {
+        let c = &mut state.clients[ci];
+        if t - c.uchan_req_window >= USER_CHAN_REQ_WINDOW {
+            c.uchan_req_window = t;
+            c.uchan_req_count = 0;
+        }
+        c.uchan_req_count += 1;
+        if c.uchan_req_count > USER_CHAN_REQ_MAX {
+            if c.uchan_req_count == USER_CHAN_REQ_MAX + 1 {
+                crate::hlog_warning!(
+                    "[CHANREQ] {} sends too many user requests; dropping\n",
+                    c.id
+                );
+            }
+            return;
+        }
+    }
+    let id = state.clients[ci].id.clone();
+    let f = |i: usize, cap: usize| crate::admin::wire_field(payload, i, cap);
+    let fields = (
+        f(0, USER_CHAN_RID_MAX + 1),
+        f(1, 8),
+        f(2, MAX_CHAN),
+        f(3, 40),
+        f(4, MAX_NICK),
+        f(5, MAX_MASK_LEN),
+    );
+    let (Some(mut rid), Some(kind), Some(chan), Some(uuid), Some(nick), Some(mask)) = fields else {
+        crate::hlog_warning!("[CHANREQ] Malformed USER_CHAN_REQUEST from {id}\n");
+        return;
+    };
+    if crate::admin::mf_field_count(payload) != 6 {
+        crate::hlog_warning!("[CHANREQ] Malformed USER_CHAN_REQUEST from {id}\n");
+        return;
+    }
+    if !rid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        rid.clear();
+    }
+    if rid.is_empty() {
+        crate::hlog_warning!("[CHANREQ] Bad request id from {id}\n");
+        return;
+    }
+    let fail = |state: &mut HubState, why: &str| {
+        let res = trunc_string(&format!("{rid}|fail|{why}"), 256);
+        client::send_cmd_to_bot(&mut state.clients[ci], CMD_USER_CHAN_RESULT, &res);
+    };
+    if kind != "op" && kind != "invite" && kind != "unban" {
+        return fail(state, "unknown request");
+    }
+    if !crate::access::uchan_name_ok(&chan) || chan == "*" {
+        return fail(state, "not a channel");
+    }
+    if !uchan_field_ok(&nick, MAX_NICK)
+        || !uchan_field_ok(&mask, MAX_MASK_LEN)
+        || !mask.contains('!')
+        || !mask.contains('@')
+    {
+        return fail(state, "bad nick or hostmask");
+    }
+    let u = state
+        .user_records
+        .iter()
+        .find(|u| u.is_active && u.uuid == uuid)
+        .cloned();
+    let allowed = u.as_ref().is_some_and(|u| {
+        if u.typ == 'a' {
+            crate::access::user_has_flag(state, &u.uuid, 'c')
+        } else {
+            crate::access::user_chan_ok(state, &u.uuid, Some(&chan))
+        }
+    });
+    let who = u.as_ref().map_or(uuid.clone(), |u| u.name.clone());
+    let Some(u) = u.filter(|_| allowed) else {
+        crate::hlog_warning!(
+            "[CHANREQ] {id} asked {kind} {nick} on {chan} for {who}: refused (no rights there)\n"
+        );
+        let why = format!("no rights on {chan}");
+        return fail(state, &why);
+    };
+    if crate::storage::chan_live(state, &chan).is_none() {
+        let why = format!("{chan} is not a managed channel");
+        return fail(state, &why);
+    }
+    crate::hlog_info!(
+        "[CHANREQ] {kind} for {nick} ({}) on {chan}, from {id}\n",
+        u.name
+    );
+    if !mesh_ready(state) {
+        // An older hub in the mesh: the old ask-everyone path, no answer back.
+        if kind == "op" {
+            return fail(state, "older hubs in the mesh: ask an admin");
+        }
+        let request_id = crate::opflow::generate_request_id();
+        forward_seen_check_and_add(state, &request_id);
+        crate::opflow::chan_request_dispatch(
+            state,
+            &request_id,
+            &u.uuid,
+            &kind,
+            &chan,
+            &nick,
+            &mask,
+            -1,
+        );
+        let res = format!("{rid}|ok|asked every bot (older hubs in the mesh)");
+        client::send_cmd_to_bot(&mut state.clients[ci], CMD_USER_CHAN_RESULT, &res);
+        return;
+    }
+    let Some(ei) = start(state, &kind, &chan, &u.uuid, &nick, &mask, None) else {
+        return fail(state, "too many channel requests in flight; try again");
+    };
+    let (fd, serial) = (state.clients[ci].fd, state.clients[ci].conn_serial);
+    let e = &mut state.chan_elections[ei];
+    e.reply_fd = fd;
+    e.reply_serial = serial;
+    e.reply_rid = rid;
 }

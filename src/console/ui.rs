@@ -493,13 +493,12 @@ const V_STATS: usize = 4;
 const V_COUNT: usize = 5;
 const VIEW_NAME: [&str; V_COUNT] = ["console", "log", "network", "upgrades", "stats"];
 
-/// y/N, type an exact word, or type a number that becomes the payload
+/// y/N, or type an exact word
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirm {
     None,
     Yn,
     Type,
-    Pick,
 }
 
 /// What a request in flight was for: replies come back in order.
@@ -595,6 +594,10 @@ pub struct Ui {
     admin: Vec<u8>,
     ip: Vec<u8>,
     hubname: Vec<u8>,
+    /// This admin's flags, from the core's "me" event (user_flags plan R4):
+    /// a command the flags do not cover is refused here, before any y/N; the
+    /// hub checks again.  None = not told yet, no check.
+    flags: Option<String>,
     term: Vec<u8>,
     core: Vec<u8>,
     /// Bytes handed to the SSH writer and not yet sent (the Rust session
@@ -632,7 +635,6 @@ pub struct Ui {
     confirming: Confirm,
     confirm_seq: i32,
     confirm_want: Vec<u8>,
-    confirm_pick_max: i32,
     confirm_op: u8,
     confirm_payload: Vec<u8>,
     confirm_rq: PendingRq,
@@ -703,8 +705,7 @@ enum B {
     Arg,
     Pipe,
     PeerAdd,
-    PeerDel,
-    PeerSet,
+    HubShow,
     ChanAdd,
     ChanSet,
     ChanOp,
@@ -724,6 +725,7 @@ enum B {
     ChanModes,
     Ban,
     NetSet,
+    UserChan,
 }
 
 struct CmdDef {
@@ -769,27 +771,22 @@ const CMDS: &[CmdDef] = &[
     cmd!("bot", Some("list"), CMD_ADMIN_LIST_FULL, B::None, 0, 0, Cf::None, Pre::None, "", "bot list", "every registered bot: state, hub, version, last seen", None),
     cmd!("bot", Some("show"), CMD_ADMIN_LIST_FULL, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot show <uuid|nick>", "one bot in detail", None),
     cmd!("bot", Some("summary"), CMD_ADMIN_LIST_SUMMARY, B::None, 0, 0, Cf::None, Pre::None, "", "bot summary", "every bot's nick and uuid", None),
-    cmd!("bot", Some("pending"), CMD_ADMIN_GET_PENDING, B::None, 0, 0, Cf::None, Pre::None, "", "bot pending", "bots that tried to connect but are not authorized", None),
-    cmd!("bot", Some("approve"), CMD_ADMIN_APPROVE, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot approve <#|uuid>", "approve a pending bot; # is the number from bot pending", None),
-    cmd!("bot", Some("authorize"), CMD_ADMIN_ADD, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot authorize <uuid>", "authorize a uuid before the bot first connects", None),
-    cmd!("bot", Some("add"), CMD_ADMIN_CREATE_BOT, B::Pipe, 3, 0, Cf::None, Pre::None, "", "bot add <nick> <uuid> <key>", "register a bot from the identity its -setup printed", Some("key: the 88-char base64 public key")),
-    cmd!("bot", Some("del"), CMD_ADMIN_DEL, B::Arg, 1, 0, Cf::Yn, Pre::BotDel, "", "bot del <uuid>", "delete a bot everywhere (asks y/N; disconnects it)", None),
-    cmd!("bot", Some("kick"), CMD_ADMIN_DISCONNECT_BOT, B::Arg, 1, 0, Cf::Yn, Pre::BotKick, "", "bot kick <uuid>", "drop its connection to this hub (asks y/N; it reconnects)", None),
+    cmd!("bot", Some("revoked"), CMD_ADMIN_LIST_REVOKED, B::None, 0, 0, Cf::None, Pre::None, "", "bot revoked", "deleted bots: told to wipe their config if they ever connect", None),
+    cmd!("bot", Some("add"), CMD_ADMIN_CREATE_BOT, B::Pipe, 3, 0, Cf::None, Pre::None, "", "bot add <nick> <uuid> <key>", "register a bot from the identity its -setup printed", Some("uuid and key: run ./ircbot -id on the bot's host")),
+    cmd!("bot", Some("del"), CMD_ADMIN_DEL, B::Arg, 1, 0, Cf::Yn, Pre::BotDel, "", "bot del <uuid|nick>", "delete a bot everywhere for good (asks y/N; wipes its config and stops it)", None),
+    cmd!("bot", Some("kick"), CMD_ADMIN_DISCONNECT_BOT, B::Arg, 1, 0, Cf::Yn, Pre::BotKick, "", "bot kick <uuid|nick>", "drop its connection to this hub (asks y/N; it reconnects)", None),
     cmd!("bot", Some("rekey"), CMD_ADMIN_REKEY_BOT, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot rekey <uuid>", "how to rekey a bot (only the bot can)", None),
-    cmd!("peer", Some("list"), CMD_ADMIN_LIST_PEERS, B::None, 0, 0, Cf::None, Pre::None, "", "peer list", "peer hubs, the mesh links and their health", None),
-    cmd!("peer", Some("show"), CMD_ADMIN_LIST_PEERS, B::Arg, 1, 0, Cf::None, Pre::None, "", "peer show <#|uuid|name>", "one peer hub in detail", None),
-    cmd!("peer", Some("add"), CMD_ADMIN_ADD_PEER, B::PeerAdd, 5, 0, Cf::None, Pre::None, "", "peer add <ip> <port> <uuid> <name|-> <key>", "add a peer hub", Some("key: the 88-char key from that hub's hub show")),
-    cmd!("peer", Some("del"), CMD_ADMIN_DEL_PEER, B::PeerDel, 0, 1, Cf::Type, Pre::PeerDel, "", "peer del [#]", "remove a peer hub (types its number to confirm)", None),
-    cmd!("peer", Some("set"), CMD_ADMIN_SET_PEER_PUBKEY, B::PeerSet, 3, 0, Cf::None, Pre::None, "", "peer set <#|uuid|name> key <key>", "replace a peer's key (the link comes back with it)", None),
-    cmd!("peer", Some("sync"), CMD_ADMIN_SYNC_MESH, B::None, 0, 0, Cf::None, Pre::None, "", "peer sync", "send a full sync to every peer", None),
-    cmd!("network", Some("tree"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|tree", "network tree", "every hub and bot as a tree", None),
-    cmd!("network", Some("status"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|status", "network status", "the mesh-wide status (what the status bar shows)", None),
-    cmd!("network", Some("set"), CMD_ADMIN_NET_SET, B::NetSet, 0, 3, Cf::None, Pre::None, "", "network set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default>]", "show the bot network settings, or change one (every bot gets it)", None),
-    cmd!("hub", Some("show"), CMD_ADMIN_GET_PUBKEY, B::None, 0, 0, Cf::None, Pre::None, "", "hub show", "this hub: identity, key, listener, counts", None),
-    cmd!("hub", Some("set"), 0, B::HubSet, 0, 3, Cf::None, Pre::None, "", "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>]", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table)", None),
-    cmd!("hub", Some("stats"), CMD_ADMIN_STATS, B::None, 0, 0, Cf::None, Pre::None, "", "hub stats", "traffic counters since the hub started", None),
-    cmd!("hub", Some("rekey"), CMD_ADMIN_REGEN_KEYS, B::None, 0, 0, Cf::Type, Pre::None, "", "hub rekey", "new hub keypair; every peer and bot must re-learn it", None),
-    cmd!("hub", Some("purge"), CMD_ADMIN_PURGE_TOMBSTONES, B::Purge, 1, 0, Cf::Yn, Pre::None, "", "hub purge <now|days>", "purge tombstones now, or those older than <days>", None),
+    cmd!("bot", Some("tree"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|tree", "bot tree", "every hub and bot as a tree", None),
+    cmd!("bot", Some("set"), CMD_ADMIN_NET_SET, B::NetSet, 0, 3, Cf::None, Pre::None, "", "bot set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default>]", "show the bot settings, or change one (every bot gets it)", None),
+    cmd!("hub", Some("show"), CMD_ADMIN_GET_PUBKEY, B::HubShow, 0, 1, Cf::None, Pre::None, "", "hub show [#|uuid|name]", "this hub (identity, key, listener, counts), or one linked hub in detail", None),
+    cmd!("hub", Some("list"), CMD_ADMIN_LIST_PEERS, B::None, 0, 0, Cf::None, Pre::None, "", "hub list", "the other hubs, the mesh links and their health", None),
+    cmd!("hub", Some("add"), CMD_ADMIN_ADD_PEER, B::PeerAdd, 5, 0, Cf::None, Pre::None, "", "hub add <ip> <port> <uuid> <name|-> <key>", "link another hub", Some("uuid and key: hub show or ./irchub -id on that hub")),
+    cmd!("hub", Some("del"), CMD_ADMIN_DEL_PEER, B::Arg, 1, 0, Cf::Yn, Pre::PeerDel, "", "hub del <uuid|name>", "unlink a hub from this hub only (shows which hubs and bots still list it; asks y/N)", None),
+    cmd!("hub", Some("set"), 0, B::HubSet, 0, 3, Cf::None, Pre::None, "", "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>] | hub set <#|uuid|name> key <key>", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table); <hub> key: replace a linked hub's key", None),
+    cmd!("hub", Some("sync"), CMD_ADMIN_SYNC_MESH, B::None, 0, 0, Cf::None, Pre::None, "", "hub sync", "send a full sync to every linked hub", None),
+    cmd!("hub", Some("stats"), CMD_ADMIN_STATS, B::None, 0, 0, Cf::None, Pre::None, "", "hub stats", "traffic, connections and maintenance timers", None),
+    cmd!("hub", Some("rekey"), CMD_ADMIN_REGEN_KEYS, B::None, 0, 0, Cf::Type, Pre::None, "", "hub rekey", "new hub keypair; every other hub and bot must re-learn it", None),
+    cmd!("hub", Some("purge"), CMD_ADMIN_PURGE_TOMBSTONES, B::Purge, 1, 0, Cf::Yn, Pre::None, "", "hub purge <now|days>", "purge tombstones now, or those older than <days> (daily: hub set autopurge)", None),
     cmd!("log", Some("show"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|log", "log show", "log levels, sizes and this session's log", None),
     cmd!("log", Some("set"), 0, B::LogSet, 2, 0, Cf::None, Pre::None, "", "log set file|console|size <value>", "the file or console ring level, or the file size limit", Some("level: none error warning info debug or 0-4 · size: <MB>, <n>k or <n>b, at most 1024 MB")),
     cmd!("log", Some("on"), 0, B::Local, 0, 1, Cf::None, Pre::None, "", "log on [level]", "line mode: stream hub log lines", None),
@@ -802,9 +799,10 @@ const CMDS: &[CmdDef] = &[
     cmd!("option", Some("set"), CMD_ADMIN_SET_OPT_FLAGS, B::OptSet, 1, 0, Cf::Yn, Pre::Opt, "", "option set <flags|->", "set the network option flags (- clears)", None),
     cmd!("user", Some("list"), 0, B::UserList, 0, 1, Cf::None, Pre::None, "", "user list [admin|oper]", "every user (or one role): key, last seen, masks", None),
     cmd!("user", Some("show"), CMD_ADMIN_MATCH, B::Arg, 1, 0, Cf::None, Pre::None, "", "user show <name|*>", "one user (or all) with masks and their last use", None),
-    cmd!("user", Some("add"), 0, B::UserAdd, 4, 0, Cf::None, Pre::None, "", "user add admin|oper <name> <key> <mask>", "add an admin or an oper", Some("key: their 88-char public key · mask: nick!user@host")),
+    cmd!("user", Some("add"), 0, B::UserAdd, 5, 0, Cf::None, Pre::None, "", "user add admin|oper <name> <key> <mask> <flags|channels>", "add an admin (with flags) or an oper (with channels)", Some("admin flags: +a full, or b c h o u · oper channels: * or #a,#b")),
     cmd!("user", Some("del"), CMD_ADMIN_DEL_ADMIN, B::Arg, 1, 0, Cf::Yn, Pre::UserDel, "", "user del <name>", "remove a user and their masks", None),
-    cmd!("user", Some("set"), CMD_ADMIN_SET_USERKEY, B::UserSet, 3, 0, Cf::Yn, Pre::UserKey, "", "user set <name> key <key>", "replace a user's key (asks y/N)", None),
+    cmd!("user", Some("set"), CMD_ADMIN_SET_USERKEY, B::UserSet, 3, 0, Cf::Yn, Pre::UserKey, "", "user set <name> key <key> | user set <name> flags <+x-y>", "replace a user's key (asks y/N), or an admin's flags", None),
+    cmd!("user", Some("chan"), CMD_ADMIN_USER_ACCESS, B::UserChan, 3, 0, Cf::None, Pre::None, "", "user chan add|del <name> <#chan|*>", "give an oper a channel (or * = every channel), or take it away", None),
     cmd!("user", Some("mask"), 0, B::UserMask, 3, 0, Cf::None, Pre::None, "", "user mask add|del <name> <mask>", "add or remove a usermask (del asks y/N)", None),
     cmd!("channel", Some("list"), CMD_ADMIN_LIST_CHANNELS, B::None, 0, 0, Cf::None, Pre::None, "", "channel list", "every managed channel with its settings", None),
     cmd!("channel", Some("show"), CMD_ADMIN_LIST_CHANNELS, B::Arg, 1, 0, Cf::None, Pre::None, "", "channel show <#chan>", "one channel in detail", None),
@@ -828,16 +826,14 @@ const CMDS: &[CmdDef] = &[
     cmd!("display", Some("ascii"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "display ascii", "plain ASCII glyphs for this session (again: Unicode)", None),
     cmd!("display", Some("format"), 0, B::Local, 1, 0, Cf::None, Pre::None, "", "display format pretty|raw", "laid-out output, or the records as the hub sends them", None),
     cmd!("display", Some("width"), 0, B::Local, 1, 0, Cf::None, Pre::None, "", "display width <60-250|auto>", "line mode: the output width", None),
-    cmd!("display", Some("events"), 0, B::Local, 1, 0, Cf::None, Pre::None, "", "display events on|off", "line mode: a line for each peer, bot and upgrade change", None),
+    cmd!("display", Some("events"), 0, B::Local, 1, 0, Cf::None, Pre::None, "", "display events on|off", "line mode: a line for each hub, bot and upgrade change", None),
     cmd!("display", Some("clear"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "display clear", "full screen: clear the current view", None),
 ];
 
 /// The root nouns, in help order, with what each groups.
-const GROUPS: [(&str, &str); 12] = [
+const GROUPS: [(&str, &str); 10] = [
     ("bot", "registered bots"),
-    ("peer", "peer hubs"),
-    ("network", "the whole mesh"),
-    ("hub", "this hub"),
+    ("hub", "this hub and the hubs it links to"),
     ("log", "the hub log"),
     ("acl", "IP allow / deny lists"),
     ("option", "network option flags"),
@@ -847,6 +843,85 @@ const GROUPS: [(&str, &str); 12] = [
     ("upgrade", "rolling upgrades"),
     ("display", "this session's screen"),
 ];
+
+/// The admin flag a command needs to change something (user_flags plan §2):
+/// shown by help, checked before a request goes out (`ui_flag_needed`; the
+/// hub checks every request again).  "a/o": +a for an admin, +o for an oper.
+#[rustfmt::skip]
+const CMD_FLAGS: &[(&str, &str, &str)] = &[
+    ("bot", "add", "b"),
+    ("bot", "del", "b"), ("bot", "kick", "b"), ("bot", "rekey", "b"),
+    ("bot", "set", "b"),
+    ("hub", "add", "h"), ("hub", "del", "h"), ("hub", "set", "h"),
+    ("hub", "sync", "h"), ("hub", "rekey", "h"), ("hub", "purge", "h"),
+    ("log", "set", "h"), ("acl", "add", "h"), ("acl", "del", "h"),
+    ("option", "set", "a"),
+    ("user", "add", "a/o"), ("user", "del", "a/o"), ("user", "set", "a/o"),
+    ("user", "mask", "a/o"), ("user", "chan", "o"),
+    ("channel", "add", "c"), ("channel", "del", "c"), ("channel", "mode", "c"),
+    ("channel", "set", "c"), ("channel", "op", "c"), ("channel", "invite", "c"),
+    ("ban", "add", "c"), ("ban", "del", "c"),
+    ("upgrade", "start", "u"), ("upgrade", "abort", "u"), ("upgrade", "forget", "u"),
+];
+
+fn cmd_flag(d: &CmdDef) -> Option<&'static str> {
+    let sub = d.sub?;
+    CMD_FLAGS
+        .iter()
+        .find(|(c, s, _)| *c == d.cmd && *s == sub)
+        .map(|(_, _, f)| *f)
+}
+
+/// The commands with a view form that needs no flag.
+fn cmd_flag_dual(d: &CmdDef) -> bool {
+    matches!(
+        (d.cmd, d.sub),
+        ("bot", Some("set")) | ("hub", Some("set")) | ("channel", Some("mode" | "set"))
+    )
+}
+
+/// The flag this command line needs, as far as the console can tell (the
+/// hub knows a target user's role; those are left to it).  C `ui_flag_needed`.
+fn ui_flag_needed(c: &CmdDef, ws: &Words, argi: usize) -> Option<u8> {
+    let na = ws.n() - argi;
+    let a0: &[u8] = if na > 0 { ws.get(argi) } else { b"" };
+    let a1: &[u8] = if na > 1 { ws.get(argi + 1) } else { b"" };
+    let sub = c.sub?;
+    match (c.cmd, sub) {
+        ("user", "add") => {
+            if eq_ic(a0, "admin") {
+                Some(b'a')
+            } else if eq_ic(a0, "oper") {
+                Some(b'o')
+            } else {
+                None
+            }
+        }
+        ("user", "set") => eq_ic(a1, "flags").then_some(b'a'),
+        ("user", "chan") => Some(b'o'),
+        ("user", _) => None,
+        ("bot", "set") => (na > 0).then_some(b'b'),
+        ("hub", "set") => {
+            (!(na == 0 || (na == 1 && (eq_ic(a0, "ssh") || eq_ic(a0, "conn"))))).then_some(b'h')
+        }
+        ("channel", "mode" | "set") => (na > 1).then_some(b'c'),
+        _ => cmd_flag(c)
+            .filter(|f| f.len() == 1)
+            .map(|f| f.as_bytes()[0]),
+    }
+}
+
+fn flag_word(f: u8) -> &'static str {
+    match f {
+        b'a' => "full admin",
+        b'b' => "bots",
+        b'c' => "channels",
+        b'h' => "hub",
+        b'o' => "opers",
+        b'u' => "upgrades",
+        _ => "?",
+    }
+}
 
 /// help <group> <command> (§2.2): each argument, then examples that run as
 /// typed.  args: "name\ttext" lines; examples: one per line.
@@ -872,7 +947,7 @@ type CmdHelp = (
 #[rustfmt::skip]
 const CMD_HELP: &[CmdHelp] = &[
     ("help", None,
-     Some("group\tone of: bot peer network hub log acl option user channel ban upgrade display\n\
+     Some("group\tone of: bot hub log acl option user channel ban upgrade display\n\
            command\tone of that group's commands: its arguments and an example\n\
            ?\ttyped in place of help it does the same"),
      "help\nhelp bot\nhelp bot add\n? upgrade start"),
@@ -881,55 +956,53 @@ const CMD_HELP: &[CmdHelp] = &[
     ("bot", Some("show"), Some("uuid|nick\tthe bot's uuid or its current nick (Tab completes both)"),
      concat!("bot show alpha\nbot show ", ex_uuid!())),
     ("bot", Some("summary"), None, "bot summary"),
-    ("bot", Some("pending"), None, "bot pending"),
-    ("bot", Some("approve"),
-     Some("#|uuid\tthe number bot pending shows in its # column, or the pending bot's uuid"),
-     concat!("bot approve 1\nbot approve ", ex_uuid!())),
-    ("bot", Some("authorize"), Some("uuid\tthe uuid of a bot that has not connected yet"),
-     concat!("bot authorize ", ex_uuid!())),
+    ("bot", Some("revoked"), None, "bot revoked"),
     ("bot", Some("add"),
      Some("nick\tthe bot's IRC nick\n\
-           uuid\tthe uuid the bot's -setup printed\n\
-           key\tthe 88-character base64 public key the bot's -setup printed"),
+           uuid\tthe bot's uuid.  Where to get it: on the bot's host, in its directory, run \
+           ./ircbot -id (it asks for the config password unless .ircbot.pass is there); it \
+           prints the uuid, the key and this whole bot add line.  -setup printed the same two \
+           values when the bot was made\n\
+           key\tthe bot's 88-character base64 public key, from the same ./ircbot -id"),
      concat!("bot add alpha ", ex_uuid!(), " ", ex_key!())),
-    ("bot", Some("del"), Some("uuid\tthe bot's uuid (Tab completes); asks y/N, then disconnects it"),
-     concat!("bot del ", ex_uuid!())),
-    ("bot", Some("kick"), Some("uuid\ta connected bot's uuid (Tab completes); asks y/N; it reconnects"),
-     concat!("bot kick ", ex_uuid!())),
+    ("bot", Some("del"), Some("uuid|nick\tthe bot's uuid or its nick (Tab completes both); asks y/N.  The \
+                                bot is told to wipe its config and exit, now if it is connected, else whenever it next \
+                                connects to any hub; its uuid can never be added again"),
+     concat!("bot del alpha\nbot del ", ex_uuid!())),
+    ("bot", Some("kick"), Some("uuid|nick\ta connected bot's uuid or its nick (Tab completes both); asks y/N; \
+                                 it reconnects"),
+     concat!("bot kick alpha\nbot kick ", ex_uuid!())),
     ("bot", Some("rekey"), Some("uuid\tthe bot's uuid; prints how to rekey it on its host"),
      concat!("bot rekey ", ex_uuid!())),
-    ("peer", Some("list"), None, "peer list"),
-    ("peer", Some("show"), Some("#|uuid|name\tthe number peer list shows, the hub's uuid, or its name"),
-     "peer show 1\npeer show east"),
-    ("peer", Some("add"),
-     Some("ip\tthe peer hub's address (no ':', so an IPv4 address or a host name)\n\
-           port\tits listening port, 1-65535\n\
-           uuid\tits uuid, from hub show on that hub\n\
-           name|-\ta name for it, or - to learn its name from the peer\n\
-           key\tthe 88-character public key from hub show on that hub"),
-     concat!("peer add 203.0.113.7 6697 ", ex_uuid!(), " east ", ex_key!(), "\n",
-             "peer add 203.0.113.7 6697 ", ex_uuid!(), " - ", ex_key!())),
-    ("peer", Some("del"), Some("#\tthe number peer list shows; alone it lists the peers to pick from; \
-                                 you type the number again to confirm"),
-     "peer del\npeer del 2"),
-    ("peer", Some("set"),
-     Some("#|uuid|name\tthe peer: its number in peer list, its uuid, or its name\n\
-           key\tthe setting; key is the only one\n\
-           key\tthe new 88-character public key from hub show on that hub"),
-     concat!("peer set east key ", ex_key!())),
-    ("peer", Some("sync"), None, "peer sync"),
-    ("network", Some("tree"), None, "network tree"),
-    ("network", Some("status"), None, "network status"),
-    ("network", Some("set"),
-     Some("(none)\tshows every bot network setting: its value, where it comes from, its default\n\
+    ("bot", Some("tree"), None, "bot tree"),
+    ("bot", Some("set"),
+     Some("(none)\tshows every bot setting: its value, where it comes from, its default\n\
            flood <type>\tcmd, msg or ctcp (below), then N:S = more than N in S seconds trips it \
            (N 1-1000, S 1-3600), off = no limit, default = back to the built-in\n\
            ignoretime\tminutes (1-1440), or default\n\
            sendq\tB:I = B lines (1-100) at once, then one every I ms (0-10000, 0 = no delay), or \
            default\n\
            (scope)\tevery bot on every hub gets the same values; there is no per-bot setting"),
-     "network set\nnetwork set flood cmd 10:30\nnetwork set flood msg off\nnetwork set ignoretime 20\nnetwork set sendq 5:250\nnetwork set sendq default"),
-    ("hub", Some("show"), None, "hub show"),
+     "bot set\nbot set flood cmd 10:30\nbot set flood msg off\nbot set ignoretime 20\nbot set sendq 5:250\nbot set sendq default"),
+    ("hub", Some("show"), Some("#|uuid|name\talone: this hub; else a linked hub by the number hub list \
+                                shows, its uuid, or its name"),
+     "hub show\nhub show 1\nhub show east"),
+    ("hub", Some("list"), None, "hub list"),
+    ("hub", Some("add"),
+     Some("ip\tthe other hub's address (no ':', so an IPv4 address or a host name)\n\
+           port\tits listening port, 1-65535\n\
+           uuid\tits uuid.  Where to get it: hub show in that hub's console, or ./irchub -id in \
+           that hub's directory on its host (it asks for the config password unless .irchub.pass \
+           is there); -id also prints this whole hub add line\n\
+           name|-\ta name for it, or - to learn its name from that hub\n\
+           key\tits 88-character public key, from the same hub show or ./irchub -id.  Its \
+           hub_public.b64 is only -setup's copy and goes stale after a hub rekey there"),
+     concat!("hub add 203.0.113.7 6697 ", ex_uuid!(), " east ", ex_key!(), "\n",
+             "hub add 203.0.113.7 6697 ", ex_uuid!(), " - ", ex_key!())),
+    ("hub", Some("del"), Some("uuid|name\tthe hub's uuid or name, as hub list shows it. It is unlinked on this \
+                                hub only: first you see which other hubs link to it and which bots list it, with what \
+                                to run on each (hub del there, -hub on the bot)"),
+     concat!("hub del east\nhub del ", ex_uuid!())),
     ("hub", Some("set"),
      Some("setting\tname, bindip, port, pubkey or autopurge; alone it shows them all. ssh and conn \
            are this hub's connection limits: hub set ssh | hub set conn show them; ssh <name> \
@@ -939,16 +1012,20 @@ const CMD_HELP: &[CmdHelp] = &[
            connection\n\
            value\tname: this hub's name · bindip: the address it listens on · port: 1-65535 · \
            pubkey: the key its private key derives (a new key is hub rekey) · \
-           autopurge: days to keep tombstones, 0 = off"),
-     "hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30\nhub set ssh\n\
+           autopurge: days to keep tombstones, 0 = off\n\
+           #|uuid|name key\ta linked hub (its number in hub list, its uuid, or its name), then \
+           key and its new 88-character public key: hub show or ./irchub -id on that hub"),
+     concat!("hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30\nhub set ssh\n\
       hub set ssh preauth 16\nhub set ssh authfail 3:3600\nhub set conn perip 8\n\
-      hub set conn churn 30:10:30"),
+      hub set conn churn 30:10:30\nhub set east key ", ex_key!())),
+    ("hub", Some("sync"), None, "hub sync"),
     ("hub", Some("stats"), None, "hub stats"),
-    ("hub", Some("rekey"), Some("(confirm)\tyou type this hub's name to go ahead; every peer and bot \
+    ("hub", Some("rekey"), Some("(confirm)\tyou type this hub's name to go ahead; every other hub and bot \
                                  must then learn the new key"),
      "hub rekey"),
     ("hub", Some("purge"), Some("now|days\tnow purges every tombstone; a number purges those older \
-                                 than that many days (asks y/N)"),
+                                 than that many days (asks y/N).  To purge on a schedule: hub set autopurge <days>, \
+                                 checked daily on every hub.  Deleted bots stay on bot revoked either way"),
      "hub purge now\nhub purge 30"),
     ("log", Some("show"), None, "log show"),
     ("log", Some("set"),
@@ -962,13 +1039,13 @@ const CMD_HELP: &[CmdHelp] = &[
     ("log", Some("off"), None, "log off"),
     ("log", Some("filter"), Some("text|clear\tthe rest of the line is the text a log view line must \
                                   contain (any case); clear drops the filter"),
-     "log filter UPGRADE\nlog filter peer east\nlog filter clear"),
+     "log filter UPGRADE\nlog filter east\nlog filter clear"),
     ("acl", Some("list"), None, "acl list"),
     ("acl", Some("add"),
      Some("allow|deny\twhich list\n\
            ip[/n]\tan IPv4 or IPv6 address, or a network as address/prefix\n\
            console\toptional scope word: the entry applies only once the connection says SSH \
-           (bots and peers are not affected); without it the entry applies to everything"),
+           (bots and other hubs are not affected); without it the entry applies to everything"),
      "acl add allow 203.0.113.0/24\nacl add deny 198.51.100.9\nacl add allow 203.0.113.7 console"),
     ("acl", Some("del"),
      Some("allow|deny\twhich list\n\
@@ -983,18 +1060,37 @@ const CMD_HELP: &[CmdHelp] = &[
      "user list\nuser list oper"),
     ("user", Some("show"), Some("name|*\ta user's name, or * for every user"), "user show robert\nuser show *"),
     ("user", Some("add"),
-     Some("admin|oper\tthe role\n\
-           name\tthe user's name\n\
-           key\ttheir 88-character public key (keygen's <stamp>_<name>.public.b64)\n\
-           mask\ta first usermask, nick!user@host (* and ? match)"),
-     concat!("user add oper alice ", ex_key!(), " alice!*@*.example.net")),
+     Some(concat!(
+         "admin|oper\tthe role\n",
+         "name\tthe user's name\n",
+         "key\ttheir 88-character public key (keygen's <stamp>_<name>.public.b64)\n",
+         "mask\ta first usermask, nick!user@host (* and ? match)\n",
+         "flags\tan admin: +a for a full admin (every command), or the letters of what they may ",
+         "change: b bots, c channels, h hub, o opers, u upgrades (+chu); every admin may log in ",
+         "and view everything\n",
+         "channels\tan oper: * for every channel, or the channels, comma-separated (#ircbot,#dev); ",
+         "on each they may op, invite, unban, key")),
+     concat!("user add admin robert ", ex_key!(), " robert!*@* +a\n",
+             "user add admin dana ", ex_key!(), " dana!*@* +chu\n",
+             "user add oper alice ", ex_key!(), " alice!*@*.example.net *\n",
+             "user add oper alice ", ex_key!(), " alice!*@*.example.net #ircbot")),
     ("user", Some("del"), Some("name\tthe user, either role; their masks go too (an admin: type the \
                                 name to confirm; an oper: y/N)"), "user del alice"),
     ("user", Some("set"),
-     Some("name\tthe user\n\
-           key\tthe setting; key is the only one\n\
-           key\ttheir new 88-character public key (asks y/N)"),
-     concat!("user set alice key ", ex_key!())),
+     Some(concat!(
+         "name\tthe user\n",
+         "key|flags\tthe setting: key (anyone's; your own needs no flag) or flags (an admin's, ",
+         "needs +a)\n",
+         "value\tkey: their new 88-character public key (asks y/N) · flags: +c-u adds and removes, ",
+         "chu or +a replaces them all")),
+     concat!("user set alice key ", ex_key!(), "\nuser set dana flags +b-u\nuser set dana flags +a")),
+    ("user", Some("chan"),
+     Some(concat!(
+         "add|del\tgive the channel, or take it away\n",
+         "name\tthe oper\n",
+         "#chan|*\ta channel, or * for every channel; * and channels exclude each other (add * ",
+         "drops the channels, add #c drops *), del * takes everything away")),
+     "user chan add alice #ops\nuser chan del alice #dev\nuser chan add alice *\nuser chan del alice *"),
     ("user", Some("mask"),
      Some("add|del\tadd a mask, or remove one (del asks y/N)\n\
            name\tthe user\n\
@@ -1070,7 +1166,7 @@ const CMD_HELP: &[CmdHelp] = &[
     ("display", Some("width"), Some("60-250|auto\tthe columns to lay output out for; auto follows the \
                                       terminal"),
      "display width 100\ndisplay width auto"),
-    ("display", Some("events"), Some("on|off\ta line for each peer, bot and upgrade change"),
+    ("display", Some("events"), Some("on|off\ta line for each hub, bot and upgrade change"),
      "display events on"),
     ("display", Some("clear"), None, "display clear"),
 ];
@@ -1098,12 +1194,17 @@ const LEVEL_WORDS: &str = "none error warning info debug";
 const ARG_COMP: &[ArgComp] = &[
     ("help", None, Some(0), Ck::Group),
     ("bot", Some("show"), Some(0), Ck::BotNick),
-    ("bot", Some("del"), Some(0), Ck::Bot),
+    ("bot", Some("del"), Some(0), Ck::BotNick),
     ("bot", Some("kick"), Some(0), Ck::BotOn),
     ("bot", Some("rekey"), Some(0), Ck::Bot),
-    ("peer", Some("show"), Some(0), Ck::HubName),
-    ("peer", Some("set"), Some(0), Ck::HubName),
-    ("peer", Some("set"), Some(1), Ck::Words("key")),
+    (
+        "bot",
+        Some("set"),
+        Some(0),
+        Ck::Words("flood ignoretime sendq"),
+    ),
+    ("bot", Some("set"), None, Ck::NetSet),
+    ("hub", Some("show"), Some(0), Ck::HubName),
     ("hub", Some("set"), None, Ck::HubSet),
     ("hub", Some("purge"), Some(0), Ck::Words("now")),
     ("log", Some("set"), Some(0), Ck::Words("file console size")),
@@ -1117,7 +1218,8 @@ const ARG_COMP: &[ArgComp] = &[
     ("acl", Some("del"), Some(2), Ck::Words("console")),
     ("user", Some("list"), Some(0), Ck::Words("admin oper")),
     ("user", Some("add"), Some(0), Ck::Words("admin oper")),
-    ("user", Some("set"), Some(1), Ck::Words("key")),
+    ("user", Some("set"), Some(1), Ck::Words("key flags")),
+    ("user", Some("chan"), Some(0), Ck::Words("add del")),
     ("user", Some("mask"), Some(0), Ck::Words("add del")),
     ("channel", Some("set"), Some(0), Ck::Words("default")),
     ("channel", Some("set"), None, Ck::ChSet),
@@ -1126,13 +1228,6 @@ const ARG_COMP: &[ArgComp] = &[
     ("ban", Some("add"), Some(2), Ck::Words("perm sticky")),
     ("ban", Some("add"), Some(3), Ck::Words("sticky")),
     ("ban", Some("del"), Some(0), Ck::Words("*")),
-    (
-        "network",
-        Some("set"),
-        Some(0),
-        Ck::Words("flood ignoretime sendq"),
-    ),
-    ("network", Some("set"), None, Ck::NetSet),
     ("upgrade", Some("releases"), None, Ck::Words("bot= hub=")),
     (
         "upgrade",
@@ -1184,7 +1279,7 @@ fn netset_words(p1: &[u8], p2: &[u8]) -> &'static str {
     }
 }
 
-/// hub set <setting> | ssh <name> <value> | conn <name> <value>
+/// hub set <setting> | ssh <name> <value> | conn <name> <value> | <hub> key <key>
 fn hubset_words(pos: usize, p1: &[u8], p2: &[u8]) -> &'static str {
     if pos == 0 {
         "name bindip port pubkey autopurge ssh conn"
@@ -1192,6 +1287,13 @@ fn hubset_words(pos: usize, p1: &[u8], p2: &[u8]) -> &'static str {
         "preauth preauthip sessions grace authtries idle authfail connect block cmdrate"
     } else if pos == 1 && eq_ic(p1, "conn") {
         "perip churn authfail"
+    } else if pos == 1
+        && !["name", "bindip", "port", "pubkey", "autopurge"]
+            .iter()
+            .any(|w| eq_ic(p1, w))
+    {
+        // hub set <#|uuid|name> key <key>
+        "key"
     } else if pos == 2 && (eq_ic(p2, "ssh") || eq_ic(p2, "conn")) {
         "default"
     } else {
@@ -1259,17 +1361,9 @@ fn cstr(s: &[u8]) -> &[u8] {
     }
 }
 
-/// `%-*s` / `%*s`: pad with spaces to n bytes (left or right aligned).
+/// `%-*s`: pad with spaces to n bytes (left aligned).
 fn padl(s: &[u8], n: usize) -> Vec<u8> {
     pad_bytes(s, n)
-}
-fn padr(s: &[u8], n: usize) -> Vec<u8> {
-    let mut v = Vec::new();
-    while v.len() + s.len() < n {
-        v.push(b' ');
-    }
-    v.extend_from_slice(s);
-    v
 }
 
 impl Ui {
@@ -1844,7 +1938,7 @@ impl Ui {
                 fmt::glyph(&c, fmt::G_OFF),
             )
         };
-        // peers up/down
+        // other hubs up/down
         for bj in &b {
             if bj.typ != b'H' || bj.depth < 1 {
                 continue;
@@ -1856,7 +1950,7 @@ impl Ui {
             {
                 let l = fmtb(&[
                     if bj.online { g_on } else { g_warn },
-                    b" peer ",
+                    b" hub ",
                     &bj.name,
                     if bj.online { b" is up" } else { b" went down" },
                 ]);
@@ -1931,7 +2025,7 @@ impl Ui {
             }
         };
         let l1 = fmtb(&[
-            format!(" peers {}/{} up ", self.st.peers_up, self.st.peers_total).as_bytes(),
+            format!(" hubs {}/{} up ", self.st.peers_up, self.st.peers_total).as_bytes(),
             dot,
             format!(" bots {}/{} online ", self.st.bots_on, self.st.bots_total).as_bytes(),
             dot,
@@ -1965,6 +2059,23 @@ impl Ui {
         let data = &payload[bar + 1..];
         let dl = data.len();
         match topic {
+            b"me" => {
+                // "flags=<letters>": only letters of USER_FLAG_LETTERS are kept
+                let mut f = String::new();
+                if let Some(v) = data.strip_prefix(b"flags=")
+                    && !v.is_empty()
+                {
+                    for &b in v {
+                        if f.len() >= USER_FLAGS_MAX {
+                            break;
+                        }
+                        if b != 0 && USER_FLAG_LETTERS.as_bytes().contains(&b) {
+                            f.push(b as char);
+                        }
+                    }
+                }
+                self.flags = Some(f);
+            }
             b"status" => {
                 let clean = sanitize(data, dl + 1);
                 self.parse_status(&clean);
@@ -2270,6 +2381,27 @@ fn help_command(c: &Ctx, f: &mut Flines, d: &CmdDef) {
         c_cut(&fmtb(&[b"   ", d.usage.as_bytes()]), 1024),
     );
     fmt::flines_add(f, RL_DIM, c_cut(&fmtb(&[b"   ", d.help.as_bytes()]), 1024));
+    // the admin flag it needs (plan §2)
+    if let Some(fl) = cmd_flag(d) {
+        let line = if fl == "a/o" {
+            format!(
+                "   needs +a for an admin, +o for an oper{}",
+                if d.sub == Some("set") {
+                    " (your own key: none)"
+                } else {
+                    ""
+                }
+            )
+        } else if cmd_flag_dual(d) {
+            format!(
+                "   changing needs +{fl} ({}); viewing needs none",
+                flag_word(fl.as_bytes()[0])
+            )
+        } else {
+            format!("   needs +{fl} ({})", flag_word(fl.as_bytes()[0]))
+        };
+        fmt::flines_add(f, RL_DIM, c_cut(line.as_bytes(), 1024));
+    }
     // "name<TAB>text" lines as a two-column list; a long name puts its text
     // on the next line
     if let Some(args) = args {
@@ -2315,9 +2447,9 @@ fn help_command(c: &Ctx, f: &mut Flines, d: &CmdDef) {
     } else {
         fmt::flines_add(f, RL_DIM, b"   (no arguments)");
     }
-    // channel set / network set: every setting, its built-in default and what
+    // channel set / bot set: every setting, its built-in default and what
     // it does (one table, fmt.rs, also behind the settings views)
-    let net_set = d.cmd == "network" && d.sub == Some("set");
+    let net_set = d.cmd == "bot" && d.sub == Some("set");
     if net_set || (d.cmd == "channel" && d.sub == Some("set")) {
         fmt::flines_add(f, RL_NORMAL, b"");
         fmt::flines_add(
@@ -2433,23 +2565,13 @@ fn build_payload(
             let name: &[u8] = if a(3) == b"-" { b"" } else { a(3) };
             fmtb(&[a(0), b":", a(1), b":", a(2), b":", name, b":", a(4)])
         }
-        B::PeerDel => {
-            if na > 0 && !all_digits(a(0)) {
-                return bad(
-                    "a peer is removed by its number in peer list",
-                    Some("peer del [#]"),
-                );
+        B::HubShow => {
+            // alone: this hub; with an argument: that linked hub
+            if na == 0 {
+                return Ok(b);
             }
-            if na > 0 { a(0).to_vec() } else { Vec::new() }
-        }
-        B::PeerSet => {
-            if !eq_ic(a(1), "key") {
-                return bad("unknown peer setting", Some("settings: key"));
-            }
-            if a(0).contains(&b':') || a(2).contains(&b':') {
-                return bad("':' is not allowed in an argument here", hint);
-            }
-            fmtb(&[a(0), b":", a(2)])
+            b.op = CMD_ADMIN_LIST_PEERS;
+            a(0).to_vec()
         }
         B::ChanAdd => fmtb(&[a(0), b"|", if na > 1 { a(1) } else { b"" }]),
         B::ChanSet => {
@@ -2577,7 +2699,7 @@ fn build_payload(
                 fmtb(&[b"sendq|", a(1)])
             } else {
                 return bad(
-                    "network set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, or sendq <B:I|default>",
+                    "bot set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, or sendq <B:I|default>",
                     hint,
                 );
             };
@@ -2680,28 +2802,39 @@ fn build_payload(
                 b.payload = o;
                 return Ok(b);
             }
-            if na > 2 {
-                return bad("hub set takes a setting and one value", hint);
+            if na == 3 && eq_ic(a(1), "key") {
+                // hub set <#|uuid|name> key <key>: a linked hub's key
+                if a(0).contains(&b':') || a(2).contains(&b':') {
+                    return bad("':' is not allowed in an argument here", hint);
+                }
+                b.op = CMD_ADMIN_SET_PEER_PUBKEY;
+                fmtb(&[a(0), b":", a(2)])
+            } else {
+                if na > 2 {
+                    return bad("hub set takes a setting and one value", hint);
+                }
+                const HS: [(&str, u8); 5] = [
+                    ("name", CMD_ADMIN_SET_HUB_NAME),
+                    ("bindip", CMD_ADMIN_SET_BIND_IP),
+                    ("port", CMD_ADMIN_SET_BIND_PORT),
+                    ("pubkey", CMD_ADMIN_SET_PUBKEY),
+                    ("autopurge", CMD_ADMIN_SET_PURGE_DAYS),
+                ];
+                let Some(k) = HS.iter().rposition(|h| eq_ic(a(0), h.0)) else {
+                    let m = fmtb(&[b"unknown hub setting \"", &a(0)[..uprec(a(0), 40)], b"\""]);
+                    return Err((
+                        c_cut(&m, 96).to_vec(),
+                        Some(
+                            "name, bindip, port, pubkey, autopurge, ssh, conn, or <hub> key <key>",
+                        ),
+                    ));
+                };
+                if na < 2 {
+                    return bad("say the new value", hint);
+                }
+                b.op = HS[k].1;
+                a(1).to_vec()
             }
-            const HS: [(&str, u8); 5] = [
-                ("name", CMD_ADMIN_SET_HUB_NAME),
-                ("bindip", CMD_ADMIN_SET_BIND_IP),
-                ("port", CMD_ADMIN_SET_BIND_PORT),
-                ("pubkey", CMD_ADMIN_SET_PUBKEY),
-                ("autopurge", CMD_ADMIN_SET_PURGE_DAYS),
-            ];
-            let Some(k) = HS.iter().rposition(|h| eq_ic(a(0), h.0)) else {
-                let m = fmtb(&[b"unknown hub setting \"", &a(0)[..uprec(a(0), 40)], b"\""]);
-                return Err((
-                    c_cut(&m, 96).to_vec(),
-                    Some("name, bindip, port, pubkey, autopurge, ssh, conn"),
-                ));
-            };
-            if na < 2 {
-                return bad("say the new value", hint);
-            }
-            b.op = HS[k].1;
-            a(1).to_vec()
         }
         B::Acl => {
             let add = c.sub == Some("add");
@@ -2754,13 +2887,29 @@ fn build_payload(
             } else {
                 return bad("role is admin or oper", hint);
             }
-            fmtb(&[a(1), b"|", a(2), b"|", a(3)])
+            fmtb(&[a(1), b"|", a(2), b"|", a(3), b"|", a(4)])
         }
         B::UserSet => {
-            if !eq_ic(a(1), "key") {
-                return bad("unknown user setting", Some("settings: key"));
+            if eq_ic(a(1), "flags") {
+                b.op = CMD_ADMIN_USER_ACCESS;
+                b.confirm = Confirm::None;
+                fmtb(&[b"flags|", a(0), b"|", a(2)])
+            } else {
+                if !eq_ic(a(1), "key") {
+                    return bad("unknown user setting", Some("settings: key, flags"));
+                }
+                fmtb(&[a(0), b"|", a(2)])
             }
-            fmtb(&[a(0), b"|", a(2)])
+        }
+        B::UserChan => {
+            let act: &[u8] = if eq_ic(a(0), "add") {
+                b"add"
+            } else if eq_ic(a(0), "del") {
+                b"del"
+            } else {
+                return bad("say add or del", hint);
+            };
+            fmtb(&[b"chan|", act, b"|", a(1), b"|", a(2)])
         }
         B::UserMask => {
             if eq_ic(a(0), "add") {
@@ -2871,19 +3020,20 @@ impl Ui {
                 for d in CMDS.iter().filter(|d| eq_ic(topic, d.cmd)) {
                     let w = str_width(d.usage.as_bytes());
                     let pad = |k: i32| vec![b' '; k.max(0) as usize];
-                    if w <= uw && 1 + uw + 2 + str_width(d.help.as_bytes()) <= c.width {
-                        let l = fmtb(&[
-                            b" ",
-                            d.usage.as_bytes(),
-                            &pad(uw - w),
-                            b"  ",
-                            d.help.as_bytes(),
-                        ]);
+                    // the help text, then the flag it needs: [+c], [+a|+o]
+                    let hx = match cmd_flag(d) {
+                        Some("a/o") => format!("{}  [+a|+o]", d.help),
+                        Some(fl) => format!("{}  [+{fl}]", d.help),
+                        None => d.help.to_string(),
+                    };
+                    let hx = c_cut(hx.as_bytes(), 320).to_vec();
+                    if w <= uw && 1 + uw + 2 + str_width(&hx) <= c.width {
+                        let l = fmtb(&[b" ", d.usage.as_bytes(), &pad(uw - w), b"  ", &hx]);
                         fmt::flines_add(&mut f, RL_NORMAL, c_cut(&l, 512));
                     } else {
                         let l = fmtb(&[b" ", d.usage.as_bytes()]);
                         fmt::flines_add(&mut f, RL_NORMAL, c_cut(&l, 512));
-                        let l = fmtb(&[b" ", &pad(uw), b"  ", d.help.as_bytes()]);
+                        let l = fmtb(&[b" ", &pad(uw), b"  ", &hx]);
                         fmt::flines_add(&mut f, RL_NORMAL, c_cut(&l, 512));
                     }
                     if let Some(args) = d.args {
@@ -3366,10 +3516,9 @@ impl Ui {
 
     /// Enter a confirmation: the question as [confirm #N] (line mode) or a
     /// highlighted line, and the next input line answers it.
-    fn ask_confirm(&mut self, kind: Confirm, want: &[u8], pick_max: i32, question: &[u8]) {
+    fn ask_confirm(&mut self, kind: Confirm, want: &[u8], question: &[u8]) {
         self.confirming = kind;
         self.confirm_want = c_cut(want, 128).to_vec();
-        self.confirm_pick_max = pick_max;
         if self.line_mode {
             let m = fmtb(&[
                 format!("[confirm #{}] ", self.confirm_seq).as_bytes(),
@@ -3436,22 +3585,18 @@ impl Ui {
         }
         let pc = self.pend.clone();
         let sl = self.session_log_phrase(128);
-        let (dot, arrow, dash, ell, g_on, g_err) = {
+        let (dot, arrow, ell) = {
             let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
             (
                 fmt::glyph(&c, fmt::G_DOT),
                 fmt::glyph(&c, fmt::G_ARROW),
-                fmt::glyph(&c, fmt::G_DASH),
                 fmt::glyph(&c, fmt::G_ELL),
-                fmt::glyph(&c, fmt::G_ON),
-                fmt::glyph(&c, fmt::G_ERR),
             )
         };
         const QCAP: usize = CONSOLE_INPUT_MAX - 64;
         let mut q: Vec<u8> = Vec::new();
         let mut kind = Confirm::Yn;
         let mut want: Vec<u8> = Vec::new();
-        let mut pick = 0;
         self.stage_confirm(rq.seq, pc.op, &pc.payload, &pc.rq);
         let mut fail: Option<(&str, Vec<u8>, Vec<u8>)> = None;
         let arg = pc.arg.as_slice();
@@ -3466,6 +3611,13 @@ impl Ui {
                 let local = on && b.and_then(|b| b.rv("hub")) == Some(b"local");
                 let id: &[u8] = b.and_then(|b| b.rv("uuid")).unwrap_or(arg);
                 let u8s = c_cut(&fmtb(&[&id[..uprec(id, 8)], ell]), 16).to_vec();
+                // a nick was typed: the request names the bot by the uuid it
+                // resolved to
+                if let Some(u) = b.and_then(|b| b.rvs("uuid"))
+                    && u.len() < 1024
+                {
+                    self.confirm_payload = u.to_vec();
+                }
                 let hub_name: &[u8] = b.and_then(|b| b.rvs("hub_name")).unwrap_or(b"another hub");
                 if pc.pre == Pre::BotDel {
                     q = if local {
@@ -3474,7 +3626,7 @@ impl Ui {
                             nick,
                             b" (",
                             &u8s,
-                            b")? It is online on this hub and will be disconnected. (y/N)",
+                            b") for good? It is online on this hub: it wipes its config and exits. (y/N)",
                         ])
                     } else if on {
                         fmtb(&[
@@ -3482,9 +3634,9 @@ impl Ui {
                             nick,
                             b" (",
                             &u8s,
-                            b")? It is online on ",
+                            b") for good? It is online on ",
                             hub_name,
-                            b" and is dropped everywhere. (y/N)",
+                            b": it wipes its config and exits. (y/N)",
                         ])
                     } else {
                         fmtb(&[
@@ -3492,7 +3644,7 @@ impl Ui {
                             nick,
                             b" (",
                             &u8s,
-                            b")? It is offline. (y/N)",
+                            b") for good? It is offline: it wipes its config if it ever connects. (y/N)",
                         ])
                     };
                 } else if !local {
@@ -3516,114 +3668,73 @@ impl Ui {
                 }
             }
             Pre::PeerDel => {
-                let mut n = 0;
-                let mut hit: Option<&fmt::Crec> = None;
-                for r in rep.r.iter().filter(|x| x.typ == b"peer") {
-                    n += 1;
-                    if !arg.is_empty() && r.rvi("n", 0) == fmt::atoll(arg) {
-                        hit = Some(r);
+                // hub del: the hub, who else still knows it, then the question
+                let t = rep.r.iter().find(|x| x.typ == b"peer");
+                let others = rep
+                    .r
+                    .iter()
+                    .filter(|x| x.typ == b"hubref" && !x.rvb("self"))
+                    .count();
+                let nb = rep.r.iter().filter(|x| x.typ == b"botref").count();
+                match t {
+                    None => {
+                        let msg = fmtb(&[b"no hub ", arg, b": none with that uuid or name"]);
+                        fail = Some((
+                            "peer.not_found",
+                            c_cut(&msg, 256).to_vec(),
+                            b"hub list".to_vec(),
+                        ));
                     }
-                }
-                if n == 0 {
-                    fail = Some((
-                        "peer.none",
-                        b"no peer hubs are configured".to_vec(),
-                        b"peer list".to_vec(),
-                    ));
-                } else if !arg.is_empty() {
-                    match hit {
-                        None => {
-                            let msg =
-                                fmtb(&[b"no peer #", arg, format!(" ({n} configured)").as_bytes()]);
-                            fail = Some((
-                                "peer.not_found",
-                                c_cut(&msg, 256).to_vec(),
-                                b"peer list".to_vec(),
-                            ));
-                        }
-                        Some(h) => {
-                            kind = Confirm::Type;
-                            want = c_cut(arg, 128).to_vec();
-                            q = fmtb(&[
-                                b"Type ",
-                                arg,
-                                b" to remove peer ",
-                                h.rvs("name").or_else(|| h.rv("ip")).unwrap_or(b"?"),
-                                b" (",
-                                h.rv("ip").unwrap_or(b"?"),
-                                b":",
-                                &fmt::num(h.rvi("port", 0)),
-                                b"):",
-                            ]);
-                        }
-                    }
-                } else {
-                    // no number: the configured peers, then the number is
-                    // the answer
-                    if self.raw {
+                    Some(t) => {
                         self.show_reply(text, &rq.words, fmt::FMT_MODE_NORMAL, false);
-                    } else {
-                        let mut f = Flines::new();
+                        let nm = t.rvs("name").or_else(|| t.rvs("ip")).unwrap_or(arg);
+                        let id = match t.rvs("uuid") {
+                            Some(u) => u[..u.len().min(8)].to_vec(),
+                            None => c_cut(
+                                &fmtb(&[
+                                    t.rv("ip").unwrap_or(b"?"),
+                                    b":",
+                                    &fmt::num(t.rvi("port", 0)),
+                                ]),
+                                96,
+                            )
+                            .to_vec(),
+                        };
+                        // a name was typed: the request names the hub by the
+                        // uuid it resolved to
+                        if let Some(u) = t.rvs("uuid")
+                            && u.len() < 1024
                         {
-                            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
-                            let right = format!("{n} configured");
-                            fmt::title(&c, &mut f, b"Peer hubs", Some(right.as_bytes()));
-                            let mut nw = 4;
-                            let mut aw = 7;
-                            let ad_of = |p: &fmt::Crec| -> Vec<u8> {
-                                c_cut(
-                                    &fmtb(&[
-                                        p.rv("ip").unwrap_or(b"?"),
-                                        b":",
-                                        &fmt::num(p.rvi("port", 0)),
-                                    ]),
-                                    96,
-                                )
-                                .to_vec()
-                            };
-                            for p in rep.r.iter().filter(|x| x.typ == b"peer") {
-                                let nm = p.rvs("name").unwrap_or(dash);
-                                nw = nw.max(str_width(nm));
-                                aw = aw.max(str_width(&ad_of(p)));
-                            }
-                            let l = fmtb(&[
-                                b"   #  ",
-                                &padl(b"NAME", nw as usize),
-                                b"  ",
-                                &padl(b"ADDRESS", aw as usize),
-                                b"  LINK",
-                            ]);
-                            fmt::flines_add(&mut f, RL_HEAD, c_cut(&l, 512));
-                            for p in rep.r.iter().filter(|x| x.typ == b"peer") {
-                                let ad = ad_of(p);
-                                let nm = p.rvs("name").unwrap_or(dash);
-                                let up = p.rvb("up");
-                                let l = fmtb(&[
-                                    b"  ",
-                                    &padr(&fmt::num(p.rvi("n", 0)), 2),
-                                    b"  ",
-                                    nm,
-                                    &vec![b' '; (nw - str_width(nm)).max(0) as usize],
-                                    b"  ",
-                                    &ad,
-                                    &vec![b' '; (aw - str_width(&ad)).max(0) as usize],
-                                    b"  ",
-                                    if up { g_on } else { g_err },
-                                    b" ",
-                                    if up { b"up" } else { b"down" },
-                                ]);
-                                fmt::flines_add(
-                                    &mut f,
-                                    if up { RL_NORMAL } else { RL_WARN },
-                                    c_cut(&l, 512),
-                                );
-                            }
+                            self.confirm_payload = u.to_vec();
                         }
-                        self.emit_flines(f);
+                        let pl = |n: usize| if n == 1 { "" } else { "s" };
+                        q = if others == 0 && nb == 0 {
+                            fmtb(&[
+                                b"Unlink ",
+                                nm,
+                                b" (",
+                                &id,
+                                b")? No other hub links to it and no bot lists it. (y/N)",
+                            ])
+                        } else {
+                            let who = if others > 0 && nb > 0 {
+                                format!("{others} more hub{} and {nb} bot{}", pl(others), pl(nb))
+                            } else if others > 0 {
+                                format!("{others} more hub{}", pl(others))
+                            } else {
+                                format!("{nb} bot{}", pl(nb))
+                            };
+                            fmtb(&[
+                                b"Unlink ",
+                                nm,
+                                b" (",
+                                &id,
+                                b") from this hub only? ",
+                                who.as_bytes(),
+                                b" still list it. (y/N)",
+                            ])
+                        };
                     }
-                    kind = Confirm::Pick;
-                    pick = n;
-                    q = b"Type the number of the peer to remove:".to_vec();
                 }
             }
             Pre::Opt => {
@@ -3843,7 +3954,7 @@ impl Ui {
             return;
         }
         let q = c_cut(&q, QCAP).to_vec();
-        self.ask_confirm(kind, &want, pick, &q);
+        self.ask_confirm(kind, &want, &q);
         // lines typed ahead answer it; then the prompt
         self.command_done(true);
     }
@@ -3951,6 +4062,25 @@ impl Ui {
                 return;
             }
         };
+        // plan R4: refused here, before any read or y/N, when this admin's
+        // flags (the core's "me" event) do not cover it; the hub checks again
+        if let (Some(need), Some(fl)) = (ui_flag_needed(c, &ws, argi), &self.flags)
+            && !fl.contains('a')
+            && !fl.as_bytes().contains(&need)
+        {
+            let m = format!("this needs +{} ({})", need as char, flag_word(need));
+            self.refuse(
+                seq,
+                "user.no_flag",
+                m.as_bytes(),
+                Some(if need == b'a' {
+                    b"ask a full admin (+a)".as_slice()
+                } else {
+                    b"ask a full admin (+a) for the flag".as_slice()
+                }),
+            );
+            return;
+        }
         let (op, confirm) = (built.op, built.confirm);
         let rq = PendingRq {
             kind: Rq::User,
@@ -3986,7 +4116,7 @@ impl Ui {
             };
             let (pop, pp): (u8, Vec<u8>) = match c.pre {
                 Pre::BotDel | Pre::BotKick => (CMD_ADMIN_LIST_FULL, c_cut(&a1, 600).to_vec()),
-                Pre::PeerDel => (CMD_ADMIN_LIST_PEERS, Vec::new()),
+                Pre::PeerDel => (CMD_ADMIN_PEER_REFS, c_cut(&a1, 600).to_vec()),
                 Pre::Opt => {
                     pc.arg = c_cut(if a1 == b"-" { b"" } else { &a1 }, 256).to_vec();
                     (CMD_ADMIN_GET_OPT_FLAGS, Vec::new())
@@ -4043,7 +4173,7 @@ impl Ui {
             let l1 = c_cut(&l1, 160).to_vec();
             self.warn_lines(&[
                 &l1,
-                b"Every peer and bot link drops now; each peer runs peer set <uuid> key, each bot +hub with the new key.",
+                b"Every hub and bot link drops now; each other hub runs hub set <uuid> key, each bot +hub with the new key.",
                 b"Back up .irchub.cnf first: the old key is overwritten.",
             ]);
             kind = Confirm::Type;
@@ -4051,12 +4181,12 @@ impl Ui {
             fmtb(&[b"Type ", &hn, b" to go ahead:"])
         } else if op == CMD_ADMIN_PURGE_TOMBSTONES {
             if eq_ic(&a1, "now") {
-                b"Purge every tombstone now, here and on all peers? (y/N)".to_vec()
+                b"Purge every tombstone now, here and on all other hubs? (y/N)".to_vec()
             } else {
                 fmtb(&[
                     b"Purge tombstones older than ",
                     &a1,
-                    b" days, here and on all peers? (y/N)",
+                    b" days, here and on all other hubs? (y/N)",
                 ])
             }
         } else if op == CMD_ADMIN_DEL_ALLOWLIST || op == CMD_ADMIN_DEL_DENYLIST {
@@ -4101,7 +4231,7 @@ impl Ui {
             fmtb(&[b"Really ", &words, b"? (y/N)"])
         };
         let q = c_cut(&q, CONSOLE_INPUT_MAX - 64).to_vec();
-        self.ask_confirm(kind, &want, 0, &q);
+        self.ask_confirm(kind, &want, &q);
     }
 
     fn confirm_answer(&mut self, answer: &[u8], cancelled: bool) {
@@ -4111,14 +4241,6 @@ impl Ui {
         if ok {
             ok = match kind {
                 Confirm::Yn => eq_ic(answer, "y") || eq_ic(answer, "yes"),
-                Confirm::Pick => {
-                    let v = fmt::atoi(answer);
-                    let good = all_digits(answer) && v >= 1 && v <= self.confirm_pick_max;
-                    if good {
-                        self.confirm_payload = v.to_string().into_bytes();
-                    }
-                    good
-                }
                 _ => answer == self.confirm_want.as_slice(),
             };
         }
@@ -4359,7 +4481,7 @@ impl Ui {
             }
             _ => {}
         }
-        // uuids (and for show / peer set, names) from the tree rows:
+        // uuids (and for show / kick / del / hub show, names) from the tree rows:
         // H|depth|name|uuid|..., B|depth|nick|uuid|..., D|nick|uuid|... (offline)
         let tree = self.tree.as_deref().unwrap_or(b"");
         for row in tree.split(|&b| b == b'\n') {
@@ -4383,7 +4505,7 @@ impl Ui {
                 }
                 Ck::Bot | Ck::BotOn | Ck::BotNick if ty == b'B' && nf >= 4 => {
                     cand[0] = Some(f[3]);
-                    if ac.3 == Ck::BotNick {
+                    if ac.3 != Ck::Bot {
                         cand[1] = Some(f[2]);
                     }
                 }
@@ -5441,7 +5563,7 @@ impl Ui {
                 &mut s,
                 2,
                 SGR_STATUS,
-                format!("peers {}/{}", self.st.peers_up, self.st.peers_total).into_bytes(),
+                format!("hubs {}/{}", self.st.peers_up, self.st.peers_total).into_bytes(),
             );
             push(
                 &mut s,
@@ -5824,6 +5946,7 @@ impl Ui {
             admin: sanitize(admin.as_bytes(), CONSOLE_NAME_MAX),
             ip: sanitize(ip.as_bytes(), 64),
             hubname: sanitize(hubname.as_bytes(), 64),
+            flags: None,
             term: Vec::new(),
             core: Vec::new(),
             backlog: 0,
@@ -5852,7 +5975,6 @@ impl Ui {
             confirming: Confirm::None,
             confirm_seq: 0,
             confirm_want: Vec::new(),
-            confirm_pick_max: 0,
             confirm_op: 0,
             confirm_payload: Vec::new(),
             confirm_rq: PendingRq::default(),
@@ -6157,7 +6279,9 @@ mod tests {
         );
         let t = String::from_utf8_lossy(&ui.take_term()).into_owned();
         assert!(
-            t.contains("[confirm #3] Delete bot alpha (abc…)? It is offline. (y/N)\r\n? "),
+            t.contains(
+                "[confirm #3] Delete bot alpha (abc…) for good? It is offline: it wipes its config if it ever connects. (y/N)\r\n? "
+            ),
             "{t}"
         );
         assert!(run(&mut ui, "n\r").contains("[err #3] cancelled\r\n> "));

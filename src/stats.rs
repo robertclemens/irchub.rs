@@ -84,7 +84,13 @@ pub fn sync_done(updates: u64) {
 
 /// The CMD_ADMIN_STATS reply as records: ok|stats|up, cfg|, sync|, then
 /// one op| per opcode that saw traffic.
-pub fn report(uptime: i64, r: &mut crate::reply::Reply) {
+/// `load` adds the hub-state records (connections, maintenance timers)
+/// between the sync counters and the per-opcode rows.
+pub fn report(
+    uptime: i64,
+    r: &mut crate::reply::Reply,
+    load: impl FnOnce(&mut crate::reply::Reply),
+) {
     let g = |a: &AtomicU64| a.load(Relaxed);
     let s = &STATS;
     r.ok("stats");
@@ -98,6 +104,7 @@ pub fn report(uptime: i64, r: &mut crate::reply::Reply) {
     r.kvu("noop", g(&s.sync_noop));
     r.kvu("records", g(&s.sync_records));
     r.kvu("applied", g(&s.sync_applied));
+    load(r);
     for op in 0..256 {
         let (rf, tf) = (g(&s.rx_frames[op]), g(&s.tx_frames[op]));
         if rf == 0 && tf == 0 {

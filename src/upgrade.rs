@@ -69,10 +69,8 @@ pub fn config_frozen(state: &HubState) -> bool {
 pub fn admin_cmd_mutates_config(cmd: u8) -> bool {
     matches!(
         cmd,
-        CMD_ADMIN_ADD
-            | CMD_ADMIN_DEL
+        CMD_ADMIN_DEL
             | CMD_ADMIN_REGEN_KEYS
-            | CMD_ADMIN_APPROVE
             | CMD_ADMIN_ADD_PEER
             | CMD_ADMIN_DEL_PEER
             | CMD_ADMIN_SET_PUBKEY
@@ -94,6 +92,7 @@ pub fn admin_cmd_mutates_config(cmd: u8) -> bool {
             | CMD_ADMIN_DEL_USERMASK
             | CMD_ADMIN_SET_PEER_PUBKEY
             | CMD_ADMIN_SET_USERKEY
+            | CMD_ADMIN_USER_ACCESS
             // the changing forms only: admin::mf_payload_mutates
             | CMD_ADMIN_CHAN_MODE
             | CMD_ADMIN_CHAN_SET
@@ -1227,7 +1226,7 @@ pub fn note_result(state: &mut HubState, payload: &str) {
         return;
     }
     let node = &mut state.upgrade.nodes[ni];
-    node.cur_version = trunc_string(f[3], ROSTER_VERSION_MAX + 1);
+    // cur_version stays what the run found ("from"); the reported one is f[3].
     // A follower saw this bot back on the target; its own "ok" follows once
     // it is back in its channels with ops.  Stays committed (Addendum A1).
     if status == "back" {
@@ -1237,7 +1236,7 @@ pub fn note_result(state: &mut HubState, payload: &str) {
         crate::hlog_info!(
             "[UPGRADE] {} is back on {}; waiting for its ready report\n",
             uuid,
-            node.cur_version
+            f[3]
         );
         return;
     }
@@ -1261,7 +1260,7 @@ pub fn note_result(state: &mut HubState, payload: &str) {
         "[UPGRADE] {} reports {} ({}){}{}\n",
         uuid,
         status,
-        node.cur_version,
+        f[3],
         if node.reason.is_empty() { "" } else { ": " },
         node.reason
     );
@@ -1302,7 +1301,6 @@ pub fn note_presence(state: &mut HubState, uuid: &str, version: &str, variant: &
     if node.state != UpgradeNodeState::Committed {
         return;
     }
-    node.cur_version = trunc_string(version, ROSTER_VERSION_MAX + 1);
     if !on_target {
         return;
     }
@@ -2707,8 +2705,14 @@ pub fn status(state: &HubState, r: &mut Reply) {
         r.rec("node");
         r.kv("kind", n.kind.name());
         r.kv("uuid", &n.uuid);
+        // a bot node has no label of its own: its nick from the config
         if !n.name.is_empty() {
             r.kv("name", &n.name);
+        } else if n.kind == UpgradeNodeKind::Bot {
+            let nick = crate::presence::bot_nick_from_config(state, &n.uuid);
+            if !nick.is_empty() {
+                r.kv("name", &nick);
+            }
         }
         r.kv(
             "state",

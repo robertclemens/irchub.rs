@@ -10,7 +10,7 @@
 
 use crate::consts::*;
 use crate::cstr::{atoll, now, trunc_string, until_nul};
-use crate::glob_overlap::glob_overlap;
+use crate::glob_overlap::hostmask_overlap;
 use crate::state::{
     Ban, BotConfig, Chanset, ConfigEntry, HubState, ModesStatus, global_value_active, lww_next_ts,
 };
@@ -589,7 +589,7 @@ pub fn ban_protected(state: &HubState, mask: &str) -> (ModesStatus, String) {
         let Some(u) = state.user_records.iter().find(|u| u.uuid == m.uuid) else {
             continue;
         };
-        if !u.is_active || !glob_overlap(mask, &m.mask) {
+        if !u.is_active || !hostmask_overlap(mask, &m.mask) {
             continue;
         }
         return (ModesStatus::Protected, format!("user {}", u.name));
@@ -771,10 +771,17 @@ pub fn ban_list(state: &HubState, chan: Option<&str>, max: usize) -> Vec<Ban> {
             setter: entry_field(e, 4, BAN_SETTER_MAX),
             reason: ban_reason(e, BAN_REASON_MAX + 1),
             ts: e.timestamp,
+            last_used: e.last_used,
         });
     }
     out.sort_by(|x, y| x.ts.cmp(&y.ts).then_with(|| x.mask.cmp(&y.mask)));
     out
+}
+
+/// hub_ban_used_slot(): index of the live ban (chan, mask) whose
+/// `last_used` activity is kept, None when there is none.
+pub fn ban_used_slot(state: &HubState, chan: &str, mask: &str) -> Option<usize> {
+    ban_find(state, chan, mask).filter(|&i| entry_live(&state.global_entries[i]))
 }
 
 /// Effective bantime of `chan` in minutes (0 = permanent).
@@ -930,6 +937,12 @@ pub fn bans_sweep(state: &mut HubState, now: i64) {
 /// -- they drop C|, D| and B| -- for the console warning.  Hubs whose version
 /// is not known yet are not listed.  At most `max`.
 pub fn old_hubs(state: &HubState, max: usize) -> Vec<String> {
+    old_hubs_for(state, max, MODES_MIN_HUB)
+}
+
+/// The hubs in the mesh map older than `min_ver` (or of unknown version).
+/// C `hub_old_hubs_for`.
+pub fn old_hubs_for(state: &HubState, max: usize, min_ver: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for m in &state.mesh_hubs {
         if names.len() >= max {
@@ -939,7 +952,7 @@ pub fn old_hubs(state: &HubState, max: usize) -> Vec<String> {
             continue;
         }
         if !m.version.is_empty()
-            && crate::update::version_cmp(&m.version, MODES_MIN_HUB) != std::cmp::Ordering::Less
+            && crate::update::version_cmp(&m.version, min_ver) != std::cmp::Ordering::Less
         {
             continue;
         }
