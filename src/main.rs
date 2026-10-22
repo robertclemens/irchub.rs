@@ -147,10 +147,7 @@ fn passfile_context() -> String {
 }
 
 /// File layout: `[SALT_SIZE][IV+ciphertext][GCM_TAG_LEN]`.
-/// The password, and whether the file only opened under
-/// PBKDF2_ITERATIONS_LEGACY (written before 2.5.0); main() then rewrites it
-/// under the current count.
-fn passfile_load(path: &str) -> Option<(Zeroizing<String>, bool)> {
+fn passfile_load(path: &str) -> Option<Zeroizing<String>> {
     let md = fs::metadata(path).ok()?;
     if md.uid() != nix::unistd::getuid().as_raw() {
         eprintln!("[WARN] {path}: wrong owner, ignoring.");
@@ -171,22 +168,12 @@ fn passfile_load(path: &str) -> Option<(Zeroizing<String>, bool)> {
     let tag = &buf[SALT_SIZE + enc_len..];
 
     let ctx = passfile_context();
-    let open = |iterations| {
-        let key = crypto::derive_config_key(ctx.as_bytes(), salt, iterations);
-        crypto::aes_gcm_decrypt(enc_blk, key.as_ref(), tag)
-    };
-    let opened = match open(PBKDF2_ITERATIONS) {
-        Some(p) => Some((p, false)),
-        None => open(PBKDF2_ITERATIONS_LEGACY).map(|p| (p, true)),
-    };
-    match opened {
-        Some((plain, legacy)) => Some((
-            Zeroizing::new(String::from_utf8_lossy(&plain).into_owned()),
-            legacy,
-        )),
+    let key = crypto::derive_config_key(ctx.as_bytes(), salt, PBKDF2_ITERATIONS);
+    match crypto::aes_gcm_decrypt(enc_blk, key.as_ref(), tag) {
+        Some(plain) => Some(Zeroizing::new(String::from_utf8_lossy(&plain).into_owned())),
         None => {
             eprintln!(
-                "[WARN] {path}: decryption failed (wrong machine or tampered file), falling through."
+                "[WARN] {path}: decryption failed (wrong machine, tampered, or written before 2.5.0), falling through."
             );
             None
         }
@@ -238,39 +225,6 @@ fn passfile_create(path: &str, password: &str) -> bool {
         let _ = fs::remove_file(&tmp);
     }
     ok
-}
-
-/// The deferred rewrite of a pre-2.5.0 pass file on an upgrade start (see
-/// UPGRADE_PASS_REWRITE_SECS).  The old file is hard-linked to
-/// HUB_PASS_PREV_FILE first; passfile_create() renames a new one over
-/// HUB_PASS_FILE, so the link keeps the old bytes and mode.  One attempt: on
-/// failure the file stays readable as it is and the next ordinary start
-/// rewrites it.
-fn passfile_upgrade_tick(state: &mut HubState, t: i64) {
-    if state.pass_rewrite_due == 0 || t < state.pass_rewrite_due {
-        return;
-    }
-    state.pass_rewrite_due = 0;
-    let pass = state.get_config_pass();
-    let _ = fs::remove_file(HUB_PASS_PREV_FILE);
-    if pass.is_empty() || fs::hard_link(HUB_PASS_FILE, HUB_PASS_PREV_FILE).is_err() {
-        hlog_warning!(
-            "[HUB] {HUB_PASS_FILE} kept at PBKDF2 {}k: could not keep a copy for rollback\n",
-            PBKDF2_ITERATIONS_LEGACY / 1000
-        );
-    } else if passfile_create(HUB_PASS_FILE, &pass) {
-        state.pass_prev_saved = true;
-        hlog_info!(
-            "[HUB] {HUB_PASS_FILE} rewritten with PBKDF2 {}k (old copy in {HUB_PASS_PREV_FILE} until the next ordinary start)\n",
-            PBKDF2_ITERATIONS / 1000
-        );
-    } else {
-        let _ = fs::remove_file(HUB_PASS_PREV_FILE);
-        hlog_warning!(
-            "[HUB] {HUB_PASS_FILE} kept at PBKDF2 {}k: rewrite failed\n",
-            PBKDF2_ITERATIONS_LEGACY / 1000
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +395,6 @@ fn maintenance(state: &mut HubState) {
 
     // Rolling network upgrade: one step per tick (no-op unless running).
     upgrade::tick(state, t);
-    passfile_upgrade_tick(state, t);
 
     // Channel-request elections: probe windows and hand-off timeouts.
     irchub::elect::tick(state, t);
@@ -1271,9 +1224,16 @@ fn selftest() -> i32 {
     if fs::metadata(HUB_CONFIG_FILE).is_err() {
         return fail(&format!("no {HUB_CONFIG_FILE}"));
     }
+    // 2.5.1 reads only the 600k key; a pass file 2.5.0 never got to rewrite
+    // is refused here so the upgrade reports it instead of leaving a hub that
+    // cannot start.
     let password = match passfile_load(HUB_PASS_FILE) {
-        Some((p, _)) if !p.is_empty() => p,
-        _ => return fail(&format!("{HUB_PASS_FILE} missing or unreadable")),
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return fail(&format!(
+                "cannot read {HUB_PASS_FILE} (written before 2.5.0? restart once on 2.5.0, or rewrite it with -p)"
+            ));
+        }
     };
     let mut state = HubState::new();
     state.log_level = HUB_DEFAULT_LOG_LEVEL;
@@ -1441,15 +1401,15 @@ fn main() {
     }
 
     // Password resolution: .irchub.pass, then the stdin prompt.
-    let (password, pass_legacy) = match passfile_load(HUB_PASS_FILE) {
-        Some((p, legacy)) if !p.is_empty() => (p, legacy),
+    let password = match passfile_load(HUB_PASS_FILE) {
+        Some(p) if !p.is_empty() => p,
         _ => {
             let p = tool::read_pass_hidden("Config Password: ", MAX_PASS);
             if p.is_empty() {
                 eprintln!("No password provided.");
                 std::process::exit(1);
             }
-            (p, false)
+            p
         }
     };
 
@@ -1457,34 +1417,9 @@ fn main() {
         std::process::exit(identity(password));
     }
 
-    // A pre-2.5.0 pass file moves to the current PBKDF2 count on an ordinary
-    // start.  On the start a hub-driven upgrade made (its marker is still
-    // here) it waits UPGRADE_PASS_REWRITE_SECS, until the old build's watchdog
-    // is done with this process, and keeps the old copy for a rollback (see
-    // passfile_upgrade_tick).  An ordinary start drops any such copy left by
-    // an earlier run: a rollback is only ever for the process that made it.
-    let upgrade_start = fs::metadata(HUB_UPGRADE_MARKER_FILE).is_ok();
-    if !upgrade_start {
-        let _ = fs::remove_file(HUB_PASS_PREV_FILE);
-    }
-    if pass_legacy {
-        if upgrade_start {
-            println!(
-                "{HUB_PASS_FILE}: rewritten with PBKDF2 {}k in {UPGRADE_PASS_REWRITE_SECS}s (upgrade in progress)",
-                PBKDF2_ITERATIONS / 1000
-            );
-        } else if passfile_create(HUB_PASS_FILE, &password) {
-            println!(
-                "{HUB_PASS_FILE}: rewritten with PBKDF2 {}k",
-                PBKDF2_ITERATIONS / 1000
-            );
-        } else {
-            eprintln!(
-                "{HUB_PASS_FILE}: could not rewrite with PBKDF2 {}k; still readable as it is",
-                PBKDF2_ITERATIONS / 1000
-            );
-        }
-    }
+    // The pre-2.5.0 pass file 2.5.0 kept for its own rollback: nothing reads
+    // it any more.
+    let _ = fs::remove_file(HUB_PASS_PREV_FILE);
 
     daemonize();
 
@@ -1507,9 +1442,6 @@ fn main() {
         std::process::exit(1);
     };
     state.pid_file = Some(pid_file);
-    if pass_legacy && upgrade_start {
-        state.pass_rewrite_due = now() + UPGRADE_PASS_REWRITE_SECS;
-    }
 
     std::process::exit(run(state, password, &stop));
 }

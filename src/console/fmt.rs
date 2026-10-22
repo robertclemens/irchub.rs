@@ -3696,24 +3696,6 @@ fn user_access(ctx: &Ctx, u: &Crec) -> Vec<u8> {
     }
 }
 
-/// old_hubs= on a user change: hubs that do not know flags / channels.
-fn user_old_hubs_warn(ctx: &Ctx, r: &Crec, out: &mut Flines) {
-    let Some(h) = r.rvs("old_hubs") else {
-        return;
-    };
-    let m = snp(
-        512,
-        cat(&[
-            b"older hubs do not know flags or channels: ",
-            h,
-            b" ",
-            glyph(ctx, G_DASH),
-            b" they and their bots do not get this user until upgraded to 2.4.7",
-        ]),
-    );
-    warn(ctx, out, &m);
-}
-
 /// "chu" -> "channels, opers, upgrades"; "a" -> "full admin".  C
 /// `flags_words` (cap bytes with the NUL).
 fn flags_words(flags: Option<&[u8]>, cap: usize) -> Vec<u8> {
@@ -3930,7 +3912,6 @@ fn render_user_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             );
         }
         effect(ctx, out, &ph);
-        user_old_hubs_warn(ctx, r, out);
         let subj = if r.rv("role") == Some(b"admin") {
             cat(&[
                 name,
@@ -4004,7 +3985,6 @@ fn render_user_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         } else {
             effect(ctx, out, &ph);
         }
-        user_old_hubs_warn(ctx, r, out);
     } else if code == b"user.chan" {
         let what = snp(96, cat(&[b"User ", name]));
         let add = r.rv("action") == Some(b"add");
@@ -4035,7 +4015,6 @@ fn render_user_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         } else {
             effect(ctx, out, &ph);
         }
-        user_old_hubs_warn(ctx, r, out);
     } else {
         let add = code == b"user.mask_added";
         let m = r.rvi("masks", 0);
@@ -4355,20 +4334,6 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         } else {
             b"Op request sent"
         };
-        let lg = r.rvi("legacy", 0);
-        if lg > 0 {
-            // nobody ready; older bots asked
-            ok(ctx, title, Some(&subj), out);
-            let ph = cat(&[
-                b"no bot reported ready; ",
-                &num(lg),
-                b" older bot",
-                pl(lg),
-                b" asked the old way",
-            ]);
-            effect(ctx, out, &snp(160, ph));
-            return;
-        }
         ok(ctx, title, Some(&subj), out);
         let local = r.rvi("local", 0);
         let ph = if local > 0 {
@@ -4655,24 +4620,6 @@ fn modes_source_phrase(src: Option<&[u8]>) -> &'static [u8] {
     }
 }
 
-/// D38: a command that wrote C|/D|/B| names the hubs that will drop them.
-fn old_hubs_warn(ctx: &Ctx, r: &Crec, out: &mut Flines) {
-    let Some(h) = r.rvs("old_hubs") else {
-        return;
-    };
-    let m = snp(
-        512,
-        cat(&[
-            b"older hubs drop settings, modes and bans: ",
-            h,
-            b" ",
-            glyph(ctx, G_DASH),
-            b" upgrade them to 2.4.5 or the bots behind them get none",
-        ]),
-    );
-    warn(ctx, out, &m);
-}
-
 fn push_effects(ctx: &Ctx, r: &Crec, out: &mut Flines) {
     let bots = r.rvi("bots", 0);
     let peers = r.rvi("peers", 0);
@@ -4792,7 +4739,6 @@ fn render_channel_mode(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             b"+l is stored but +dynamiclimit is on: the dynamic limit wins",
         );
     }
-    old_hubs_warn(ctx, r, out);
 }
 
 /// channel.settings / network.settings: every setting, its value, where it
@@ -4935,7 +4881,6 @@ fn render_settings_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             effect(ctx, out, &ph);
             push_effects(ctx, r, out);
         }
-        old_hubs_warn(ctx, r, out);
         return;
     }
     let what = if net_target {
@@ -4966,7 +4911,6 @@ fn render_settings_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     } else {
         push_effects(ctx, r, out);
     }
-    old_hubs_warn(ctx, r, out);
 }
 
 /// ban.*
@@ -5108,7 +5052,6 @@ fn render_ban_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     if rep.code == b"ban.removed" {
         ok(ctx, b"Ban removed", Some(&subj), out);
         push_effects(ctx, r, out);
-        old_hubs_warn(ctx, r, out);
         return;
     }
     ok(
@@ -5134,7 +5077,6 @@ fn render_ban_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         effect(ctx, out, &snp(256, cat(&[b"reason: ", reason])));
     }
     push_effects(ctx, r, out);
-    old_hubs_warn(ctx, r, out);
 }
 
 /// The settings a channel overrides ("bitch=1,flood join=5:60") as a person
@@ -5248,9 +5190,82 @@ fn node_rank(st: Option<&[u8]>) -> i32 {
     }
 }
 
+/// "2.4.8 → 2.5.0 → 2.5.1" from a plan record's `<p>_from` / `<p>_path`.
+fn plan_path_line(ctx: &Ctx, pl: &Crec, p: &str) -> Vec<u8> {
+    let mut out = pl.rv(&format!("{p}_from")).unwrap_or(b"").to_vec();
+    let path = pl.rv(&format!("{p}_path")).unwrap_or(b"");
+    for t in path.split(|&c| c == b',').filter(|t| !t.is_empty()) {
+        if !out.is_empty() {
+            out.push(b' ');
+        }
+        out.extend_from_slice(glyph(ctx, G_ARROW));
+        out.push(b' ');
+        out.extend_from_slice(t);
+    }
+    out
+}
+
+/// The multi-step plan card lines (view 4 and `upgrade status`).
+fn render_upg_plan(ctx: &Ctx, pl: &Crec, l: i32, out: &mut Flines) {
+    let (step, steps) = (pl.rvi("step", 0), pl.rvi("steps", 0));
+    let active = pl.rvb("active");
+    let v = if active && pl.rv("state") == Some(b"running") {
+        format!("step {step}/{steps} running").into_bytes()
+    } else if active {
+        let nx = pl.rvi("next", 0) - ctx.now;
+        cat(&[
+            format!("step {step}/{steps} starts in ").as_bytes(),
+            &span(nx.max(0)),
+        ])
+    } else {
+        format!("stopped at step {step}/{steps}").into_bytes()
+    };
+    card(
+        out,
+        l,
+        "multi-step",
+        &v,
+        if active { RL_NORMAL } else { RL_DIM },
+    );
+    let v = plan_path_line(ctx, pl, "bot");
+    if !v.is_empty() {
+        card(out, l, "  bots", &snp(512, v), RL_NORMAL);
+    }
+    if let Some(hf) = pl.rvs("hub_final") {
+        let mut v = plan_path_line(ctx, pl, "hub");
+        if v.is_empty() {
+            v = cat(&[b"already on ", hf]);
+        }
+        card(out, l, "  hubs", &snp(512, v), RL_NORMAL);
+    }
+    let a = when(pl.rvi("started", 0), ctx.now);
+    let b = span(ctx.now.wrapping_sub(pl.rvi("started", 0)));
+    let dot = glyph(ctx, G_DOT);
+    card(
+        out,
+        l,
+        "  started",
+        &cat(&[&a, b" ", dot, b" ", &b, b" ago"]),
+        RL_DIM,
+    );
+    if let Some(s) = pl.rvs("summary") {
+        card(out, l, "  ended", s, RL_DIM);
+    }
+    if active {
+        card(
+            out,
+            l,
+            "",
+            b"upgrade abort stops the rest and rolls back only the step running",
+            RL_DIM,
+        );
+    }
+}
+
 fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let r = &rep.res;
     let ru = rep.r.iter().rfind(|x| x.is("rollup"));
+    let plan_rec = rep.r.iter().rfind(|x| x.is("plan"));
     let dot = glyph(ctx, G_DOT);
     let arrow = glyph(ctx, G_ARROW);
     let plan = match ru {
@@ -5275,6 +5290,9 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     const L: i32 = 12;
     let Some(id) = r.rvs("id") else {
         title(ctx, out, b"Upgrades", Some(b"no run on this hub"));
+        if let Some(p) = plan_rec {
+            render_upg_plan(ctx, p, L, out);
+        }
         if let Some(ru) = ru {
             let a = when(ru.rvi("set", 0), ctx.now);
             let b = span(ctx.now.wrapping_sub(ru.rvi("set", 0)));
@@ -5341,6 +5359,9 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         &cat(&[&a, b" ", dot, b" ", &b, b" ago"]),
         RL_NORMAL,
     );
+    if let Some(p) = plan_rec {
+        render_upg_plan(ctx, p, L, out);
+    }
     let sel = r.rvi("selective", 0);
     let v = if sel > 0 {
         cat(&[&num(sel), b" node", pl(sel), b" named"])
@@ -5485,7 +5506,6 @@ fn ver_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 fn render_upg_releases(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     for prod in 0..2 {
         let p: &[u8] = if prod == 0 { b"bot" } else { b"hub" };
-        let base = rep.res.rv(if prod == 0 { "bot_base" } else { "hub_base" });
         let mut oldest: Option<&[u8]> = None;
         for nd in &rep.r {
             let kind = nd.rv("kind").unwrap_or(b"");
@@ -5497,10 +5517,10 @@ fn render_upg_releases(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 oldest = Some(v);
             }
         }
-        let right: &[u8] = match base {
-            Some(b) if !b.is_empty() => b,
-            _ if prod == 0 => b"ircbot-releases (default base)",
-            _ => b"this hub's release base",
+        let right: &[u8] = if prod == 0 {
+            b"ircbot-releases"
+        } else {
+            b"irchub-releases"
         };
         title(
             ctx,
@@ -5706,15 +5726,56 @@ fn render_upg_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             ])
         };
         effect(ctx, out, &snp(160, ph));
+        if r.rvi("steps", 0) > 1 {
+            let (s, n) = (r.rvi("step", 0), r.rvi("steps", 0));
+            let ph = match r.rvs("hub_final") {
+                Some(hf) => cat(&[
+                    format!("step {s} of {n} on the way to bots ").as_bytes(),
+                    nul(r.rv("bot_final")),
+                    b", hubs ",
+                    hf,
+                    b"; the next starts when this one is done",
+                ]),
+                None => cat(&[
+                    format!("step {s} of {n} on the way to bots ").as_bytes(),
+                    r.rv("bot_final").unwrap_or(b"?"),
+                    b"; the next starts when this one is done",
+                ]),
+            };
+            effect(ctx, out, &snp(160, ph));
+        }
         effect(ctx, out, b"the config is frozen until it finishes");
     } else if rep.code == b"upg.aborted" {
-        let what = snp(
-            128,
-            cat(&[b"Upgrade ", r.rv("id").unwrap_or(b"?"), b" aborted"]),
-        );
+        let what = match r.rvs("id") {
+            Some(id) => snp(128, cat(&[b"Upgrade ", id, b" aborted"])),
+            None => b"Multi-step upgrade aborted".to_vec(),
+        };
         let n = r.rvi("rolled_back", 0);
-        let subj = cat(&[b"rolling back ", &num(n), b" upgraded node", pl(n)]);
+        let subj = if r.rvs("id").is_some() {
+            cat(&[b"rolling back ", &num(n), b" upgraded node", pl(n)])
+        } else {
+            b"between steps: nothing to roll back".to_vec()
+        };
         ok(ctx, &what, Some(&subj), out);
+        if r.rvi("steps", 0) > 0 {
+            let ph = format!(
+                "stopped at step {} of {}; no later step will start",
+                r.rvi("step", 0),
+                r.rvi("steps", 0)
+            );
+            effect(ctx, out, ph.as_bytes());
+        }
+    } else if rep.code == b"upg.abort_sent" {
+        let peers = r.rvi("peers", 0);
+        ok(ctx, b"No upgrade runs on this hub", None, out);
+        let ph = cat(&[
+            b"told ",
+            &num(peers),
+            b" other hub",
+            pl(peers),
+            b" to stop any upgrade they drive",
+        ]);
+        effect(ctx, out, &ph);
     } else {
         let peers = r.rvi("peers", 0);
         let ph = cat(&[
@@ -6186,7 +6247,6 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
     let c = rep.code.as_slice();
     if rep.err {
         error(ctx, rep.res.rv("msg"), rep.res.rv("hint"), out);
-        old_hubs_warn(ctx, &rep.res, out);
         if c == b"bot.ambiguous" {
             const COLS: [Col; 3] = [
                 col("UUID", b'L', 1),

@@ -191,6 +191,20 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
         started = 0;
     }
 
+    // D1 of the 2.5.1 plan: a bot below MESH_MIN_VERSION is not served (it
+    // still reads 100k files and old record shapes).  The hub cannot roll it
+    // up either, so it says what to do and drops the link.
+    if !version.is_empty()
+        && crate::update::version_cmp(&version, MESH_MIN_VERSION) == std::cmp::Ordering::Less
+    {
+        let id = state.clients[ci].id.clone();
+        crate::hlog_warning!(
+            "[HUB] Bot {id} runs {version}: refused; upgrade it by hand to {MESH_MIN_VERSION}\n"
+        );
+        state.clients[ci].refused = true;
+        return;
+    }
+
     let c = &mut state.clients[ci];
     let changed = c.bot_version != version
         || c.bot_server != server
@@ -261,22 +275,8 @@ fn follower_presence_ok(
     if !want.is_empty() && variant != want {
         return None;
     }
-    let gated = crate::update::version_cmp(&state.follow_target, UPGRADE_OPS_GATE_MIN_BOT)
-        != std::cmp::Ordering::Less;
-    let driver_new = state
-        .peers
-        .iter()
-        .find(|p| p.uuid == state.follow_origin)
-        .is_some_and(|p| {
-            !p.remote_version.is_empty()
-                && crate::update::version_cmp(&p.remote_version, UPGRADE_SELECT_MIN_HUB)
-                    != std::cmp::Ordering::Less
-        });
-    let status = if gated && driver_new { "back" } else { "ok" };
-    Some(format!(
-        "{}|{}|{status}|{}|",
-        state.follow_id, uuid, version
-    ))
+    // A bot that reports ready itself is only "back".
+    Some(format!("{}|{}|back|{}|", state.follow_id, uuid, version))
 }
 
 /// The nick the config knows this bot by (the persisted 'n' key); empty if
@@ -621,6 +621,22 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 if dirty {
                     state.tree_dirty = true;
                 }
+            }
+            // D4 of the 2.5.1 plan: a direct peer below MESH_MIN_VERSION
+            // loses its link once its own roster header names its version
+            // (relayed headers of hubs further away are only shown).
+            if !hub_ver.is_empty()
+                && crate::update::version_cmp(&hub_ver, MESH_MIN_VERSION)
+                    == std::cmp::Ordering::Less
+                && from < state.clients.len()
+                && hub_uuid == upgrade::peer_uuid_of(state, from)
+            {
+                let ip = state.clients[from].ip.clone();
+                crate::hlog_warning!(
+                    "[MESH] Peer {hub_name} ({ip}) runs {hub_ver}: link refused; upgrade it by hand to {MESH_MIN_VERSION}\n"
+                );
+                state.clients[from].refused = true;
+                return;
             }
             // Same authoritative signal the bots give through their presence:
             // a hub node of a run we drive is done when it reappears in the
@@ -1202,21 +1218,9 @@ mod tests {
         // Listed without a variant: the run's applies.
         s.follow_sel = "b".to_string();
         assert!(follower_presence_ok(&s, "b", "2.4.5", "c").is_some());
-        // Addendum A1: a gated bot's report is "back" — but only to a driver
-        // new enough to read it; an older one gets the old "ok".
-        let p = follower_presence_ok(&s, "b", "2.4.5", "c").unwrap();
-        assert_eq!(p, "r1|b|ok|2.4.5|");
-        s.follow_origin = "drv".to_string();
-        s.peers.push(crate::state::PeerConfig {
-            uuid: "drv".to_string(),
-            remote_version: "2.4.3".to_string(),
-            ..Default::default()
-        });
+        // Addendum A1: a bot's report is "back"; its own "ok" finishes it.
         let p = follower_presence_ok(&s, "b", "2.4.5", "c").unwrap();
         assert_eq!(p, "r1|b|back|2.4.5|");
-        s.follow_target = "2.4.4".to_string();
-        let p = follower_presence_ok(&s, "b", "2.4.4", "c").unwrap();
-        assert_eq!(p, "r1|b|ok|2.4.4|");
     }
 
     use super::*;

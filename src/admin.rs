@@ -720,14 +720,21 @@ fn chan_entry(state: &HubState, chan: &str) -> Option<usize> {
 
 /// chan|name|key|modes|ts — the generic channel record; a later setting
 /// adds a set.<name>= key (docs/console.md §3.1).
-fn reply_chan(r: &mut Reply, value: &str, ts: i64) -> bool {
-    let Some((name, key, modes, op)) = mesh::parse_global_channel_value(value) else {
+fn reply_chan(state: &HubState, r: &mut Reply, value: &str, ts: i64) -> bool {
+    let Some((name, key, mut modes, op)) = mesh::parse_global_channel_value(value) else {
         return false;
     };
     let name = trunc_string(&name, 128);
-    let key = trunc_string(&key, 64);
+    let mut key = trunc_string(&key, 64);
     if name.is_empty() || op == "del" {
         return false;
+    }
+    // the key the bots join with and the +k/+i they saw (K|, when newer)
+    if let Some(l) = storage::learned_find(state, &name) {
+        modes = l.modes;
+        if l.ts > ts {
+            key = trunc_string(&l.key, 64);
+        }
     }
     r.rec("chan");
     r.kv("name", &name);
@@ -773,6 +780,16 @@ fn chan_active_key(state: &HubState, chan: &str) -> Option<String> {
         return None;
     }
     Some(trunc_string(&key, 64))
+}
+
+/// The key the bots join with: the newer of the admin's (c|) and the one they
+/// learned on IRC (K|); a tie keeps the admin's.  None when not managed.
+fn chan_effective_key(state: &HubState, chan: &str) -> Option<String> {
+    let key = chan_active_key(state, chan)?;
+    Some(match storage::learned_find(state, chan) {
+        Some(l) if l.ts > storage::global_ts(state, "c", chan) => l.key.clone(),
+        _ => key,
+    })
 }
 
 fn user_by_name(state: &HubState, name: &str) -> Option<usize> {
@@ -1803,6 +1820,15 @@ fn add_user_record(state: &mut HubState, ci: usize, payload: &str, typ: char) ->
         if chans.is_empty() || (star && chans.len() > 1) {
             return bad(state);
         }
+        // a binding to a channel nobody manages would be an orphan from the
+        // start (user chan add refuses it too)
+        if let Some(c) = chans
+            .iter()
+            .find(|c| *c != "*" && storage::chan_live(state, c).is_none())
+        {
+            let c = c.clone();
+            return mf_status_err(state, ci, ModesStatus::NotManaged, Some(&c));
+        }
     }
     if pname.is_empty() || pname.contains('|') || pname.contains(' ') {
         return admin_err(
@@ -1912,7 +1938,7 @@ fn add_user_record(state: &mut HubState, ci: usize, payload: &str, typ: char) ->
     // downgrades it for an older peer).
     let u = state.user_records.last().unwrap().clone();
     let m = state.mask_records.last().unwrap().clone();
-    let mut sync = crate::config::format_user_record(&u, false);
+    let mut sync = crate::config::format_user_record(&u);
     sync.push_str(&format!("m|{}|{}|add|0|{t}\n", m.uuid, m.mask));
     access::append(state, &mut sync, Some(&|uu: &str| uu == new_uuid));
     client::broadcast_config_to_bots(state, &sync);
@@ -1931,9 +1957,6 @@ fn add_user_record(state: &mut HubState, ci: usize, payload: &str, typ: char) ->
     r.kvi("peers", linked_peer_count(state));
     r.kvi("bots", local_bot_count(state));
     r.kvi("port", i64::from(listen_port(state)));
-    if access::user_restricted(state, &u) {
-        reply_old_hubs_for(state, &mut r, USER_FLAGS_MIN_HUB);
-    }
     send_reply(state, ci, &mut r)
 }
 
@@ -1979,7 +2002,7 @@ fn del_user_record(state: &mut HubState, ci: usize, payload: &str) -> bool {
 
     let target_uuid = state.user_records[ui].uuid.clone();
     let target_name = state.user_records[ui].name.clone();
-    let uline = crate::config::format_user_record(&state.user_records[ui], false);
+    let uline = crate::config::format_user_record(&state.user_records[ui]);
     let mut sync = if uline.len() < USER_LINE_MAX {
         uline.clone()
     } else {
@@ -2225,7 +2248,7 @@ fn set_userkey(state: &mut HubState, ci: usize, payload: &str) -> bool {
         u.timestamp = lww_next_ts(u.timestamp);
     }
     state.config_dirty = true;
-    let sync = crate::config::format_user_record(&state.user_records[ti], false);
+    let sync = crate::config::format_user_record(&state.user_records[ti]);
     client::broadcast_config_to_bots(state, &sync);
     mesh::broadcast_sync_to_peers(state, &sync, -1);
     let name = state.user_records[ti].name.clone();
@@ -2295,7 +2318,7 @@ fn list_channels(state: &mut HubState, ci: usize, payload: &str) -> bool {
             state.global_entries[i].value.clone(),
             state.global_entries[i].timestamp,
         );
-        reply_chan(&mut r, &v, ts);
+        reply_chan(state, &mut r, &v, ts);
         // every setting's effective value, so the view need not say only
         // "all default"
         mf_setting_rows(
@@ -2319,7 +2342,7 @@ fn list_channels(state: &mut HubState, ci: usize, payload: &str) -> bool {
     r.kvi("count", count);
     r.kvi("bots_online", network_bots_online(state));
     for e in state.global_entries.iter().filter(|e| e.key == "c") {
-        reply_chan(&mut r, &e.value, e.timestamp);
+        reply_chan(state, &mut r, &e.value, e.timestamp);
     }
     send_reply(state, ci, &mut r)
 }
@@ -2430,44 +2453,6 @@ fn mf_admin_name(state: &HubState, ci: usize) -> String {
     id.strip_prefix("ADMIN:").unwrap_or(id).to_string()
 }
 
-/// D38: names of the peer hubs older than 2.4.5, sorted, comma-joined, as
-/// old_hubs=; nothing when there are none.  A command that wrote C|/D|/B|
-/// calls this on its reply.
-pub(crate) fn mf_reply_old_hubs(state: &HubState, r: &mut Reply) {
-    reply_old_hubs_for(state, r, MODES_MIN_HUB);
-}
-
-/// old_hubs= for the hubs older than `min_ver` (user_flags:
-/// USER_FLAGS_MIN_HUB).  C `reply_old_hubs_for`.
-fn reply_old_hubs_for(state: &HubState, r: &mut Reply, min_ver: &str) {
-    let mut names: Vec<String> = modes::old_hubs_for(state, 16, min_ver)
-        .iter()
-        .map(|n| crate::cstr::trunc(n, 64).to_string())
-        .collect();
-    if names.is_empty() {
-        return;
-    }
-    names.sort();
-    const CAP: usize = 16 * 65 + 1;
-    let mut joined = String::new();
-    for (i, n) in names.iter().enumerate() {
-        if i > 0 {
-            joined.push(',');
-        }
-        for c in n.chars() {
-            if joined.len() + c.len_utf8() + 2 >= CAP {
-                break;
-            }
-            joined.push(if c == ',' || (c as u32) < 0x20 || c == '\x7f' {
-                '_'
-            } else {
-                c
-            });
-        }
-    }
-    r.kv("old_hubs", &joined);
-}
-
 fn mf_status_err(state: &mut HubState, ci: usize, st: ModesStatus, what: Option<&str>) -> bool {
     let (code, msg, hint): (&str, String, Option<&str>) = match st {
         ModesStatus::Frozen => (
@@ -2574,7 +2559,7 @@ pub(crate) fn mf_mode_card_extra(state: &HubState, r: &mut Reply, cname: &str) {
     r.kv("modes", cs.as_ref().map_or("", |c| c.modes.as_str()));
     r.kv("effective", &eff);
     r.kv("source", src);
-    let key = zeroize::Zeroizing::new(chan_active_key(state, cname).unwrap_or_default());
+    let key = zeroize::Zeroizing::new(chan_effective_key(state, cname).unwrap_or_default());
     r.kvb("key_set", !key.is_empty());
     r.kv(
         "live",
@@ -2776,7 +2761,7 @@ fn admin_chan_mode(state: &mut HubState, ci: usize, payload: &str) -> bool {
         .unwrap_or_default();
     let st = modes::chanset_put(state, &cname, &m.stored, &settings);
     if st == ModesStatus::Ok && m.key_op != 0 {
-        let cur = zeroize::Zeroizing::new(chan_active_key(state, &cname).unwrap_or_default());
+        let cur = zeroize::Zeroizing::new(chan_effective_key(state, &cname).unwrap_or_default());
         let want: &str = if m.key_op > 0 { &m.key } else { "" };
         if *cur != want {
             chan_store(state, &cname, want);
@@ -3079,9 +3064,6 @@ fn admin_chan_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
     r.kvb("written", written);
     r.kvi("bots", local_bot_count(state));
     r.kvi("peers", linked_peer_count(state));
-    if written {
-        mf_reply_old_hubs(state, &mut r);
-    }
     for c in &chg {
         mf_chg_rec(&mut r, c, &c.name);
     }
@@ -3211,9 +3193,6 @@ fn admin_net_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
     r.kvb("written", written);
     r.kvi("bots", local_bot_count(state));
     r.kvi("peers", linked_peer_count(state));
-    if written {
-        mf_reply_old_hubs(state, &mut r);
-    }
     send_reply(state, ci, &mut r)
 }
 
@@ -3466,7 +3445,6 @@ fn admin_ban(state: &mut HubState, ci: usize, payload: &str) -> bool {
         r.kv("mask", &mask);
         r.kvi("bots", local_bot_count(state));
         r.kvi("peers", linked_peer_count(state));
-        mf_reply_old_hubs(state, &mut r);
         return send_reply(state, ci, &mut r);
     }
     // add
@@ -3514,7 +3492,6 @@ fn admin_ban(state: &mut HubState, ci: usize, payload: &str) -> bool {
     r.kvb("existed", existed);
     r.kvi("bots", local_bot_count(state));
     r.kvi("peers", linked_peer_count(state));
-    mf_reply_old_hubs(state, &mut r);
     send_reply(state, ci, &mut r)
 }
 
@@ -3772,6 +3749,11 @@ fn user_access(state: &mut HubState, ci: usize, payload: &str) -> bool {
             .is_some_and(|i| state.uchan_records[i].is_active);
         let any_live = access::user_chan_count(state, &t.uuid).0 > 0;
         let missing = if f3 == "*" { !any_live } else { !live };
+        // A binding to a channel nobody manages would be an orphan from the
+        // start: the purge removes those (as channel mode / set / ban refuse).
+        if add && f3 != "*" && storage::chan_live(state, &f3).is_none() {
+            return mf_status_err(state, ci, ModesStatus::NotManaged, Some(&f3));
+        }
         if !add && missing {
             let m = format!(
                 "{} has no {}",
@@ -3810,9 +3792,6 @@ fn user_access(state: &mut HubState, ci: usize, payload: &str) -> bool {
     }
     r.kvi("peers", linked_peer_count(state));
     r.kvi("bots", local_bot_count(state));
-    if !sync.is_empty() {
-        reply_old_hubs_for(state, &mut r, USER_FLAGS_MIN_HUB);
-    }
     send_reply(state, ci, &mut r)
 }
 
@@ -3899,10 +3878,11 @@ pub fn console_admin_op(cmd: u8) -> bool {
 }
 
 fn upgrade_status_cmd(state: &mut HubState, ci: usize, payload: &str) -> bool {
-    // "releases[|bot_base|hub_base]": what the console's `upgrade releases`
+    // "releases[|bot_ver|hub_ver|sel]": what the console's `upgrade releases`
     // offers to pick from — the verified release manifests of both products
-    // and the nodes a selective run could name.  Read-only; allowed during a
-    // run.
+    // and the nodes a selective run could name — plus, when targets are
+    // given, the path an `upgrade start` would take to them.  Read-only;
+    // allowed during a run.
     let lower = payload.get(..8).map(str::to_ascii_lowercase);
     if lower.as_deref() == Some("releases") && (payload.len() == 8 || payload.as_bytes()[8] == b'|')
     {
@@ -3910,17 +3890,13 @@ fn upgrade_status_cmd(state: &mut HubState, ci: usize, payload: &str) -> bool {
         upgrade::releases(state, payload, &mut r);
         return send_reply(state, ci, &mut r);
     }
-    // A payload of "abort" stops a run in flight and rolls the mesh back.
+    // A payload of "abort" stops a run in flight and rolls the mesh back, and
+    // stops a multi-step upgrade for good — here, and (flooded) on the hub
+    // driving it if that is another one.
     if payload.eq_ignore_ascii_case("abort") {
-        if !state.upgrade.active {
-            return admin_err(
-                state,
-                ci,
-                "upg.none",
-                "no upgrade is running",
-                Some("upgrade status"),
-            );
-        }
+        let run = state.upgrade.active;
+        let plan = state.plan.active;
+        let (step, steps) = (state.plan.step as i64 + 1, state.plan.steps() as i64);
         let moved = state
             .upgrade
             .nodes
@@ -3933,16 +3909,41 @@ fn upgrade_status_cmd(state: &mut HubState, ci: usize, payload: &str) -> bool {
                 )
             })
             .count() as i64;
-        let id = state.upgrade.id.clone();
+        let moved = if run { moved } else { 0 };
+        let id = if run {
+            state.upgrade.id.clone()
+        } else {
+            String::new()
+        };
         let admin_fd = state.clients[ci].fd;
-        upgrade::abort(state, "aborted by admin");
+        if run {
+            upgrade::abort(state, "aborted by admin");
+        }
+        if state.plan.active {
+            upgrade::plan_stop(
+                state,
+                &format!("aborted by admin before step {step}/{steps}"),
+            );
+        }
+        let told = upgrade::cancel_flood(state);
         let Some(ci) = refind(state, admin_fd) else {
             return false;
         };
         let mut r = Reply::new();
+        if !run && !plan {
+            // Nothing here; whatever runs elsewhere has been told to stop.
+            r.ok("upg.abort_sent");
+            r.kvi("peers", told);
+            return send_reply(state, ci, &mut r);
+        }
         r.ok("upg.aborted");
-        r.kv("id", &id);
+        opt(&mut r, "id", &id);
         r.kvi("rolled_back", moved);
+        if plan {
+            r.kvi("step", step);
+            r.kvi("steps", steps);
+        }
+        r.kvi("peers", told);
         return send_reply(state, ci, &mut r);
     }
     // "forget" drops the roll-up plan a finished run left behind, here and
@@ -4112,11 +4113,12 @@ pub fn handle_admin_command(
         CMD_ADMIN_UPGRADE_NET => {
             // Payload: target_ver|variant|kind|min_from|base|hub_ver|hub_base
             // |sel — everything past the version is optional ("" = let each
-            // node decide).  target_ver/base are the bots' (ircbot-releases);
-            // hub_ver/hub_base are the hubs' own (irchub-releases), and an
-            // empty hub_ver leaves every hub where it is.  A base never
-            // contains '|' (upgrade::start refuses one), so only the last
-            // field — the selection ("" = whole network), comma-separated
+            // node decide).  target_ver is the bots' (ircbot-releases);
+            // hub_ver is the hubs' own (irchub-releases), and an empty hub_ver
+            // leaves every hub where it is.  The two base slots are no longer
+            // read: every node fetches from its own compiled-in root, the only
+            // tree its pinned key verifies.  Only the last field — the
+            // selection ("" = whole network), comma-separated
             // name-or-uuid[=c|rs] tokens — is a tail.
             // wire_field: a field that does not fit its buffer reads as ""
             let caps = [64, 8, 8, 64, 512, 64, 512];
@@ -4132,7 +4134,7 @@ pub fn handle_admin_command(
                 }
             };
             let fd = state.clients[ci].fd;
-            let msg = upgrade::start(
+            let msg = upgrade::plan_begin(
                 state,
                 fd,
                 &upgrade::StartArgs {
@@ -4140,9 +4142,7 @@ pub fn handle_admin_command(
                     variant: at(1),
                     kind: at(2),
                     min_from: at(3),
-                    base: at(4),
                     hub_ver: at(5),
-                    hub_base: at(6),
                     sel: at(7),
                 },
             );
@@ -4177,6 +4177,13 @@ pub fn handle_admin_command(
             r.kvi("selected", u.select.len() as i64);
             r.kvi("bots", bots);
             r.kvi("peers", hubs);
+            let pl = &state.plan;
+            if pl.active && pl.run_id == u.id {
+                r.kvi("step", pl.step as i64 + 1);
+                r.kvi("steps", pl.steps() as i64);
+                r.kv("bot_final", &pl.bot_target);
+                opt(&mut r, "hub_final", &pl.hub_target);
+            }
             send_reply(state, ci, &mut r)
         }
 
@@ -4413,43 +4420,27 @@ pub fn handle_admin_command(
             let channel = chan.unwrap_or_default();
             let admin_fd = state.clients[ci].fd;
             // One bot does it (CMD_CHAN_PROBE); the answer goes out when the
-            // election ends.  A mesh with an older hub keeps the old fan-out.
-            if crate::elect::mesh_ready(state) {
-                if crate::elect::start(
-                    state,
-                    "op",
-                    &channel,
-                    "ADMIN",
-                    &nick,
-                    "",
-                    Some((admin_fd, state.clients[ci].conn_serial)),
-                )
-                .is_some()
-                {
-                    return true;
-                }
-                return admin_err(
-                    state,
-                    ci,
-                    "channel.busy",
-                    "too many channel requests in flight",
-                    Some("try again in a few seconds"),
-                );
+            // election ends.
+            if crate::elect::start(
+                state,
+                "op",
+                &channel,
+                "ADMIN",
+                &nick,
+                "",
+                Some((admin_fd, state.clients[ci].conn_serial)),
+            )
+            .is_some()
+            {
+                return true;
             }
-            // Every local bot is asked; one that is not opped there ignores
-            // it.  Forwarding may drop a peer whose URGENT queue was full,
-            // which swap-removes the client list.
-            let sent = opflow::admin_op_user(state, &nick, &channel);
-            let Some(ci) = refind(state, admin_fd) else {
-                return false;
-            };
-            let mut r = Reply::new();
-            r.ok("channel.op");
-            r.kv("nick", &nick);
-            r.kv("chan", &channel);
-            r.kvi("local", sent as i64);
-            r.kvi("peers", linked_peer_count(state));
-            send_reply(state, ci, &mut r)
+            admin_err(
+                state,
+                ci,
+                "channel.busy",
+                "too many channel requests in flight",
+                Some("try again in a few seconds"),
+            )
         }
 
         CMD_ADMIN_INVITE_USER => {
@@ -4473,61 +4464,26 @@ pub fn handle_admin_command(
             let nick = f[0].to_string();
             let channel = chan.unwrap_or_default();
             let admin_fd = state.clients[ci].fd;
-            if crate::elect::mesh_ready(state) {
-                if crate::elect::start(
-                    state,
-                    "invite",
-                    &channel,
-                    "ADMIN",
-                    &nick,
-                    "",
-                    Some((admin_fd, state.clients[ci].conn_serial)),
-                )
-                .is_some()
-                {
-                    return true;
-                }
-                return admin_err(
-                    state,
-                    ci,
-                    "channel.busy",
-                    "too many channel requests in flight",
-                    Some("try again in a few seconds"),
-                );
+            if crate::elect::start(
+                state,
+                "invite",
+                &channel,
+                "ADMIN",
+                &nick,
+                "",
+                Some((admin_fd, state.clients[ci].conn_serial)),
+            )
+            .is_some()
+            {
+                return true;
             }
-            // Older hub in the mesh: the bots' own invite path, asked of
-            // everyone.
-            let request_id = opflow::generate_request_id();
-            opflow::forward_seen_check_and_add(state, &request_id);
-            let told = opflow::broadcast_chan_action(
+            admin_err(
                 state,
-                &request_id,
-                "ADMIN",
-                "invite",
-                &channel,
-                &nick,
-                "",
-            );
-            opflow::forward_chan_request_to_peers(
-                state,
-                &request_id,
-                "ADMIN",
-                "invite",
-                &channel,
-                &nick,
-                "",
-                -1,
-            );
-            let Some(ci) = refind(state, admin_fd) else {
-                return false;
-            };
-            let mut r = Reply::new();
-            r.ok("channel.invite");
-            r.kv("nick", &nick);
-            r.kv("chan", &channel);
-            r.kvi("local", told as i64);
-            r.kvi("peers", linked_peer_count(state));
-            send_reply(state, ci, &mut r)
+                ci,
+                "channel.busy",
+                "too many channel requests in flight",
+                Some("try again in a few seconds"),
+            )
         }
 
         CMD_ADMIN_PURGE_TOMBSTONES => {

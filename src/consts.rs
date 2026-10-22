@@ -27,22 +27,21 @@ pub const GCM_IV_LEN: usize = 12;
 pub const GCM_TAG_LEN: usize = 16;
 pub const HEADER_SIZE: usize = 4;
 pub const MAX_PENDING_OP_REQUESTS: usize = 500;
-/// PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys.
-/// 2.5.0 raised them from 100k (PBKDF2_ITERATIONS_LEGACY); a file still under
-/// the legacy count is read and rewritten once (config::load, passfile_load).
-/// Releases after 2.5.0 carry min_from 2.5.0 so no node skips that rewrite.
+/// PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys
+/// (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; releases
+/// after it carry min_from 2.5.0, so only this count is read.
 pub const PBKDF2_ITERATIONS: u32 = 600_000;
-pub const PBKDF2_ITERATIONS_LEGACY: u32 = 100_000;
-/// Passwordless (docs/passwordless.md): a bot advertises this as "v|2" in its
-/// CMD_CONFIG_PUSH; until it has, it is sent legacy record shapes with an
-/// empty password slot (old bots then fail closed).
-pub const BOT_PROTO_PASSWORDLESS: i32 = 2;
 /// A bot that knows admin flags and oper channel bindings (uf| / uc|) says
-/// "v|3"; below that it is an older node (user_flags plan §3.2).  Mirrored in
-/// ircbot/bot.h (BOT_PROTO_VERSION).
+/// "v|3" at the head of its full CMD_CONFIG_PUSH (docs/passwordless.md §3.4);
+/// a push whose v| is below that is refused (record-only pushes carry no v|
+/// and are taken).  Mirrored in ircbot/bot.h
+/// (BOT_PROTO_VERSION).
 pub const BOT_PROTO_USER_FLAGS: i32 = 3;
-/// Oldest hub that stores uf| / uc|; older peers get the downgraded sync.
-pub const USER_FLAGS_MIN_HUB: &str = "2.4.7";
+/// The oldest bot or hub this hub links with (2.5.1 plan D1 / D4): a bot's
+/// CMD_BOT_PRESENCE or a direct peer's roster header below it drops the link
+/// with a "upgrade it by hand" line.  2.5.0 moved every file to PBKDF2 600k,
+/// which is all 2.5.1 reads.
+pub const MESH_MIN_VERSION: &str = "2.5.0";
 pub const KEY_FP_LEN: usize = 19; // "ab12:cd34:ef56:7890"
 pub const HUB_PID_FILE: &str = ".irchub.pid";
 pub const HUB_PASS_FILE: &str = ".irchub.pass";
@@ -100,8 +99,9 @@ pub const MAX_RECENT_PURGES: usize = 64;
 /// burst, the bots get one push per this many seconds, with the latest state.
 pub const BOT_CONFIG_PUSH_COALESCE: i64 = 1;
 pub const PURGE_DEDUP_WINDOW: i64 = 3600;
-pub const PURGE_DEDUP_WINDOW_LEGACY: i64 = 60;
 pub const PURGE_ID_HEX: usize = 16;
+/// Seconds a purge refuses re-creating older tombstones (the purge floor).
+pub const PURGE_FLOOR_HOLD: i64 = 600;
 
 // OP_FORWARD_REQUEST deduplication — prevents packet storms
 pub const OP_FORWARD_TTL_SECONDS: i64 = 60;
@@ -118,7 +118,7 @@ pub const HIDEPINGPONG: bool = true;
 /// the bots tree and the one every upgrade comparison is made against.
 pub const HUB_VERSION: &str = match option_env!("IRCHUB_VERSION") {
     Some(v) => v,
-    None => "2.5.0",
+    None => "2.5.1",
 };
 
 /// Signed-release channel for the hub (irchub-releases).  Same Ed25519 key
@@ -145,7 +145,8 @@ pub const HUB_UPGRADE_MARKER_FILE: &str = ".irchub.upgrade";
 /// Retained previous binary/config, kept (not deleted) after an upgrade so
 /// CMD_UPGRADE_ABORT can put this hub back.
 pub const HUB_UPGRADE_PREV_SUFFIX: &str = ".prev";
-/// The pre-2.5.0 pass file kept for a rollback (HUB_PASS_FILE + HUB_UPGRADE_PREV_SUFFIX).
+/// 2.5.0's rollback copy of the pass file (HUB_PASS_FILE +
+/// HUB_UPGRADE_PREV_SUFFIX): removed at start.
 pub const HUB_PASS_PREV_FILE: &str = ".irchub.pass.prev";
 /// The generated installer, written 0700 and exec'd once the old process has
 /// let go of its pid lock.
@@ -160,16 +161,6 @@ pub const HUB_UPDATE_QUICK_TIMEOUT: u64 = 8;
 /// The upgrade script's startup watchdog: how long the new build's daemon has
 /// to be up and alive before the script keeps it.
 pub const UPGRADE_WATCH_SECS: u32 = 20;
-/// A pre-2.5.0 HUB_PASS_FILE found on the start a hub-driven upgrade made is
-/// rewritten at PBKDF2_ITERATIONS this long after that start: past the old
-/// build's watchdog, which restores `<exe>.prev` and the config but not this
-/// file.  The old copy stays as HUB_PASS_PREV_FILE until the next ordinary
-/// start, for this process's own update::rollback() to put back (hub.h).
-pub const UPGRADE_PASS_REWRITE_SECS: i64 = 120;
-const _: () = assert!(
-    UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS as i64,
-    "the pass rewrite must wait out the old build's watchdog"
-);
 /// The bots' release tree ROOT (ircbot-releases), for the console's release
 /// list and for walking a bot up via the roll-up.  Mirrors
 /// HUB_BOT_RELEASE_BASE in hub.h.
@@ -323,16 +314,19 @@ pub const CMD_CHAN_FWD_REPLY: u8 = 0x5D;
 // origin floods the question to the mesh (ELECT_FWD), each hub probes its own
 // bots and answers ELECT_ACK back along the path, and the origin hands it to
 // one hub with a ready bot (ELECT_DO -> ELECT_DONE, along the same path).
-// Bots that never answer a probe predate it: when nobody is ready they get
-// the old CMD_OP_GRANT / CMD_CHAN_ACTION.  A mesh holding any hub older than
-// CHAN_ELECT_MIN_HUB keeps the old ask-everyone path.  Mirrors irchub/hub.h.
+// A bot that has not answered when CHAN_ELECT_PROBE_WAIT runs out counts as
+// a no ("no answer"): every bot the mesh admits answers probes, so it is
+// never sent a blind old-style CMD_OP_GRANT / CMD_CHAN_ACTION (that skipped
+// +bitch).  Mirrors irchub/hub.h.
 //   PROBE      hub->bot  eid|kind|channel
 //   PROBE_ACK  bot->hub  eid|1| or eid|0|reason
 //   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
 //   DONE       bot->hub  eid|ok|detail or eid|fail|detail
 //   ELECT_FWD  hub->hub  eid|origin_hub|kind|channel|requester|nick|hostmask|origin_ts
-//   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|silent
-//   ELECT_DO   hub->hub  eid|hub_uuid|elect or eid|hub_uuid|legacy
+//   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|silent (silent: 0
+//              from 2.5.1; a 2.5.0 hub's count is read and ignored)
+//   ELECT_DO   hub->hub  eid|hub_uuid|elect (a 2.5.0 origin's "legacy" is
+//              ignored)
 //   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
 // kind = op / invite / unban / key; requester = a bot uuid, or ADMIN.
 pub const CMD_CHAN_PROBE: u8 = 0x6D;
@@ -413,12 +407,10 @@ pub const CHAN_EVENT_MAX_PER_WINDOW: i32 = 30;
 // or fail|reason; a `channel op` to a nick that is not authorised on a +bitch
 // channel answers fail|bitch, which the origin turns into
 // channel.not_authorised.
-/// Every hub in the mesh map at least this.
-pub const CHAN_ELECT_MIN_HUB: &str = "2.4.5";
-/// Seconds: local bots' answers.
-pub const CHAN_ELECT_PROBE_WAIT: i64 = 2;
-/// Seconds: other hubs' answers, after the flood.
-pub const CHAN_ELECT_MESH_WAIT: i64 = 4;
+/// Seconds: local bots' answers (whole seconds: >= 2 s).
+pub const CHAN_ELECT_PROBE_WAIT: i64 = 3;
+/// Seconds: other hubs' answers (their probe wait + 2).
+pub const CHAN_ELECT_MESH_WAIT: i64 = 5;
 /// Seconds: one bot's DONE.
 pub const CHAN_ELECT_DO_WAIT: i64 = 5;
 /// Seconds: one hub's ELECT_DONE (it may retry its own bots).
@@ -572,20 +564,10 @@ pub const MAX_UPGRADE_ROUTES: usize = MAX_UPGRADE_NODES;
 /// A selective run (CMD_ADMIN_UPGRADE_NET's 8th field) names at most this many
 /// nodes; an empty selection is the whole network.
 pub const MAX_UPGRADE_SELECT: usize = 16;
-/// Selective runs need every hub they cross to understand the peer PREPARE's
-/// `sel` field: an older follower would PREPARE all its bots and adopt the
-/// run's target as its roll-up plan, walking bots nobody selected up to it.
-pub const UPGRADE_SELECT_MIN_HUB: &str = "2.4.3";
-/// Bots from this version on hold their upgrade "ok" until they are back in
-/// their channels with ops; for them presence on the target only stamps
-/// `back_at` (hub.h UPGRADE_OPS_GATE_MIN_BOT).
-pub const UPGRADE_OPS_GATE_MIN_BOT: &str = "2.4.5";
 /// How long after a committed bot was seen back on the target its "ok" may
 /// take before the driver counts it done anyway (seconds).
 pub const UPGRADE_OPS_GRACE: i64 = 240;
-/// The first hub version with `-selftest` (an older build would not know the
-/// flag and would start a second daemon) and the staged run's timeout.
-pub const SELFTEST_MIN_HUB: &str = "2.4.3";
+/// The staged new binary's `-selftest` timeout.
 pub const SELFTEST_TIMEOUT: u64 = 15;
 /// Releases listed by the console's "upgrade releases" query, per product.
 pub const MAX_UPGRADE_RELEASES: usize = 24;
@@ -612,6 +594,19 @@ pub const MAX_ROLLUP_TRIES: usize = 64;
 /// long regardless -- a bot down for a day is likely coming back, one down for
 /// months is not, and its admin can still run an upgrade by hand.
 pub const ROLLUP_PLAN_TTL: i64 = 7 * 86400;
+
+// Multi-step upgrades (2.5.1): a target some node cannot jump to directly is
+// reached through the intermediate releases the manifests name, one ordinary
+// run per step.  See `upgrade::plan_begin`.
+/// Longer paths are refused at start.
+pub const MAX_UPGRADE_STEPS: usize = 16;
+/// Seconds between steps, and after boot.
+pub const UPGRADE_PLAN_SETTLE: i64 = 60;
+/// A plan with no progress for this long is dropped.
+pub const UPGRADE_PLAN_TTL: i64 = 86400;
+/// An `upgrade abort` is re-sent to every peer link that comes up for this
+/// long, so a planner restarting onto a step when it was typed still gets it.
+pub const UPGRADE_CANCEL_HOLD: i64 = 600;
 /// Stop waiting for READY acks.
 pub const UPGRADE_PREPARE_TIMEOUT: i64 = 45;
 /// PREPARE also stays open this long after the node table last grew: a hub
@@ -661,12 +656,16 @@ pub const MAX_BANS_TOTAL: usize = MAX_CHANNELS * MAX_BANS_PER_CHAN + MAX_GLOBAL_
 pub const C_LINE_MAX: usize = 704;
 pub const D_LINE_MAX: usize = 640;
 pub const B_LINE_MAX: usize = 448;
+/// `K|<#chan>|<key>|<modes>|<ts>`: what the bots saw on IRC (learned key, M_K /
+/// M_I bits).  Never existence: kept only while the channel's c| is add, one
+/// per channel, dropped with it (docs/plans/2026-10-20_learned_state_purge_plan.md).
+pub const K_LINE_MAX: usize = 2 + MAX_CHAN + MAX_KEY + 32;
+/// M_K | M_I
+pub const K_MODES_MASK: i32 = 64 | 128;
 /// `bu|<#chan|*>|<mask>|<last_used>`: a ban's last use, cnf only (activity).
 pub const BU_LINE_MAX: usize = MAX_CHAN + BAN_MASK_MAX + 32;
 /// `global_entries`: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B.
 pub const MAX_GLOBAL_ENTRIES: usize = MAX_BOT_ENTRIES + MAX_CHANNELS + 1 + MAX_BANS_TOTAL;
-/// Oldest hub that stores and forwards C|/D|/B| (older ones drop them).
-pub const MODES_MIN_HUB: &str = "2.4.5";
 /// Live bans one bot may hold per channel.
 pub const BOT_BANS_PER_CHAN: usize = 10;
 /// Tombstone age kept when purge is off (seconds).
@@ -677,9 +676,11 @@ pub const BAN_BOT_SLACK: i64 = 60;
 pub const BANTIME_DEFAULT_MIN: i64 = 120;
 /// Seconds between expiry sweeps.
 pub const BAN_SWEEP_INTERVAL: i64 = 60;
-/// What C|, D| and B| add to a bulk payload at their caps.
-pub const MODES_RECORDS_MAX: usize =
-    MAX_CHANNELS * C_LINE_MAX + D_LINE_MAX + MAX_BANS_TOTAL * B_LINE_MAX;
+/// What C|, D|, B| and K| add to a bulk payload at their caps.
+pub const MODES_RECORDS_MAX: usize = MAX_CHANNELS * C_LINE_MAX
+    + D_LINE_MAX
+    + MAX_BANS_TOTAL * B_LINE_MAX
+    + MAX_CHANNELS * K_LINE_MAX;
 
 pub const MAX_HUB_USER_RECORDS: usize = 40;
 pub const MAX_HUB_USER_MASKS: usize = 200;
@@ -768,10 +769,14 @@ pub const MAX_SYNC_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
 /// per-bot term scaled by the bots actually present.  A config that does not
 /// fit is NOT written (the old file is kept) — never a truncated one.
 /// The persisted roll-up plan (see `PendingRollup`): `rollup|` + target,
-/// variant, kind, min_from, hub_target, plan_set and both 512-byte bases.
+/// variant, kind, min_from, hub_target, plan_set and two empty base slots.
 pub const ROLLUP_LINE_MAX: usize = 1536;
+/// The persisted multi-step plan (see `UpgradePlan`): `uplan|` + the fixed
+/// fields, both paths (MAX_UPGRADE_STEPS versions each) and the selection.
+pub const PLAN_LINE_MAX: usize = 512 + 2 * MAX_UPGRADE_STEPS * 65 + MAX_UPGRADE_SELECT * 80;
 pub const HUB_CONFIG_FIXED_MAX: usize = 8192
     + ROLLUP_LINE_MAX
+    + PLAN_LINE_MAX
     + MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + MAX_HUB_USER_RECORDS * USER_LINE_MAX
     + MAX_HUB_USER_MASKS * MASK_LINE_MAX

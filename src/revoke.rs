@@ -235,8 +235,7 @@ pub fn append(state: &HubState, out: &mut String) {
 }
 
 /// hub_revoke_from_bot(): a deleted bot that has a key goes on the list (bot
-/// del, a synced delete, a config load — so tombstones from before the list
-/// existed migrate).  True when the list changed.
+/// del, a synced delete).  True when the list changed.
 pub fn from_bot(state: &mut HubState, b: &BotConfig) -> bool {
     if b.is_active || !cstr::is_uuid(&b.uuid) {
         return false;
@@ -262,17 +261,6 @@ pub fn from_bot(state: &mut HubState, b: &BotConfig) -> bool {
         return false;
     }
     merge(state, &r)
-}
-
-/// hub_revoke_migrate().
-pub fn migrate(state: &mut HubState) -> usize {
-    let bots: Vec<BotConfig> = state
-        .bots
-        .iter()
-        .filter(|b| !b.is_active)
-        .cloned()
-        .collect();
-    bots.iter().filter(|b| from_bot(state, b)).count()
 }
 
 /// hub_revoke_mark_wiped(): the bot wiped itself: stamp it.  The rv| line to

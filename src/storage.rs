@@ -10,7 +10,9 @@
 
 use crate::consts::*;
 use crate::cstr::trunc_string;
-use crate::state::{BotConfig, ConfigEntry, HubState, global_value_active, lww_accepts};
+use crate::state::{
+    BotConfig, ChanLearned, ConfigEntry, HubState, global_value_active, lww_accepts,
+};
 use crate::{config, crypto, mesh};
 use std::collections::HashMap;
 
@@ -310,6 +312,12 @@ pub fn update_global_entry(
         return false;
     }
 
+    if !global_value_active(&combined) && purge_floor_blocks(state, ts) {
+        crate::hlog_debug!(
+            "[STORAGE] Global {key}={value}: tombstone ts={ts} older than the last purge: not re-created\n"
+        );
+        return false;
+    }
     if global_room(state, key) {
         crate::hlog_debug!("[STORAGE] Global {key}={value}: NEW entry ts={ts}\n");
         state.global_entries.push(ConfigEntry {
@@ -360,6 +368,15 @@ pub fn update_entry(
     if per_bot
         && crate::revoke::is_revoked(state, uuid)
         && key != "d"
+        && !state.bots.iter().any(|b| b.uuid == uuid)
+    {
+        return false;
+    }
+    // A deleted bot purged here is not re-created from a sync built before
+    // the purge (a revoked one can only come back through its d entry).
+    if key == "d"
+        && value == "1"
+        && purge_floor_blocks(state, ts)
         && !state.bots.iter().any(|b| b.uuid == uuid)
     {
         return false;
@@ -422,11 +439,10 @@ fn update_entry_inner(
     op: &str,
     ts: i64,
 ) -> bool {
-    // Retired password-era keys (docs/passwordless.md §3.3): the shared bot
-    // password 'p' and the legacy global admin password 'a' are never stored
-    // again, whichever path (delta, push, sync, load) offers them.
+    // Keys no writer may store as plain entries, whichever path (delta,
+    // push, sync, load) offers them.
     if key == "p" || key == "a" {
-        crate::hlog_warning!("[STORAGE] REJECTED retired key '{key}' (passwordless)\n");
+        crate::hlog_warning!("[STORAGE] REJECTED unknown key '{key}'\n");
         return false;
     }
 
@@ -613,16 +629,7 @@ pub fn delete(state: &mut HubState, uuid: &str) -> Option<i64> {
 /// hub_generate_bot_payload(): global + bot-specific config for one bot.
 /// Global items carry no "b|uuid|" prefix, preserving protocol
 /// compatibility.
-///
-/// `bot_proto` is what the receiving connection advertised: v|2 or more gets
-/// the new a|/o|/b| shapes, less the fail-closed legacy shapes.  Below
-/// `BOT_PROTO_USER_FLAGS` the bot does not know uf| / uc| (plan §3.2): users
-/// are re-stamped, a restricted one is a tombstone (a v2 bot) or left out (an
-/// older or not-yet-known one), and its masks and the access lines are not
-/// sent.
-pub fn generate_bot_payload(state: &HubState, uuid: &str, bot_proto: i32) -> String {
-    let proto_v2 = bot_proto >= BOT_PROTO_PASSWORDLESS;
-    let flags_ok = bot_proto >= BOT_PROTO_USER_FLAGS;
+pub fn generate_bot_payload(state: &HubState, uuid: &str) -> String {
     let mut out = String::with_capacity(4096);
 
     // 1. Global entries (channels; skip h/n/a/m/o — now in typed arrays — and
@@ -633,26 +640,16 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str, bot_proto: i32) -> Str
         }
         out.push_str(&format!("{}|{}|{}\n", e.key, e.value, e.timestamp));
     }
+    // K|: what the bots saw on IRC, after the c| lines it hangs off.
+    learned_append(state, &mut out);
 
-    // 1a. Named admin/oper records.  A v2 (passwordless) bot gets
-    //     uuid|name|pubkey|act|seen|ts|; any other connection gets the legacy
-    //     shape with an EMPTY password slot, so an old bot refuses every
-    //     admin command instead of reading the public key as a password.
+    // 1a. Named admin/oper records: uuid|name|pubkey|act|seen|ts|
     for u in &state.user_records {
-        if flags_ok {
-            out.push_str(&config::format_user_record(u, !proto_v2));
-        } else {
-            out.push_str(&crate::access::format_user_for_old(
-                state, u, !proto_v2, proto_v2,
-            ));
-        }
+        out.push_str(&config::format_user_record(u));
     }
 
     // 1b. Usermask records (m| lines).
     for m in &state.mask_records {
-        if !flags_ok && !crate::access::from_old_ok(state, &m.uuid) {
-            continue;
-        }
         out.push_str(&format!(
             "m|{}|{}|{}|{}|{}\n",
             m.uuid,
@@ -664,9 +661,7 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str, bot_proto: i32) -> Str
     }
 
     // 1b. Admin flags and oper channel bindings, after the users they name.
-    if flags_ok {
-        crate::access::append(state, &mut out, None);
-    }
+    crate::access::append(state, &mut out, None);
 
     // 1b. purge_days setting, so bots can validate purge policies.
     out.push_str(&format!(
@@ -696,15 +691,13 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str, bot_proto: i32) -> Str
     }
 
     // 3. Other bots as trusted-bot lines (for offline peer operation):
-    //      v2:     b|<hostmask>|<uuid>|<pubkey>|<ts>   (pubkey seals ~B2)
-    //      legacy: b|<hostmask>|<uuid>|<ts>
+    //      b|<hostmask>|<uuid>|<pubkey>|<ts>   (pubkey seals ~B2)
     //    ts = max(hostmask ts, pubkey ts) so a rekey alone is seen as newer.
     //
-    //    v2 payloads end the list with T|<count>: the lines above are the
-    //    whole trusted set, so the bot drops every trusted bot they do not
-    //    name (a deleted or purged bot).  Without it a bot only ever added or
-    //    updated trust and a revoked bot kept ~B2 and op grants forever.
-    //    Bots that predate the marker ignore the unknown line.
+    //    The list ends with T|<count>: the lines above are the whole trusted
+    //    set, so the bot drops every trusted bot they do not name (a deleted
+    //    or purged bot).  Without it a revoked bot kept ~B2 and op grants
+    //    forever.
     let mut trusted_lines = 0;
     for b in &state.bots {
         if b.uuid == uuid || !b.is_active {
@@ -713,28 +706,22 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str, bot_proto: i32) -> Str
         let Some(h) = b.entry("h") else { continue };
         let pubk = b.entry("pub");
         let mut ts = h.timestamp;
-        if proto_v2 {
-            let key_ok = pubk.is_some_and(|p| crypto::pubkey_b64_decode(&p.value).is_some());
-            if key_ok
-                && let Some(p) = pubk
-                && p.timestamp > ts
-            {
-                ts = p.timestamp;
-            }
-            let key = if key_ok {
-                pubk.map_or("", |p| p.value.as_str())
-            } else {
-                ""
-            };
-            out.push_str(&format!("b|{}|{}|{}|{}\n", h.value, b.uuid, key, ts));
-        } else {
-            out.push_str(&format!("b|{}|{}|{}\n", h.value, b.uuid, ts));
+        let key_ok = pubk.is_some_and(|p| crypto::pubkey_b64_decode(&p.value).is_some());
+        if key_ok
+            && let Some(p) = pubk
+            && p.timestamp > ts
+        {
+            ts = p.timestamp;
         }
+        let key = if key_ok {
+            pubk.map_or("", |p| p.value.as_str())
+        } else {
+            ""
+        };
+        out.push_str(&format!("b|{}|{}|{}|{}\n", h.value, b.uuid, key, ts));
         trusted_lines += 1;
     }
-    if proto_v2 {
-        out.push_str(&format!("T|{trusted_lines}\n"));
-    }
+    out.push_str(&format!("T|{trusted_lines}\n"));
 
     out
 }
@@ -1021,6 +1008,12 @@ pub fn put_record(state: &mut HubState, key: &str, value: &str, ts: i64) -> bool
         return true;
     }
 
+    if !in_active && purge_floor_blocks(state, ts) {
+        crate::hlog_debug!(
+            "[STORAGE] {key}| tombstone ts={ts} older than the last purge: not re-created\n"
+        );
+        return false;
+    }
     if key == "B" && in_active {
         let chan = first_field(value);
         if chan.len() >= MAX_CHAN {
@@ -1073,6 +1066,9 @@ pub fn chan_del_stamp(state: &HubState, chan: &str) -> i64 {
 /// owe the bots a push.  The c| line itself is the caller's.  Returns how
 /// many records changed.
 pub fn chan_cascade_del(state: &mut HubState, chan: &str, ts: i64, announce: bool) -> usize {
+    // What the bots saw goes with the channel: K| has no tombstone, and every
+    // hub drops it on the same c| del.
+    learned_drop(state, chan);
     let mut changed = 0;
     let mut out = String::new();
     let mut i = 0;
@@ -1145,6 +1141,168 @@ pub fn chan_cascade_del(state: &mut HubState, chan: &str, ts: i64, announce: boo
         }
     }
     changed
+}
+
+// ---- K|: learned channel state (docs/plans/2026-10-20_learned_state_purge_plan.md)
+// One slot per live channel.  Existence is c|'s alone: a slot is written only
+// while the channel is live and dropped with it, so a bot report that lands
+// after a delete cannot bring the channel back.
+
+fn learned_index(state: &HubState, chan: &str) -> Option<usize> {
+    state
+        .chan_learned
+        .iter()
+        .position(|l| l.chan.eq_ignore_ascii_case(chan))
+}
+
+pub fn learned_find<'a>(state: &'a HubState, chan: &str) -> Option<&'a ChanLearned> {
+    learned_index(state, chan).map(|i| &state.chan_learned[i])
+}
+
+fn learned_key_ok(k: &str) -> bool {
+    k.len() < MAX_KEY
+        && k.bytes()
+            .all(|c| c > 0x20 && c != b',' && c != b'|' && c < 0x7f)
+}
+
+/// hub_learned_put(): only while `chan` is live; LWW on ts, a tie to the
+/// byte-wise greater "key|modes".
+pub fn learned_put(state: &mut HubState, chan: &str, key: &str, modes: i32, ts: i64) -> bool {
+    if ts <= 0
+        || !rec_chan_ok(chan, false)
+        || !learned_key_ok(key)
+        || modes < 0
+        || modes & !K_MODES_MASK != 0
+    {
+        return false;
+    }
+    let Some(name) = chan_live(state, chan) else {
+        return false;
+    };
+    if let Some(i) = learned_index(state, &name) {
+        let l = &mut state.chan_learned[i];
+        if ts < l.ts || (ts == l.ts && format!("{key}|{modes}") <= format!("{}|{}", l.key, l.modes))
+        {
+            return false;
+        }
+        l.key = key.to_string();
+        l.modes = modes;
+        l.ts = ts;
+        return true;
+    }
+    if state.chan_learned.len() >= MAX_CHANNELS {
+        return false;
+    }
+    state.chan_learned.push(ChanLearned {
+        chan: name,
+        key: key.to_string(),
+        modes,
+        ts,
+    });
+    true
+}
+
+/// hub_learned_ingest(): one "chan|key|modes|ts" body (after "K|"),
+/// validated; true when stored.
+pub fn learned_ingest(state: &mut HubState, body: &str) -> bool {
+    if body.len() >= K_LINE_MAX {
+        return false;
+    }
+    let f: Vec<&str> = body.split('|').collect();
+    if f.len() != 4 || !rec_num_ok(f[2]) || f[2].len() > 3 || !rec_num_ok(f[3]) {
+        return false;
+    }
+    let (Ok(modes), Ok(ts)) = (f[2].parse::<i32>(), f[3].parse::<i64>()) else {
+        return false;
+    };
+    learned_put(state, f[0], f[1], modes, ts)
+}
+
+/// hub_learned_drop(): forget it (the channel went).
+pub fn learned_drop(state: &mut HubState, chan: &str) {
+    if let Some(i) = learned_index(state, chan) {
+        let mut l = state.chan_learned.swap_remove(i);
+        zeroize::Zeroize::zeroize(&mut l.key);
+    }
+}
+
+pub fn learned_format(l: &ChanLearned) -> String {
+    format!("K|{}|{}|{}|{}\n", l.chan, l.key, l.modes, l.ts)
+}
+
+/// hub_learned_append(): every K| line.
+pub fn learned_append(state: &HubState, out: &mut String) {
+    for l in &state.chan_learned {
+        out.push_str(&learned_format(l));
+    }
+}
+
+// ---- Orphans and the purge floor --------------------------------------------
+
+/// hub_purge_chan_orphans(): the purge's orphan sweep over global records:
+/// live C|, B| (not "*") and K| of a channel with no live c|.  `note` gets
+/// (kind, channel, ts) of each one removed.
+pub fn purge_chan_orphans(state: &mut HubState, note: &mut dyn FnMut(&str, &str, i64)) -> usize {
+    // Decide first (the index still matches the vector), then compact.
+    let mut drop = vec![false; state.global_entries.len()];
+    let mut gone = 0;
+    for (i, e) in state.global_entries.iter().enumerate() {
+        let is_c = e.key == "C";
+        // Live ones only: a tombstone is the purge's own business (its
+        // cutoff), and while it is young it is what stops an old add coming
+        // back.
+        if !(is_c || e.key == "B") || !entry_active(e) {
+            continue;
+        }
+        let chan = first_field(&e.value);
+        if chan.len() >= MAX_CHAN
+            || (e.key == "B" && chan == "*")
+            || chan_live(state, chan).is_some()
+        {
+            continue;
+        }
+        note(if is_c { "chanset" } else { "ban" }, chan, e.timestamp);
+        drop[i] = true;
+        gone += 1;
+    }
+    if gone > 0 {
+        let mut i = 0;
+        state.global_entries.retain(|_| {
+            i += 1;
+            !drop[i - 1]
+        });
+        global_reindex(state);
+    }
+    let mut i = 0;
+    while i < state.chan_learned.len() {
+        if chan_live(state, &state.chan_learned[i].chan).is_some() {
+            i += 1;
+            continue;
+        }
+        let (chan, ts) = (state.chan_learned[i].chan.clone(), state.chan_learned[i].ts);
+        note("learned", &chan, ts);
+        learned_drop(state, &chan);
+        gone += 1;
+    }
+    if gone > 0 {
+        state.config_dirty = true;
+    }
+    gone
+}
+
+/// hub_purge_floor_blocks(): a tombstone stamped `ts` that this hub does not
+/// hold may not be created while a purge's floor holds (PURGE_FLOOR_HOLD).
+pub fn purge_floor_blocks(state: &HubState, ts: i64) -> bool {
+    state.purge_floor_until > crate::cstr::now() && ts < state.purge_floor
+}
+
+pub fn purge_floor_set(state: &mut HubState, cutoff: i64) {
+    let now = crate::cstr::now();
+    let floor = if cutoff > 0 { cutoff } else { now };
+    if state.purge_floor_until <= now || floor > state.purge_floor {
+        state.purge_floor = floor;
+    }
+    state.purge_floor_until = now + PURGE_FLOOR_HOLD;
 }
 
 #[cfg(test)]
@@ -1299,7 +1457,7 @@ mod tests {
 
         // Before flags: the admin is a full admin (access::migrate).
         crate::access::migrate(&mut s);
-        let v2 = generate_bot_payload(&s, "me", BOT_PROTO_USER_FLAGS);
+        let v2 = generate_bot_payload(&s, "me");
         assert!(v2.contains("c|#chan|key|0|add|100\n"));
         assert!(v2.contains(&format!(
             "a|11111111-2222-3333-4444-555555555555|rob|{k}|add|10|20|\n"
@@ -1313,16 +1471,6 @@ mod tests {
         // Hub-only metadata never reaches a bot.
         assert!(!v2.contains("\nh|"));
         assert!(!v2.contains("\nn|"));
-
-        let legacy = generate_bot_payload(&s, "me", 0);
-        // Field 3 EMPTY so an old bot refuses every admin command; the key
-        // still rides in field 7.
-        assert!(legacy.contains(&format!(
-            "a|11111111-2222-3333-4444-555555555555|rob||add|10|20|{k}\n"
-        )));
-        // No key on the b| line, and no T| marker for a bot that predates it.
-        assert!(legacy.contains("b|otherbot!u@h|other|100\n"));
-        assert!(!legacy.contains("T|"));
     }
 
     /// A bot that is not registered gets the globals but no b| line for
@@ -1331,7 +1479,7 @@ mod tests {
     fn bot_payload_never_trusts_the_bot_itself() {
         let mut s = st();
         update_entry(&mut s, "me", "h", "mybot!u@h", "", "", 100);
-        let p = generate_bot_payload(&s, "me", BOT_PROTO_USER_FLAGS);
+        let p = generate_bot_payload(&s, "me");
         assert!(!p.contains("b|mybot!u@h|me"));
         assert!(p.ends_with("T|0\n"));
     }

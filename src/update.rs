@@ -18,7 +18,6 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::RwLock;
 
 use crate::consts::*;
 use crate::state::HubState;
@@ -129,36 +128,42 @@ fn version_eq(a: &str, b: &str) -> bool {
 // Release base
 // ---------------------------------------------------------------------------
 
-/// The release tree the driving hub named at COMMIT time.  The C twin puts it
-/// in the environment (`setenv`); `#![forbid(unsafe_code)]` rules
-/// `std::env::set_var` out here, so it lives in a process-global that
-/// `env_base()` consults ahead of the env var.  Same effect, same
-/// verification: only the github/https host allow-list is relaxed, never the
-/// signature or the hash.
-static DRIVER_BASE: RwLock<String> = RwLock::new(String::new());
-
-fn set_driver_base(base: &str) -> bool {
-    match DRIVER_BASE.write() {
-        Ok(mut slot) => {
-            slot.clear();
-            slot.push_str(base);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-/// A non-empty override repoints the updater at a local irchub-releases tree
-/// (the sandboxed testnet uses a `file://` base with no outbound network).
+/// Test hook, compiled in only with the `test-hooks` feature (the testnet's
+/// builds; never a release): a non-empty IRCHUB_UPDATE_BASE repoints the
+/// updater at a local irchub-releases root over `file://`, and
+/// IRCHUB_UPDATE_PUBKEY / IRCHUB_BOT_RELEASE_BASE are read alongside it.  A
+/// production binary has no code that reads any of them: its roots and key
+/// are the compiled-in ones, so nobody who can set the daemon's environment
+/// can point it at their own signed releases.  A run never names a base
+/// either: every node reads its own root, the only one its key can verify.
+#[cfg(feature = "test-hooks")]
 fn env_base() -> Option<String> {
-    if let Ok(b) = DRIVER_BASE.read()
-        && !b.is_empty()
-    {
-        return Some(b.clone());
-    }
     std::env::var("IRCHUB_UPDATE_BASE")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn env_base() -> Option<String> {
+    None
+}
+
+/// A test hook beside env_base(), read only while it is set.
+#[cfg(feature = "test-hooks")]
+fn env_hook(name: &str) -> Option<String> {
+    env_base()?;
+    std::env::var(name).ok().filter(|s| !s.is_empty())
+}
+
+/// The bots' release root, for reading their manifest (roll-up stepping and
+/// the console's release list): the compiled-in tree, or in a test-hooks
+/// build IRCHUB_BOT_RELEASE_BASE.
+pub fn bot_root() -> String {
+    #[cfg(feature = "test-hooks")]
+    if let Some(b) = env_hook("IRCHUB_BOT_RELEASE_BASE") {
+        return b;
+    }
+    HUB_BOT_RELEASE_BASE.to_string()
 }
 
 /// `irchub -checkupdate [variant]`: fetch the irchub release manifest and its
@@ -204,11 +209,12 @@ pub fn check_cli(variant: Option<&str>) -> i32 {
     0
 }
 
-/// The base a run works against: what the driver named, else the operator's
-/// env override, else the compiled-in root.
-fn effective_root(base: &str) -> String {
-    if !base.is_empty() {
-        return base.to_string();
+/// The hub release root: the operator's env override, else the compiled-in
+/// root.  `root`, when given, is a tree the caller names explicitly (the
+/// bots' ircbot-releases root, for the roll-up and the release list).
+fn effective_root(root: &str) -> String {
+    if !root.is_empty() {
+        return root.to_string();
     }
     env_base().unwrap_or_else(|| HUB_UPDATE_BASE.to_string())
 }
@@ -422,13 +428,12 @@ fn download(url: &str, path: &str) -> bool {
 /// Fetch releases.txt and its detached signature and verify one against the
 /// other before any field in the manifest is trusted.
 fn fetch_verified_manifest(base: &str) -> Result<String, String> {
-    // Pinned key, unless the local-source override is active AND a test key is
-    // provided (sandbox only): IRCHUB_UPDATE_PUBKEY is honoured solely when
-    // the base override is set, so production always uses the compiled key.
-    let pubkey_b64: String = match (env_base(), std::env::var("IRCHUB_UPDATE_PUBKEY")) {
-        (Some(_), Ok(k)) if !k.is_empty() => k,
-        _ => HUB_UPDATE_PUBKEY_B64.to_string(),
-    };
+    // Pinned key; only a test-hooks build takes a throwaway one.
+    #[cfg(feature = "test-hooks")]
+    let pubkey_b64 =
+        env_hook("IRCHUB_UPDATE_PUBKEY").unwrap_or_else(|| HUB_UPDATE_PUBKEY_B64.to_string());
+    #[cfg(not(feature = "test-hooks"))]
+    let pubkey_b64 = HUB_UPDATE_PUBKEY_B64.to_string();
     if pubkey_b64.is_empty() {
         return Err("hub updater disabled (no signing key configured)".to_string());
     }
@@ -566,7 +571,7 @@ fn manifest_select(manifest: &str, version: &str, variant: &str) -> Result<Manif
 /// the node itself picks the artifact when it commits.  Returns the highest
 /// version `cur_ver` may take right now on the way to `target_ver`.
 pub fn next_step(
-    base: &str,
+    root: &str,
     variant: &str,
     cur_ver: &str,
     target_ver: &str,
@@ -574,7 +579,7 @@ pub fn next_step(
     if target_ver.is_empty() {
         return Err("no target version".to_string());
     }
-    let root = effective_root(base);
+    let root = effective_root(root);
     let var = if variant.is_empty() {
         host_variant()
     } else {
@@ -665,21 +670,16 @@ fn bad_variant(v: &str) -> bool {
 /// abort, so the question is asked in full up front.  `min_from` is what the
 /// driving hub sent; empty or "*" means the manifest decides.  `Err` is the
 /// reason.
-pub fn can_take(target_ver: &str, variant: &str, min_from: &str, base: &str) -> Result<(), String> {
+pub fn can_take(target_ver: &str, variant: &str, min_from: &str) -> Result<(), String> {
     let want_variant = if variant.is_empty() {
         host_variant()
     } else {
         variant
     };
     can_take_local(target_ver, want_variant, min_from)?;
-    let root = effective_root(base);
+    let root = effective_root("");
     if root.len() >= 512 || bad_url_chars(&root) || bad_variant(want_variant) {
         return Err("rejected malformed manifest base or variant".to_string());
-    }
-    // A run's base travels the way the operator's override does, so artifact
-    // URLs under it validate here exactly as they will at COMMIT.
-    if !base.is_empty() && !set_driver_base(base) {
-        return Err("could not record the driver's manifest base".to_string());
     }
     let manifest = quick(|| fetch_verified_manifest(&format!("{root}/{want_variant}")))?;
     let row = match manifest_select(&manifest, target_ver, want_variant) {
@@ -844,13 +844,6 @@ pub fn rollback(state: &mut HubState, reason: &str) -> bool {
             crate::hlog_error!("[UPGRADE] Could not restore {prev_cfg}; keeping the current one\n");
         }
     }
-    // The pre-2.5.0 pass file, only if this process rewrote it (the old build
-    // cannot read the new one).
-    if state.pass_prev_saved && std::fs::rename(HUB_PASS_PREV_FILE, HUB_PASS_FILE).is_err() {
-        crate::hlog_error!(
-            "[UPGRADE] Could not restore {HUB_PASS_PREV_FILE}; keeping the current one\n"
-        );
-    }
     if std::fs::rename(&prev_exe, &exe).is_err() {
         crate::hlog_error!("[UPGRADE] Could not restore {prev_exe}\n");
         return false;
@@ -981,7 +974,6 @@ pub fn commit(
     upgrade_id: &str,
     target_ver: &str,
     variant: &str,
-    base: &str,
 ) -> Result<(), String> {
     if state.executable_path.is_empty() {
         return Err("this hub does not know its own executable path".to_string());
@@ -995,15 +987,12 @@ pub fn commit(
         return Err("rejected malformed variant".to_string());
     }
     can_take_local(target_ver, want_variant, "")?;
-    // The driving hub names the release tree ROOT; the variant picks the
-    // subtree.  That is what lets one run leave each node on its own kind of
-    // build — and lets an admin move a hub from the Rust build to the C one.
-    let root = effective_root(base);
+    // The run picks only the variant subtree under this hub's own root.  That
+    // is what lets one run leave each node on its own kind of build — and
+    // lets an admin move a hub from the Rust build to the C one.
+    let root = effective_root("");
     if root.len() >= 512 || root.contains([';', '|', '&', '`', '$', ' ', '\t', '\r', '\n']) {
         return Err("rejected malformed manifest base".to_string());
-    }
-    if !base.is_empty() && !set_driver_base(base) {
-        return Err("could not record the driver's manifest base".to_string());
     }
     let tree = format!("{root}/{want_variant}");
 
@@ -1041,11 +1030,15 @@ pub fn commit(
         return Err("artifact SHA-256 mismatch".to_string());
     }
     // Run the new build's own -selftest BEFORE anything is renamed: a build
-    // that cannot run here is refused with nothing touched.  Only a build new
-    // enough to know the flag is asked — an older one would start a second
-    // daemon instead.
-    let selftest = version_cmp(target_ver, SELFTEST_MIN_HUB) != std::cmp::Ordering::Less;
-    if row.kind.eq_ignore_ascii_case("bin") && selftest {
+    // that cannot run here is refused with nothing touched.  A target older
+    // than MESH_MIN_VERSION cannot read this config (PBKDF2 600k) at all.
+    if version_cmp(target_ver, MESH_MIN_VERSION) == std::cmp::Ordering::Less {
+        let _ = std::fs::remove_file(&archive);
+        return Err(format!(
+            "target predates {MESH_MIN_VERSION} and cannot read this config"
+        ));
+    }
+    if row.kind.eq_ignore_ascii_case("bin") {
         crate::hlog_info!("[UPGRADE] Running the new build's selftest\n");
         if let Err(e) = staged_selftest(&archive) {
             let _ = std::fs::remove_file(&archive);
@@ -1078,7 +1071,7 @@ pub fn commit(
         &archive,
         &prev_exe,
         &exe,
-        selftest,
+        true,
     );
     let staged = marker_write(upgrade_id, target_ver, want_variant)
         && OpenOptions::new()
@@ -1334,10 +1327,10 @@ v3.0.0 2026-03-01 https://github.com/x/c.tar.gz cc none bin any any v2.0.0
     /// fetched, and so is one below its own min_from.
     #[test]
     fn can_take_refuses_non_upgrades() {
-        assert!(can_take(HUB_VERSION, "", "", "").is_err());
-        assert!(can_take("0.1", "", "", "").is_err());
-        assert!(can_take("", "", "", "").is_err());
-        assert!(can_take("99.0", "", "98.0", "").is_err());
+        assert!(can_take(HUB_VERSION, "", "").is_err());
+        assert!(can_take("0.1", "", "").is_err());
+        assert!(can_take("", "", "").is_err());
+        assert!(can_take("99.0", "", "98.0").is_err());
         // Same version on the other build is a switch, not "already running"
         // (it then fails later on the password file / manifest, not here).
         assert_eq!(

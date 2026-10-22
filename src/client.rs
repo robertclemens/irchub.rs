@@ -201,8 +201,7 @@ fn bot_config_hash(payload: &str) -> [u8; 32] {
 /// re-shape).
 pub fn send_config_to_bot(state: &mut HubState, ci: usize, force: bool) {
     let id = state.clients[ci].id.clone();
-    let bot_proto = state.clients[ci].bot_proto;
-    let payload = Zeroizing::new(storage::generate_bot_payload(state, &id, bot_proto));
+    let payload = Zeroizing::new(storage::generate_bot_payload(state, &id));
     if payload.is_empty() {
         crate::hlog_warning!("[HUB] No config to send to {id}\n");
         return;
@@ -438,6 +437,19 @@ fn push_sync(state: &mut HubState, s: &mut String, fd: i32, line: &str) {
     s.push_str(line);
 }
 
+/// The v| protocol a config push carries (0 when unreadable), -1 when it has
+/// no v| line.
+fn push_proto(payload: &str) -> i64 {
+    payload
+        .split('\n')
+        .find_map(|l| l.strip_prefix("v|"))
+        .map(|v| {
+            let v = crate::cstr::atoll(v);
+            if v > 0 && v < 1000 { v } else { 0 }
+        })
+        .unwrap_or(-1)
+}
+
 fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     if state.clients[ci].typ != ClientType::Bot || !state.clients[ci].authenticated {
         crate::hlog_warning!("[HUB] Rejected config push from non-bot client\n");
@@ -457,8 +469,7 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     // stops a well-behaved bot from issuing the command locally; a modified
     // or compromised bot can ignore it and push the record straight up this
     // path.  These map 1:1 to the bot-side HUB_ONLY_CMDS list: a=+/-admin and
-    // chkey, o=+/-oper and chkey, m=+/-usermask, c=join/part.  (p, the
-    // retired bot password, is ignored under every opt.)  The bot's own
+    // chkey, o=+/-oper and chkey, m=+/-usermask, c=join/part.  The bot's own
     // runtime identity (nick 'n', hostmask 'h') and its protocol version 'v'
     // are intrinsic state only the bot can report, so they stay accepted.
     //
@@ -481,10 +492,21 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
         return;
     }
 
+    // v|<proto>|<unused> (docs/passwordless.md §3.4) heads a bot's full
+    // push; record-only pushes (user/mask/ban deltas, split frames) carry
+    // none.  A bot below BOT_PROTO_USER_FLAGS is refused before a line of it
+    // is taken in: it would over-trust restricted users (MESH_MIN_VERSION).
+    let proto = push_proto(payload);
+    if (0..i64::from(BOT_PROTO_USER_FLAGS)).contains(&proto) {
+        crate::hlog_warning!(
+            "[HUB] Bot {id} pushes protocol v{proto} (below v{BOT_PROTO_USER_FLAGS}): refused; upgrade it by hand to {MESH_MIN_VERSION}\n"
+        );
+        state.clients[ci].refused = true;
+        return;
+    }
+
     let work_buf = trunc_string(payload, MAX_BUFFER);
     let mut updates = 0u32;
-    let mut proto_upgraded = false;
-    let mut saw_proto = false;
     let mut sync_buffer = String::new();
 
     for line in work_buf.split('\n') {
@@ -555,26 +577,8 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
         }
         let data = &line[2..];
 
-        // v|<proto>|<unused>: protocol capability (docs/passwordless.md §3.4).
-        // Recorded on this connection only; the first v >= 2 earns a fresh
-        // config in the new record shapes.
         if typ == 'v' {
-            saw_proto = true;
-            let v = crate::cstr::atoll(data);
-            if v >= i64::from(BOT_PROTO_PASSWORDLESS)
-                && v < 1000
-                && i64::from(state.clients[ci].bot_proto) < v
-            {
-                state.clients[ci].bot_proto = v as i32;
-                proto_upgraded = true;
-                crate::hlog_info!("[HUB] Bot {id} speaks protocol v{v} (passwordless)\n");
-            }
-            continue;
-        }
-        if typ == 'p' {
-            crate::hlog_warning!(
-                "[HUB] Ignored retired bot-password line from {id} (pre-passwordless bot)\n"
-            );
+            // read up front (push_proto)
             continue;
         }
 
@@ -623,6 +627,19 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                     );
                 }
             }
+            'K' => {
+                // K|chan|key|modes|ts: what this bot saw on IRC (learned key,
+                // +k/+i).  Never existence: taken only while the channel is
+                // managed, under every opt (enforcement, D43).
+                if crate::storage::learned_ingest(state, data) {
+                    updates += 1;
+                    push_sync(state, &mut sync_buffer, fd, &format!("K|{data}\n"));
+                } else {
+                    crate::hlog_debug!(
+                        "[HUB] K| from {id} not taken (channel not managed or not newer)\n"
+                    );
+                }
+            }
             'B' => {
                 // Enforcement ban: B|chan|mask|expires|flags|setter|reason|op|ts.
                 // A bot writes only its own timed bans (modes::ban_bot_write
@@ -659,21 +676,15 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 let last_used = atoll(f[3]);
                 let ts = atoll(f[4]);
                 let is_active = act.starts_with("add");
-                // An older bot may hold a tombstone of a restricted user (plan
-                // §3.2): nothing it pushes about that user is taken in.
-                if state.clients[ci].bot_proto < BOT_PROTO_USER_FLAGS
-                    && !access::from_old_ok(state, &uuid)
-                {
-                    continue;
-                }
-
                 let found = state
                     .mask_records
                     .iter()
                     .position(|m| m.uuid == uuid && m.mask.eq_ignore_ascii_case(&mask_s));
                 let mi = match found {
                     Some(i) => i,
-                    None if state.mask_records.len() < MAX_HUB_USER_MASKS => {
+                    None if state.mask_records.len() < MAX_HUB_USER_MASKS
+                        && (is_active || !crate::storage::purge_floor_blocks(state, ts)) =>
+                    {
                         state.mask_records.push(crate::state::MaskRecord {
                             uuid: uuid.clone(),
                             mask: mask_s.clone(),
@@ -705,17 +716,11 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 );
             }
             'o' | 'a' => {
-                // hub_parse_user_record: uuid|name|pubkey|act|seen|ts| (or a
-                // legacy password shape, password dropped).  LWW by
-                // timestamp.  Outside opt 'h' the network lets bots
+                // hub_parse_user_record: uuid|name|pubkey|act|seen|ts|.  LWW
+                // by timestamp.  Outside opt 'h' the network lets bots
                 // create/re-key users (+admin/+oper/chkey); a keyless push
                 // never erases a key the hub already holds.
-                let Some((incoming, _)) =
-                    crate::config::parse_user_record(data, typ).filter(|(u, _)| {
-                        state.clients[ci].bot_proto >= BOT_PROTO_USER_FLAGS
-                            || access::from_old_ok(state, &u.uuid)
-                    })
-                else {
+                let Some(incoming) = crate::config::parse_user_record(data, typ) else {
                     continue;
                 };
                 let found = state
@@ -724,7 +729,10 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                     .position(|u| u.uuid == incoming.uuid);
                 let ui = match found {
                     Some(i) => i,
-                    None if state.user_records.len() < MAX_HUB_USER_RECORDS => {
+                    None if state.user_records.len() < MAX_HUB_USER_RECORDS
+                        && (incoming.is_active
+                            || !crate::storage::purge_floor_blocks(state, incoming.timestamp)) =>
+                    {
                         state.user_records.push(crate::state::UserRecord {
                             uuid: incoming.uuid.clone(),
                             ..Default::default()
@@ -764,7 +772,7 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 }
                 state.config_dirty = true;
                 updates += 1;
-                let uline = crate::config::format_user_record(&state.user_records[ui], false);
+                let uline = crate::config::format_user_record(&state.user_records[ui]);
                 if uline.len() < USER_LINE_MAX {
                     push_sync(state, &mut sync_buffer, fd, &uline);
                 }
@@ -821,24 +829,14 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
         }
     }
 
-    // A user this push created without uf| / uc| (an older bot's +admin /
-    // +oper) gets what it could do before flags (access::migrate).
+    // A user this push created without uf| / uc| gets what it could do
+    // before flags (access::migrate).
     if access::migrate(state) > 0 {
         updates += 1;
     }
 
-    // Every passwordless bot puts v| in each push, so its absence marks an
-    // old build.  Say so once per connection, and sync it right away: its
-    // first config replaces every password it still holds with an empty slot,
-    // so it must not wait for the next periodic broadcast.
-    let mut legacy_first = false;
-    if !saw_proto && state.clients[ci].bot_proto == 0 {
-        state.clients[ci].bot_proto = 1;
-        legacy_first = true;
-        crate::hlog_warning!(
-            "[HUB] Bot {id} is a pre-passwordless build (no v|2): it gets legacy records with empty password slots; upgrade it\n"
-        );
-    }
+    let first_push = !state.clients[ci].pushed;
+    state.clients[ci].pushed = true;
 
     if updates > 0 {
         crate::hlog_debug!("[HUB] Applied {updates} updates from {id}\n");
@@ -851,14 +849,8 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
         // Send the FULL config to all connected bots: this keeps them
         // consistent even when one of them missed an earlier update.
         broadcast_full_config_to_all_bots(state);
-    } else if proto_upgraded || legacy_first {
-        // proto_upgraded: this connection just proved it is
-        // passwordless-capable — replace the legacy-shaped config it may hold
-        // right away.  legacy_first: an old build — empty its stored
-        // passwords right away.
-        if let Some(i) = state.client_by_fd(fd) {
-            send_config_to_bot(state, i, true);
-        }
+    } else if first_push && let Some(i) = state.client_by_fd(fd) {
+        send_config_to_bot(state, i, true);
     }
 }
 
@@ -1337,18 +1329,8 @@ fn handle_unauthenticated(state: &mut HubState, ci: usize, data: &[u8]) -> bool 
         state.clients[ci].session_key = session_key;
         let payload = String::from_utf8_lossy(crate::cstr::until_nul_bytes(&plain)).into_owned();
 
-        // HUBv2 is a pre-passwordless peer.  It would send a|/o| records with
-        // passwords and read ours as passwords, so mixed versions must never
-        // exchange state (docs/passwordless.md §3.4): refuse it by name.
-        if payload.starts_with("HUBv2|") {
-            let ip = state.clients[ci].ip.clone();
-            crate::hlog_warning!(
-                "[HUB] Peer {ip} speaks HUBv2 (pre-passwordless) — refusing; upgrade that hub (all hubs upgrade together)\n"
-            );
-            ratelimit::record_failed_auth(state, &ip);
-            auth::disconnect_client(state, ci);
-            return false;
-        }
+        // v3 hub peer authentication.  Any other handshake (HUBv2 and older
+        // included) is refused below.
         if payload.starts_with("HUBv3|") {
             return handle_hubv3(state, ci, &payload);
         }
@@ -1588,6 +1570,14 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
                     }
                     ClientType::Bot => process_bot_command(state, ci, cmd, &payload),
                     ClientType::Hub => handle_peer_frame(state, ci, cmd, &payload),
+                }
+                // A bot or peer below MESH_MIN_VERSION (or a push below
+                // BOT_PROTO_USER_FLAGS): drop the link.
+                if let Some(ci) = state.client_by_fd(fd)
+                    && state.clients[ci].refused
+                {
+                    auth::disconnect_client(state, ci);
+                    return false;
                 }
             }
         }

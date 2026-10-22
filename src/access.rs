@@ -181,6 +181,10 @@ pub fn uchan_put(state: &mut HubState, uuid: &str, chan: &str, active: bool, ts:
             i
         }
         None => {
+            // a tombstone older than the last purge is not re-created
+            if !active && crate::storage::purge_floor_blocks(state, ts) {
+                return false;
+            }
             if state.uchan_records.len() >= MAX_HUB_CHAN_BINDS {
                 crate::hlog_warning!(
                     "[ACCESS] Binding table full ({}): uc| {} for {} dropped\n",
@@ -410,11 +414,23 @@ pub fn purge(state: &mut HubState, cutoff: i64) -> usize {
         .filter(|u| u.is_active)
         .map(|u| u.uuid.clone())
         .collect();
+    // A live binding to a channel nobody manages is an orphan: the channel
+    // went (or never was -- user chan add needs a managed one).
+    let orphan: Vec<bool> = state
+        .uchan_records
+        .iter()
+        .map(|r| {
+            r.is_active && r.chan != "*" && crate::storage::chan_live(state, &r.chan).is_none()
+        })
+        .collect();
     let before = state.uchan_records.len();
+    let mut i = 0;
     state.uchan_records.retain(|r| {
-        !(!r.is_active
-            && (cutoff == 0 || r.timestamp < cutoff)
-            && !(live.contains(&r.uuid) && r.chan == "*"))
+        i += 1;
+        !(orphan[i - 1]
+            || (!r.is_active
+                && (cutoff == 0 || r.timestamp < cutoff)
+                && !(live.contains(&r.uuid) && r.chan == "*")))
     });
     let dropped = before - state.uchan_records.len();
     prune(state);
@@ -439,7 +455,8 @@ pub fn append(state: &HubState, out: &mut String, keep: Option<&dyn Fn(&str) -> 
 }
 
 // ---- Older nodes (plan §3.2, T2) -------------------------------------------
-// See C hub_access.c: an older bot or hub never gets uf| / uc|, sees each
+// See C hub_access.c: a peer hub whose version is not known yet (or older
+// than MESH_MIN_VERSION, its link being refused) never gets uf| / uc|, sees each
 // user at `user_ts`, gets a restricted user as a tombstone (a node known to be
 // older) or not at all (one whose version is not known yet), never with its
 // masks, and nothing it sends about a restricted user is taken in.
@@ -459,12 +476,7 @@ pub fn user_ts(state: &HubState, u: &UserRecord) -> i64 {
 
 /// u's a|/o| line for an older node; "" = left out (a restricted user and
 /// not `tomb`).
-pub fn format_user_for_old(
-    state: &HubState,
-    u: &UserRecord,
-    legacy_v1: bool,
-    tomb: bool,
-) -> String {
+pub fn format_user_for_old(state: &HubState, u: &UserRecord, tomb: bool) -> String {
     let restricted = user_restricted(state, u);
     if restricted && !tomb {
         return String::new();
@@ -474,7 +486,7 @@ pub fn format_user_for_old(
     if restricted {
         c.is_active = false;
     }
-    crate::config::format_user_record(&c, legacy_v1)
+    crate::config::format_user_record(&c)
 }
 
 /// A record an older node sent about user `uuid` may be taken in: not about
@@ -516,7 +528,7 @@ pub fn downgrade(state: &HubState, payload: &str, tomb: bool) -> String {
                         continue;
                     }
                 } else {
-                    out.push_str(&format_user_for_old(state, u, false, tomb));
+                    out.push_str(&format_user_for_old(state, u, tomb));
                     continue;
                 }
             }

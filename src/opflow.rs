@@ -727,25 +727,10 @@ pub fn process_chan_request(state: &mut HubState, ci: usize, payload: &str) {
     }
 
     crate::hlog_info!("[HUB] CHAN_REQUEST {kind} from {id} for {channel}\n");
-    // One bot answers it (CMD_CHAN_PROBE) unless an older hub is in the mesh.
-    if crate::elect::mesh_ready(state) {
-        if crate::elect::start(state, &kind, &channel, &id, &nick, &hostmask, None).is_none() {
-            crate::hlog_warning!("[CHANREQ] Election table full — dropping {kind} for {channel}\n");
-        }
-        return;
+    // One bot answers it (CMD_CHAN_PROBE).
+    if crate::elect::start(state, &kind, &channel, &id, &nick, &hostmask, None).is_none() {
+        crate::hlog_warning!("[CHANREQ] Election table full — dropping {kind} for {channel}\n");
     }
-    let request_id = generate_request_id();
-    forward_seen_check_and_add(state, &request_id);
-    chan_request_dispatch(
-        state,
-        &request_id,
-        &id,
-        &kind,
-        &channel,
-        &nick,
-        &hostmask,
-        -1,
-    );
 }
 
 /// process_chan_reply(): a bot answering a request (today only `key`).  Route

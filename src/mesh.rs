@@ -23,20 +23,14 @@ use crate::{access, client, config, crypto, queue, storage};
 // A purge is known by its cutoff plus the random id its origin hub gave it.
 // Keyed on the cutoff alone, every "immediate" purge (cutoff 0) looked like
 // the previous one for PURGE_DEDUP_WINDOW seconds, and peers skipped a second
-// purge sent inside that window.  A line from a hub that predates the id
-// carries id "" and dedupes on its cutoff as before.
+// purge sent inside that window.
 
 fn is_purge_recent(state: &HubState, cutoff: i64, id: &str) -> bool {
     let t = now();
-    let window = if id.is_empty() {
-        PURGE_DEDUP_WINDOW_LEGACY
-    } else {
-        PURGE_DEDUP_WINDOW
-    };
     state
         .recent_purges
         .iter()
-        .any(|p| p.cutoff == cutoff && p.id == id && t - p.received_at < window)
+        .any(|p| p.cutoff == cutoff && p.id == id && t - p.received_at < PURGE_DEDUP_WINDOW)
 }
 
 fn record_recent_purge(state: &mut HubState, cutoff: i64, id: &str) {
@@ -329,10 +323,12 @@ fn sync_bcast_opcode(state: &HubState, ci: usize) -> u8 {
     if knows { CMD_PEER_BCAST } else { CMD_PEER_SYNC }
 }
 
-/// Whether peer `ci` knows admin flags / oper channel bindings (uf| / uc|):
-/// 2 = USER_FLAGS_MIN_HUB or newer, 1 = known older, 0 = not known yet (its
-/// version arrives with its first roster).  Below 2 it gets the downgraded
-/// sync (`access::downgrade`; tombstones only at 1).  C `peer_flags_level`.
+/// Whether peer `ci` is known current: 2 = MESH_MIN_VERSION or newer, 1 =
+/// known older (its link is being refused), 0 = not known yet (its version
+/// arrives with its first roster).  Below 2 it gets the downgraded sync
+/// (`access::downgrade`; tombstones only at 1), so a peer that turns out to
+/// be older never over-trusts a restricted user meanwhile.  C
+/// `peer_flags_level`.
 pub fn peer_flags_level(state: &HubState, ci: usize) -> u8 {
     let cu = crate::upgrade::peer_uuid_of(state, ci);
     if cu.is_empty() {
@@ -352,7 +348,7 @@ pub fn peer_flags_level(state: &HubState, ci: usize) -> u8 {
     if ver.is_empty() {
         return 0;
     }
-    if crate::update::version_cmp(&ver, USER_FLAGS_MIN_HUB) != std::cmp::Ordering::Less {
+    if crate::update::version_cmp(&ver, MESH_MIN_VERSION) != std::cmp::Ordering::Less {
         2
     } else {
         1
@@ -543,12 +539,14 @@ pub fn generate_sync_packet(state: &HubState) -> String {
         }
         out.push_str(&line);
     }
+    // K|: what the bots saw on IRC, after the c| lines it hangs off.
+    storage::learned_append(state, &mut out);
 
     // User records, so peer hubs share admin/oper records, in the
     // passwordless shape uuid|name|pubkey|act|seen|ts| (peers are HUBv3, so
     // they parse it).
     for u in &state.user_records {
-        let line = config::format_user_record(u, false);
+        let line = config::format_user_record(u);
         if out.len() + line.len() >= max_len {
             break;
         }
@@ -663,6 +661,10 @@ fn store_global_entry_raw(state: &mut HubState, key: &str, value: &str, ts: i64)
         return false;
     }
 
+    // Add new entry (a tombstone older than the last purge is not re-created)
+    if !global_value_active(value) && storage::purge_floor_blocks(state, ts) {
+        return false;
+    }
     if storage::global_room(state, key) {
         state.global_entries.push(ConfigEntry {
             key: trunc_string(key, 32),
@@ -720,6 +722,11 @@ pub fn parse_global_channel_value(value: &str) -> Option<(String, String, i32, S
 /// ASCII case-insensitively on the channel name (D39), same as the storage
 /// layer.
 pub fn global_channel_modes(state: &HubState, chan: &str) -> i32 {
+    // The +k/+i the bots last saw: K| (2.5.1), else the modes field a 2.5.0
+    // bot left on c|.
+    if let Some(l) = storage::learned_find(state, chan) {
+        return l.modes;
+    }
     for e in state.global_entries.iter().filter(|e| e.key == "c") {
         if let Some((stored_chan, _, modes, _)) = parse_global_channel_value(&e.value)
             && trunc_string(&stored_chan, 128).eq_ignore_ascii_case(chan)
@@ -744,9 +751,8 @@ struct SyncCounters {
 
 /// One `a|`/`o|` record from a peer.
 fn sync_user_record(state: &mut HubState, key: char, vstart: &str, cnt: &mut SyncCounters) {
-    // hub_parse_user_record: uuid|name|pubkey|act|seen|ts| (a legacy password
-    // shape parses too; the password is dropped).
-    let Some((incoming, _)) = config::parse_user_record(vstart, key) else {
+    // hub_parse_user_record: uuid|name|pubkey|act|seen|ts|
+    let Some(incoming) = config::parse_user_record(vstart, key) else {
         return;
     };
     let mut found = state
@@ -793,7 +799,11 @@ fn sync_user_record(state: &mut HubState, key: char, vstart: &str, cnt: &mut Syn
         }
     }
 
-    if found.is_none() && !discard_incoming && state.user_records.len() < MAX_HUB_USER_RECORDS {
+    if found.is_none()
+        && !discard_incoming
+        && state.user_records.len() < MAX_HUB_USER_RECORDS
+        && (incoming.is_active || !storage::purge_floor_blocks(state, incoming.timestamp))
+    {
         state.user_records.push(UserRecord {
             uuid: incoming.uuid.clone(),
             ..Default::default()
@@ -833,9 +843,8 @@ fn sync_user_record(state: &mut HubState, key: char, vstart: &str, cnt: &mut Syn
     cnt.updates += 1;
     cnt.bot_push_updates += 1; // admin/oper name change — bots need this
 
-    // Forward our canonical a|/o| line, never the raw one: a legacy-shaped
-    // line must not carry a password onward.
-    let uline = config::format_user_record(&state.user_records[ui], false);
+    // Forward our canonical a|/o| line, never the raw one.
+    let uline = config::format_user_record(&state.user_records[ui]);
     if uline.len() < USER_LINE_MAX && cnt.forward.len() + uline.len() < MAX_SYNC_PAYLOAD {
         cnt.forward.push_str(&uline);
     }
@@ -864,7 +873,9 @@ fn sync_mask_record(state: &mut HubState, vstart: &str, line: &str, cnt: &mut Sy
         .position(|m| m.uuid == uuid && m.mask.eq_ignore_ascii_case(&mask));
     let mi = match found {
         Some(i) => i,
-        None if state.mask_records.len() < MAX_HUB_USER_MASKS => {
+        None if state.mask_records.len() < MAX_HUB_USER_MASKS
+            && (is_active || !storage::purge_floor_blocks(state, ts)) =>
+        {
             state.mask_records.push(MaskRecord {
                 uuid,
                 mask,
@@ -979,9 +990,9 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bc
         forward: String::new(),
     };
     crate::stats::sync_frame();
-    // A peer that does not know uf| / uc| (or whose version we do not know
-    // yet) may hold a tombstone we sent it for a restricted user: nothing it
-    // says about such a user is taken in (access::from_old_ok).
+    // A peer whose version we do not know yet may be an older node holding
+    // no uf| / uc|: nothing it says about a restricted user is taken in
+    // (access::from_old_ok).
     let origin_flags_ok = peer_fd_flags_level(state, origin_fd) == 2;
 
     for line in trunc_string(payload, MAX_SYNC_PAYLOAD).split('\n') {
@@ -1053,6 +1064,21 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bc
                 cnt.updates += 1;
                 cnt.bot_push_updates += 1;
                 if cnt.forward.len() < MAX_SYNC_PAYLOAD - UC_LINE_MAX {
+                    cnt.forward.push_str(line);
+                    cnt.forward.push('\n');
+                }
+            }
+            continue;
+        }
+
+        // K|chan|key|modes|ts: what the bots saw on IRC.  Taken only while
+        // the channel is managed here; its c| line comes first in every sync.
+        if let Some(body) = line.strip_prefix("K|") {
+            if storage::learned_ingest(state, body) {
+                cnt.updates += 1;
+                cnt.bot_push_updates += 1;
+                state.config_dirty = true;
+                if cnt.forward.len() < MAX_SYNC_PAYLOAD - K_LINE_MAX {
                     cnt.forward.push_str(line);
                     cnt.forward.push('\n');
                 }
@@ -1222,6 +1248,9 @@ pub fn execute_purge(
     cutoff: i64,
     mut tombs: Option<&mut crate::reply::Reply>,
 ) -> i32 {
+    // For PURGE_FLOOR_HOLD, a sync built before this purge cannot re-create
+    // what it removes.
+    storage::purge_floor_set(state, cutoff);
     let mut purged_count = 0;
     // One purged tombstone, for the console.
     let mut note = |kind: &str, id: &str, name: &str, ts: i64| {
@@ -1263,6 +1292,11 @@ pub fn execute_purge(
     }
     state.global_entries = kept;
     storage::global_reindex(state);
+
+    // --- Orphans: live C| / B| (not "*") / K| of a channel no one manages,
+    //     whatever the cutoff (every hub and bot applies the same rule) ---
+    purged_count +=
+        storage::purge_chan_orphans(state, &mut |kind, name, ts| note(kind, "", name, ts)) as i32;
 
     // --- Tombstoned user_records (admins/opers) ---
     let mut kept_users: Vec<UserRecord> = Vec::new();
@@ -1588,12 +1622,10 @@ mod tests {
         assert_eq!(s.mask_records.len(), 1);
     }
 
-    /// A legacy-shaped a| line carries a password in field 3.  It may be
-    /// ingested (the key is taken from field 7), but what this hub forwards
-    /// on must be its own canonical line — the password must not travel one
-    /// hop further.
+    /// A password-era a| line (a password in field 3) is refused outright:
+    /// nothing of it is stored, and no password travels one hop further.
     #[test]
-    fn peer_sync_forwards_canonically_never_a_password() {
+    fn peer_sync_refuses_a_password_line() {
         let mut s = HubState::new();
         s.hub_uuid = "me".into();
         let (_, pubk) = crypto::generate_combined_keypair().unwrap();
@@ -1606,20 +1638,15 @@ mod tests {
 
         let legacy = format!("a|11111111-2222-3333-4444-555555555555|rob|hunter2|add|10|20|{k}\n");
         process_peer_sync(&mut s, &legacy, -1, false);
-
-        let u = &s.user_records[0];
-        assert_eq!(u.name, "rob");
-        assert!(u.has_pubkey);
-        assert_eq!(u.pubkey_b64, k);
-        // Nothing anywhere in this hub's state holds the password.
-        let canonical = config::format_user_record(u, false);
-        assert!(!canonical.contains("hunter2"));
-        assert_eq!(
-            canonical,
-            format!("a|11111111-2222-3333-4444-555555555555|rob|{k}|add|10|20|\n")
-        );
-        // And the sync packet it will hand any peer carries only that shape.
+        assert!(s.user_records.is_empty());
         assert!(!generate_sync_packet(&s).contains("hunter2"));
+
+        // The current shape is taken, and forwarded as this hub's own line.
+        let line = format!("a|11111111-2222-3333-4444-555555555555|rob|{k}|add|10|20|\n");
+        process_peer_sync(&mut s, &line, -1, false);
+        let u = &s.user_records[0];
+        assert_eq!(u.pubkey_b64, k);
+        assert_eq!(config::format_user_record(u), line);
     }
 
     /// The `b|` re-forward must be byte-identical to what arrived: splitting

@@ -568,8 +568,8 @@ struct PendCmd {
     payload: Vec<u8>,
     /// the object: uuid, #, name, flags
     arg: Vec<u8>,
-    /// upgrade start: hub=, nodes=, botbase=, hubbase=
-    extra: [Vec<u8>; 4],
+    /// upgrade start: hub=, nodes=
+    extra: [Vec<u8>; 2],
     rq: PendingRq,
 }
 
@@ -816,8 +816,8 @@ const CMDS: &[CmdDef] = &[
     cmd!("ban", Some("add"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; the bots set it on the channel (never on a bot or user)", None),
     cmd!("ban", Some("del"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban del <#chan|*> <mask>", "remove a listed ban", None),
     cmd!("upgrade", Some("status"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::None, Pre::None, "", "upgrade status", "the upgrade run on this hub", None),
-    cmd!("upgrade", Some("releases"), CMD_ADMIN_UPGRADE_STATUS, B::UpgReleases, 0, 2, Cf::None, Pre::None, "", "upgrade releases [bot=<base>] [hub=<base>]", "releases both products offer, and the nodes", None),
-    cmd!("upgrade", Some("start"), CMD_ADMIN_UPGRADE_NET, B::UpgStart, 1, 4, Cf::Yn, Pre::UpgStart, "", "upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>] [botbase=<url>] [hubbase=<url>]", "start a rolling network upgrade (shows the plan, asks y/N)", None),
+    cmd!("upgrade", Some("releases"), CMD_ADMIN_UPGRADE_STATUS, B::UpgReleases, 0, 0, Cf::None, Pre::None, "", "upgrade releases", "releases both products offer, and the nodes", None),
+    cmd!("upgrade", Some("start"), CMD_ADMIN_UPGRADE_NET, B::UpgStart, 1, 4, Cf::Yn, Pre::UpgStart, "", "upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>]", "start a rolling network upgrade (shows the plan, asks y/N)", None),
     cmd!("upgrade", Some("abort"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, Pre::None, "abort", "upgrade abort", "stop the run and roll back", None),
     cmd!("upgrade", Some("forget"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, Pre::None, "forget", "upgrade forget", "drop the roll-up plan on every hub", None),
     cmd!("display", Some("show"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "display show", "this session's display settings", None),
@@ -1139,17 +1139,12 @@ const CMD_HELP: &[CmdHelp] = &[
     ("ban", Some("del"), Some("#chan|*\tas listed by ban list\nmask\tthe mask exactly as ban list shows it"),
      "ban del #ops *!*@203.0.113.7"),
     ("upgrade", Some("status"), None, "upgrade status"),
-    ("upgrade", Some("releases"),
-     Some("bot=<base>\ta different release site for the bot builds (a URL)\n\
-           hub=<base>\ta different release site for the hub builds (a URL)"),
-     "upgrade releases\nupgrade releases bot=https://example.net/ircbot"),
+    ("upgrade", Some("releases"), None, "upgrade releases"),
     ("upgrade", Some("start"),
      Some("bot=<ver>\tthe bot version to move to, as upgrade releases lists it (required)\n\
            hub=<ver>\talso move the hubs to this version (- or left out = leave them)\n\
            nodes=<sel>\tonly these nodes: names or uuids, comma-separated; name=c or name=rs \
            also switches that node's build (default: the whole network)\n\
-           botbase=<url>\ta different release site for the bot builds\n\
-           hubbase=<url>\ta different release site for the hub builds\n\
            (confirm)\tit shows the plan, then asks y/N to start"),
      "upgrade start bot=2.4.5\nupgrade start bot=2.4.5 hub=2.4.4\n\
       upgrade start bot=2.4.5 nodes=alpha,beta=rs"),
@@ -1228,12 +1223,11 @@ const ARG_COMP: &[ArgComp] = &[
     ("ban", Some("add"), Some(2), Ck::Words("perm sticky")),
     ("ban", Some("add"), Some(3), Ck::Words("sticky")),
     ("ban", Some("del"), Some(0), Ck::Words("*")),
-    ("upgrade", Some("releases"), None, Ck::Words("bot= hub=")),
     (
         "upgrade",
         Some("start"),
         None,
-        Ck::Words("bot= hub= nodes= botbase= hubbase="),
+        Ck::Words("bot= hub= nodes="),
     ),
     ("display", Some("view"), Some(0), Ck::Words("1 2 3 4 5")),
     ("display", Some("format"), Some(0), Ck::Words("pretty raw")),
@@ -2502,6 +2496,26 @@ fn all_digits(s: &[u8]) -> bool {
 }
 
 /// key=value option of "upgrade" commands.
+/// "2.4.8 → 2.5.0 → 2.5.1" from a releases "path" record, and the number of
+/// steps (0 when there is no record).
+fn upg_path_text(p: Option<&fmt::Crec>, arrow: &[u8]) -> (Vec<u8>, usize) {
+    let Some(st) = p.and_then(|p| p.rvs("steps")) else {
+        return (Vec::new(), 0);
+    };
+    let mut out = p.and_then(|p| p.rv("from")).unwrap_or(b"").to_vec();
+    let mut n = 0;
+    for t in st.split(|&c| c == b',').filter(|t| !t.is_empty()) {
+        if !out.is_empty() {
+            out.push(b' ');
+        }
+        out.extend_from_slice(arrow);
+        out.push(b' ');
+        out.extend_from_slice(t);
+        n += 1;
+    }
+    (out, n)
+}
+
 fn kv_opt<'a>(arg: &'a [u8], key: &str) -> Option<&'a [u8]> {
     let kl = key.len();
     (arg.len() > kl && arg[..kl].eq_ignore_ascii_case(key.as_bytes()) && arg[kl] == b'=')
@@ -2923,27 +2937,10 @@ fn build_payload(
             }
             fmtb(&[a(1), b"|", a(2)])
         }
-        B::UpgReleases => {
-            let (mut bot, mut hub): (&[u8], &[u8]) = (b"", b"");
-            for i in 0..na {
-                if let Some(v) = kv_opt(a(i), "bot") {
-                    bot = v;
-                } else if let Some(v) = kv_opt(a(i), "hub") {
-                    hub = v;
-                } else {
-                    return bad("options: bot=<base> hub=<base>", hint);
-                }
-            }
-            if !bot.is_empty() || !hub.is_empty() {
-                fmtb(&[b"releases|", bot, b"|", hub])
-            } else {
-                b"releases".to_vec()
-            }
-        }
+        B::UpgReleases => b"releases".to_vec(),
         B::UpgStart => {
             let mut botv: &[u8] = b"";
-            let (mut hubv, mut nodes, mut bb, mut hb): (&[u8], &[u8], &[u8], &[u8]) =
-                (b"", b"", b"", b"");
+            let (mut hubv, mut nodes): (&[u8], &[u8]) = (b"", b"");
             for i in 0..na {
                 if let Some(v) = kv_opt(a(i), "bot") {
                     botv = v;
@@ -2951,15 +2948,8 @@ fn build_payload(
                     hubv = if v == b"-" { b"" } else { v };
                 } else if let Some(v) = kv_opt(a(i), "nodes") {
                     nodes = v;
-                } else if let Some(v) = kv_opt(a(i), "botbase") {
-                    bb = v;
-                } else if let Some(v) = kv_opt(a(i), "hubbase") {
-                    hb = v;
                 } else {
-                    return bad(
-                        "options: bot=<ver> hub=<ver> nodes=<list> botbase=<url> hubbase=<url>",
-                        hint,
-                    );
+                    return bad("options: bot=<ver> hub=<ver> nodes=<list>", hint);
                 }
             }
             if botv.is_empty() {
@@ -2970,8 +2960,9 @@ fn build_payload(
             }
             // ver|variant|kind|min_from|base|hub_ver|hub_base|sel — variant,
             // kind and min_from are left to each node, as hub_admin always did.
-            let hbv: &[u8] = if hubv.is_empty() { b"" } else { hb };
-            fmtb(&[botv, b"||||", bb, b"|", hubv, b"|", hbv, b"|", nodes])
+            // The two base slots stay empty: every node fetches from its own
+            // compiled-in release root, the only one its pinned key can verify.
+            fmtb(&[botv, b"|||||", hubv, b"||", nodes])
         }
     };
     if w.len() >= CAP {
@@ -3585,13 +3576,9 @@ impl Ui {
         }
         let pc = self.pend.clone();
         let sl = self.session_log_phrase(128);
-        let (dot, arrow, ell) = {
+        let (arrow, ell) = {
             let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
-            (
-                fmt::glyph(&c, fmt::G_DOT),
-                fmt::glyph(&c, fmt::G_ARROW),
-                fmt::glyph(&c, fmt::G_ELL),
-            )
+            (fmt::glyph(&c, fmt::G_ARROW), fmt::glyph(&c, fmt::G_ELL))
         };
         const QCAP: usize = CONSOLE_INPUT_MAX - 64;
         let mut q: Vec<u8> = Vec::new();
@@ -3856,9 +3843,16 @@ impl Ui {
                 }
             }
             Pre::UpgStart => {
-                // the plan card: how many nodes already run the target (D2)
+                // the plan card: how many nodes already run the target (D2),
+                // and the steps the hub would take to get there
                 let bv = arg;
                 let hv = pc.extra[0].as_slice();
+                let path_of = |hub: bool| {
+                    rep.r
+                        .iter()
+                        .find(|x| x.typ == b"path" && (x.rv("product") == Some(b"hub")) == hub)
+                };
+                let (bpath, hpath) = (path_of(false), path_of(true));
                 let (mut b_on, mut b_to, mut h_on, mut h_to) = (0, 0, 0, 0);
                 for nd in rep.r.iter().filter(|x| x.typ == b"node") {
                     let bot = nd.rv("kind") == Some(b"bot");
@@ -3881,14 +3875,32 @@ impl Ui {
                         let card = |f: &mut Flines, label: &str, v: &[u8]| {
                             fmt::card_line(f, 6, label.as_bytes(), Some(v), RL_NORMAL)
                         };
-                        let v = fmtb(&[
-                            arrow,
-                            b" ",
-                            bv,
-                            format!("   ({b_on} already on it, {b_to} to upgrade)").as_bytes(),
-                        ]);
+                        let (pb, nb) = upg_path_text(bpath, arrow);
+                        let (ph, nh) = if hv.is_empty() {
+                            (Vec::new(), 0)
+                        } else {
+                            upg_path_text(hpath, arrow)
+                        };
+                        let v = if nb > 1 {
+                            fmtb(&[
+                                &pb,
+                                format!("   ({b_on} already on it, {b_to} to upgrade)").as_bytes(),
+                            ])
+                        } else {
+                            fmtb(&[
+                                arrow,
+                                b" ",
+                                bv,
+                                format!("   ({b_on} already on it, {b_to} to upgrade)").as_bytes(),
+                            ])
+                        };
                         card(&mut f, "bots", c_cut(&v, 512));
-                        let v = if !hv.is_empty() {
+                        let v = if !hv.is_empty() && nh > 1 {
+                            fmtb(&[
+                                &ph,
+                                format!("   ({h_on} already on it, {h_to} to upgrade)").as_bytes(),
+                            ])
+                        } else if !hv.is_empty() {
                             fmtb(&[
                                 arrow,
                                 b" ",
@@ -3908,23 +3920,24 @@ impl Ui {
                                 &pc.extra[1]
                             },
                         );
-                        let v = fmtb(&[
-                            b"bots: ",
-                            if pc.extra[2].is_empty() {
-                                b"default"
-                            } else {
-                                &pc.extra[2]
-                            },
-                            b" ",
-                            dot,
-                            b" hubs: ",
-                            if pc.extra[3].is_empty() {
-                                b"default"
-                            } else {
-                                &pc.extra[3]
-                            },
-                        ]);
-                        card(&mut f, "bases", c_cut(&v, 512));
+                        let steps = nb.max(nh);
+                        if steps > 1 {
+                            let v = format!(
+                                "{steps}, one full run each; every node finishes a step before the next"
+                            );
+                            card(&mut f, "steps", v.as_bytes());
+                            fmt::card_line(
+                                &mut f,
+                                6,
+                                b"",
+                                Some(b"upgrade abort stops the rest and rolls back only the step running"),
+                                RL_DIM,
+                            );
+                        }
+                        if let Some(e) = bpath.and_then(|p| p.rvs("err")) {
+                            let v = fmtb(&[b"no path: ", e]);
+                            fmt::card_line(&mut f, 6, b"", Some(c_cut(&v, 512)), RL_WARN);
+                        }
                     }
                     self.emit_flines(f);
                 }
@@ -4123,7 +4136,6 @@ impl Ui {
                 }
                 Pre::UserDel | Pre::UserKey => (CMD_ADMIN_MATCH, c_cut(&a1, 600).to_vec()),
                 Pre::UpgStart => {
-                    let (mut bb, mut hb): (&[u8], &[u8]) = (b"", b"");
                     for i in argi..ws.n() {
                         let w = ws.get(i);
                         if let Some(v) = kv_opt(w, "bot") {
@@ -4132,19 +4144,18 @@ impl Ui {
                             pc.extra[0] = c_cut(if v == b"-" { b"" } else { v }, 256).to_vec();
                         } else if let Some(v) = kv_opt(w, "nodes") {
                             pc.extra[1] = c_cut(v, 256).to_vec();
-                        } else if let Some(v) = kv_opt(w, "botbase") {
-                            bb = v;
-                        } else if let Some(v) = kv_opt(w, "hubbase") {
-                            hb = v;
                         }
                     }
-                    pc.extra[2] = c_cut(bb, 256).to_vec();
-                    pc.extra[3] = c_cut(hb, 256).to_vec();
-                    let pp = if !bb.is_empty() || !hb.is_empty() {
-                        fmtb(&[b"releases|", bb, b"|", hb])
-                    } else {
-                        b"releases".to_vec()
-                    };
+                    // with the targets, the hub also answers the path the run
+                    // would take
+                    let pp = fmtb(&[
+                        b"releases|",
+                        &pc.arg,
+                        b"|",
+                        &pc.extra[0],
+                        b"|",
+                        &pc.extra[1],
+                    ]);
                     (CMD_ADMIN_UPGRADE_STATUS, c_cut(&pp, 600).to_vec())
                 }
                 Pre::None => (0, Vec::new()),

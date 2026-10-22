@@ -180,6 +180,16 @@ pub struct ConfigEntry {
     pub last_used: i64,
 }
 
+/// K| (storage.rs `learned_*`): one per managed channel.
+#[derive(Clone, Debug, Default)]
+pub struct ChanLearned {
+    pub chan: String,
+    pub key: String,
+    /// K_MODES_MASK bits
+    pub modes: i32,
+    pub ts: i64,
+}
+
 /// An admin ('a') or oper ('o') record.
 #[derive(Clone, Debug, Default)]
 pub struct UserRecord {
@@ -535,6 +545,44 @@ impl UpgradeNodeKind {
 /// volatile.  The roll-up is a convenience, never the record of what the
 /// network runs (that is each node's own presence), and it only ever chases a
 /// target some other bot is demonstrably running (`rollup_target_proven`).
+/// A multi-step upgrade this hub drives (2.5.1): the path to the admin's
+/// targets through the releases the manifests floor on, run one ordinary run
+/// per step.  Persisted in this hub's own .irchub.cnf (`uplan|`) because the
+/// hub restarts onto each step itself.
+#[derive(Clone, Debug, Default)]
+pub struct UpgradePlan {
+    pub active: bool,
+    /// The final targets the admin asked for ("" hub = hubs are not moved).
+    pub bot_target: String,
+    pub hub_target: String,
+    pub variant: String,
+    pub kind: String,
+    /// The admin's selection, as typed.
+    pub sel: String,
+    /// The oldest bot / hub when it was planned.
+    pub bot_from: String,
+    pub hub_from: String,
+    pub bot_path: Vec<String>,
+    pub hub_path: Vec<String>,
+    /// 0-based: the step running, or next.
+    pub step: usize,
+    /// The run driving `step`; "" = none yet.
+    pub run_id: String,
+    pub started: i64,
+    /// Last step started or finished.
+    pub progressed: i64,
+    /// Volatile: when the next step may start (0 = not scheduled yet).
+    pub next_at: i64,
+    /// Why it ended (kept after it stops).
+    pub summary: String,
+}
+
+impl UpgradePlan {
+    pub fn steps(&self) -> usize {
+        self.bot_path.len().max(self.hub_path.len())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PendingRollup {
     pub have_plan: bool,
@@ -542,10 +590,8 @@ pub struct PendingRollup {
     pub variant: String,
     pub kind: String,
     pub min_from: String,
-    pub base: String,
     /// The run's hub target, "" = hubs were not moved.
     pub hub_target: String,
-    pub hub_base: String,
     pub plan_set: i64,
 
     /// The attempt in flight, if any.
@@ -672,15 +718,11 @@ pub struct PendingUpgrade {
     pub kind: String,
     /// "*" = any.
     pub min_from: String,
-    /// Release base override, "" = compiled-in.
-    pub base: String,
     /// The hubs' own target.  ircbot and irchub are separate products with
     /// separate version lines and separate release trees, so a hub node is
-    /// never checked against `target_ver`/`base` — those are the bots'.  An
-    /// empty `hub_ver` leaves every hub on the build it runs.
+    /// never checked against `target_ver` — that is the bots'.  An empty
+    /// `hub_ver` leaves every hub on the build it runs.
     pub hub_ver: String,
-    /// irchub-releases override, "" = compiled-in.
-    pub hub_base: String,
     /// Admin connection that started it, or -1.
     pub origin_fd: i32,
     pub started: i64,
@@ -942,12 +984,10 @@ pub struct HubClient {
     /// be handed to the console thread untouched.
     pub sniff_pending: bool,
     pub sniff_deadline_ms: i64,
-    /// Protocol version this bot connection advertised ("v|N" in its config
-    /// push): 0 = not known yet, 1 = its push carried no v| (a
-    /// pre-passwordless build), >= 2 = advertised.  Per connection on
-    /// purpose: a downgraded binary reconnecting is never mistaken for a
-    /// passwordless one.
-    pub bot_proto: i32,
+    /// Set by a handler that found this bot or peer below MESH_MIN_VERSION
+    /// (or a push below BOT_PROTO_USER_FLAGS): the dispatch then drops the
+    /// link.
+    pub refused: bool,
     /// CMD_CHAN_EVENT rate limit for this connection
     /// (CHAN_EVENT_MAX_PER_WINDOW per CHAN_EVENT_WINDOW seconds); dropped
     /// events are counted.
@@ -997,6 +1037,11 @@ pub struct HubClient {
     /// dropped on overflow and whenever the bot sends a config push of its
     /// own.
     pub cfg_sent_hash: Option<[u8; 32]>,
+    /// This connection has pushed its config once: the first push is
+    /// answered with a full config even when it changed nothing (a
+    /// reconnecting bot may hold a stale copy, e.g. its own old key after a
+    /// rekey).
+    pub pushed: bool,
     /// SHA-256 of the last bot tree queued to this bot (CMD_BOT_TREE): a
     /// change push that would repeat it is skipped (the BOT_TREE_REFRESH one
     /// never is).  Cleared when a queued tree is dropped on overflow.
@@ -1037,7 +1082,7 @@ impl HubClient {
             console: None,
             sniff_pending: false,
             sniff_deadline_ms: 0,
-            bot_proto: 0,
+            refused: false,
             chan_ev_window: 0,
             chan_ev_count: 0,
             chan_ev_dropped: 0,
@@ -1062,6 +1107,7 @@ impl HubClient {
             bot_variant: String::new(),
             bot_started: 0,
             cfg_sent_hash: None,
+            pushed: false,
             tree_sent_hash: None,
         }
     }
@@ -1186,6 +1232,8 @@ pub struct HubState {
     /// Derived from `global_entries` (storage.rs): lookup index, per-class
     /// and per-channel ban counts.  `storage::global_reindex` rebuilds it.
     pub global_idx: crate::storage::GlobalIdx,
+    /// K|: what the bots saw on IRC, one per live channel (never a tombstone).
+    pub chan_learned: Vec<ChanLearned>,
 
     /// Named admin/oper records and their usermasks.
     pub user_records: Vec<UserRecord>,
@@ -1225,15 +1273,8 @@ pub struct HubState {
     pub follow_bot_variant: String,
     /// A selective run's resolved selection from the PREPARE, uuid[=v],...
     pub follow_sel: String,
-    /// irchub-releases base for this hub.
-    pub follow_hub_base: String,
     /// Whether this hub itself can take the followed run.
     pub follow_self_ready: bool,
-    /// UPGRADE_PASS_REWRITE_SECS: when the deferred pass rewrite is due (0 =
-    /// none), and whether this process saved HUB_PASS_PREV_FILE —
-    /// update::rollback() restores it only then, never a stale copy.
-    pub pass_rewrite_due: i64,
-    pub pass_prev_saved: bool,
     pub follow_prepared: i64,
     /// Nodes below this hub in the followed run's fan-out tree (its own
     /// peers' subtrees).  Rebuilt for every run; see [`UpgradeRoute`].
@@ -1241,6 +1282,14 @@ pub struct HubState {
     /// Offline roll-up; see [`PendingRollup`].
     pub rollup: PendingRollup,
     pub rollup_tries: Vec<RollupTry>,
+    /// A multi-step upgrade this hub drives.
+    pub plan: UpgradePlan,
+    /// The last `upgrade abort` this hub issued or relayed (see
+    /// UPGRADE_CANCEL_HOLD): its id, when the admin typed it (mesh clock),
+    /// and when this hub heard it (local clock).
+    pub upgrade_cancel_id: String,
+    pub upgrade_cancel_issued: i64,
+    pub upgrade_cancel_seen: i64,
 
     pub ip_limits: Vec<IpRateLimit>,
 
@@ -1271,6 +1320,11 @@ pub struct HubState {
     pub recent_purges: Vec<RecentPurge>,
     /// Timestamp of the last scheduled purge this hub initiated.
     pub last_scheduled_purge: i64,
+    /// Purge floor: until `purge_floor_until`, a tombstone stamped before
+    /// `purge_floor` is not re-created (a sync built before the purge,
+    /// landing after it, would bring it back).  Memory only.
+    pub purge_floor: i64,
+    pub purge_floor_until: i64,
 
     /// OP_FORWARD_REQUEST deduplication: an LRU ring of MAX_SEEN_FORWARD_IDS
     /// slots prevents infinite re-broadcast storms.
@@ -1369,6 +1423,7 @@ impl HubState {
             clients: Vec::new(),
             bots: Vec::new(),
             global_entries: Vec::new(),
+            chan_learned: Vec::new(),
             global_idx: Default::default(),
             user_records: Vec::new(),
             mask_records: Vec::new(),
@@ -1387,14 +1442,15 @@ impl HubState {
             follow_bot_variant: String::new(),
             follow_sel: String::new(),
             follow_hub_target: String::new(),
-            follow_hub_base: String::new(),
             follow_self_ready: false,
-            pass_rewrite_due: 0,
-            pass_prev_saved: false,
             follow_prepared: 0,
             follow_routes: Vec::new(),
             rollup: PendingRollup::default(),
             rollup_tries: Vec::new(),
+            plan: UpgradePlan::default(),
+            upgrade_cancel_id: String::new(),
+            upgrade_cancel_issued: 0,
+            upgrade_cancel_seen: 0,
             ip_limits: Vec::new(),
             ip_allow: Vec::new(),
             ip_deny: Vec::new(),
@@ -1408,6 +1464,8 @@ impl HubState {
             running: true,
             recent_purges: Vec::new(),
             last_scheduled_purge: 0,
+            purge_floor: 0,
+            purge_floor_until: 0,
             seen_forwards: vec![SeenForward::default(); MAX_SEEN_FORWARD_IDS],
             seen_forward_head: 0,
             log_level: HUB_DEFAULT_LOG_LEVEL,

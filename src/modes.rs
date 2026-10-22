@@ -931,59 +931,6 @@ pub fn bans_sweep(state: &mut HubState, now: i64) {
     }
 }
 
-// ---- older hubs (D38) ----------------------------------------------------------
-
-/// hub_old_hubs(): names of peer hubs known to predate MODES_MIN_HUB (2.4.5)
-/// -- they drop C|, D| and B| -- for the console warning.  Hubs whose version
-/// is not known yet are not listed.  At most `max`.
-pub fn old_hubs(state: &HubState, max: usize) -> Vec<String> {
-    old_hubs_for(state, max, MODES_MIN_HUB)
-}
-
-/// The hubs in the mesh map older than `min_ver` (or of unknown version).
-/// C `hub_old_hubs_for`.
-pub fn old_hubs_for(state: &HubState, max: usize, min_ver: &str) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for m in &state.mesh_hubs {
-        if names.len() >= max {
-            break;
-        }
-        if !state.hub_uuid.is_empty() && m.uuid == state.hub_uuid {
-            continue;
-        }
-        if !m.version.is_empty()
-            && crate::update::version_cmp(&m.version, min_ver) != std::cmp::Ordering::Less
-        {
-            continue;
-        }
-        names.push(trunc_string(
-            if m.name.is_empty() { &m.uuid } else { &m.name },
-            64,
-        ));
-    }
-    // A linked peer that never sent a roster at all is older still.
-    for p in &state.peers {
-        if names.len() >= max {
-            break;
-        }
-        if !p.connected || !p.remote_version.is_empty() {
-            continue;
-        }
-        if state.mesh_hubs.iter().any(|m| m.uuid == p.uuid) {
-            continue;
-        }
-        names.push(trunc_string(
-            if p.friendly_name.is_empty() {
-                &p.uuid
-            } else {
-                &p.friendly_name
-            },
-            64,
-        ));
-    }
-    names
-}
-
 // ---- CMD_CHAN_EVENT (D42) --------------------------------------------------------
 
 fn event_action_ok(a: &str) -> bool {

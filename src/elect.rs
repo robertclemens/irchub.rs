@@ -14,7 +14,7 @@ use crate::opflow::{add_pending_chan_request, chan_kind_valid, forward_seen_chec
 use crate::presence::{bot_nick_from_config, roster_clean};
 use crate::reply::Reply;
 use crate::state::{ChanElect, ChanElectBot, ChanElectHub, ChanElectPhase, ClientType, HubState};
-use crate::{client, crypto, queue, update};
+use crate::{client, crypto, queue};
 
 fn find(state: &HubState, id: &str) -> Option<usize> {
     state
@@ -40,16 +40,6 @@ fn alloc(state: &mut HubState) -> Option<usize> {
 /// A uniformly drawn index below n (n > 0).
 fn pick(n: usize) -> usize {
     crypto::random_below(n as u32) as usize
-}
-
-/// Every hub this one knows of speaks the election; otherwise the request
-/// takes the old path end to end (an older hub ignores the new frames).
-pub fn mesh_ready(state: &HubState) -> bool {
-    state.mesh_hubs.iter().all(|m| {
-        (!state.hub_uuid.is_empty() && m.uuid == state.hub_uuid)
-            || (!m.version.is_empty()
-                && update::version_cmp(&m.version, CHAN_ELECT_MIN_HUB) != std::cmp::Ordering::Less)
-    })
 }
 
 fn peer(state: &HubState, fd: i32) -> Option<usize> {
@@ -171,39 +161,6 @@ fn try_local(state: &mut HubState, ei: usize) -> bool {
     }
 }
 
-/// The old path, for local bots that never answered the probe.  Returns how
-/// many were told.
-fn legacy_local(state: &mut HubState, ei: usize) -> i64 {
-    let e = state.chan_elections[ei].clone();
-    // "mode" is new in 2.4.5: an older bot has no old-style request for it.
-    if e.kind == "mode" {
-        return 0;
-    }
-    let mut told = 0;
-    for b in e.bots.iter().filter(|b| b.st == b'a') {
-        let Some(ci) = bot(state, &b.uuid) else {
-            continue;
-        };
-        let ok = if e.kind == "op" {
-            let buf = format!("{}|{}", e.nick, e.channel);
-            client::send_cmd_to_bot(&mut state.clients[ci], CMD_OP_GRANT, &buf)
-        } else {
-            let buf = trunc_string(
-                &format!(
-                    "{}|{}|{}|{}|{}|{}",
-                    e.id, e.kind, e.channel, e.requester, e.nick, e.hostmask
-                ),
-                MAX_MASK_LEN + 256,
-            );
-            client::send_cmd_to_bot(&mut state.clients[ci], CMD_CHAN_ACTION, &buf)
-        };
-        if ok {
-            told += 1;
-        }
-    }
-    told
-}
-
 /// "3 not opped, 1 not in channel" from our own bots' answers.
 fn reasons(e: &ChanElect, cap: usize) -> String {
     let said_no = |b: &ChanElectBot| (b.st == b'n' || b.st == b't') && !b.reason.is_empty();
@@ -245,9 +202,8 @@ fn kind_word(kind: &str) -> &'static str {
 }
 
 /// The origin's end of an election: answer the console that asked, log, and
-/// free the slot.  status: "ok" (one bot did it), "legacy" (older bots were
-/// asked the old way), anything else = nobody could.
-#[allow(clippy::too_many_arguments)]
+/// free the slot.  status: "ok" (one bot did it), "bitch" (refused, D12),
+/// anything else = nobody could.
 fn finish(
     state: &mut HubState,
     ei: usize,
@@ -256,13 +212,11 @@ fn finish(
     by_nick: &str,
     hub_name: &str,
     detail: &str,
-    legacy: i64,
 ) {
     let e = state.chan_elections[ei].clone();
     let asked = e.bots.len() as i64 + e.hubs.iter().map(|h| h.asked).sum::<i64>();
     let hubs = 1 + e.hubs.len() as i64;
     let ok = status == "ok";
-    let leg = status == "legacy";
     let bitch = status == "bitch";
     let who = if e.nick.is_empty() {
         &e.requester
@@ -282,12 +236,6 @@ fn finish(
             e.channel,
             e.id,
             if by_nick.is_empty() { by_uuid } else { by_nick }
-        );
-    } else if leg {
-        crate::hlog_info!(
-            "[CHANREQ] {kw} {who} on {} (id:{}): no ready bot; {legacy} older bot(s) asked\n",
-            e.channel,
-            e.id
         );
     } else {
         crate::hlog_info!(
@@ -320,12 +268,6 @@ fn finish(
                 kw,
                 crate::cstr::trunc(if by_nick.is_empty() { by_uuid } else { by_nick }, 32),
                 crate::cstr::trunc(hub_name, 64)
-            )
-        } else if leg {
-            format!(
-                "{}|ok|asked {legacy} older bot{}",
-                e.reply_rid,
-                if legacy == 1 { "" } else { "s" }
             )
         } else {
             let why = reasons(&e, 160);
@@ -368,32 +310,27 @@ fn finish(
         admin_err(state, ai, "channel.not_authorised", &msg, Some(&hint));
     } else if let Some(ai) = admin {
         let code = format!("channel.{}", e.kind);
-        if ok || leg {
+        if ok {
             let mut r = Reply::new();
             r.ok(&code);
             if !e.nick.is_empty() || e.kind != "mode" {
                 r.kv("nick", &e.nick);
             }
             r.kv("chan", &e.channel);
-            if ok {
-                r.kv("by", if by_nick.is_empty() { by_uuid } else { by_nick });
-                r.kv("by_uuid", by_uuid);
-                r.kv("hub_name", hub_name);
-                if !detail.is_empty() {
-                    r.kv("detail", detail);
-                }
-            } else {
-                r.kvi("legacy", legacy);
+            r.kv("by", if by_nick.is_empty() { by_uuid } else { by_nick });
+            r.kv("by_uuid", by_uuid);
+            r.kv("hub_name", hub_name);
+            if !detail.is_empty() {
+                r.kv("detail", detail);
             }
             r.kvi("asked", asked);
             r.kvi("hubs", hubs);
             if e.kind == "mode"
                 && let Some(cn) = crate::storage::chan_live(state, &e.channel)
             {
-                // the stored string and the warnings ride the apply answer: it
-                // is the one reply channel mode gets
+                // the stored string rides the apply answer: it is the one
+                // reply channel mode gets
                 crate::admin::mf_mode_card_extra(state, &mut r, &cn);
-                crate::admin::mf_reply_old_hubs(state, &mut r);
             }
             send_reply(state, ai, &mut r);
         } else {
@@ -443,7 +380,6 @@ fn finish(
                     ),
                 );
                 er.kvb("stored", true);
-                crate::admin::mf_reply_old_hubs(state, &mut er);
                 send_reply(state, ai, &mut er);
             } else {
                 admin_err(
@@ -485,8 +421,10 @@ fn done_up(
     up(state, ei, CMD_CHAN_ELECT_DONE, &buf);
 }
 
-/// Origin, nobody local can: the next hub with a ready bot, else the older
-/// bots, else nobody.
+/// Origin, nobody local can: the next hub with a ready bot, else nobody.  A
+/// bot that never answered the probe is not handed a blind old-style request:
+/// every bot the mesh admits (MESH_MIN_VERSION) answers probes, so silence
+/// means busy or gone, and the old fan-out skipped +bitch (D12).
 fn try_hub(state: &mut HubState, ei: usize) {
     loop {
         let e = &state.chan_elections[ei];
@@ -508,23 +446,7 @@ fn try_hub(state: &mut HubState, ei: usize) {
         e.phase_at = now();
         return;
     }
-    let mut legacy = legacy_local(state, ei);
-    let e = state.chan_elections[ei].clone();
-    for h in e.hubs.iter().filter(|h| h.silent > 0 && e.kind != "mode") {
-        if send_peer(
-            state,
-            h.fd,
-            CMD_CHAN_ELECT_DO,
-            &format!("{}|{}|legacy", e.id, h.uuid),
-        ) {
-            legacy += h.silent;
-        }
-    }
-    if legacy > 0 {
-        finish(state, ei, "legacy", "", "", "", "", legacy);
-    } else {
-        finish(state, ei, "nobody", "", "", "", "", 0);
-    }
+    finish(state, ei, "nobody", "", "", "", "");
 }
 
 /// Nothing (more) to do locally: the origin asks the mesh, a relay says so.
@@ -659,7 +581,7 @@ pub fn process_done(state: &mut HubState, ci: usize, payload: &str) {
     if status == "ok" {
         if e.origin {
             let hn = hub_display_name(state).to_string();
-            finish(state, ei, "ok", &from, &nick, &hn, &clean, 0);
+            finish(state, ei, "ok", &from, &nick, &hn, &clean);
         } else {
             done_up(state, ei, &from, &nick, "ok", &clean);
             state.chan_elections[ei].phase = ChanElectPhase::Acked;
@@ -671,7 +593,7 @@ pub fn process_done(state: &mut HubState, ci: usize, payload: &str) {
     if status == "fail" && clean == "bitch" && state.chan_elections[ei].kind == "op" {
         if state.chan_elections[ei].origin {
             let hn = hub_display_name(state).to_string();
-            finish(state, ei, "bitch", &from, &nick, &hn, &clean, 0);
+            finish(state, ei, "bitch", &from, &nick, &hn, &clean);
         } else {
             done_up(state, ei, &from, &nick, "fail", &clean);
             state.chan_elections[ei].phase = ChanElectPhase::Acked;
@@ -791,7 +713,8 @@ pub fn process_elect_ack(state: &mut HubState, ci: usize, payload: &str) {
     }
 }
 
-/// ELECT_DO: eid|hub_uuid|elect or legacy.  Ours: act; else route it on.
+/// ELECT_DO: eid|hub_uuid|elect.  Ours: act; else route it on.  "legacy"
+/// (from a 2.5.0 origin) is no longer acted on: see try_hub.
 pub fn process_elect_do(state: &mut HubState, ci: usize, payload: &str) {
     let f = |i, cap| wire_field(payload, i, cap).unwrap_or_default();
     let (id, hub, mode) = (f(0, 64), f(1, 64), f(2, 8));
@@ -810,20 +733,7 @@ pub fn process_elect_do(state: &mut HubState, ci: usize, payload: &str) {
         }
         return;
     }
-    if mode == "legacy" {
-        let n = legacy_local(state, ei);
-        let e = &state.chan_elections[ei];
-        crate::hlog_info!(
-            "[CHANREQ] {} {} on {} (id:{}): {n} older bot(s) asked here\n",
-            kind_word(&e.kind),
-            if e.nick.is_empty() {
-                &e.requester
-            } else {
-                &e.nick
-            },
-            e.channel,
-            e.id
-        );
+    if mode != "elect" {
         return;
     }
     if !try_local(state, ei) {
@@ -864,7 +774,6 @@ pub fn process_elect_done(state: &mut HubState, _ci: usize, payload: &str) {
             &roster_clean(&nick, MAX_NICK),
             &cn,
             &roster_clean(&detail, 96),
-            0,
         );
     } else if status == "fail"
         && roster_clean(&detail, 96) == "bitch"
@@ -878,7 +787,6 @@ pub fn process_elect_done(state: &mut HubState, _ci: usize, payload: &str) {
             &roster_clean(&nick, MAX_NICK),
             &cn,
             &roster_clean(&detail, 96),
-            0,
         );
     } else {
         try_hub(state, ei);
@@ -918,7 +826,7 @@ pub fn tick(state: &mut HubState, t: i64) {
         }
         if t - e.created > CHAN_ELECT_TTL {
             if e.origin {
-                finish(state, ei, "timeout", "", "", "", "timed out", 0);
+                finish(state, ei, "timeout", "", "", "", "timed out");
             }
             state.chan_elections[ei].active = false;
             continue;
@@ -928,6 +836,16 @@ pub fn tick(state: &mut HubState, t: i64) {
                 if count(e, b'a') > 0 && t - e.phase_at < CHAN_ELECT_PROBE_WAIT {
                     continue;
                 }
+                // still silent: a no, with the reason the answer gives
+                for b in state.chan_elections[ei]
+                    .bots
+                    .iter_mut()
+                    .filter(|b| b.st == b'a')
+                {
+                    b.st = b'n';
+                    b.reason = "no answer".into();
+                }
+                let e = &state.chan_elections[ei];
                 if !e.origin {
                     let ack = format!(
                         "{}|{}|{}|{}|{}|{}",
@@ -1081,27 +999,6 @@ pub fn process_user_chan_request(state: &mut HubState, ci: usize, payload: &str)
         "[CHANREQ] {kind} for {nick} ({}) on {chan}, from {id}\n",
         u.name
     );
-    if !mesh_ready(state) {
-        // An older hub in the mesh: the old ask-everyone path, no answer back.
-        if kind == "op" {
-            return fail(state, "older hubs in the mesh: ask an admin");
-        }
-        let request_id = crate::opflow::generate_request_id();
-        forward_seen_check_and_add(state, &request_id);
-        crate::opflow::chan_request_dispatch(
-            state,
-            &request_id,
-            &u.uuid,
-            &kind,
-            &chan,
-            &nick,
-            &mask,
-            -1,
-        );
-        let res = format!("{rid}|ok|asked every bot (older hubs in the mesh)");
-        client::send_cmd_to_bot(&mut state.clients[ci], CMD_USER_CHAN_RESULT, &res);
-        return;
-    }
     let Some(ei) = start(state, &kind, &chan, &u.uuid, &nick, &mask, None) else {
         return fail(state, "too many channel requests in flight; try again");
     };

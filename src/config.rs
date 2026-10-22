@@ -24,13 +24,9 @@ use crate::{access, crypto, ratelimit, storage};
 // a|/o| user record codec (docs/passwordless.md §3.1)
 // ---------------------------------------------------------------------------
 //
-//   new     uuid|name|pubkey|add/del|last_seen|ts|<reserved, empty>
-//   legacy  uuid|name|password|add/del|last_seen|ts[|pubkey]
+//   uuid|name|pubkey|add/del|last_seen|ts|<reserved, empty>
 //
-// Field 3 decides.  A valid key there means the new format; anything else is
-// a legacy password, which is never copied anywhere, and the key (if any) is
-// field 7.  Covers every older shape, including an old hub that stored a
-// pubkey in the password slot.
+// pubkey may be empty (a user not given a key yet).
 
 /// A field that is exactly a valid 88-char combined public key.
 fn field_pubkey(f: &str) -> Option<String> {
@@ -63,9 +59,9 @@ pub fn parse_opt_value(v: &str) -> Option<(String, i64)> {
     }
 }
 
-/// hub_parse_user_record().  The bool reports whether a legacy (password)
-/// shape was seen.
-pub fn parse_user_record(data: &str, typ: char) -> Option<(UserRecord, bool)> {
+/// hub_parse_user_record(): anything in the key field that is not a valid
+/// key refuses the line.
+pub fn parse_user_record(data: &str, typ: char) -> Option<UserRecord> {
     let f = split_fields(data, 8);
     if f.len() < 6 || !crate::cstr::is_uuid(f[0]) {
         return None;
@@ -82,49 +78,25 @@ pub fn parse_user_record(data: &str, typ: char) -> Option<(UserRecord, bool)> {
         timestamp: atoll(f[5]),
         ..Default::default()
     };
-    let mut legacy = false;
-    match field_pubkey(f[2]) {
-        Some(k) => {
-            out.pubkey_b64 = k;
-            out.has_pubkey = true;
-        }
-        None => {
-            legacy = true;
-            if f.len() >= 7
-                && let Some(k) = field_pubkey(f[6])
-            {
-                out.pubkey_b64 = k;
-                out.has_pubkey = true;
-            }
-        }
+    if !f[2].is_empty() {
+        out.pubkey_b64 = field_pubkey(f[2])?;
+        out.has_pubkey = true;
     }
-    Some((out, legacy))
+    Some(out)
 }
 
-/// hub_format_user_record(): a full line including its "\n".  `legacy_v1`
-/// emits the fail-closed shape for bots that have not advertised v|2:
-/// `a|uuid|name||act|seen|ts|pubkey`.
-pub fn format_user_record(u: &UserRecord, legacy_v1: bool) -> String {
+/// hub_format_user_record(): a full line including its "\n".
+pub fn format_user_record(u: &UserRecord) -> String {
     let pk = if u.has_pubkey {
         u.pubkey_b64.as_str()
     } else {
         ""
     };
     let act = if u.is_active { "add" } else { "del" };
-    if legacy_v1 {
-        // Old bots read field 3 as a ~A1 password: leave it EMPTY so they
-        // refuse every admin command (fail closed); they still get the key in
-        // field 7.
-        format!(
-            "{}|{}|{}||{}|{}|{}|{}\n",
-            u.typ, u.uuid, u.name, act, u.last_seen, u.timestamp, pk
-        )
-    } else {
-        format!(
-            "{}|{}|{}|{}|{}|{}|{}|\n",
-            u.typ, u.uuid, u.name, pk, act, u.last_seen, u.timestamp
-        )
-    }
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|\n",
+        u.typ, u.uuid, u.name, pk, act, u.last_seen, u.timestamp
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -207,32 +179,63 @@ pub fn write(state: &mut HubState) {
     }
 
     // The roll-up plan (upgrade plan, Task 13): hub-local, never replicated.
-    // rollup|target|variant|kind|min_from|hub_target|plan_set|base|hub_base —
-    // every field was checked free of '|' and line breaks before it was
-    // accepted (upgrade::plan_field_ok), and is checked again here, so the
-    // line can never split or inject another.
+    // rollup|target|variant|kind|min_from|hub_target|plan_set|| — the two
+    // trailing slots once held run bases (gone in 2.5.1) and stay empty so a
+    // rolled-back 2.5.0 still reads the line.  Every field was checked free
+    // of '|' and line breaks before it was accepted (upgrade::plan_field_ok),
+    // and is checked again here, so the line can never split or inject
+    // another.
     {
         let r = &state.rollup;
-        let fields = [
-            &r.target,
-            &r.variant,
-            &r.kind,
-            &r.min_from,
-            &r.hub_target,
-            &r.base,
-            &r.hub_base,
-        ];
+        let fields = [&r.target, &r.variant, &r.kind, &r.min_from, &r.hub_target];
         if r.have_plan && fields.iter().all(|f| crate::upgrade::plan_field_ok(f)) {
             buf.push_str(&format!(
-                "rollup|{}|{}|{}|{}|{}|{}|{}|{}\n",
-                r.target,
-                r.variant,
-                r.kind,
-                r.min_from,
-                r.hub_target,
-                r.plan_set,
-                r.base,
-                r.hub_base
+                "rollup|{}|{}|{}|{}|{}|{}||\n",
+                r.target, r.variant, r.kind, r.min_from, r.hub_target, r.plan_set
+            ));
+        }
+    }
+
+    // A multi-step upgrade this hub drives (hub-local, never replicated):
+    // uplan|bot_target|hub_target|variant|kind|step|run_id|started|progressed|
+    //       bot_from|hub_from|bot_path|hub_path|sel
+    // The hub restarts onto each step itself; this line is how it carries on.
+    // Every field passed plan_field_ok when it was set and is checked again
+    // here, so the line can never split or inject another.
+    {
+        let p = &state.plan;
+        let fields = [
+            &p.bot_target,
+            &p.hub_target,
+            &p.variant,
+            &p.kind,
+            &p.run_id,
+            &p.bot_from,
+            &p.hub_from,
+            &p.sel,
+        ];
+        if p.active
+            && fields.iter().all(|f| crate::upgrade::plan_field_ok(f))
+            && p.bot_path
+                .iter()
+                .chain(&p.hub_path)
+                .all(|v| crate::upgrade::plan_field_ok(v))
+        {
+            buf.push_str(&format!(
+                "uplan|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+                p.bot_target,
+                p.hub_target,
+                p.variant,
+                p.kind,
+                p.step,
+                p.run_id,
+                p.started,
+                p.progressed,
+                p.bot_from,
+                p.hub_from,
+                p.bot_path.join(","),
+                p.hub_path.join(","),
+                p.sel
             ));
         }
     }
@@ -278,6 +281,8 @@ pub fn write(state: &mut HubState) {
             }
         }
     }
+    // K|: what the bots saw on IRC, after the c| lines it needs at load.
+    storage::learned_append(state, &mut buf);
 
     // Local IP access lists: w|<pattern>|<added> (allow), x|... (deny).
     // The console scope (D27) is written wc|/xc|, which older hubs ignore.
@@ -295,7 +300,7 @@ pub fn write(state: &mut HubState) {
     // own uuid).  Writing only the first per name kept the oldest tombstone
     // and lost the live user on the next start.
     for u in &state.user_records {
-        let line = format_user_record(u, false);
+        let line = format_user_record(u);
         if line.len() >= USER_LINE_MAX {
             crate::hlog_error!(
                 "[CONFIG] user record for '{}' exceeds its line bound; NOT written (previous file kept)\n",
@@ -493,64 +498,42 @@ fn load_bot_line(state: &mut HubState, v: &str) {
     }
 }
 
-/// One `peer|` config line body.  Formats accepted:
-///   `ip|port`                              (oldest)
-///   `ip|port|uuid|friendly_name`           (v1)
-///   `ip|port|uuid|friendly_name|pubkey_b64` (v2; pubkey may be empty)
+/// One `peer|` config line body: `ip|port|uuid|friendly_name|pubkey_b64`
+/// (pubkey may be empty).
 fn load_peer_line(state: &mut HubState, v: &str) {
+    let f: Vec<&str> = v.splitn(5, '|').collect();
+    if f.len() < 4 || f[2].is_empty() {
+        crate::hlog_warning!("[CONFIG] Ignoring malformed peer line\n");
+        return;
+    }
     if state.peers.len() >= MAX_PEERS {
         return;
     }
-    let sep = v.find('|').or_else(|| v.find(':'));
-    let Some(sep) = sep else { return };
-    let ip = &v[..sep];
-    let after = &v[sep + 1..];
-
     let mut p = crate::state::PeerConfig {
-        ip: trunc_string(ip, 64),
+        ip: trunc_string(f[0], 64),
+        port: crate::cstr::atoi(f[1]),
+        uuid: trunc_string(f[2], 64),
         fd: -1,
         ..Default::default()
     };
-
-    match after.find('|') {
-        None => {
-            // Old format: peer|ip|port.
-            p.port = crate::cstr::atoi(after);
-        }
-        Some(i) => {
-            p.port = crate::cstr::atoi(&after[..i]);
-            let rest = &after[i + 1..];
-            let (uuid, rest) = match rest.find('|') {
-                Some(j) => (&rest[..j], Some(&rest[j + 1..])),
-                None => (rest, None),
-            };
-            p.uuid = trunc_string(uuid, 64);
-            if let Some(rest) = rest {
-                let (name, pubkey) = match rest.find('|') {
-                    Some(j) => (&rest[..j], Some(&rest[j + 1..])),
-                    None => (rest, None),
-                };
-                if !name.is_empty() {
-                    p.friendly_name = trunc_string(name, 64);
-                }
-                if let Some(pk) = pubkey
-                    && !pk.is_empty()
-                {
-                    match crypto::b64_decode(pk) {
-                        Some(dec) if dec.len() == COMBINED_KEY_LEN => {
-                            p.ed_pub.copy_from_slice(&dec[..ED25519_KEY_LEN]);
-                            p.x25519_pub.copy_from_slice(&dec[ED25519_KEY_LEN..]);
-                            p.has_pubkey = true;
-                        }
-                        other => {
-                            crate::hlog_warning!(
-                                "[PEER] peer {} pubkey wrong length ({}, need {COMBINED_KEY_LEN}) — ignoring; v2 auth disabled for this peer\n",
-                                p.uuid,
-                                other.map_or(0, |d| d.len())
-                            );
-                        }
-                    }
-                }
+    if !f[3].is_empty() {
+        p.friendly_name = trunc_string(f[3], 64);
+    }
+    if let Some(pk) = f.get(4)
+        && !pk.is_empty()
+    {
+        match crypto::b64_decode(pk) {
+            Some(dec) if dec.len() == COMBINED_KEY_LEN => {
+                p.ed_pub.copy_from_slice(&dec[..ED25519_KEY_LEN]);
+                p.x25519_pub.copy_from_slice(&dec[ED25519_KEY_LEN..]);
+                p.has_pubkey = true;
+            }
+            other => {
+                crate::hlog_warning!(
+                    "[PEER] peer {} pubkey wrong length ({}, need {COMBINED_KEY_LEN}) — ignoring; v2 auth disabled for this peer\n",
+                    p.uuid,
+                    other.map_or(0, |d| d.len())
+                );
             }
         }
     }
@@ -720,8 +703,8 @@ fn dedup_records(state: &mut HubState) -> bool {
 
 /// hub_config_load().
 pub fn load(state: &mut HubState, password: &str) -> bool {
-    // Password-era a|/o| lines, or a p| line, seen.
-    let mut cfg_legacy_users = 0u32;
+    // a|/o| lines that did not parse.
+    let mut cfg_bad_users = 0u32;
     // w|/x| lines dropped, merged or canonicalised.
     let mut cfg_acl_fixed = 0u32;
 
@@ -749,24 +732,12 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
     let tag = &file[SALT_SIZE + GCM_IV_LEN..hdr];
     let ct = &file[hdr..];
 
-    // Current PBKDF2 count first, then the pre-2.5.0 count for a one-time
-    // migration: a legacy hit is rewritten under the current count below
-    // (never under -selftest, which must not touch the running build's file).
-    let open = |iterations| {
-        let key = crypto::derive_config_key(password.as_bytes(), salt, iterations);
-        crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag)
-    };
-    let (plain, kdf_legacy) = match open(PBKDF2_ITERATIONS) {
-        Some(p) => (p, false),
-        None => match open(PBKDF2_ITERATIONS_LEGACY) {
-            Some(p) => (p, true),
-            None => {
-                crate::hlog_error!(
-                    "[HUB] Config decryption failed (wrong password or corrupted file)\n"
-                );
-                return false;
-            }
-        },
+    let key = crypto::derive_config_key(password.as_bytes(), salt, PBKDF2_ITERATIONS);
+    let Some(plain) = crypto::gcm_decrypt_detached(key.as_ref(), iv, &[], ct, tag) else {
+        crate::hlog_error!(
+            "[HUB] Config decryption failed (wrong password, corrupted file, or written before 2.5.0: run 2.5.0 once)\n"
+        );
+        return false;
     };
     let text = Zeroizing::new(String::from_utf8_lossy(&plain).into_owned());
 
@@ -794,11 +765,6 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                     state.hub_friendly_name = trunc_string(v, 64);
                 }
             }
-            // Legacy 'admin|' line ignored (the global admin password was
-            // dropped in favour of per-admin records).  Old configs simply
-            // lose the field on the next save; admins must already exist as
-            // a| records.
-            "admin" => {}
             "log_level" => {
                 state.log_level = crate::cstr::atoi(v).clamp(LOG_NONE, LOG_DEBUG);
             }
@@ -848,7 +814,8 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                 }
             }
             // rollup|target|variant|kind|min_from|hub_target|plan_set|base|hub_base
-            // — see write().  A line that does not parse cleanly is dropped
+            // — see write(); the two base slots are read past and ignored.
+            // A line that does not parse cleanly is dropped
             // whole: no plan is better than half of one.
             "rollup" => {
                 let f: Vec<&str> = v.split('|').collect();
@@ -867,12 +834,78 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                     r.min_from = f[3].to_string();
                     r.hub_target = f[4].to_string();
                     r.plan_set = ts;
-                    r.base = f[6].to_string();
-                    r.hub_base = f[7].to_string();
                     r.have_plan = true;
                 } else {
                     state.rollup = Default::default();
                     crate::hlog_warning!("[CONFIG] Ignoring a malformed rollup| line\n");
+                }
+            }
+            // uplan|… — see write().  Dropped whole when it does not parse:
+            // no plan is better than half of one, and the admin can start
+            // again.
+            "uplan" => {
+                let f: Vec<&str> = v.split('|').collect();
+                let caps = [
+                    64,
+                    64,
+                    8,
+                    8,
+                    0,
+                    64,
+                    0,
+                    0,
+                    64,
+                    64,
+                    0,
+                    0,
+                    MAX_UPGRADE_SELECT * 80,
+                ];
+                let path = |s: &str| -> Option<Vec<String>> {
+                    if s.is_empty() {
+                        return Some(Vec::new());
+                    }
+                    let p: Vec<String> = s.split(',').map(str::to_string).collect();
+                    (p.len() <= MAX_UPGRADE_STEPS
+                        && p.iter().all(|x| {
+                            !x.is_empty() && x.len() < 64 && crate::upgrade::plan_field_ok(x)
+                        }))
+                    .then_some(p)
+                };
+                let ok = f.len() == 13
+                    && !f[0].is_empty()
+                    && f.iter().zip(caps).all(|(x, cap)| {
+                        cap == 0 || (x.len() < cap && crate::upgrade::plan_field_ok(x))
+                    });
+                let paths = if ok {
+                    path(f[10]).zip(path(f[11]))
+                } else {
+                    None
+                };
+                let step = if ok { parse_uint(f[4], u64::MAX) } else { None };
+                match (paths, step) {
+                    (Some((bp, hp)), Some(step)) if (step as usize) < bp.len().max(hp.len()) => {
+                        state.plan = crate::state::UpgradePlan {
+                            active: true,
+                            bot_target: f[0].to_string(),
+                            hub_target: f[1].to_string(),
+                            variant: f[2].to_string(),
+                            kind: f[3].to_string(),
+                            step: step as usize,
+                            run_id: f[5].to_string(),
+                            started: crate::cstr::atoll(f[6]),
+                            progressed: crate::cstr::atoll(f[7]),
+                            bot_from: f[8].to_string(),
+                            hub_from: f[9].to_string(),
+                            bot_path: bp,
+                            hub_path: hp,
+                            sel: f[12].to_string(),
+                            ..Default::default()
+                        };
+                    }
+                    _ => {
+                        state.plan = Default::default();
+                        crate::hlog_warning!("[CONFIG] Ignoring a malformed uplan| line\n");
+                    }
                 }
             }
             "lamport_seq" => {
@@ -893,7 +926,7 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                     state.hub_keys_loaded = true;
                 }
                 Some(_) => crate::hlog_error!(
-                    "[HUB] Hub private key in config is not 64 bytes (legacy RSA?). Re-run -setup with a Curve25519 key.\n"
+                    "[HUB] Hub private key in config is not 64 bytes. Re-run -setup with a Curve25519 key.\n"
                 ),
                 None => {}
             },
@@ -915,20 +948,16 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                 cfg_acl_fixed += 1; // rewrite as w|/x|
             }
             "g" => load_global_line(state, v),
-            // hub_parse_user_record: new uuid|name|pubkey|act|seen|ts| or the
-            // legacy password shape (password dropped).  The pre-UUID global
-            // admin-password shape a|<password>|<ts> is ignored outright.
+            // hub_parse_user_record: uuid|name|pubkey|act|seen|ts|
             "a" | "o" => {
                 if state.user_records.len() < MAX_HUB_USER_RECORDS {
                     match parse_user_record(v, k.as_bytes()[0] as char) {
-                        Some((u, legacy)) => {
-                            state.user_records.push(u);
-                            if legacy {
-                                cfg_legacy_users += 1;
-                            }
+                        Some(u) => state.user_records.push(u),
+                        None => {
+                            crate::hlog_warning!("[CONFIG] Ignoring malformed {} line\n", k);
+                            // Rewrite without the unparseable line.
+                            cfg_bad_users += 1;
                         }
-                        // Rewrite without the unparseable line.
-                        None => cfg_legacy_users += 1,
                     }
                 }
             }
@@ -950,6 +979,13 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                     storage::put_record(state, k, &v[..p], atoll(&v[p + 1..]));
                 }
             }
+            // K|chan|key|modes|ts: kept only for a channel managed here (c| is
+            // written first); anything else is an orphan and stays behind.
+            "K" => {
+                if !storage::learned_ingest(state, v) {
+                    crate::hlog_debug!("[CONFIG] Dropped K| line for a channel not managed here\n");
+                }
+            }
             // bu|<#chan|*>|<mask>|<last_used>: a ban's last use, written right
             // after its B| line (activity, outside LWW).  No live ban: dropped.
             "bu" => {
@@ -964,8 +1000,6 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
                     }
                 }
             }
-            // Retired shared bot password: dropped (bots use public keys).
-            "p" => cfg_legacy_users += 1,
             "w" | "x" | "wc" | "xc"
                 if !load_ip_acl_line(state, k.as_bytes()[0] as char, v, k.len() == 2) =>
             {
@@ -996,34 +1030,14 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
     access::prune(state);
     let mut access_changed = state.uflag_records.len() + state.uchan_records.len() != access_before;
     access_changed |= access::migrate(state) > 0;
-    // Deleted bots from before the revoke list join it.
-    let rv_new = crate::revoke::migrate(state);
-    if rv_new > 0 {
-        crate::hlog_info!("[REVOKE] {rv_new} deleted bot(s) added to the revoke list\n");
-        access_changed = true;
-    }
     if access_changed {
         write(state);
-    } else if cfg_legacy_users > 0 || cfg_acl_fixed > 0 || kdf_legacy {
-        // Rewrite once so the passwords / p| line, IP-list lines that were
-        // dropped or canonicalised, and a pre-2.5.0 PBKDF2 count leave the
-        // file for good.
+    } else if cfg_bad_users > 0 || cfg_acl_fixed > 0 {
+        // Rewrite once so unparseable user lines and IP-list lines that were
+        // dropped or canonicalised leave the file for good.
         write(state);
     }
 
-    if kdf_legacy && !READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::hlog_info!(
-            "[HUB] Config re-encrypted with PBKDF2 {}k (was {}k)\n",
-            PBKDF2_ITERATIONS / 1000,
-            PBKDF2_ITERATIONS_LEGACY / 1000
-        );
-    }
-
-    if cfg_legacy_users > 0 {
-        crate::hlog_info!(
-            "[HUB] Config migrated to passwordless records ({cfg_legacy_users} legacy line(s)); passwords dropped\n"
-        );
-    }
     for u in &state.user_records {
         if u.is_active && !u.has_pubkey {
             crate::hlog_warning!(
@@ -1058,29 +1072,24 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAg=";
     fn user_record_new_shape_roundtrips() {
         let k = real_key();
         let line = format!("11111111-2222-3333-4444-555555555555|rob|{k}|add|10|20|");
-        let (u, legacy) = parse_user_record(&line, 'a').unwrap();
-        assert!(!legacy);
+        let u = parse_user_record(&line, 'a').unwrap();
         assert_eq!(u.name, "rob");
         assert!(u.has_pubkey);
         assert_eq!(u.pubkey_b64, k);
         assert!(u.is_active);
         assert_eq!((u.last_seen, u.timestamp), (10, 20));
-        assert_eq!(format_user_record(&u, false), format!("a|{line}\n"));
+        assert_eq!(format_user_record(&u), format!("a|{line}\n"));
     }
 
     #[test]
-    fn legacy_password_is_dropped_and_key_taken_from_field_7() {
+    fn password_era_shape_is_refused() {
         let k = real_key();
         let line = format!("11111111-2222-3333-4444-555555555555|rob|hunter2|add|10|20|{k}");
-        let (u, legacy) = parse_user_record(&line, 'a').unwrap();
-        assert!(legacy);
-        assert!(u.has_pubkey);
-        assert_eq!(u.pubkey_b64, k);
-        // The password never reaches any output shape; the legacy line leaves
-        // field 3 EMPTY so an old bot fails closed.
-        let out = format_user_record(&u, true);
-        assert!(!out.contains("hunter2"));
-        assert!(out.starts_with("a|11111111-2222-3333-4444-555555555555|rob||add|10|20|"));
+        assert!(parse_user_record(&line, 'a').is_none());
+        // A user not given a key yet: an empty key field.
+        let u =
+            parse_user_record("11111111-2222-3333-4444-555555555555|rob||add|10|20|", 'a').unwrap();
+        assert!(!u.has_pubkey);
     }
 
     #[test]
@@ -1093,14 +1102,14 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAg=";
         assert!(
             parse_user_record("11111111-2222-3333-4444-555555555555|rob|k|add|1", 'a').is_none()
         );
-        // A field-3 value that is 88 chars but not a valid key is a password.
-        let (u, legacy) = parse_user_record(
-            &format!("11111111-2222-3333-4444-555555555555|rob|{KEY}|add|1|2|"),
-            'a',
-        )
-        .unwrap();
-        assert!(legacy);
-        assert!(!u.has_pubkey);
+        // A field-3 value that is 88 chars but not a valid key is refused.
+        assert!(
+            parse_user_record(
+                &format!("11111111-2222-3333-4444-555555555555|rob|{KEY}|add|1|2|"),
+                'a',
+            )
+            .is_none()
+        );
     }
 
     #[test]

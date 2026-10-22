@@ -1,6 +1,6 @@
 [package]
 name = "irchub"
-version = "2.5.0"
+version = "2.5.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Encrypted hub mesh for ircbot (safe-Rust port of irchub.c)"
@@ -18,6 +18,12 @@ path = "src/main.rs"
 [[bin]]
 name = "keygen"
 path = "src/bin/keygen.rs"
+
+[features]
+# Testnet only, never a release: compiles in the env overrides that point the
+# updater at a sandbox release tree and its throwaway signing key.  Without it
+# the binary has no code that reads them (see update.rs env_base).
+test-hooks = []
 
 [dependencies]
 # Cryptography (RustCrypto + dalek), matched to ircbot.rs so the two trees

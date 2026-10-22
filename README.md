@@ -144,7 +144,7 @@ This prompts for the config password (with confirmation), then writes `.irchub.p
 
 When `.irchub.pass` is present and passes validation (correct ownership, `0600` permissions, GCM tag intact), irchub reads the password from it automatically and no interactive input is required. If the file is absent, has wrong permissions, or fails decryption, irchub falls back to the stdin prompt.
 
-Since 2.5.0 the `.irchub.cnf` and `.irchub.pass` keys use PBKDF2-HMAC-SHA256 with 600,000 rounds (was 100,000). A 2.5.0+ hub still reads older files and rewrites them once: the config on its first start, the pass file at once on an ordinary start, or 120 s after a start made by a hub-driven upgrade (once the old build's 20 s watchdog can no longer put that build back). That later rewrite keeps the old file as `.irchub.pass.prev`, which a hub-ordered rollback of that same run restores, and the next ordinary start deletes. After that an older build cannot read them, so do not copy a pre-2.5.0 binary over a migrated hub.
+From 2.5.1 only files keyed with PBKDF2-HMAC-SHA256 at 600,000 rounds are read (`.irchub.cnf` and `.irchub.pass`). A node must run 2.5.0 once first, which rewrites them; a pass file 2.5.0 never rewrote makes `-selftest` refuse the upgrade. A pre-2.5.0 binary cannot read the migrated files, so do not copy one over a hub.
 
 ### 4. Auto-start (optional — requires password file)
 
@@ -196,7 +196,7 @@ Rekeying is bot-local: only the bot holds its private key. `bot rekey <uuid>` sh
 - `user set <name> key <pubkey>` — replaces a key (rotation, a lost key, or a legacy user with no key). UUID and usermasks are kept; the old key stops working on the hub and on every bot as soon as it syncs.
 - `user list`, `user show <name|*>` — each user's flags or channels, key fingerprint and masks; `user mask add|del <name> <mask>` manages usermasks.
 - On IRC (outside opt `h`): `+admin <name> <pubkey> <mask> <+a|flags>`, `+oper <name> <pubkey> <mask> <*|#a,#b>`, `chattr <name> <+x-y>`, `chanoper add|del <#chan|*> <oper>`.
-- Older bots (before `v|3`) and hubs (before 2.4.7) never receive a restricted admin or a channel-bound oper: they would over-trust them.
+- Bots and hubs below 2.5.0 are refused, so no node that would over-trust a restricted admin or a channel-bound oper is ever served one.
 
 ### Opt flags
 
@@ -208,7 +208,7 @@ The hub's private key lives only inside the encrypted `.irchub.cnf`; no command 
 
 ## Peer Mesh
 
-Multiple hub instances can be linked to share configuration and bot state. Link another hub with `hub add <ip> <port> <uuid> <name> <pubkey>` (on that hub, `./irchub -id` prints its uuid and pubkey — and this whole `hub add` line — from the config; `hub show` in its console shows the same; `hub_public.b64` is only `-setup`'s copy and goes stale after a `hub rekey`); `hub list` shows the links. Peers authenticate each other with Ed25519 signatures (`HUBv3`); a pre-passwordless hub (`HUBv2`) is refused, so upgrade all hubs together.
+Multiple hub instances can be linked to share configuration and bot state. Link another hub with `hub add <ip> <port> <uuid> <name> <pubkey>` (on that hub, `./irchub -id` prints its uuid and pubkey — and this whole `hub add` line — from the config; `hub show` in its console shows the same; `hub_public.b64` is only `-setup`'s copy and goes stale after a `hub rekey`); `hub list` shows the links. Peers authenticate each other with Ed25519 signatures (`HUBv3`); a hub below 2.5.0 is refused, so upgrade all hubs by hand to 2.5.0 first.
 
 Connected peers:
 - Synchronize bot config and global config entries
@@ -218,7 +218,7 @@ Connected peers:
 
 ## Configuration
 
-The config file (`.irchub.cnf`) is AES-256-GCM encrypted with a key derived from your config password via PBKDF2-SHA256 (100,000 iterations). It is never stored in plaintext.
+The config file (`.irchub.cnf`) is AES-256-GCM encrypted with a key derived from your config password via PBKDF2-SHA256 (600,000 iterations). It is never stored in plaintext.
 
 **Settings managed from the console:**
 
@@ -254,7 +254,7 @@ Writes `YYYYMMDDHHMMSS_<name>.private.b64` (mode 0600) and `YYYYMMDDHHMMSS_<name
 - Each IP is limited to 5 simultaneous connections (`MAX_CONNECTIONS_PER_IP` in `src/consts.rs` — compile-time constant).
 - Private key material is wiped from memory as soon as it is no longer needed: secrets live in `Zeroizing` buffers, and the config password and the hub's two private key halves sit in heap-pinned, `mlock`'d `Locked` buffers that wipe on drop.
 - No private key ever crosses the network: bots, admins and opers make their own keypairs and only public keys are registered and synced. Admins reach the hub only through its SSH console (public-key auth against the admin record; the host key is the hub's own key, so `known_hosts` pins the hub).
-- Mixed-version rollout is fail-closed: bots that have not advertised protocol `v|2` get records with an empty password slot, and pre-passwordless hubs are refused as peers ([`irchub/docs/passwordless.md`](https://github.com/robertclemens/irchub/blob/main/docs/passwordless.md) §9).
+- Version floor is fail-closed: bots and peer hubs below 2.5.0 are refused (a bot push below protocol `v|3`, or with no `v|`, is refused before any line is applied) and must be upgraded by hand to 2.5.0 ([`irchub/docs/passwordless.md`](https://github.com/robertclemens/irchub/blob/main/docs/passwordless.md) §9).
 
 ## Files
 
