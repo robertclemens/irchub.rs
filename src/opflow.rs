@@ -133,7 +133,8 @@ pub fn forward_op_request_to_peers(
             return;
         }
         crate::hlog_debug!(
-            "[HUB] Routed OP_FORWARD_REQUEST (id:{request_id}) to peer fd={fd}, the hub of {target_uuid}\n"
+            "[HUB] Routed OP_FORWARD_REQUEST (id:{request_id}) to peer fd={fd}, the hub of {target_uuid}\n",
+            target_uuid = state.who('b', target_uuid)
         );
         return;
     }
@@ -225,7 +226,7 @@ pub fn process_op_request(state: &mut HubState, ci: usize, payload: &str) {
     if conv.len() != 2 {
         crate::hlog_warning!(
             "[HUB] Invalid OP_REQUEST payload from {}\n",
-            state.clients[ci].id
+            state.who_client(ci)
         );
         return;
     }
@@ -233,13 +234,20 @@ pub fn process_op_request(state: &mut HubState, ci: usize, payload: &str) {
     let channel = conv[1].s().to_string();
     let id = state.clients[ci].id.clone();
     let fd = state.clients[ci].fd;
-    crate::hlog_info!("[HUB] OP_REQUEST from {id} for target {target_uuid} in {channel}\n");
+    crate::hlog_info!(
+        "[HUB] OP_REQUEST from {id} for target {target_uuid} in {channel}\n",
+        id = state.who_client(ci),
+        target_uuid = state.who('b', &target_uuid)
+    );
 
     let target = state.bot_client(&target_uuid);
 
     if target.is_none() {
         // Target bot not connected locally — check for peer hubs.
-        crate::hlog_info!("[HUB] Target bot {target_uuid} not connected locally\n");
+        crate::hlog_info!(
+            "[HUB] Target {target_uuid} not connected locally\n",
+            target_uuid = state.who('b', &target_uuid)
+        );
         let mut peer_count = state.peer_clients().len();
 
         if peer_count > 0 {
@@ -248,7 +256,8 @@ pub fn process_op_request(state: &mut HubState, ci: usize, payload: &str) {
             let req_hostmask = requester_hostmask(state, &id);
             if req_hostmask.is_empty() {
                 crate::hlog_warning!(
-                    "[HUB] No hostmask for requester {id} — cannot forward OP_REQUEST\n"
+                    "[HUB] No hostmask for requester {id} — cannot forward OP_REQUEST\n",
+                    id = state.who_client(ci)
                 );
                 peer_count = 0; // fall through to OP_FAILED
             } else {
@@ -294,7 +303,10 @@ pub fn process_op_request(state: &mut HubState, ci: usize, payload: &str) {
 
     let hostmask = requester_hostmask(state, &id);
     if hostmask.is_empty() {
-        crate::hlog_warning!("[HUB] No hostmask stored for requesting bot {id}\n");
+        crate::hlog_warning!(
+            "[HUB] No hostmask stored for requesting {id}\n",
+            id = state.who_client(ci)
+        );
         if let Some(i) = state.client_by_fd(fd) {
             client::send_cmd_to_bot(
                 &mut state.clients[i],
@@ -310,7 +322,8 @@ pub fn process_op_request(state: &mut HubState, ci: usize, payload: &str) {
     let ti = target.expect("checked above");
     if client::send_cmd_to_bot(&mut state.clients[ti], CMD_OP_GRANT, &grant_payload) {
         crate::hlog_info!(
-            "[HUB] Forwarded OP_GRANT to {target_uuid}: grant ops to {hostmask} in {channel}\n"
+            "[HUB] Forwarded OP_GRANT to {target_uuid}: grant ops to {hostmask} in {channel}\n",
+            target_uuid = state.who('b', &target_uuid)
         );
     }
 }
@@ -368,7 +381,8 @@ pub fn process_forward_op_request(state: &mut HubState, ci: usize, payload: &str
     }
 
     crate::hlog_debug!(
-        "[HUB] Received OP_FORWARD_REQUEST (id:{request_id}) from peer fd={fd} target={target_uuid} channel={channel}\n"
+        "[HUB] Received OP_FORWARD_REQUEST (id:{request_id}) from peer fd={fd} target={target_uuid} channel={channel}\n",
+        target_uuid = state.who('b', &target_uuid)
     );
 
     // Admin requests are special: target_uuid "ANY", requester_uuid "ADMIN",
@@ -407,8 +421,9 @@ pub fn process_forward_op_request(state: &mut HubState, ci: usize, payload: &str
     let Some(ti) = state.bot_client(&target_uuid) else {
         // Target not found locally — forward to the other peers.
         crate::hlog_debug!(
-            "[HUB] Target bot {target_uuid} not found locally, forwarding to {} peer(s)\n",
-            state.clients.len()
+            "[HUB] Target {target_uuid} not found locally, forwarding to {} peer(s)\n",
+            state.clients.len(),
+            target_uuid = state.who('b', &target_uuid)
         );
         forward_op_request_to_peers(
             state,
@@ -434,7 +449,8 @@ pub fn process_forward_op_request(state: &mut HubState, ci: usize, payload: &str
 
     if hostmask.is_empty() {
         crate::hlog_warning!(
-            "[HUB] No hostmask for requester {requester_uuid} (not in payload or storage)\n"
+            "[HUB] No hostmask for requester {requester_uuid} (not in payload or storage)\n",
+            requester_uuid = state.who('b', &requester_uuid)
         );
         let fail_payload = trunc_string(&format!("{request_id}|No hostmask found"), 256);
         if let Some(i) = state.client_by_fd(fd)
@@ -448,7 +464,8 @@ pub fn process_forward_op_request(state: &mut HubState, ci: usize, payload: &str
     let grant_payload = trunc_string(&format!("{hostmask}|{channel}"), 512);
     if client::send_cmd_to_bot(&mut state.clients[ti], CMD_OP_GRANT, &grant_payload) {
         crate::hlog_debug!(
-            "[HUB] Sent OP_GRANT to local bot {target_uuid} for request id:{request_id}\n"
+            "[HUB] Sent OP_GRANT to local {target_uuid} for request id:{request_id}\n",
+            target_uuid = state.who('b', &target_uuid)
         );
         // Forward the grant confirmation back to the origin peer.
         if let Some(i) = state.client_by_fd(fd) {
@@ -632,8 +649,8 @@ pub(crate) fn broadcast_chan_action(
             sent += 1;
         } else {
             crate::hlog_warning!(
-                "[HUB] Failed to send CHAN_ACTION to bot {}\n",
-                state.clients[ci].id
+                "[HUB] Failed to send CHAN_ACTION to {}\n",
+                state.who_client(ci)
             );
         }
     }
@@ -698,13 +715,19 @@ pub fn process_chan_request(state: &mut HubState, ci: usize, payload: &str) {
     let conv = sscanf(payload, &[Fmt::Set(7, b"|"), Fmt::Lit("|"), Fmt::Word(64)]);
     let id = state.clients[ci].id.clone();
     if conv.len() != 2 || !chan_kind_valid(conv[0].s()) {
-        crate::hlog_warning!("[HUB] Invalid CHAN_REQUEST payload from {id}\n");
+        crate::hlog_warning!(
+            "[HUB] Invalid CHAN_REQUEST payload from {id}\n",
+            id = state.who_client(ci)
+        );
         return;
     }
     let kind = conv[0].s().to_string();
     let channel = conv[1].s().to_string();
     if !channel.starts_with('#') && !channel.starts_with('&') {
-        crate::hlog_warning!("[HUB] CHAN_REQUEST from {id} for non-channel '{channel}'\n");
+        crate::hlog_warning!(
+            "[HUB] CHAN_REQUEST from {id} for non-channel '{channel}'\n",
+            id = state.who_client(ci)
+        );
         return;
     }
 
@@ -718,15 +741,24 @@ pub fn process_chan_request(state: &mut HubState, ci: usize, payload: &str) {
     // nick.  Without them the request is unserviceable, so say so rather than
     // flooding the mesh with something no bot can act on.
     if kind == "unban" && hostmask.is_empty() {
-        crate::hlog_warning!("[HUB] No hostmask for {id} — cannot service unban for {channel}\n");
+        crate::hlog_warning!(
+            "[HUB] No hostmask for {id} — cannot service unban for {channel}\n",
+            id = state.who_client(ci)
+        );
         return;
     }
     if kind == "invite" && nick.is_empty() {
-        crate::hlog_warning!("[HUB] No nick for {id} — cannot service invite for {channel}\n");
+        crate::hlog_warning!(
+            "[HUB] No nick for {id} — cannot service invite for {channel}\n",
+            id = state.who_client(ci)
+        );
         return;
     }
 
-    crate::hlog_info!("[HUB] CHAN_REQUEST {kind} from {id} for {channel}\n");
+    crate::hlog_info!(
+        "[HUB] CHAN_REQUEST {kind} from {id} for {channel}\n",
+        id = state.who_client(ci)
+    );
     // One bot answers it (CMD_CHAN_PROBE).
     if crate::elect::start(state, &kind, &channel, &id, &nick, &hostmask, None).is_none() {
         crate::hlog_warning!("[CHANREQ] Election table full — dropping {kind} for {channel}\n");
@@ -751,7 +783,10 @@ pub fn process_chan_reply(state: &mut HubState, ci: usize, payload: &str) {
     );
     let id = state.clients[ci].id.clone();
     if conv.len() != 4 {
-        crate::hlog_warning!("[HUB] Invalid CHAN_REPLY payload from {id}\n");
+        crate::hlog_warning!(
+            "[HUB] Invalid CHAN_REPLY payload from {id}\n",
+            id = state.who_client(ci)
+        );
         return;
     }
     let request_id = conv[0].s().to_string();
@@ -776,7 +811,8 @@ pub fn process_chan_reply(state: &mut HubState, ci: usize, payload: &str) {
     let Some(pi) = find_pending_chan_request(state, &request_id) else {
         // Late or duplicate answer — the first one already went home.
         crate::hlog_warning!(
-            "[HUB] CHAN_REPLY (id:{request_id}) from {id} matches no pending request\n"
+            "[HUB] CHAN_REPLY (id:{request_id}) from {id} matches no pending request\n",
+            id = state.who_client(ci)
         );
         return;
     };
@@ -793,7 +829,8 @@ pub fn process_chan_reply(state: &mut HubState, ci: usize, payload: &str) {
     };
     if req_kind != kind || !req_chan.eq_ignore_ascii_case(&channel) {
         crate::hlog_warning!(
-            "[HUB] CHAN_REPLY (id:{request_id}) from {id} answers {kind}/{channel} but the request was {req_kind}/{req_chan} — dropped\n"
+            "[HUB] CHAN_REPLY (id:{request_id}) from {id} answers {kind}/{channel} but the request was {req_kind}/{req_chan} — dropped\n",
+            id = state.who_client(ci)
         );
         return;
     }
@@ -811,11 +848,13 @@ pub fn process_chan_reply(state: &mut HubState, ci: usize, payload: &str) {
         match state.bot_client(&req_uuid) {
             Some(ti) if client::send_cmd_to_bot(&mut state.clients[ti], CMD_CHAN_REPLY, &out) => {
                 crate::hlog_info!(
-                    "[HUB] CHAN_REPLY {kind} for {channel} delivered to {req_uuid}\n"
+                    "[HUB] CHAN_REPLY {kind} for {channel} delivered to {req_uuid}\n",
+                    req_uuid = state.who('b', &req_uuid)
                 );
             }
             _ => crate::hlog_warning!(
-                "[HUB] CHAN_REPLY {kind} for {channel} undeliverable to {req_uuid}\n"
+                "[HUB] CHAN_REPLY {kind} for {channel} undeliverable to {req_uuid}\n",
+                req_uuid = state.who('b', &req_uuid)
             ),
         }
     } else if let Some(i) = state.client_by_fd(origin_fd)
@@ -909,7 +948,8 @@ pub fn process_forward_chan_reply(state: &mut HubState, ci: usize, payload: &str
         if let Some(ti) = state.bot_client(&req_uuid) {
             client::send_cmd_to_bot(&mut state.clients[ti], CMD_CHAN_REPLY, payload);
             crate::hlog_debug!(
-                "[HUB] CHAN_FWD_REPLY (id:{request_id}) from peer fd={fd} delivered to {req_uuid}\n"
+                "[HUB] CHAN_FWD_REPLY (id:{request_id}) from peer fd={fd} delivered to {req_uuid}\n",
+                req_uuid = state.who('b', &req_uuid)
             );
         }
     } else if let Some(i) = state.client_by_fd(origin_fd)

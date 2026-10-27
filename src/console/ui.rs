@@ -547,8 +547,8 @@ const MAX_AUDIT: usize = 16;
 #[derive(Clone, Default)]
 struct Status {
     name: Vec<u8>,
-    peers_up: i32,
-    peers_total: i32,
+    hubs_up: i32,
+    hubs_total: i32,
     bots_on: i32,
     bots_total: i32,
     upg: Vec<u8>,
@@ -1007,7 +1007,7 @@ const CMD_HELP: &[CmdHelp] = &[
      Some("setting\tname, bindip, port, pubkey or autopurge; alone it shows them all. ssh and conn \
            are this hub's connection limits: hub set ssh | hub set conn show them; ssh <name> \
            <value|default> changes one (ssh: preauth preauthip sessions grace authtries idle \
-           authfail connect block cmdrate; conn: perip churn authfail). N:S is N per S seconds; \
+           authfail connect block cmdrate; conn: perip churn authfail startups). N:S is N per S seconds; \
            block doubles per repeat within 24 h up to 24 h. A change applies to the next \
            connection\n\
            value\tname: this hub's name · bindip: the address it listens on · port: 1-65535 · \
@@ -1066,8 +1066,8 @@ const CMD_HELP: &[CmdHelp] = &[
          "key\ttheir 88-character public key (keygen's <stamp>_<name>.public.b64)\n",
          "mask\ta first usermask, nick!user@host (* and ? match)\n",
          "flags\tan admin: +a for a full admin (every command), or the letters of what they may ",
-         "change: b bots, c channels, h hub, o opers, u upgrades (+chu); every admin may log in ",
-         "and view everything\n",
+         "change: b bots, c channels, h hub, o opers, u upgrades (+chu; listed below); every ",
+         "admin may log in and view everything\n",
          "channels\tan oper: * for every channel, or the channels, comma-separated (#ircbot,#dev); ",
          "on each they may op, invite, unban, key")),
      concat!("user add admin robert ", ex_key!(), " robert!*@* +a\n",
@@ -1082,7 +1082,7 @@ const CMD_HELP: &[CmdHelp] = &[
          "key|flags\tthe setting: key (anyone's; your own needs no flag) or flags (an admin's, ",
          "needs +a)\n",
          "value\tkey: their new 88-character public key (asks y/N) · flags: +c-u adds and removes, ",
-         "chu or +a replaces them all")),
+         "chu or +a replaces them all (the letters are listed below)")),
      concat!("user set alice key ", ex_key!(), "\nuser set dana flags +b-u\nuser set dana flags +a")),
     ("user", Some("chan"),
      Some(concat!(
@@ -1280,7 +1280,7 @@ fn hubset_words(pos: usize, p1: &[u8], p2: &[u8]) -> &'static str {
     } else if pos == 1 && eq_ic(p1, "ssh") {
         "preauth preauthip sessions grace authtries idle authfail connect block cmdrate"
     } else if pos == 1 && eq_ic(p1, "conn") {
-        "perip churn authfail"
+        "perip churn authfail startups"
     } else if pos == 1
         && !["name", "bindip", "port", "pubkey", "autopurge"]
             .iter()
@@ -1865,7 +1865,7 @@ impl Ui {
             let (k, v) = (&f[..eq], &f[eq + 1..]);
             match k {
                 b"name" => st.name = sanitize(v, 64),
-                b"peers" => scan_pair(v, &mut st.peers_up, &mut st.peers_total),
+                b"hubs" => scan_pair(v, &mut st.hubs_up, &mut st.hubs_total),
                 b"bots" => scan_pair(v, &mut st.bots_on, &mut st.bots_total),
                 b"upg" => st.upg = sanitize(v, 24),
                 b"frozen" => st.frozen = fmt::atoi(v) != 0,
@@ -2019,7 +2019,7 @@ impl Ui {
             }
         };
         let l1 = fmtb(&[
-            format!(" hubs {}/{} up ", self.st.peers_up, self.st.peers_total).as_bytes(),
+            format!(" hubs {}/{} up ", self.st.hubs_up, self.st.hubs_total).as_bytes(),
             dot,
             format!(" bots {}/{} online ", self.st.bots_on, self.st.bots_total).as_bytes(),
             dot,
@@ -2338,6 +2338,36 @@ fn cmd_words(d: &CmdDef) -> Vec<u8> {
 }
 
 /// help <group> <command>: usage, what it does, each argument, examples.
+/// The commands flag `f` allows, from `CMD_FLAGS`: "bot add, del · ban add".
+/// "a/o" rows count for a and for o.  C `flag_cmds`.
+fn flag_cmds(f: u8) -> String {
+    let mut out = String::new();
+    let mut prev: Option<&str> = None;
+    for &(cmd, sub, fl) in CMD_FLAGS {
+        let hit = if fl == "a/o" {
+            f == b'a' || f == b'o'
+        } else {
+            fl.as_bytes() == [f]
+        };
+        if !hit {
+            continue;
+        }
+        if prev == Some(cmd) {
+            out.push_str(", ");
+            out.push_str(sub);
+        } else {
+            if !out.is_empty() {
+                out.push_str(" · ");
+            }
+            out.push_str(cmd);
+            out.push(' ');
+            out.push_str(sub);
+        }
+        prev = Some(cmd);
+    }
+    out
+}
+
 fn help_command(c: &Ctx, f: &mut Flines, d: &CmdDef) {
     let words = c_cut(&cmd_words(d), 32).to_vec();
     let (mut args, mut ex) = (None, None);
@@ -2457,6 +2487,38 @@ fn help_command(c: &Ctx, f: &mut Flines, d: &CmdDef) {
             fmt::flines_add(f, RL_NORMAL, c_cut(l.as_bytes(), 1024));
             i += 1;
         }
+    }
+    // user add / user set: what each admin flag allows (from CMD_FLAGS)
+    if d.cmd == "user" && matches!(d.sub, Some("add" | "set")) {
+        fmt::flines_add(f, RL_NORMAL, b"");
+        fmt::flines_add(
+            f,
+            RL_HEAD,
+            b" Admin flags: letter, name, what it lets the admin change",
+        );
+        for &l in b"abchou" {
+            let cmds = flag_cmds(l);
+            let line = if l == b'a' {
+                format!(
+                    "   +a  {:<10} every command; only +a: {cmds} on an admin",
+                    flag_word(b'a')
+                )
+            } else {
+                format!(
+                    "   +{}  {:<10} {cmds}{}",
+                    l as char,
+                    flag_word(l),
+                    if l == b'o' { " on an oper" } else { "" }
+                )
+            };
+            fmt::flines_add(f, RL_NORMAL, c_cut(line.as_bytes(), 1024));
+        }
+        fmt::flines_add(
+            f,
+            RL_NORMAL,
+            b"   no flag        log in, view everything, set your own key",
+        );
+        fmt::flines_add(f, RL_DIM, b"   letters combine (+chu); +a covers them all");
     }
     if let Some(ex) = ex {
         fmt::flines_add(f, RL_NORMAL, b"");
@@ -2803,7 +2865,7 @@ fn build_payload(
                 if na != 3 {
                     return bad(
                         if conn {
-                            "usage: hub set conn <perip|churn|authfail> <value|default>"
+                            "usage: hub set conn <perip|churn|authfail|startups> <value|default>"
                         } else {
                             "usage: hub set ssh <name> <value|default>"
                         },
@@ -3937,6 +3999,19 @@ impl Ui {
                         if let Some(e) = bpath.and_then(|p| p.rvs("err")) {
                             let v = fmtb(&[b"no path: ", e]);
                             fmt::card_line(&mut f, 6, b"", Some(c_cut(&v, 512)), RL_WARN);
+                        }
+                        // Every node already on the version and no build switch
+                        // asked for: the run will move nothing, and the likely
+                        // intent was name=c / name=rs.
+                        if b_to == 0 && (hv.is_empty() || h_to == 0) && !pc.extra[1].contains(&b'=')
+                        {
+                            fmt::card_line(
+                                &mut f,
+                                6,
+                                b"",
+                                Some(b"nothing to move; to switch a node's build add =c or =rs (nodes=<name>=rs)"),
+                                RL_DIM,
+                            );
                         }
                     }
                     self.emit_flines(f);
@@ -5574,7 +5649,7 @@ impl Ui {
                 &mut s,
                 2,
                 SGR_STATUS,
-                format!("hubs {}/{}", self.st.peers_up, self.st.peers_total).into_bytes(),
+                format!("hubs {}/{}", self.st.hubs_up, self.st.hubs_total).into_bytes(),
             );
             push(
                 &mut s,

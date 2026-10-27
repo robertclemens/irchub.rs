@@ -11,7 +11,7 @@ use crate::consts::*;
 use crate::crypto;
 use crate::cstr::now;
 use crate::net::{self, SendOutcome};
-use crate::state::{DeltaSeen, HubClient, HubState, Lane, QueuedMsg};
+use crate::state::{ClientType, DeltaSeen, HubClient, HubState, Lane, QueuedMsg};
 
 /// peer_enqueue(): put `m` on the client's lane, coalescing when its key
 /// matches one already queued.
@@ -61,14 +61,35 @@ pub fn enqueue(client: &mut HubClient, m: QueuedMsg) -> bool {
         if let Some(old) = lane.msgs.pop_front() {
             lane.bytes -= old.len();
             client.out_total_bytes -= old.len();
-            crate::hlog_warning!(
-                "[MESH] queue {} lane full — dropping oldest (peer fd={fd})\n",
-                m.lane.name()
-            );
+            let t = now();
+            if t - client.drop_logged >= QUEUE_DROP_LOG_EVERY {
+                if client.drop_unlogged > 0 {
+                    crate::hlog_warning!(
+                        "[MESH] queue {} lane full — dropping oldest (peer fd={fd}); \
+                         {} more dropped in the last {}s\n",
+                        m.lane.name(),
+                        client.drop_unlogged,
+                        t - client.drop_logged
+                    );
+                } else {
+                    crate::hlog_warning!(
+                        "[MESH] queue {} lane full — dropping oldest (peer fd={fd})\n",
+                        m.lane.name()
+                    );
+                }
+                client.drop_logged = t;
+                client.drop_unlogged = 0;
+            } else {
+                client.drop_unlogged += 1;
+            }
             cfg_push_lost(client, &old);
         }
     }
 
+    // Output waiting where none was: the write-stall clock starts.
+    if !client.has_pending_writes() {
+        client.write_wait_since = now();
+    }
     let n = m.len();
     client.out_lanes[li].msgs.push_back(m);
     client.out_lanes[li].bytes += n;
@@ -88,6 +109,16 @@ fn cfg_push_lost(client: &mut HubClient, m: &QueuedMsg) {
     }
 }
 
+/// Review 6: the AAD of frame number `ctr` sent with direction byte `dir` on a
+/// sequenced link (CMD_LINK_SEQ).
+pub fn link_aad(dir: u8, ctr: u64) -> [u8; HUB_LINK_AAD_LEN] {
+    let mut out = [0u8; HUB_LINK_AAD_LEN];
+    out[..4].copy_from_slice(b"LNK1");
+    out[4] = dir;
+    out[5..].copy_from_slice(&ctr.to_be_bytes());
+    out
+}
+
 /// Encrypt `m` with the client's session key into `writing_buf`.  Returns the
 /// total wire length (4-byte length prefix + ciphertext + tag), or 0 on
 /// failure.
@@ -96,23 +127,37 @@ fn encrypt_into_writing(client: &mut HubClient, m: &QueuedMsg) -> usize {
         return 0;
     }
     // The wire envelope; see net::frame_plain for why the inner length is
-    // stamped big-endian for bot-destined opcodes only.
+    // stamped big-endian for everything a bot receives.
     let plain = zeroize::Zeroizing::new(net::frame_plain(
         m.cmd,
         &m.payload,
-        net::inner_len_is_network_order(m.cmd),
+        client.typ == ClientType::Bot || net::inner_len_is_network_order(m.cmd),
     ));
 
     // D2: writing_buf may still be at the small pre-auth cap.  Refuse to
-    // encrypt a frame that would not fit (4-byte length prefix + ciphertext +
-    // tag).  AES-GCM ciphertext length equals the plaintext length.
-    if 4 + plain.len() + GCM_TAG_LEN > client.writing_cap {
+    // encrypt a frame that would not fit (4-byte length prefix + IV +
+    // ciphertext + tag: aes_gcm_encrypt puts the IV first).  AES-GCM
+    // ciphertext length equals the plaintext length.
+    if 4 + GCM_IV_LEN + plain.len() + GCM_TAG_LEN > client.writing_cap {
         return 0;
     }
 
-    let Some((body, tag)) = crypto::aes_gcm_encrypt(&plain, client.session_key.as_ref()) else {
+    let seq = client.link_tx_seq;
+    let aad = if seq {
+        link_aad(client.link_dir_tx, client.link_tx_ctr).to_vec()
+    } else {
+        Vec::new()
+    };
+    let Some((body, tag)) = crypto::aes_gcm_encrypt_aad(&plain, &aad, client.session_key.as_ref())
+    else {
         return 0;
     };
+    // Review 6: every frame sealed after our "go" is sequenced.
+    if seq {
+        client.link_tx_ctr += 1;
+    } else if m.cmd == CMD_LINK_SEQ && m.payload.as_slice() == b"go" {
+        client.link_tx_seq = true;
+    }
     let packet_len = body.len() + GCM_TAG_LEN;
     client.writing_buf.clear();
     client
@@ -137,6 +182,7 @@ fn push_in_flight(client: &mut HubClient) -> bool {
             SendOutcome::Sent(n) if n > 0 => {
                 client.writing_offset += n;
                 let t = now();
+                client.write_wait_since = t;
                 if client.bw_window_start != t {
                     client.bw_window_start = t;
                     client.bw_bytes_in_window = 0;

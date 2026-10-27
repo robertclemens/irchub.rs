@@ -79,7 +79,7 @@ pub fn gsetting_ingest(state: &mut HubState, rest: &str) -> Option<bool> {
     }
     let ts_s = &after[n + 1..];
     let (ts, m) = cstr::strtoll(ts_s);
-    if m == 0 || m != ts_s.len() || ts <= 0 {
+    if m == 0 || m != ts_s.len() || ts <= 0 || crate::state::ts_ahead(ts) {
         return None;
     }
     let (cur, cur_ts) = gs_get(state, g.name);
@@ -156,7 +156,7 @@ pub fn merge(state: &mut HubState, inp: &Revoked) -> bool {
                 "[REVOKE] Revoke list full ({}): dropping the oldest, {} ({}); it can no longer \
                  be wiped if it connects\n",
                 MAX_REVOKED,
-                o.uuid,
+                state.who('b', &o.uuid),
                 if o.nick.is_empty() {
                     "no nick"
                 } else {

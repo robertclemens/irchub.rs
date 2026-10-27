@@ -147,7 +147,7 @@ fn parse_line(state: &HubState, line: &str) -> Option<(Slot, i64, String)> {
 /// on its own; a bad or unknown one is dropped.  Lines that raised our value
 /// go on to the other peers.
 pub fn process(state: &mut HubState, ci: usize, payload: &str) {
-    let from_id = state.clients[ci].id.clone();
+    let from_id = state.who_client(ci);
     let exclude_fd = if state.clients[ci].typ == ClientType::Hub {
         state.clients[ci].fd
     } else {
@@ -225,7 +225,7 @@ pub fn send_bans(state: &mut HubState, ci: usize) {
     if lines > 0 {
         crate::hlog_debug!(
             "[ACTIVITY] {lines} ban last-use line(s) sent to {}\n",
-            state.clients[ci].id
+            state.who_client(ci)
         );
     }
 }
@@ -238,7 +238,7 @@ fn reply_send(state: &mut HubState, ci: usize, frame: &str) {
     if !queue::enqueue(&mut state.clients[ci], m) {
         crate::hlog_warning!(
             "[ACTIVITY] reply enqueue failed for {}\n",
-            state.clients[ci].id
+            state.who_client(ci)
         );
     }
 }
@@ -256,7 +256,7 @@ fn req_id_ok(s: &str) -> bool {
 /// left out), chunked under MAX_BUFFER.
 pub fn process_query(state: &mut HubState, ci: usize, payload: &str) {
     let f: Vec<&str> = payload.trim_end_matches(['\r', '\n']).split('|').collect();
-    let id = state.clients[ci].id.clone();
+    let id = state.who_client(ci);
     if f.len() < 2 || !req_id_ok(f[0]) {
         crate::hlog_warning!("[ACTIVITY] invalid query from {id}\n");
         return;

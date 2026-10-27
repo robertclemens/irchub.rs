@@ -219,6 +219,24 @@ fn effective_root(root: &str) -> String {
     env_base().unwrap_or_else(|| HUB_UPDATE_BASE.to_string())
 }
 
+/// An https:// URL whose host is exactly github.com, githubusercontent.com
+/// or a subdomain of it (raw. for manifests; downloads redirect to
+/// objects.).  "Contains github.com" let https://evil.example/github.com
+/// through; userinfo (github.com@evil.example) is refused outright.
+fn url_host_trusted(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let end = rest.find(['/', ':', '?', '#', '@']).unwrap_or(rest.len());
+    if rest[end..].starts_with('@') {
+        return false;
+    }
+    let host = rest[..end].to_ascii_lowercase();
+    host == "github.com"
+        || host == "githubusercontent.com"
+        || host.ends_with(".githubusercontent.com")
+}
+
 fn validate_url(url: &str) -> bool {
     // Reject shell metacharacters regardless of source.
     if url.contains([';', '|', '&', '`', '$']) {
@@ -229,8 +247,7 @@ fn validate_url(url: &str) -> bool {
     {
         return true;
     }
-    url.starts_with("https://")
-        && (url.contains("github.com") || url.contains("githubusercontent.com"))
+    url_host_trusted(url)
 }
 
 /// Keep `[A-Za-z0-9._-]`; the result must end in ".tar.gz".
@@ -1031,11 +1048,11 @@ pub fn commit(
     }
     // Run the new build's own -selftest BEFORE anything is renamed: a build
     // that cannot run here is refused with nothing touched.  A target older
-    // than MESH_MIN_VERSION cannot read this config (PBKDF2 600k) at all.
+    // than MESH_MIN_VERSION would be refused by every peer and bot.
     if version_cmp(target_ver, MESH_MIN_VERSION) == std::cmp::Ordering::Less {
         let _ = std::fs::remove_file(&archive);
         return Err(format!(
-            "target predates {MESH_MIN_VERSION} and cannot read this config"
+            "target predates {MESH_MIN_VERSION}, the oldest the mesh links with"
         ));
     }
     if row.kind.eq_ignore_ascii_case("bin") {

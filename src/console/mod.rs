@@ -655,14 +655,11 @@ pub fn on_wake(state: &mut HubState) {
 // ---------------------------------------------------------------------------
 
 /// One status line, fields in a fixed order.  `tree` is the current
-/// presence::build_tree output: bots online are the distinct B rows, and the
-/// mesh is split when any hub row is offline.
+/// presence::build_tree output: hubs are its H rows (this hub, its peers and
+/// the hubs beyond them), bots online are the distinct B rows, and the mesh
+/// is split when any hub row is offline.
 pub fn status_line(state: &HubState, tree: &str) -> String {
-    let peers_up = state
-        .peers
-        .iter()
-        .filter(|p| presence::peer_is_linked(state, p))
-        .count();
+    let (mut hubs_up, mut hubs_total) = (0, 0);
     let bots_total = state.bots.iter().filter(|b| b.is_active).count();
     let mut seen: Vec<&str> = Vec::new();
     let mut split = false;
@@ -671,8 +668,13 @@ pub fn status_line(state: &HubState, tree: &str) -> String {
             continue;
         }
         let f: Vec<&str> = row.split('|').filter(|s| !s.is_empty()).collect();
-        if f.len() >= 5 && f[0] == "H" && f[4] == "0" {
-            split = true;
+        if f.len() >= 5 && f[0] == "H" {
+            hubs_total += 1;
+            if f[4] == "0" {
+                split = true;
+            } else {
+                hubs_up += 1;
+            }
         }
         if f.len() >= 4 && f[0] == "B" && !seen.contains(&f[3]) && seen.len() < MAX_BOTS {
             seen.push(f[3]);
@@ -688,14 +690,14 @@ pub fn status_line(state: &HubState, tree: &str) -> String {
         "-".to_string()
     };
     format!(
-        "name={}|peers={}/{}|bots={}/{}|upg={}|frozen={}|rollup={}|split={}|loglevel={}|consolelevel={}",
+        "name={}|hubs={}/{}|bots={}/{}|upg={}|frozen={}|rollup={}|split={}|loglevel={}|consolelevel={}",
         if state.hub_friendly_name.is_empty() {
             "hub"
         } else {
             &state.hub_friendly_name
         },
-        peers_up,
-        state.peers.len(),
+        hubs_up,
+        hubs_total,
         seen.len(),
         bots_total,
         upg,

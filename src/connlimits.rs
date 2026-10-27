@@ -51,6 +51,10 @@ pub struct ConnCfg {
     pub fail_n: i32,
     pub fail_s: i32,
     pub fail_block: i32,
+    /// 13b random early drop on logins in progress.
+    pub startups_start: i32,
+    pub startups_rate: i32,
+    pub startups_full: i32,
 }
 
 /// Built-ins (the former compile-time constants).
@@ -97,6 +101,9 @@ impl Default for ConnCfg {
             fail_n: MAX_FAILED_AUTH_ATTEMPTS,
             fail_s: FAILED_AUTH_RESET_TIME as i32,
             fail_block: FAILED_AUTH_BLOCK_DURATION as i32,
+            startups_start: STARTUPS_DEF_START,
+            startups_rate: STARTUPS_DEF_RATE,
+            startups_full: STARTUPS_DEF_FULL,
         }
     }
 }
@@ -196,6 +203,11 @@ static SETS: &[CSet] = &[
                  FAILED_AUTH_BLOCK_DURATION as i32],
            lo: [1, 1, 30], hi: [1000, 86400, SSH_BLOCK_MAX],
            range: "N:S[:B], N 1 to 1000, S 1 to 86400, B 30 to 86400" },
+    CSet { group: Group::Conn, name: "startups", parts: 3,
+           slot: [|c| &mut c.startups_start, |c| &mut c.startups_rate, |c| &mut c.startups_full],
+           def: [STARTUPS_DEF_START, STARTUPS_DEF_RATE, STARTUPS_DEF_FULL],
+           lo: [1, 1, 1], hi: [MAX_CLIENTS as i32, 100, MAX_CLIENTS as i32],
+           range: "S:R[:F], S 1 to 100, R 1 to 100 (%), F 1 to 100" },
 ];
 
 fn find_set(group: Group, name: &str) -> Option<&'static CSet> {

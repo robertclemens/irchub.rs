@@ -56,11 +56,15 @@ pub fn retire_ack_apply(state: &mut HubState, ci: usize, payload: &[u8]) {
         crate::mesh::broadcast_sync_to_peers(state, &line, -1);
     }
     if payload.first() == Some(&b'1') {
-        crate::hlog_info!("[REVOKE] Revoked bot {id} wiped its config and is exiting\n");
+        crate::hlog_info!(
+            "[REVOKE] Revoked {id} wiped its config and is exiting\n",
+            id = state.who_client(ci)
+        );
     } else {
         crate::hlog_warning!(
-            "[REVOKE] Revoked bot {id} could not wipe its config; it exits, and is told again \
-             if it ever connects\n"
+            "[REVOKE] Revoked {id} could not wipe its config; it exits, and is told again \
+             if it ever connects\n",
+            id = state.who_client(ci)
         );
     }
 }
@@ -81,20 +85,18 @@ pub fn retire_revoked_bots(state: &mut HubState) -> usize {
         {
             continue;
         }
+        let who = state.who_client(i);
         let c = &mut state.clients[i];
         let Some(m) = crate::state::QueuedMsg::new(CMD_BOT_RETIRE, Lane::Urgent, &[]) else {
             continue;
         };
         if !crate::queue::enqueue(c, m) {
-            crate::hlog_warning!("[REVOKE] Could not queue CMD_BOT_RETIRE for {}\n", c.id);
+            crate::hlog_warning!("[REVOKE] Could not queue CMD_BOT_RETIRE for {who}\n");
             continue;
         }
         c.retiring = true;
         c.retire_sent = t;
-        crate::hlog_info!(
-            "[REVOKE] Deleted bot {} is connected here: told to wipe its config\n",
-            c.id
-        );
+        crate::hlog_info!("[REVOKE] Deleted {who} is connected here: told to wipe its config\n");
         n += 1;
     }
     // Its row in the tree goes now, on every hub, rather than when the gossip
@@ -153,8 +155,8 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
                 retire_ack_apply(state, ci, &[st]);
             }
             _ => crate::hlog_info!(
-                "[REVOKE] Revoked bot {} did not answer the wipe (an older build?); closed\n",
-                state.clients[ci].id
+                "[REVOKE] Revoked {} did not answer the wipe (an older build?); closed\n",
+                state.who_client(ci)
             ),
         }
         crypto::wipe(state.clients[ci].session_key.as_mut());
@@ -197,7 +199,8 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         }
         if quarantine {
             crate::hlog_info!(
-                "[REVOKE] Revoked bot {uuid} connecting from {ip}: checking its key\n"
+                "[REVOKE] Revoked {uuid} connecting from {ip}: checking its key\n",
+                uuid = state.who('b', &uuid)
             );
         }
 
@@ -227,7 +230,10 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             return false;
         };
         if !net::write_framed(sock, &out_buf) {
-            crate::hlog_warning!("[HUB] Failed to send v2 challenge to {uuid}\n");
+            crate::hlog_warning!(
+                "[HUB] Failed to send v2 challenge to {uuid}\n",
+                uuid = state.who('b', &uuid)
+            );
             return false;
         }
 
@@ -239,7 +245,10 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         c.bot_auth_state = BotAuthState::ChallengeSent;
         c.last_seen = now();
 
-        crate::hlog_debug!("[HUB] Sent v2 signed Curve25519 challenge to bot {uuid}\n");
+        crate::hlog_debug!(
+            "[HUB] Sent v2 signed Curve25519 challenge to {uuid}\n",
+            uuid = state.who('b', &uuid)
+        );
         return true;
     }
 
@@ -249,10 +258,16 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
     {
         let id = state.clients[ci].id.clone();
         let ip = state.clients[ci].ip.clone();
-        crate::hlog_debug!("[HUB] Received signature from bot {id} ({packet_len} bytes)\n");
+        crate::hlog_debug!(
+            "[HUB] Received signature from {id} ({packet_len} bytes)\n",
+            id = state.who_client(ci)
+        );
 
         if packet_len != ED25519_SIG_LEN || !state.clients[ci].bot_eph_priv_set {
-            crate::hlog_warning!("[HUB] Bad signature size or state from {id}\n");
+            crate::hlog_warning!(
+                "[HUB] Bad signature size or state from {id}\n",
+                id = state.who_client(ci)
+            );
             return false;
         }
 
@@ -262,7 +277,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             load_bot_combined_pub(state, &id)
         };
         let Some(bot_combined) = key else {
-            crate::hlog_warning!("[HUB] No public key for bot {id}\n");
+            crate::hlog_warning!("[HUB] No public key for {id}\n", id = state.who_client(ci));
             return false;
         };
         let (bot_ed_pub, bot_x_pub) = crypto::pub_halves(&bot_combined);
@@ -273,7 +288,10 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             &state.clients[ci].challenge,
         );
         if !crypto::ed25519_verify(&bot_ed_pub, &msg, data) {
-            crate::hlog_warning!("[HUB] Invalid signature from bot {id}\n");
+            crate::hlog_warning!(
+                "[HUB] Invalid signature from {id}\n",
+                id = state.who_client(ci)
+            );
             ratelimit::record_failed_auth(state, &ip);
             return false;
         }
@@ -281,7 +299,10 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         let Some(shared) =
             crypto::x25519_derive(&state.clients[ci].bot_eph_x25519_priv, &bot_x_pub)
         else {
-            crate::hlog_error!("[HUB] X25519 derive failed for {id}\n");
+            crate::hlog_error!(
+                "[HUB] X25519 derive failed for {id}\n",
+                id = state.who_client(ci)
+            );
             return false;
         };
 
@@ -299,7 +320,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             c.bot_eph_priv_set = false;
         }
         if !ok {
-            crate::hlog_error!("[HUB] HKDF failed for {id}\n");
+            crate::hlog_error!("[HUB] HKDF failed for {id}\n", id = state.who_client(ci));
             return false;
         }
         state.clients[ci].session_key = session_key;
@@ -312,7 +333,10 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         let Some((body, tag)) =
             crypto::aes_gcm_encrypt(&[ack_plain], state.clients[ci].session_key.as_ref())
         else {
-            crate::hlog_error!("[HUB] ACK encrypt failed for {id}\n");
+            crate::hlog_error!(
+                "[HUB] ACK encrypt failed for {id}\n",
+                id = state.who_client(ci)
+            );
             return false;
         };
         let mut ack = body;
@@ -324,13 +348,17 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
                 return false;
             };
             if !net::write_framed(sock, &ack) {
-                crate::hlog_warning!("[HUB] Failed to send v2 ACK to {id}\n");
+                crate::hlog_warning!(
+                    "[HUB] Failed to send v2 ACK to {id}\n",
+                    id = state.who_client(ci)
+                );
                 return false;
             }
             if quarantine {
                 c.bot_auth_state = BotAuthState::Quarantine;
                 crate::hlog_info!(
-                    "[REVOKE] Revoked bot {id} proved its key: told to wipe its config\n"
+                    "[REVOKE] Revoked {id} proved its key: told to wipe its config\n",
+                    id = state.who_client(ci)
                 );
                 return true;
             }
@@ -341,6 +369,10 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
             // D2: grow the buffers now that the bot is authenticated.
             c.promote_buffers();
         }
+        supersede_bot_sessions(state, ci);
+        let ip = state.clients[ci].ip.clone();
+        crate::ratelimit::known_ip_note(state, &ip);
+        crate::client::link_offer(state, ci, None);
 
         let seen = state.clients[ci].last_seen;
         storage::update_entry(state, &id, "seen", "", "", "", seen);
@@ -350,11 +382,52 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         presence::roster_mark_dirty(state, true);
         state.last_presence_gossip = 0;
 
-        crate::hlog_info!("[HUB] Bot {id} authenticated (Curve25519)\n");
+        crate::hlog_info!(
+            "[HUB] {id} authenticated (Curve25519)\n",
+            id = state.who_client(ci)
+        );
         return true;
     }
 
     false
+}
+
+/// L6: one live session per bot.  An older one for the same uuid (a reconnect
+/// before its dead socket timed out, or a second process with the same key)
+/// is shut down now and reaped by the main loop on its EOF; the bot lookups
+/// skip it meanwhile.  Repeats are counted per hour across sessions.
+fn supersede_bot_sessions(state: &mut HubState, ci: usize) {
+    let t = now();
+    let id = state.clients[ci].id.clone();
+    for oi in 0..state.clients.len() {
+        let o = &mut state.clients[oi];
+        if oi == ci || o.typ != ClientType::Bot || !o.authenticated || o.superseded || o.id != id {
+            continue;
+        }
+        o.superseded = true;
+        if let Some(s) = o.sock.as_ref() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        let (window, count, ip) = (o.replace_window, o.replace_count, o.ip.clone());
+        let same_hour = t - window < 3600;
+        let c = &mut state.clients[ci];
+        c.replace_window = if same_hour { window } else { t };
+        c.replace_count = if same_hour { count } else { 0 } + 1;
+        let n = c.replace_count;
+        if n > BOT_REPLACE_WARN_PER_HOUR {
+            crate::hlog_warning!(
+                "[HUB] {} replaced its own live session again ({n} times in the last hour): \
+                 two processes with one key, or a stolen key\n",
+                state.who_client(ci)
+            );
+        } else {
+            crate::hlog_info!(
+                "[HUB] {} logged in while its old session ({ip}) was live: the old one is \
+                 closed\n",
+                state.who_client(ci)
+            );
+        }
+    }
 }
 
 /// hub_state_add_bot_memory(): register a bot the admin just created.

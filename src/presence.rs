@@ -45,13 +45,9 @@ pub fn roster_expire(state: &mut HubState, now_ts: i64) {
         if now_ts - state.roster[i].reported_at > BOT_ROSTER_TTL {
             let e = &state.roster[i];
             crate::hlog_info!(
-                "[PRESENCE] {} on hub {} aged out of the roster\n",
-                if e.nick.is_empty() {
-                    &e.bot_uuid
-                } else {
-                    &e.nick
-                },
-                e.hub_name
+                "[PRESENCE] {} on {} aged out of the roster\n",
+                state.who('b', &e.bot_uuid),
+                state.who('h', &e.hub_uuid)
             );
             state.roster.swap_remove(i);
             state.tree_dirty = true;
@@ -60,16 +56,19 @@ pub fn roster_expire(state: &mut HubState, now_ts: i64) {
         i += 1;
     }
     let before = state.mesh_hubs.len();
-    state.mesh_hubs.retain(|h| {
-        let keep = now_ts - h.reported_at <= BOT_ROSTER_TTL;
-        if !keep {
-            crate::hlog_info!(
-                "[PRESENCE] Hub {} aged out of the mesh map\n",
-                if h.name.is_empty() { &h.uuid } else { &h.name }
-            );
-        }
-        keep
-    });
+    for h in state
+        .mesh_hubs
+        .iter()
+        .filter(|h| now_ts - h.reported_at > BOT_ROSTER_TTL)
+    {
+        crate::hlog_info!(
+            "[PRESENCE] {} aged out of the mesh map\n",
+            state.who('h', &h.uuid)
+        );
+    }
+    state
+        .mesh_hubs
+        .retain(|h| now_ts - h.reported_at <= BOT_ROSTER_TTL);
     if state.mesh_hubs.len() != before {
         state.tree_dirty = true;
     }
@@ -89,7 +88,8 @@ fn mesh_hub_get(state: &mut HubState, uuid: &str) -> Option<usize> {
     }
     if state.mesh_hubs.len() >= MAX_MESH_HUBS {
         crate::hlog_warning!(
-            "[PRESENCE] Mesh map full ({MAX_MESH_HUBS}) — {uuid} is not relayed\n"
+            "[PRESENCE] Mesh map full ({MAX_MESH_HUBS}) — {uuid} is not relayed\n",
+            uuid = state.who('h', uuid)
         );
         return None;
     }
@@ -140,7 +140,7 @@ fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
     if state.roster.len() >= MAX_BOT_ROSTER {
         crate::hlog_warning!(
             "[PRESENCE] Roster full ({MAX_BOT_ROSTER}) — dropping report for {}\n",
-            incoming.bot_uuid
+            state.who('b', &incoming.bot_uuid)
         );
         return;
     }
@@ -197,9 +197,22 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
     if !version.is_empty()
         && crate::update::version_cmp(&version, MESH_MIN_VERSION) == std::cmp::Ordering::Less
     {
-        let id = state.clients[ci].id.clone();
+        let id = state.who_client(ci);
         crate::hlog_warning!(
-            "[HUB] Bot {id} runs {version}: refused; upgrade it by hand to {MESH_MIN_VERSION}\n"
+            "[HUB] {id} runs {version}: refused; upgrade it by hand to {MESH_MIN_VERSION}\n"
+        );
+        state.clients[ci].refused = true;
+        return;
+    }
+    // Review 6: a bot this new sends CMD_LINK_SEQ "offer" as its first frame,
+    // before any presence; none means it was stripped on the way.
+    if !version.is_empty()
+        && !state.clients[ci].link_offered
+        && crate::update::version_cmp(&version, HUB_LINK_SEQ_VERSION) != std::cmp::Ordering::Less
+    {
+        let id = state.who_client(ci);
+        crate::hlog_warning!(
+            "[HUB] {id} runs {version} but never offered the sequenced link framing (a frame stripped on the way?): dropped\n"
         );
         state.clients[ci].refused = true;
         return;
@@ -216,9 +229,9 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
     c.bot_started = started;
 
     if changed {
-        let id = c.id.clone();
+        let id = state.who_client(ci);
         crate::hlog_info!(
-            "[PRESENCE] Bot {id}: version {} ({}) on {}\n",
+            "[PRESENCE] {id}: version {} ({}) on {}\n",
             if version.is_empty() { "?" } else { &version },
             if variant.is_empty() { "?" } else { &variant },
             if server.is_empty() {
@@ -634,6 +647,21 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 let ip = state.clients[from].ip.clone();
                 crate::hlog_warning!(
                     "[MESH] Peer {hub_name} ({ip}) runs {hub_ver}: link refused; upgrade it by hand to {MESH_MIN_VERSION}\n"
+                );
+                state.clients[from].refused = true;
+                return;
+            }
+            // Review 6: a direct peer this new offered CMD_LINK_SEQ on connect.
+            if !hub_ver.is_empty()
+                && from < state.clients.len()
+                && !state.clients[from].link_offered
+                && crate::update::version_cmp(&hub_ver, HUB_LINK_SEQ_VERSION)
+                    != std::cmp::Ordering::Less
+                && hub_uuid == upgrade::peer_uuid_of(state, from)
+            {
+                let ip = state.clients[from].ip.clone();
+                crate::hlog_warning!(
+                    "[MESH] Peer {hub_name} ({ip}) runs {hub_ver} but never offered the sequenced link framing (a frame stripped on the way?): link dropped\n"
                 );
                 state.clients[from].refused = true;
                 return;

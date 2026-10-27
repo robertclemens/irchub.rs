@@ -9,7 +9,7 @@
 //! mirrored in ircbot, so a bot and a hub never disagree about a record.
 
 use crate::consts::*;
-use crate::cstr::{atoll, now, split_fields, trunc_string};
+use crate::cstr::{atoll, now, split_fields, trunc, trunc_string};
 use crate::state::{
     ClientType, ConfigEntry, HubState, Lane, MaskRecord, QueuedMsg, UserRecord,
     global_value_active, lww_accepts, opt_accepts,
@@ -265,7 +265,12 @@ pub fn process_mesh_state(state: &mut HubState, ci: usize, payload: &str) {
     let mesh_start = &payload[bar + 1..];
     // Parse: ip:port:uuid:friendly_name|
     let f: Vec<&str> = mesh_start.splitn(4, ':').collect();
-    if f.len() < 3 {
+    // As C's "%255[^:]:%d:...": nothing past a port that is not a number.
+    let port_ok = f.len() >= 2 && {
+        let (_, m) = crate::cstr::strtoll(f[1]);
+        m > 0 && m == f[1].len()
+    };
+    if f.len() < 3 || !port_ok {
         return;
     }
     let remote_uuid = trunc_string(f[2], 64);
@@ -295,13 +300,17 @@ pub fn process_mesh_state(state: &mut HubState, ci: usize, payload: &str) {
         config_updated = true;
     }
 
-    // Also update the UUID if it changed (a peer added without one).
-    if !remote_uuid.is_empty()
-        && remote_uuid != "-"
-        && (state.peers[pi].uuid.is_empty() || state.peers[pi].uuid != remote_uuid)
-    {
+    // Fill in the uuid only for a peer we hold none for.  A linked peer
+    // proved the uuid we hold in its handshake; gossip proves nothing.
+    // Rewriting it let a peer take another hub's identity (that hub's own
+    // handshake then checked the wrong key) and wrote the unchecked text into
+    // the config's peer| line.
+    if state.peers[pi].uuid.is_empty() && crate::cstr::is_uuid(&remote_uuid) {
         state.peers[pi].uuid = remote_uuid.clone();
-        crate::hlog_debug!("[MESH] Updated peer UUID to: {remote_uuid}\n");
+        crate::hlog_debug!(
+            "[MESH] Updated peer UUID to: {remote_uuid}\n",
+            remote_uuid = state.who('h', &remote_uuid)
+        );
         config_updated = true;
     }
 
@@ -325,11 +334,10 @@ fn sync_bcast_opcode(state: &HubState, ci: usize) -> u8 {
 
 /// Whether peer `ci` is known current: 2 = MESH_MIN_VERSION or newer, 1 =
 /// known older (its link is being refused), 0 = not known yet (its version
-/// arrives with its first roster).  Below 2 it gets the downgraded sync
-/// (`access::downgrade`; tombstones only at 1), so a peer that turns out to
-/// be older never over-trusts a restricted user meanwhile.  C
-/// `peer_flags_level`.
-pub fn peer_flags_level(state: &HubState, ci: usize) -> u8 {
+/// arrives with its first roster).  Config sync flows only at 2: an older hub
+/// does not know uf| / uc| and would over-trust every restricted user.  C
+/// `peer_version_level`.
+pub fn peer_version_level(state: &HubState, ci: usize) -> u8 {
     let cu = crate::upgrade::peer_uuid_of(state, ci);
     if cu.is_empty() {
         return 0;
@@ -355,17 +363,10 @@ pub fn peer_flags_level(state: &HubState, ci: usize) -> u8 {
     }
 }
 
-/// The level of the peer on `fd` (0 when no authenticated peer has it).
-pub fn peer_fd_flags_level(state: &HubState, fd: i32) -> u8 {
-    state
-        .peer_clients()
-        .into_iter()
-        .find(|&ci| state.clients[ci].fd == fd)
-        .map_or(0, |ci| peer_flags_level(state, ci))
-}
-
-/// One sync payload onto peer `ci`'s queue, downgraded for an older peer
-/// (every sync to a peer goes through it).  C `hub_peer_enqueue_sync`.
+/// One sync payload onto peer `ci`'s queue (every sync to a peer goes
+/// through it).  Held, not sent, while the peer's version is not known:
+/// `peer_sync_release` sends the full state once it is.  C
+/// `hub_peer_enqueue_sync`.
 pub fn peer_enqueue_sync(
     state: &mut HubState,
     ci: usize,
@@ -374,18 +375,17 @@ pub fn peer_enqueue_sync(
     payload: &str,
     coalesce: Option<(&str, u64)>,
 ) {
-    let level = peer_flags_level(state, ci);
-    let down;
-    let send = if level < 2 {
-        down = access::downgrade(state, payload, level == 1);
-        down.as_str()
-    } else {
-        payload
-    };
-    if send.is_empty() {
+    let level = peer_version_level(state, ci);
+    if level < 2 {
+        if level == 0 {
+            state.clients[ci].sync_held = true;
+        }
         return;
     }
-    let Some(mut m) = QueuedMsg::new(op, lane, send.as_bytes()) else {
+    if payload.is_empty() {
+        return;
+    }
+    let Some(mut m) = QueuedMsg::new(op, lane, payload.as_bytes()) else {
         return;
     };
     if let Some((key, seq)) = coalesce {
@@ -397,6 +397,32 @@ pub fn peer_enqueue_sync(
         // effectively unreachable, but be safe.
         crate::hlog_warning!("[MESH] enqueue failed for peer {}\n", state.clients[ci].ip);
     }
+}
+
+/// Peer `ci`'s roster just named a current version: everything held while
+/// it was unknown goes now, as one full sync, and a CMD_SYNC_REQUEST fetches
+/// the state it sent meanwhile (dropped unread, see the dispatch).  C
+/// `hub_peer_sync_release`.
+pub fn peer_sync_release(state: &mut HubState, ci: usize) {
+    if !state.clients[ci].sync_held || peer_version_level(state, ci) != 2 {
+        return;
+    }
+    state.clients[ci].sync_held = false;
+    let full = generate_sync_packet(state);
+    let seq = state.next_lamport_seq();
+    peer_enqueue_sync(
+        state,
+        ci,
+        CMD_PEER_SYNC,
+        Lane::Bulk,
+        &full,
+        Some(("handshake_sync", seq)),
+    );
+    queue::send_urgent(&mut state.clients[ci], CMD_SYNC_REQUEST, "");
+    crate::hlog_debug!(
+        "[MESH] Peer {} is current: held sync sent, its own requested\n",
+        state.clients[ci].ip
+    );
 }
 
 /// split_horizon_sender(): the peers the peer on `from_fd` is linked to right
@@ -423,6 +449,25 @@ pub fn split_horizon_links(state: &HubState, from_fd: i32) -> Option<Vec<String>
                 .map(|l| l.uuid.clone())
                 .collect()
         })
+}
+
+// Sync tracing (debug): a delta's path through the mesh, record by record,
+// so a lost or leaked record can be followed hub to hub.  Frames longer than
+// SYNC_TRACE_MAX_LINES are full-state syncs and are not traced.
+const SYNC_TRACE_MAX_LINES: usize = 16;
+const SYNC_TRACE_LINE: usize = 120;
+
+fn sync_trace_lines(payload: &str) -> usize {
+    payload.matches('\n').count() + usize::from(!payload.is_empty() && !payload.ends_with('\n'))
+}
+
+/// Append peer ci's name to a ", "-separated list (C: a char[256]).
+fn sync_trace_name(list: &mut String, state: &HubState, ci: usize) {
+    let c = &state.clients[ci];
+    let name = if c.id.is_empty() { &c.ip } else { &c.id };
+    let sep = if list.is_empty() { "" } else { ", " };
+    let joined = format!("{list}{sep}{name}");
+    *list = trunc_string(&joined, 256);
 }
 
 /// One config payload to every authenticated peer except `exclude_fd`.
@@ -453,6 +498,7 @@ pub fn sync_send_to_peers(
         None
     };
     let mut skipped = 0;
+    let (mut to, mut skip, mut held) = (String::new(), String::new(), String::new());
     for ci in state.peer_clients() {
         if state.clients[ci].fd == exclude_fd {
             continue;
@@ -461,14 +507,45 @@ pub fn sync_send_to_peers(
             let cu = crate::upgrade::peer_uuid_of(state, ci);
             if !cu.is_empty() && links.contains(&cu) {
                 skipped += 1;
+                sync_trace_name(&mut skip, state, ci);
                 continue;
             }
+        }
+        if peer_version_level(state, ci) == 2 {
+            sync_trace_name(&mut to, state, ci);
+        } else {
+            sync_trace_name(&mut held, state, ci);
         }
         let op = sync_bcast_opcode(state, ci);
         peer_enqueue_sync(state, ci, op, lane, payload, coalesce);
     }
     if skipped > 0 {
         crate::hlog_debug!("[MESH] Forward skipped {skipped} peer(s) the sender reaches itself\n");
+    }
+    // Where a delta went (a full-state sync is too big and too routine).
+    let lines = sync_trace_lines(payload);
+    if lines <= SYNC_TRACE_MAX_LINES {
+        let first = trunc(payload.split('\n').next().unwrap_or(""), SYNC_TRACE_LINE);
+        let how = if split {
+            "bcast forward"
+        } else if exclude_fd != -1 {
+            "forward"
+        } else {
+            "own change"
+        };
+        let or_dash = |l: &str| {
+            if l.is_empty() {
+                "-".to_string()
+            } else {
+                l.to_string()
+            }
+        };
+        crate::hlog_debug!(
+            "[MESH] Sync {how}, {lines} line(s) [{first}]: to {}; skipped {}; held {}\n",
+            or_dash(&to),
+            or_dash(&skip),
+            or_dash(&held)
+        );
     }
 }
 
@@ -582,8 +659,7 @@ pub fn generate_sync_packet(state: &HubState) -> String {
         }
     }
 
-    // Mesh-wide settings and the revoke list.  An older peer never gets
-    // either (access::downgrade).
+    // Mesh-wide settings and the revoke list.
     let mut rv = String::new();
     crate::revoke::gsetting_append(state, &mut rv);
     crate::revoke::append(state, &mut rv);
@@ -662,6 +738,9 @@ fn store_global_entry_raw(state: &mut HubState, key: &str, value: &str, ts: i64)
     }
 
     // Add new entry (a tombstone older than the last purge is not re-created)
+    if crate::state::ts_ahead(ts) {
+        return false;
+    }
     if !global_value_active(value) && storage::purge_floor_blocks(state, ts) {
         return false;
     }
@@ -722,19 +801,9 @@ pub fn parse_global_channel_value(value: &str) -> Option<(String, String, i32, S
 /// ASCII case-insensitively on the channel name (D39), same as the storage
 /// layer.
 pub fn global_channel_modes(state: &HubState, chan: &str) -> i32 {
-    // The +k/+i the bots last saw: K| (2.5.1), else the modes field a 2.5.0
-    // bot left on c|.
-    if let Some(l) = storage::learned_find(state, chan) {
-        return l.modes;
-    }
-    for e in state.global_entries.iter().filter(|e| e.key == "c") {
-        if let Some((stored_chan, _, modes, _)) = parse_global_channel_value(&e.value)
-            && trunc_string(&stored_chan, 128).eq_ignore_ascii_case(chan)
-        {
-            return modes;
-        }
-    }
-    0
+    // The +k/+i the bots last saw (K|), 0 when no bot has reported the
+    // channel.
+    storage::learned_find(state, chan).map_or(0, |l| l.modes)
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +816,11 @@ struct SyncCounters {
     /// Only keys bots actually consume; gates the full config push.
     bot_push_updates: u32,
     forward: String,
+    /// Sync tracing: the frame's opcode name, its sender, and whether it is
+    /// a delta (refused records are logged too) rather than a full sync.
+    frame: &'static str,
+    from: String,
+    trace: bool,
 }
 
 /// One `a|`/`o|` record from a peer.
@@ -779,7 +853,7 @@ fn sync_user_record(state: &mut HubState, key: char, vstart: &str, cnt: &mut Syn
                 crate::hlog_info!(
                     "[MESH] Dedup: '{}' ({key}) UUID collision resolved, adopting {}\n",
                     incoming.name,
-                    incoming.uuid
+                    state.who('u', &incoming.uuid)
                 );
                 let old_uuid = state.user_records[ni].uuid.clone();
                 // Remap the existing record's masks, flags and channel
@@ -802,6 +876,7 @@ fn sync_user_record(state: &mut HubState, key: char, vstart: &str, cnt: &mut Syn
     if found.is_none()
         && !discard_incoming
         && state.user_records.len() < MAX_HUB_USER_RECORDS
+        && !crate::state::ts_ahead(incoming.timestamp)
         && (incoming.is_active || !storage::purge_floor_blocks(state, incoming.timestamp))
     {
         state.user_records.push(UserRecord {
@@ -874,6 +949,7 @@ fn sync_mask_record(state: &mut HubState, vstart: &str, line: &str, cnt: &mut Sy
     let mi = match found {
         Some(i) => i,
         None if state.mask_records.len() < MAX_HUB_USER_MASKS
+            && !crate::state::ts_ahead(ts)
             && (is_active || !storage::purge_floor_blocks(state, ts)) =>
         {
             state.mask_records.push(MaskRecord {
@@ -968,7 +1044,18 @@ fn sync_bot_entry(state: &mut HubState, ptr: &str, cnt: &mut SyncCounters) {
         parsed_val.as_str()
     };
 
-    if storage::update_entry(state, &uuid, &key, store_val, &parsed_extra, &parsed_op, ts) {
+    let stored =
+        storage::update_entry(state, &uuid, &key, store_val, &parsed_extra, &parsed_op, ts);
+    if stored || cnt.trace {
+        crate::hlog_debug!(
+            "[MESH] {} from {}: {} {key}|{val}|{ts} -> {}\n",
+            cnt.frame,
+            cnt.from,
+            state.who('b', &uuid),
+            if stored { "applied" } else { "refused" }
+        );
+    }
+    if stored {
         cnt.updates += 1;
         // seen/t are hub-side metadata; bots don't consume them.
         if key != "seen" && key != "t" {
@@ -984,18 +1071,24 @@ fn sync_bot_entry(state: &mut HubState, ptr: &str, cnt: &mut SyncCounters) {
 /// process_peer_sync(): apply one CMD_PEER_SYNC payload and re-forward what
 /// it actually changed.
 pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bcast: bool) {
+    // Sync tracing: every record applied is logged, and in a delta (not a
+    // full-state sync) every record refused too.
     let mut cnt = SyncCounters {
         updates: 0,
         bot_push_updates: 0,
         forward: String::new(),
+        frame: if bcast { "PEER_BCAST" } else { "PEER_SYNC" },
+        from: state
+            .client_by_fd(origin_fd)
+            .map(|ci| state.who_client(ci))
+            .unwrap_or_else(|| "?".into()),
+        trace: sync_trace_lines(payload) <= SYNC_TRACE_MAX_LINES,
     };
     crate::stats::sync_frame();
-    // A peer whose version we do not know yet may be an older node holding
-    // no uf| / uc|: nothing it says about a restricted user is taken in
-    // (access::from_old_ok).
-    let origin_flags_ok = peer_fd_flags_level(state, origin_fd) == 2;
 
-    for line in trunc_string(payload, MAX_SYNC_PAYLOAD).split('\n') {
+    // Borrowed, not copied: the frame is already one of several copies
+    // (review 2026-10-25 #25).
+    for line in trunc(payload, MAX_SYNC_PAYLOAD).split('\n') {
         if line.is_empty() {
             continue;
         }
@@ -1157,18 +1250,6 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bc
                     _ => "",
                 };
                 let is_new_fmt = crate::cstr::has_uuid_dashes(first_f);
-                if is_new_fmt
-                    && (is_user_key || is_mask_key)
-                    && !origin_flags_ok
-                    && !access::from_old_ok(state, first_f)
-                {
-                    crate::hlog_debug!(
-                        "[MESH] Ignored {}| record for restricted user {} from an older peer\n",
-                        key,
-                        first_f
-                    );
-                    continue;
-                }
 
                 if is_new_fmt && is_user_key {
                     sync_user_record(state, key.as_bytes()[0] as char, vstart, &mut cnt);
@@ -1192,7 +1273,16 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bc
                 {
                     let val = trunc_string(&vstart[..p_last], 1024);
                     let ts = atoll(&vstart[p_last + 1..]);
-                    if store_global_entry_raw(state, key, &val, ts) {
+                    let stored = store_global_entry_raw(state, key, &val, ts);
+                    if stored || cnt.trace {
+                        crate::hlog_debug!(
+                            "[MESH] {} from {}: {key}|{val}|{ts} -> {}\n",
+                            cnt.frame,
+                            cnt.from,
+                            if stored { "applied" } else { "refused" }
+                        );
+                    }
+                    if stored {
                         cnt.updates += 1;
                         cnt.bot_push_updates += 1; // channel/global — bots need this
                         let fwd = format!("{key}|{val}|{ts}\n");
@@ -1212,10 +1302,20 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bc
     }
 
     // Records left on a merged-away uuid go; a user this sync created without
-    // uf| / uc| (an older hub's) gets what it could do before flags.
+    // uf| / uc| gets its default (access::migrate).
     access::prune(state);
     if access::migrate(state) > 0 {
         cnt.updates += 1;
+        cnt.bot_push_updates += 1;
+    }
+    // Two hubs that each removed a different +a admin before they synced may
+    // have left none: undo the race, on every peer including the sender.
+    if cnt.updates > 0
+        && let Some((floor, _)) = access::admin_floor_restore(state, "a peer sync")
+    {
+        if !floor.is_empty() {
+            broadcast_sync_to_peers(state, &floor, -1);
+        }
         cnt.bot_push_updates += 1;
     }
 
@@ -1371,16 +1471,13 @@ pub fn execute_purge(
     client::broadcast_config_to_bots(state, &purge_msg);
     for ci in state.bot_clients() {
         let Some(m) = QueuedMsg::new(CMD_CONFIG_DATA, Lane::Bulk, purge_msg.as_bytes()) else {
-            crate::hlog_error!(
-                "[PURGE] OOM queueing PURGE for bot {}\n",
-                state.clients[ci].id
-            );
+            crate::hlog_error!("[PURGE] OOM queueing PURGE for {}\n", state.who_client(ci));
             continue;
         };
         if !queue::enqueue(&mut state.clients[ci], m) {
             crate::hlog_warning!(
-                "[PURGE] could not queue PURGE for bot {}\n",
-                state.clients[ci].id
+                "[PURGE] could not queue PURGE for {}\n",
+                state.who_client(ci)
             );
         }
     }
@@ -1408,10 +1505,45 @@ mod tests {
                 uuid: uuid.into(),
                 connected: true,
                 fd,
+                remote_version: MESH_MIN_VERSION.into(),
                 ..Default::default()
             });
         }
         (s, keep)
+    }
+
+    #[test]
+    fn a_peer_of_unknown_version_gets_no_sync_until_its_roster_names_one() {
+        let (mut s, _keep) = three_peers();
+        s.peers[0].remote_version.clear();
+        let ci = s.clients.iter().position(|c| c.fd == 10).unwrap();
+        // Something for the full sync to carry.
+        process_peer_sync(&mut s, "b|bot|n|nick|4\n", -1, false);
+        peer_enqueue_sync(
+            &mut s,
+            ci,
+            CMD_PEER_SYNC,
+            Lane::Bulk,
+            "b|bot|n|nick|5\n",
+            None,
+        );
+        assert!(queued(&s, 10).is_empty(), "held while unknown");
+        assert!(s.clients[ci].sync_held);
+        peer_sync_release(&mut s, ci);
+        assert!(queued(&s, 10).is_empty(), "still unknown: still held");
+        // Below the floor: never sent, and the hold is not released.
+        s.peers[0].remote_version = "2.5.0".into();
+        peer_sync_release(&mut s, ci);
+        assert!(queued(&s, 10).is_empty(), "an older peer gets nothing");
+        // Current: one full sync and a request for theirs.
+        s.peers[0].remote_version = MESH_MIN_VERSION.into();
+        peer_sync_release(&mut s, ci);
+        assert!(!s.clients[ci].sync_held);
+        let q = queued(&s, 10);
+        assert!(
+            q.contains(&CMD_PEER_SYNC) && q.contains(&CMD_SYNC_REQUEST),
+            "{q:?}"
+        );
     }
 
     fn queued(s: &HubState, fd: i32) -> Vec<u8> {
@@ -1425,7 +1557,7 @@ mod tests {
     #[test]
     fn a_bcast_forward_skips_the_peers_the_sender_reaches_itself() {
         let (mut s, _keep) = three_peers();
-        // s says it is linked to x; x knows CMD_PEER_BCAST, y is an old hub.
+        // s says it is linked to x; x knows CMD_PEER_BCAST, y has sent no links.
         s.mesh_hubs.push(crate::state::MeshHub {
             uuid: "s".into(),
             have_links: true,
@@ -1449,7 +1581,7 @@ mod tests {
         assert_eq!(
             queued(&s, 12),
             vec![CMD_PEER_SYNC],
-            "y: old hub, old opcode"
+            "y: no link report, plain sync"
         );
         // A forward of a point-to-point sync reaches every other peer, under
         // the opcode each one understands.

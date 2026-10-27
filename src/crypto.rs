@@ -126,11 +126,21 @@ pub fn gcm_decrypt_detached(
 /// separately.  None on an RNG failure — GCM IV reuse under one key is
 /// catastrophic, so there is no fallback.
 pub fn aes_gcm_encrypt(plain: &[u8], key: &[u8]) -> Option<(Vec<u8>, [u8; GCM_TAG_LEN])> {
+    aes_gcm_encrypt_aad(plain, &[], key)
+}
+
+/// aes_gcm_encrypt_aad(): the same, authenticating `aad` (not sent): the link
+/// frames' direction and counter (review 6, `queue::link_aad`).
+pub fn aes_gcm_encrypt_aad(
+    plain: &[u8],
+    aad: &[u8],
+    key: &[u8],
+) -> Option<(Vec<u8>, [u8; GCM_TAG_LEN])> {
     let mut iv = [0u8; GCM_IV_LEN];
     if !random_bytes(&mut iv) {
         return None;
     }
-    let (ct, tag) = gcm_encrypt_detached(key, &iv, &[], plain)?;
+    let (ct, tag) = gcm_encrypt_detached(key, &iv, aad, plain)?;
     let mut out = Vec::with_capacity(GCM_IV_LEN + ct.len());
     out.extend_from_slice(&iv);
     out.extend_from_slice(&ct);
@@ -139,11 +149,21 @@ pub fn aes_gcm_encrypt(plain: &[u8], key: &[u8]) -> Option<(Vec<u8>, [u8; GCM_TA
 
 /// aes_gcm_decrypt(): `input` is iv(12) || ciphertext, `tag` the detached tag.
 pub fn aes_gcm_decrypt(input: &[u8], key: &[u8], tag: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    aes_gcm_decrypt_aad(input, &[], key, tag)
+}
+
+/// aes_gcm_decrypt_aad(): inverse of [`aes_gcm_encrypt_aad`].
+pub fn aes_gcm_decrypt_aad(
+    input: &[u8],
+    aad: &[u8],
+    key: &[u8],
+    tag: &[u8],
+) -> Option<Zeroizing<Vec<u8>>> {
     if input.len() < GCM_IV_LEN {
         return None;
     }
     let (iv, ct) = input.split_at(GCM_IV_LEN);
-    gcm_decrypt_detached(key, iv, &[], ct, tag)
+    gcm_decrypt_detached(key, iv, aad, ct, tag)
 }
 
 /// hub_crypto_hkdf_sha256: extract-and-expand into `out`.

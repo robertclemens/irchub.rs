@@ -2426,12 +2426,24 @@ fn render_hub_show(ctx: &Ctx, h: &Crec, out: &mut Flines) {
     );
     let v = cat(&[b"ssh-ed25519 ", h.rvs("ssh_fp").unwrap_or(b"?")]);
     card(out, L, "ssh host key", &snp(512, v), RL_NORMAL);
-    let v = cat(&[
-        &num(h.rvi("peers_up", 0)),
-        b" / ",
-        &num(h.rvi("peers", 0)),
-        b" up",
-    ]);
+    // direct links (with the total only when some are down), then the mesh
+    let (pu, pt) = (h.rvi("peers_up", 0), h.rvi("peers", 0));
+    let mut v = if pu == pt {
+        cat(&[&num(pu), b" linked"])
+    } else {
+        cat(&[&num(pu), b" / ", &num(pt), b" linked"])
+    };
+    if h.rv("hubs").is_some() {
+        v.extend_from_slice(&cat(&[
+            b" ",
+            dot,
+            b" ",
+            &num(h.rvi("hubs_up", 0)),
+            b" / ",
+            &num(h.rvi("hubs", 0)),
+            b" on the network",
+        ]));
+    }
     card(out, L, "hubs", &v, RL_NORMAL);
     let v = cat(&[
         &num(h.rvi("bots_here", 0)),
@@ -2486,6 +2498,8 @@ fn render_hub_show(ctx: &Ctx, h: &Crec, out: &mut Flines) {
         "ssh_fp",
         "peers_up",
         "peers",
+        "hubs_up",
+        "hubs",
         "bots_here",
         "bots_online",
         "bots",
@@ -2554,7 +2568,7 @@ fn render_hub_settings(ctx: &Ctx, h: &Crec, out: &mut Flines) {
 /// hub set ssh / hub set conn: this hub's connection limits.  ok|hub.show
 /// with group=ssh|conn and, per setting, <name>=<value> and
 /// <name>_def=<built-in>.
-const LIMIT_ROWS: [(&str, &str, &str); 13] = [
+const LIMIT_ROWS: [(&str, &str, &str); 14] = [
     (
         "ssh",
         "preauth",
@@ -2615,6 +2629,11 @@ const LIMIT_ROWS: [(&str, &str, &str); 13] = [
         "conn",
         "authfail",
         "failed logins per address, N:S[:B], then blocked B seconds",
+    ),
+    (
+        "conn",
+        "startups",
+        "logins in progress, S:R[:F]: from S, unknown addresses refused R%, rising to all at F",
     ),
 ];
 
@@ -2678,7 +2697,7 @@ fn render_limits(ctx: &Ctx, h: &Crec, out: &mut Flines) {
     hint(
         out,
         if conn {
-            b"hub set conn <perip|churn|authfail> <value|default>"
+            b"hub set conn <perip|churn|authfail|startups> <value|default>"
         } else {
             "hub set ssh <name> <value|default> \u{b7} hub set conn shows the shared limits"
                 .as_bytes()
@@ -3074,6 +3093,8 @@ fn opname(op: u64) -> Option<&'static str> {
         0x7F => "CMD_BOT_RETIRE",
         0x80 => "CMD_BOT_RETIRE_ACK",
         0x81 => "CMD_ADMIN_LIST_REVOKED",
+        0x82 => "CMD_ADMIN_PEER_REFS",
+        0x83 => "CMD_LINK_SEQ",
         _ => return None,
     })
 }
@@ -5190,6 +5211,15 @@ fn node_rank(st: Option<&[u8]>) -> i32 {
     }
 }
 
+/// A status row's group: a node already on the target sits with the done.
+fn upg_row_rank(n: &Crec) -> i32 {
+    if n.rvb("already") {
+        3
+    } else {
+        node_rank(n.rv("state"))
+    }
+}
+
 /// "2.4.8 → 2.5.0 → 2.5.1" from a plan record's `<p>_from` / `<p>_path`.
 fn plan_path_line(ctx: &Ctx, pl: &Crec, p: &str) -> Vec<u8> {
     let mut out = pl.rv(&format!("{p}_from")).unwrap_or(b"").to_vec();
@@ -5369,14 +5399,24 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         b"no (whole network)".to_vec()
     };
     card(out, L, "selective", &v, RL_NORMAL);
+    // A hub a bots-only run never moves (idle) is not part of the count or
+    // the table -- one line says how many relayed it; a node already on the
+    // target (already) is a no-op, counted apart from the failures.
     let (mut done, mut failed, mut waiting, mut total) = (0i32, 0i32, 0i32, 0i32);
+    let (mut already, mut idle) = (0i32, 0i32);
     for n in rep.r.iter().filter(|x| x.is("node")) {
-        let k = node_rank(n.rv("state"));
+        if n.rvb("idle") {
+            idle += 1;
+            continue;
+        }
+        let k = upg_row_rank(n);
         if k == 4 {
             continue;
         }
         total += 1;
-        if k == 3 {
+        if n.rvb("already") {
+            already += 1;
+        } else if k == 3 {
             done += 1;
         } else if k == 1 {
             failed += 1;
@@ -5389,12 +5429,12 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let fill = if total != 0 { done * bar / total } else { 0 };
     sb.rep(glyph(ctx, G_FULL), fill);
     sb.rep(glyph(ctx, G_EMPTY), bar - fill);
+    sb.a(&cat(&[b"  ", &num(done), b" / ", &num(total), b" done"]));
+    if already > 0 {
+        sb.a(&cat(&[b" ", dot, b" ", &num(already), b" already on it"]));
+    }
     sb.a(&cat(&[
-        b"  ",
-        &num(done),
-        b" / ",
-        &num(total),
-        b" done ",
+        b" ",
         dot,
         b" ",
         &num(failed),
@@ -5405,6 +5445,18 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         b" waiting",
     ]));
     card(out, L, "progress", &sb.p, RL_NORMAL);
+    if idle > 0 {
+        let one = idle == 1;
+        let v = cat(&[
+            b"not moving: ",
+            &num(idle),
+            if one { b" hub" } else { b" hubs" },
+            b" relayed the run to ",
+            if one { b"its" } else { b"their" },
+            b" bots",
+        ]);
+        card(out, L, "hubs", &v, RL_NORMAL);
+    }
     if ru.is_some() {
         card(out, L, "roll-up", &plan, RL_NORMAL);
     }
@@ -5427,7 +5479,7 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let mut t = Tbl::new(&COLS, -1, 1, 1);
     for rank in 0..=4 {
         for n in rep.r.iter() {
-            if !n.is("node") || node_rank(n.rv("state")) != rank {
+            if !n.is("node") || n.rvb("idle") || upg_row_rank(n) != rank {
                 continue;
             }
             let code = match n.rvs("want") {
@@ -5435,10 +5487,15 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 None => n.rvs("base").unwrap_or(b"").to_vec(),
             };
             let code = snp(32, code);
+            let st = if n.rvb("already") {
+                Some(&b"on target"[..])
+            } else {
+                n.rv("state")
+            };
             let cells = [
                 n.rv("kind"),
                 n.rvs("name").or_else(|| n.rv("uuid")),
-                n.rv("state"),
+                st,
                 n.rv("from"),
                 n.rv("to"),
                 Some(code.as_slice()),
@@ -5452,7 +5509,7 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             } else {
                 RL_NORMAL
             };
-            t.row(ctx, role, n.rv("state"), &cells);
+            t.row(ctx, role, st, &cells);
         }
     }
     if t.nr() > 0 {
@@ -5545,7 +5602,7 @@ fn render_upg_releases(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             }
             listed += 1;
             if let (Some(o), Some(v)) = (oldest, r.rv("ver"))
-                && ver_cmp(v, o).is_le()
+                && ver_cmp(v, o).is_lt()
             {
                 continue;
             }
@@ -5570,7 +5627,7 @@ fn render_upg_releases(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 out,
                 RL_DIM,
                 &[
-                    b"  (none newer than ",
+                    b"  (none at or above ",
                     old,
                     b", the oldest ",
                     p,
@@ -5677,6 +5734,11 @@ fn render_upg_releases(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         out,
         RL_DIM,
         &[b"  start a run: upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>]"],
+    );
+    line(
+        out,
+        RL_DIM,
+        &[b"  switch a node between the C and Rust builds: nodes=<name>=c or nodes=<name>=rs"],
     );
 }
 

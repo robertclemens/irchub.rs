@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 
 use crate::consts::*;
 use crate::crypto::Key32;
-use crate::cstr::now;
+use crate::cstr::{now, trunc};
 use crate::secret::Locked;
 
 // ---------------------------------------------------------------------------
@@ -36,7 +36,19 @@ use crate::secret::Locked;
 /// remove would never replicate (a removed admin staying active elsewhere).
 pub fn lww_next_ts(prev: i64) -> i64 {
     let n = now();
-    if n > prev { n } else { prev + 1 }
+    if n > prev { n } else { prev.saturating_add(1) }
+}
+
+/// hub_ts_ahead(): a replicated record's stamp may run at most
+/// LWW_MAX_FUTURE past this node's clock.  Linked nodes agree within the 60 s
+/// handshake window, so a stamp beyond it is hostile or broken: refused on
+/// every store, it can neither win LWW for good nor run the stamp arithmetic
+/// past i64::MAX.  Stamps read by `config::load` are this hub's own record
+/// and are kept whatever the clock says (`config::LOADING`).  Hub-side only:
+/// bots take records from their hub, which already refused.
+pub fn ts_ahead(ts: i64) -> bool {
+    !crate::config::LOADING.load(std::sync::atomic::Ordering::Relaxed)
+        && ts > now() + LWW_MAX_FUTURE
 }
 
 /// LWW acceptance for a replicated add/del record: a strictly newer stamp
@@ -47,6 +59,9 @@ pub fn lww_next_ts(prev: i64) -> i64 {
 /// other's forever.  Delete-over-add is deterministic, so every node
 /// converges.  Mirrored in ircbot (lww_accepts) — the rule must match on both.
 pub fn lww_accepts(in_ts: i64, in_active: bool, cur_ts: i64, cur_active: bool) -> bool {
+    if ts_ahead(in_ts) {
+        return false;
+    }
     in_ts > cur_ts || (in_ts == cur_ts && cur_active && !in_active)
 }
 
@@ -55,6 +70,9 @@ pub fn lww_accepts(in_ts: i64, in_active: bool, cur_ts: i64, cur_active: bool) -
 /// picks the same side -- and a set ("h") beats a clear (""), the stricter
 /// policy.  Mirrored in ircbot (opt_accepts).
 pub fn opt_accepts(in_ts: i64, in_flags: &str, cur_ts: i64, cur_flags: &str) -> bool {
+    if ts_ahead(in_ts) {
+        return false;
+    }
     in_ts > cur_ts || (in_ts == cur_ts && in_flags > cur_flags)
 }
 
@@ -312,7 +330,6 @@ pub struct ChanElectHub {
     pub fd: i32,
     pub asked: i64,
     pub ready: i64,
-    pub silent: i64,
     pub tried: bool,
 }
 
@@ -957,6 +974,33 @@ pub struct HubClient {
     pub typ: ClientType,
     pub last_seen: i64,
     pub last_pong_sent: i64,
+    /// Second the relay count is for.
+    pub relay_window: i64,
+    /// CMD_BOT_RELAY in that second.
+    pub relay_count: i32,
+    /// Output queued, no byte taken since.
+    pub write_wait_since: i64,
+    /// Last queue-drop warning for this client.
+    pub drop_logged: i64,
+    /// Drops since, not yet in a warning.
+    pub drop_unlogged: i32,
+    /// A newer session of this bot replaced it.
+    pub superseded: bool,
+    /// Start of the hour replace_count is for.
+    pub replace_window: i64,
+    /// Live sessions of this bot replaced.
+    pub replace_count: i32,
+    /// Review 6 (CMD_LINK_SEQ): its offer seen, our go queued, the direction
+    /// bytes of our / its frames, sequencing on for our / its frames, and the
+    /// counters of the frames sealed / opened since.
+    pub link_offered: bool,
+    pub link_go_queued: bool,
+    pub link_dir_tx: u8,
+    pub link_dir_rx: u8,
+    pub link_tx_seq: bool,
+    pub link_rx_seq: bool,
+    pub link_tx_ctr: u64,
+    pub link_rx_ctr: u64,
     /// D4: when the socket was accepted/created.
     pub connected_at: i64,
     /// Accepted on the listener (subject to the IP lists).
@@ -984,10 +1028,21 @@ pub struct HubClient {
     /// be handed to the console thread untouched.
     pub sniff_pending: bool,
     pub sniff_deadline_ms: i64,
+    /// Review 16: an outbound peer link whose non-blocking connect is still
+    /// in flight (since dial_started), to the peer with uuid dial_uuid.  Only
+    /// its writability matters; main.rs finish_dials completes it.
+    pub dialing: bool,
+    pub dial_started: i64,
+    pub dial_uuid: String,
     /// Set by a handler that found this bot or peer below MESH_MIN_VERSION
     /// (or a push below BOT_PROTO_USER_FLAGS): the dispatch then drops the
     /// link.
     pub refused: bool,
+    /// A peer whose version is not known yet: no config sync goes to it and
+    /// none from it is taken in (`mesh::peer_enqueue_sync` / the dispatch)
+    /// until its first roster names a version at MESH_MIN_VERSION or newer;
+    /// then `mesh::peer_sync_release` sends a full sync and asks for one.
+    pub sync_held: bool,
     /// CMD_CHAN_EVENT rate limit for this connection
     /// (CHAN_EVENT_MAX_PER_WINDOW per CHAN_EVENT_WINDOW seconds); dropped
     /// events are counted.
@@ -1000,6 +1055,9 @@ pub struct HubClient {
     /// D2: PREAUTH_BUF_SIZE, then the per-type bulk size on auth.  `len()` is
     /// the C `recv_len`.
     pub recv_buf: Vec<u8>,
+    /// Unread data is `recv_buf[recv_off..]`: frames are consumed by moving
+    /// this, and the buffer is compacted only once it is full.
+    pub recv_off: usize,
     pub recv_cap: usize,
     pub bot_auth_state: BotAuthState,
     pub challenge: [u8; 32],
@@ -1072,6 +1130,22 @@ impl HubClient {
             typ: ClientType::Bot,
             last_seen: t,
             last_pong_sent: 0,
+            relay_window: 0,
+            relay_count: 0,
+            write_wait_since: 0,
+            drop_logged: 0,
+            drop_unlogged: 0,
+            superseded: false,
+            replace_window: 0,
+            replace_count: 0,
+            link_offered: false,
+            link_go_queued: false,
+            link_dir_tx: 0,
+            link_dir_rx: 0,
+            link_tx_seq: false,
+            link_rx_seq: false,
+            link_tx_ctr: 0,
+            link_rx_ctr: 0,
             connected_at: t,
             inbound: false,
             retiring: false,
@@ -1081,14 +1155,19 @@ impl HubClient {
             conn_serial: next_conn_serial(),
             console: None,
             sniff_pending: false,
+            dialing: false,
+            dial_started: 0,
+            dial_uuid: String::new(),
             sniff_deadline_ms: 0,
             refused: false,
+            sync_held: false,
             chan_ev_window: 0,
             chan_ev_count: 0,
             chan_ev_dropped: 0,
             uchan_req_window: 0,
             uchan_req_count: 0,
             recv_buf: Vec::with_capacity(size.min(PREAUTH_BUF_SIZE)),
+            recv_off: 0,
             recv_cap: size,
             bot_auth_state: BotAuthState::Idle,
             challenge: [0; 32],
@@ -1151,22 +1230,27 @@ impl HubClient {
     /// for the rest without waiting for new bytes, or they sit unread until
     /// the sender's next packet.
     pub fn has_buffered_frame(&self) -> bool {
-        if self.fd <= 0 || self.recv_buf.len() < 4 {
+        let unread = &self.recv_buf[self.recv_off..];
+        if self.fd <= 0 || unread.len() < 4 {
             return false;
         }
-        let packet_len = u32::from_be_bytes([
-            self.recv_buf[0],
-            self.recv_buf[1],
-            self.recv_buf[2],
-            self.recv_buf[3],
-        ]) as i64;
+        let packet_len = u32::from_be_bytes([unread[0], unread[1], unread[2], unread[3]]) as i64;
         // An out-of-range prefix counts: the pump refuses it and drops the
         // client rather than leaving it parked on a length that can never
         // complete.
         if packet_len < 0 || packet_len > (self.recv_cap as i64 - 4) {
             return true;
         }
-        self.recv_buf.len() as i64 >= 4 + packet_len
+        unread.len() as i64 >= 4 + packet_len
+    }
+
+    /// Move the unread bytes to the front, only once the buffer has no room
+    /// left to read into (a drain per frame made a backlog quadratic).
+    pub fn compact_recv(&mut self) {
+        if self.recv_off > 0 && self.recv_buf.len() >= self.recv_cap {
+            self.recv_buf.drain(..self.recv_off);
+            self.recv_off = 0;
+        }
     }
 
     /// peer_queue_destroy(): free all queued messages and wipe any
@@ -1217,6 +1301,17 @@ pub struct HubState {
     /// the process (needed on every config write) in an mlock'd buffer.  See
     /// the threat model in `secret`.
     pub config_pass: Locked<MAX_PASS>,
+    /// Review 23: the config key (`salt || key`), derived once (the load,
+    /// else the first write) and reused with the salt it was derived with;
+    /// every write takes a fresh IV.  A 600k-round PBKDF2 per write stalled
+    /// the event loop ~0.5 s.  Reset by `set_config_pass` (a new password
+    /// derives anew); mlock'd, wiped with `config_key_forget` and on drop.
+    pub cfg_key: Locked<{ SALT_SIZE + 32 }>,
+    pub cfg_key_set: bool,
+    /// Review 7: the hello replay cache (ephemeral key, accepted at), a ring
+    /// of HELLO_SEEN_MAX.
+    pub hello_seen: Vec<([u8; 32], i64)>,
+    pub hello_seen_next: usize,
 
     pub hub_ed25519_priv: Locked<32>,
     pub hub_x25519_priv: Locked<32>,
@@ -1241,6 +1336,14 @@ pub struct HubState {
     /// Admin flags and oper channel bindings (access.rs).
     pub uflag_records: Vec<UflagRecord>,
     pub uchan_records: Vec<UchanRecord>,
+    /// `uf|` changes that took 'a' away, as (uuid, the new `uf|` stamp): the
+    /// `uf|` no longer says it held 'a', and the admin floor must know
+    /// (`access::admin_floor_restore`).  Memory only, a ring of
+    /// `ADMIN_DROP_LOG`.
+    pub adrop: Vec<(String, i64)>,
+    pub adrop_next: usize,
+    /// "no full admin, nothing to restore" logged once.
+    pub floor_warned: bool,
 
     pub peers: Vec<PeerConfig>,
 
@@ -1304,6 +1407,12 @@ pub struct HubState {
     pub conn_cfg: crate::connlimits::ConnCfg,
     /// D26: SSH-only failure and connect table (memory only).
     pub ssh_ips: Vec<crate::connlimits::SshIp>,
+    /// 13b: addresses a bot or peer authenticated from, with when
+    /// (`ratelimit::known_ip_note`).
+    pub known_ips: Vec<(String, i64)>,
+    /// Last refusal warning, and refusals since not yet logged.
+    pub startup_logged: i64,
+    pub startup_unlogged: i32,
 
     /// Days threshold for the tombstone purge (0 = disabled).
     pub purge_days_setting: i32,
@@ -1403,6 +1512,24 @@ impl Default for HubState {
     }
 }
 
+/// Names come from the store and from peers: no control byte reaches a log
+/// line through one (hub_logic.c who_clean).
+fn who_clean(s: String) -> String {
+    if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        s.chars()
+            .map(|q| {
+                if (q as u32) < 0x20 || q as u32 == 0x7f {
+                    '_'
+                } else {
+                    q
+                }
+            })
+            .collect()
+    } else {
+        s
+    }
+}
+
 impl HubState {
     pub fn new() -> HubState {
         HubState {
@@ -1415,6 +1542,10 @@ impl HubState {
             executable_path: String::new(),
             hub_friendly_name: String::new(),
             config_pass: Locked::new(),
+            cfg_key: Locked::new(),
+            cfg_key_set: false,
+            hello_seen: Vec::new(),
+            hello_seen_next: 0,
             hub_ed25519_priv: Locked::new(),
             hub_x25519_priv: Locked::new(),
             hub_ed25519_pub: [0; 32],
@@ -1429,6 +1560,9 @@ impl HubState {
             mask_records: Vec::new(),
             uflag_records: Vec::new(),
             uchan_records: Vec::new(),
+            adrop: vec![(String::new(), 0); crate::consts::ADMIN_DROP_LOG],
+            adrop_next: 0,
+            floor_warned: false,
             peers: Vec::new(),
             revoked: Vec::new(),
             pending_op_requests: vec![PendingOpRequest::default(); MAX_PENDING_OP_REQUESTS],
@@ -1457,6 +1591,9 @@ impl HubState {
             ip_acl_changed: false,
             conn_cfg: crate::connlimits::ConnCfg::default(),
             ssh_ips: Vec::new(),
+            known_ips: Vec::new(),
+            startup_logged: 0,
+            startup_unlogged: 0,
             purge_days_setting: 0,
             purge_days_ts: 0,
             trust_loopback: false,
@@ -1500,6 +1637,22 @@ impl HubState {
     /// hub_set_config_pass().
     pub fn set_config_pass(&mut self, pass: &str) {
         self.config_pass.set_str(pass);
+        self.config_key_forget(); // derived from the old password
+    }
+
+    /// hub_config_key_forget().
+    pub fn config_key_forget(&mut self) {
+        self.cfg_key.wipe();
+        self.cfg_key_set = false;
+    }
+
+    /// cfg_key_keep(): remember the key a load or write derived.
+    pub fn config_key_keep(&mut self, salt: &[u8], key: &[u8; 32]) {
+        let mut sk = Zeroizing::new([0u8; SALT_SIZE + 32]);
+        sk[..SALT_SIZE].copy_from_slice(salt);
+        sk[SALT_SIZE..].copy_from_slice(key);
+        self.cfg_key.set(&sk);
+        self.cfg_key_set = true;
     }
 
     /// hub_get_config_pass().
@@ -1557,9 +1710,9 @@ impl HubState {
 
     /// Index of the authenticated bot with this UUID, or None.
     pub fn bot_client(&self, uuid: &str) -> Option<usize> {
-        self.clients
-            .iter()
-            .position(|c| c.typ == ClientType::Bot && c.authenticated && c.id == uuid)
+        self.clients.iter().position(|c| {
+            c.typ == ClientType::Bot && c.authenticated && !c.superseded && c.id == uuid
+        })
     }
 
     /// Indices of every authenticated peer hub.
@@ -1594,6 +1747,113 @@ impl HubState {
         }
     }
 
+    /// The name a uuid goes by and what it is ("bot", "hub", "admin",
+    /// "oper"): hub_logic.c who_name().
+    fn who_name(&self, kind: char, uuid: &str) -> (&'static str, Option<&str>) {
+        if kind == '\0' || kind == 'b' {
+            if let Some(n) = self.bot_entry(uuid, "n") {
+                return ("bot", Some(n));
+            }
+            if let Some(r) = self
+                .roster
+                .iter()
+                .find(|r| r.bot_uuid == uuid && !r.nick.is_empty())
+            {
+                return ("bot", Some(&r.nick));
+            }
+        }
+        if kind == '\0' || kind == 'h' {
+            if self.hub_uuid == uuid && !self.hub_friendly_name.is_empty() {
+                return ("hub", Some(&self.hub_friendly_name));
+            }
+            if let Some(p) = self
+                .peers
+                .iter()
+                .find(|p| p.uuid == uuid && !p.friendly_name.is_empty())
+            {
+                return ("hub", Some(&p.friendly_name));
+            }
+            if let Some(m) = self
+                .mesh_hubs
+                .iter()
+                .find(|m| m.uuid == uuid && !m.name.is_empty())
+            {
+                return ("hub", Some(&m.name));
+            }
+        }
+        if (kind == '\0' || kind == 'u')
+            && let Some(u) = self.user_records.iter().find(|u| u.uuid == uuid)
+        {
+            let word = if u.typ == 'a' { "admin" } else { "oper" };
+            return (word, (!u.name.is_empty()).then_some(u.name.as_str()));
+        }
+        let word = match kind {
+            'b' => "bot",
+            'h' => "hub",
+            'u' => "user",
+            _ => "?",
+        };
+        (word, None)
+    }
+
+    /// Log label for a node or user (hub_who): "bot bunny_ (<uuid>)",
+    /// "hub hubtbl (<uuid>)", "admin robert (<uuid>)"; an unknown name reads
+    /// "?".  kind: 'b' bot, 'h' hub, 'u' admin/oper, '\0' = whichever knows
+    /// the uuid.
+    pub fn who(&self, kind: char, uuid: &str) -> String {
+        let (word, name) = if uuid.is_empty() {
+            (
+                match kind {
+                    'b' => "bot",
+                    'h' => "hub",
+                    'u' => "user",
+                    _ => "?",
+                },
+                None,
+            )
+        } else {
+            self.who_name(kind, uuid)
+        };
+        let id = if uuid.is_empty() {
+            "?"
+        } else {
+            trunc(uuid, 64)
+        };
+        if kind == '\0' && name.is_none() {
+            return who_clean(format!("? ({id})"));
+        }
+        who_clean(format!("{word} {} ({id})", trunc(name.unwrap_or("?"), 64)))
+    }
+
+    /// Log label for connection `ci` (hub_who_client): a bot by its uuid, a
+    /// peer by its name and uuid, a console by its admin.
+    pub fn who_client(&self, ci: usize) -> String {
+        let Some(c) = self.clients.get(ci) else {
+            return "?".into();
+        };
+        who_clean(match c.typ {
+            ClientType::Bot if !c.id.is_empty() => self.who('b', &c.id),
+            ClientType::Hub => {
+                let uuid = self
+                    .peers
+                    .iter()
+                    .find(|p| p.connected && p.fd == c.fd)
+                    .map_or("?", |p| {
+                        if p.uuid.is_empty() {
+                            "?"
+                        } else {
+                            p.uuid.as_str()
+                        }
+                    });
+                let name = if c.id.is_empty() { "?" } else { c.id.as_str() };
+                format!("hub {} ({})", trunc(name, 64), trunc(uuid, 64))
+            }
+            ClientType::Admin if c.id.starts_with("ADMIN:") => format!("admin {}", &c.id[6..]),
+            _ if !c.id.is_empty() => c.id.clone(),
+            _ => c.ip.clone(),
+        })
+    }
+
     /// Whether the network opt flag is set.
     pub fn opt(&self, flag: char) -> bool {
         self.opt_flags.contains(flag)
@@ -1603,6 +1863,25 @@ impl HubState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recv_offset_and_compaction() {
+        let mut c = HubClient::new_detached(7, "127.0.0.1", 16);
+        // two 2-byte frames, then half of a third
+        c.recv_buf
+            .extend_from_slice(&[0, 0, 0, 2, b'a', b'b', 0, 0, 0, 2, b'c', b'd', 0, 0]);
+        assert!(c.has_buffered_frame());
+        c.recv_off = 6; // the first frame consumed
+        assert!(c.has_buffered_frame());
+        c.recv_off = 12; // the second too: only a partial prefix is left
+        assert!(!c.has_buffered_frame());
+        c.compact_recv(); // not full yet: nothing moves
+        assert_eq!(c.recv_off, 12);
+        c.recv_buf.extend_from_slice(&[0, 2]); // now full (16 bytes)
+        c.compact_recv();
+        assert_eq!((c.recv_off, &c.recv_buf[..]), (0, &[0u8, 0, 0, 2][..]));
+        assert!(!c.has_buffered_frame());
+    }
 
     #[test]
     fn lww_tie_prefers_delete() {

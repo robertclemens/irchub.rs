@@ -28,8 +28,8 @@ pub const GCM_TAG_LEN: usize = 16;
 pub const HEADER_SIZE: usize = 4;
 pub const MAX_PENDING_OP_REQUESTS: usize = 500;
 /// PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys
-/// (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; releases
-/// after it carry min_from 2.5.0, so only this count is read.
+/// (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; every
+/// release since carries min_from 2.5.0 or later, so only this count is read.
 pub const PBKDF2_ITERATIONS: u32 = 600_000;
 /// A bot that knows admin flags and oper channel bindings (uf| / uc|) says
 /// "v|3" at the head of its full CMD_CONFIG_PUSH (docs/passwordless.md §3.4);
@@ -39,9 +39,9 @@ pub const PBKDF2_ITERATIONS: u32 = 600_000;
 pub const BOT_PROTO_USER_FLAGS: i32 = 3;
 /// The oldest bot or hub this hub links with (2.5.1 plan D1 / D4): a bot's
 /// CMD_BOT_PRESENCE or a direct peer's roster header below it drops the link
-/// with a "upgrade it by hand" line.  2.5.0 moved every file to PBKDF2 600k,
-/// which is all 2.5.1 reads.
-pub const MESH_MIN_VERSION: &str = "2.5.0";
+/// with a "upgrade it by hand" line.  2.5.2 raised it to 2.5.1: every node
+/// reads only PBKDF2 600k files, reports K|, and has dropped .pass.prev.
+pub const MESH_MIN_VERSION: &str = "2.5.1";
 pub const KEY_FP_LEN: usize = 19; // "ab12:cd34:ef56:7890"
 pub const HUB_PID_FILE: &str = ".irchub.pid";
 pub const HUB_PASS_FILE: &str = ".irchub.pass";
@@ -85,6 +85,22 @@ pub const CHURN_WINDOW_SEC: i64 = 10;
 pub const CHURN_MAX_CONNS: i32 = 30;
 pub const CHURN_BLOCK_SEC: i64 = 30;
 
+/// 13b — connections not yet authenticated (MaxStartups-style random early
+/// drop, `hub set conn startups S:R:F`).  Below S of them every new one is
+/// taken; from S, a new one from an unknown address is refused with
+/// probability R%, rising linearly to 100% at F.  A known address — a
+/// configured peer, a bot in the roster, a bot or peer that authenticated
+/// here within KNOWN_IP_MEMORY, a recent console login — skips the gate, and
+/// so does the rate-limit table being full of live entries, which refuses
+/// an unknown address instead of letting it through untracked.
+pub const STARTUPS_DEF_START: i32 = 20;
+pub const STARTUPS_DEF_RATE: i32 = 30;
+pub const STARTUPS_DEF_FULL: i32 = 50;
+pub const MAX_KNOWN_IPS: usize = 256;
+pub const KNOWN_IP_MEMORY: i64 = 86400;
+/// One refusal warning per this, with a count.
+pub const STARTUP_LOG_EVERY: i64 = 60;
+
 /// PURGE loop suppression.  A purge is flooded to every peer and forwarded
 /// on, so on a big mesh each hub sees many copies, some of them minutes late
 /// when peer queues back up.  An id is random and never reused, so it is
@@ -118,7 +134,7 @@ pub const HIDEPINGPONG: bool = true;
 /// the bots tree and the one every upgrade comparison is made against.
 pub const HUB_VERSION: &str = match option_env!("IRCHUB_VERSION") {
     Some(v) => v,
-    None => "2.5.1",
+    None => "2.5.2",
 };
 
 /// Signed-release channel for the hub (irchub-releases).  Same Ed25519 key
@@ -145,9 +161,6 @@ pub const HUB_UPGRADE_MARKER_FILE: &str = ".irchub.upgrade";
 /// Retained previous binary/config, kept (not deleted) after an upgrade so
 /// CMD_UPGRADE_ABORT can put this hub back.
 pub const HUB_UPGRADE_PREV_SUFFIX: &str = ".prev";
-/// 2.5.0's rollback copy of the pass file (HUB_PASS_FILE +
-/// HUB_UPGRADE_PREV_SUFFIX): removed at start.
-pub const HUB_PASS_PREV_FILE: &str = ".irchub.pass.prev";
 /// The generated installer, written 0700 and exec'd once the old process has
 /// let go of its pid lock.
 pub const HUB_UPGRADE_SCRIPT: &str = "hub_upgrade.sh";
@@ -323,10 +336,9 @@ pub const CMD_CHAN_FWD_REPLY: u8 = 0x5D;
 //   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
 //   DONE       bot->hub  eid|ok|detail or eid|fail|detail
 //   ELECT_FWD  hub->hub  eid|origin_hub|kind|channel|requester|nick|hostmask|origin_ts
-//   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|silent (silent: 0
-//              from 2.5.1; a 2.5.0 hub's count is read and ignored)
-//   ELECT_DO   hub->hub  eid|hub_uuid|elect (a 2.5.0 origin's "legacy" is
-//              ignored)
+//   ELECT_ACK  hub->hub  eid|hub_uuid|hub_name|asked|ready|0 (the last field
+//              is a reserved slot, always 0 and never read)
+//   ELECT_DO   hub->hub  eid|hub_uuid|elect
 //   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
 // kind = op / invite / unban / key; requester = a bot uuid, or ADMIN.
 pub const CMD_CHAN_PROBE: u8 = 0x6D;
@@ -386,6 +398,23 @@ pub const CMD_ADMIN_LIST_REVOKED: u8 = 0x81;
 /// hub "<uuid|name>"; the reply names the hubs that link to it and the bots
 /// whose hl| list holds it.
 pub const CMD_ADMIN_PEER_REFS: u8 = 0x82;
+/// Review 6: link framing with a sequence (bot<->hub and hub<->hub).  After a
+/// link authenticates each side sends "offer"; the side that sees the other's
+/// offer answers "go", and every frame it seals after its go carries
+/// HUB_LINK_AAD_LEN bytes of AAD: "LNK1" || direction || 64-bit counter (big
+/// endian, from 0, not sent).  The counter makes a replayed or reordered frame
+/// fail its tag, the direction byte a reflected one (H hub->bot, B bot->hub;
+/// between hubs L from the lower uuid, G from the greater).  A 2.5.1 node
+/// ignores the offer and the link keeps the old framing; one that says it is
+/// HUB_LINK_SEQ_VERSION or newer without having offered is dropped (a stripped
+/// offer).  2.5.3 drops the old framing.
+pub const CMD_LINK_SEQ: u8 = 0x83;
+pub const HUB_LINK_AAD_LEN: usize = 13;
+pub const HUB_LINK_SEQ_VERSION: &str = "2.5.2";
+/// Review 7: ephemeral keys of the HUBv3 hellos accepted in the last
+/// HELLO_SEEN_SECS (the hello's freshness window); a repeat is a replay.
+pub const HELLO_SEEN_MAX: usize = 128;
+pub const HELLO_SEEN_SECS: i64 = 60;
 /// Revoke list ceiling; the oldest is dropped past it.
 pub const MAX_REVOKED: usize = 1024;
 /// Seconds an online bot gets to answer CMD_BOT_RETIRE.
@@ -439,6 +468,17 @@ pub const CMD_ADMIN_UPGRADE_STATUS: u8 = 0x64;
 pub const CMD_BOT_RELAY_FWD: u8 = 0x65;
 /// Seconds a forwarded relay stays deliverable.
 pub const BOT_RELAY_FWD_TTL: i64 = 30;
+/// CMD_BOT_RELAY a local bot may send per second; the rest are dropped.  Each
+/// one not for a local bot goes to every peer, so one bot could fill them.
+pub const BOT_RELAY_PER_SEC: i32 = 20;
+/// A client with output queued that takes no byte of it for this long is
+/// dropped: a bot or peer that stopped reading only looks connected.
+pub const WRITE_STALL_TIMEOUT: i64 = 60;
+/// A full DELTA/BULK lane's drop warning: one line per client this often.
+pub const QUEUE_DROP_LOG_EVERY: i64 = 60;
+/// A bot whose new session replaces a live one more often than this in an
+/// hour is warned about: two processes with one key, or a stolen key.
+pub const BOT_REPLACE_WARN_PER_HOUR: i32 = 3;
 
 /// Drop the roll-up plan mesh-wide (mirrors irchub/hub.h).  Every hub that
 /// followed a run keeps that run's plan in its own .irchub.cnf and walks any
@@ -505,6 +545,10 @@ pub const ACTIVITY_BUCKET: i64 = 3600;
 /// A reported time this far ahead of our clock is refused: activity only
 /// rises, so one bogus future stamp would stick for good.
 pub const ACTIVITY_MAX_FUTURE: i64 = 300;
+/// How far past this node's clock a replicated record's stamp may run
+/// (`state::ts_ahead`); room for `lww_next_ts` stepping past now under a
+/// burst of edits.
+pub const LWW_MAX_FUTURE: i64 = 3600;
 pub const ACTIVITY_REQ_ID_MAX: usize = 32;
 /// After a peer link drops, ask the remaining peers for a full sync this many
 /// seconds later: a forwarder may have skipped us on the strength of that
@@ -683,6 +727,11 @@ pub const MODES_RECORDS_MAX: usize = MAX_CHANNELS * C_LINE_MAX
     + MAX_CHANNELS * K_LINE_MAX;
 
 pub const MAX_HUB_USER_RECORDS: usize = 40;
+/// The admin floor (`access::admin_floor_restore`): +a removals stamped
+/// within this many seconds of the newest one are one race and are all
+/// undone; the ring of remembered 'a' flag drops.
+pub const ADMIN_FLOOR_WINDOW: i64 = 60;
+pub const ADMIN_DROP_LOG: usize = 16;
 pub const MAX_HUB_USER_MASKS: usize = 200;
 /// Admin flags and oper channel bindings (user_flags plan §3.1).  The
 /// letters in their canonical order: a full, b bots, c channels, h hub,

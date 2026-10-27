@@ -5,8 +5,8 @@
 //! The C hub ran `select()` over blocking sockets and used
 //! `send(..., MSG_DONTWAIT | MSG_NOSIGNAL)` on the queue-drain path only.
 //! That split is reproduced exactly: `write_all` is the blocking write the
-//! handshake and response paths use, `send_dontwait` is the one-shot send the
-//! drain uses, and `poll_fds` replaces `select()` (poll(2) has no FD_SETSIZE
+//! handshake paths use (every frame after it is queued: `client::client_send`),
+//! `send_dontwait` is the one-shot send the drain uses, and `poll_fds` replaces `select()` (poll(2) has no FD_SETSIZE
 //! ceiling, and the hub already indexes clients by fd, never by set bit).
 
 use std::io::{self, Read, Write};
@@ -45,20 +45,35 @@ pub fn bind_addr(bind_ip: &str, port: i32) -> Result<SocketAddr, SocketAddr> {
     }
 }
 
-/// Outbound peer connect, bounded by CONNECT_TIMEOUT.  The C hub set
-/// SO_SNDTIMEO on a blocking connect; socket2 does the non-blocking
-/// connect + wait, with the same ceiling and the same blocking socket
-/// afterwards.
-pub fn connect_peer(ip: &str, port: i32) -> io::Result<TcpStream> {
+/// Review 16: start an outbound peer connect without waiting for it (the
+/// blocking one froze the hub for up to CONNECT_TIMEOUT per dead peer).  The
+/// socket is non-blocking until [`finish_connect`].
+pub fn start_connect(ip: &str, port: i32) -> io::Result<TcpStream> {
     let ip: Ipv4Addr = ip
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad peer address"))?;
     let addr = SocketAddr::new(IpAddr::V4(ip), port as u16);
     let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    sock.connect_timeout(&SockAddr::from(addr), Duration::from_secs(CONNECT_TIMEOUT))?;
-    let s = TcpStream::from(sock);
+    sock.set_nonblocking(true)?;
+    match sock.connect(&SockAddr::from(addr)) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(nix::libc::EINPROGRESS) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(TcpStream::from(sock))
+}
+
+/// The connect [`start_connect`] began, once poll says it is done: its
+/// outcome, and on success the blocking socket with the SO_SNDTIMEO the C
+/// hub's dial always had (everything after the connect is as before).
+pub fn finish_connect(s: &TcpStream) -> io::Result<()> {
+    if let Some(e) = s.take_error()? {
+        return Err(e);
+    }
+    s.peer_addr()?; // a connect still in flight has no peer yet
     s.set_nonblocking(false)?;
-    Ok(s)
+    s.set_write_timeout(Some(Duration::from_secs(CONNECT_TIMEOUT)))?;
+    Ok(())
 }
 
 /// The dotted-quad of a peer address, as `inet_ntoa` rendered it.

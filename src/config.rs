@@ -108,13 +108,21 @@ pub fn format_user_record(u: &UserRecord) -> String {
 /// Set by `-selftest`: nothing may write the config the running build owns,
 /// whatever migration or dedup load() would otherwise do.
 pub static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// g_hub_config_loading: true while `load` runs.  Stamps on disk are this
+/// hub's own record and are kept whatever the clock says (a box booting with
+/// its clock in the past must not drop its config): `state::ts_ahead` lets
+/// them through.
+pub static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn write(state: &mut HubState) {
     if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let estimated_size = HUB_CONFIG_FIXED_MAX + state.bots.len() * HUB_CONFIG_PER_BOT_MAX;
-    let mut buf = Zeroizing::new(String::with_capacity(8192));
+    // Sized to the bound checked below (plus a last line): a String that has
+    // to grow frees its old allocation unwiped, private key included
+    // (review 2026-10-25 L1).
+    let mut buf = Zeroizing::new(String::with_capacity(estimated_size + 4096));
 
     buf.push_str(&format!("port|{}\n", state.port));
     buf.push_str(&format!(
@@ -180,8 +188,8 @@ pub fn write(state: &mut HubState) {
 
     // The roll-up plan (upgrade plan, Task 13): hub-local, never replicated.
     // rollup|target|variant|kind|min_from|hub_target|plan_set|| — the two
-    // trailing slots once held run bases (gone in 2.5.1) and stay empty so a
-    // rolled-back 2.5.0 still reads the line.  Every field was checked free
+    // trailing slots once held run bases (gone in 2.5.1) and are reserved,
+    // always empty.  Every field was checked free
     // of '|' and line breaks before it was accepted (upgrade::plan_field_ok),
     // and is checked again here, so the line can never split or inject
     // another.
@@ -262,7 +270,10 @@ pub fn write(state: &mut HubState) {
         let priv64 = state.hub_priv_combined();
         let pub64 = state.hub_pub_combined();
         let priv_b64 = Zeroizing::new(crypto::b64_encode(priv64.as_ref()));
-        buf.push_str(&format!("key|{}\n", priv_b64.as_str()));
+        // pieces, not format!: its String would hold the key unwiped
+        buf.push_str("key|");
+        buf.push_str(priv_b64.as_str());
+        buf.push('\n');
         buf.push_str(&format!("pub|{}\n", crypto::b64_encode(&pub64)));
     }
 
@@ -364,14 +375,24 @@ pub fn write(state: &mut HubState) {
     // with a predictable IV/salt if the RNG is unavailable.
     let mut salt = [0u8; SALT_SIZE];
     let mut iv = [0u8; GCM_IV_LEN];
-    if !crypto::random_bytes(&mut salt) || !crypto::random_bytes(&mut iv) {
+    if !crypto::random_bytes(&mut iv) || (!state.cfg_key_set && !crypto::random_bytes(&mut salt)) {
         crate::hlog_error!("[HUB] RAND_bytes failed; aborting config write\n");
         return;
     }
 
-    let pass = state.get_config_pass();
-    let key = crypto::derive_config_key(pass.as_bytes(), &salt, PBKDF2_ITERATIONS);
-    drop(pass);
+    let key = if state.cfg_key_set {
+        let sk = state.cfg_key.get();
+        salt.copy_from_slice(&sk[..SALT_SIZE]);
+        let mut key = crypto::Key32::new([0u8; 32]);
+        key.copy_from_slice(&sk[SALT_SIZE..]);
+        key
+    } else {
+        let pass = state.get_config_pass();
+        let key = crypto::derive_config_key(pass.as_bytes(), &salt, PBKDF2_ITERATIONS);
+        drop(pass);
+        state.config_key_keep(&salt, &key);
+        key
+    };
 
     let Some((ct, tag)) = crypto::gcm_encrypt_detached(key.as_ref(), &iv, &[], buf.as_bytes())
     else {
@@ -387,18 +408,26 @@ pub fn write(state: &mut HubState) {
         .truncate(true)
         .mode(0o600)
         .open(&tmp);
-    let Ok(mut f) = out else { return };
-    let ok = f.write_all(&salt).is_ok()
-        && f.write_all(&iv).is_ok()
-        && f.write_all(&tag).is_ok()
-        && f.write_all(&ct).is_ok()
-        && f.flush().is_ok()
-        && f.sync_all().is_ok();
-    drop(f);
-    if ok {
-        let _ = fs::rename(&tmp, HUB_CONFIG_FILE);
-    } else {
-        let _ = fs::remove_file(&tmp);
+    // Renamed over the config only when every byte reached the disk.
+    let ok = match out {
+        Ok(mut f) => {
+            let ok = f.write_all(&salt).is_ok()
+                && f.write_all(&iv).is_ok()
+                && f.write_all(&tag).is_ok()
+                && f.write_all(&ct).is_ok()
+                && f.flush().is_ok()
+                && f.sync_all().is_ok();
+            drop(f);
+            let ok = ok && fs::rename(&tmp, HUB_CONFIG_FILE).is_ok();
+            if !ok {
+                let _ = fs::remove_file(&tmp);
+            }
+            ok
+        }
+        Err(_) => false,
+    };
+    if !ok {
+        crate::hlog_error!("[HUB] Config write failed: the previous config is kept\n");
     }
 }
 
@@ -530,8 +559,8 @@ fn load_peer_line(state: &mut HubState, v: &str) {
             }
             other => {
                 crate::hlog_warning!(
-                    "[PEER] peer {} pubkey wrong length ({}, need {COMBINED_KEY_LEN}) — ignoring; v2 auth disabled for this peer\n",
-                    p.uuid,
+                    "[PEER] {} pubkey wrong length ({}, need {COMBINED_KEY_LEN}) — ignoring; v2 auth disabled for this peer\n",
+                    state.who('h', &p.uuid),
                     other.map_or(0, |d| d.len())
                 );
             }
@@ -662,9 +691,9 @@ fn dedup_records(state: &mut HubState) -> bool {
         // Drop masks whose UUID has no surviving owner.
         if !users.iter().any(|u| u.uuid == m.uuid) {
             crate::hlog_debug!(
-                "[HUB] Dedup: dropped orphaned mask '{}' (UUID {})\n",
+                "[HUB] Dedup: dropped orphaned mask '{}' ({})\n",
                 m.mask,
-                m.uuid
+                state.who('u', &m.uuid)
             );
             continue;
         }
@@ -703,6 +732,13 @@ fn dedup_records(state: &mut HubState) -> bool {
 
 /// hub_config_load().
 pub fn load(state: &mut HubState, password: &str) -> bool {
+    LOADING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ok = load_inner(state, password);
+    LOADING.store(false, std::sync::atomic::Ordering::Relaxed);
+    ok
+}
+
+fn load_inner(state: &mut HubState, password: &str) -> bool {
     // a|/o| lines that did not parse.
     let mut cfg_bad_users = 0u32;
     // w|/x| lines dropped, merged or canonicalised.
@@ -739,6 +775,7 @@ pub fn load(state: &mut HubState, password: &str) -> bool {
         );
         return false;
     };
+    state.config_key_keep(salt, &key);
     let text = Zeroizing::new(String::from_utf8_lossy(&plain).into_owned());
 
     state.bots.clear();

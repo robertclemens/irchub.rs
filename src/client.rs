@@ -17,7 +17,7 @@ use crate::consts::*;
 use crate::cstr::{Fmt, Tok, atoll, now, sscanf, trunc_string};
 use crate::state::{BotAuthState, ClientType, HubClient, HubState, Lane, QueuedMsg};
 use crate::{
-    access, admin, auth, crypto, mesh, net, opflow, presence, queue, ratelimit, storage, upgrade,
+    access, admin, auth, crypto, mesh, opflow, presence, queue, ratelimit, storage, upgrade,
 };
 
 const PEER_INFO: &[u8] = b"irchub-peer-session-v1";
@@ -26,32 +26,40 @@ const PEER_INFO: &[u8] = b"irchub-peer-session-v1";
 // Sending
 // ---------------------------------------------------------------------------
 
-/// send_cmd_to_bot(): frame `payload` under `cmd` and write it to one
-/// authenticated bot.
-///
-/// The plaintext frame is wiped after it goes out: a CHAN_REPLY carries a
-/// channel key.
+/// hub_client_send(): every frame to a linked bot or peer after the
+/// handshake goes through its queue.  A direct write blocked the whole loop
+/// on a client that stopped reading, and could land inside a part-sent
+/// queued frame (the receiver's GCM check then failed and it dropped the
+/// link).  The urgent lane keeps the old order -- ahead of queued deltas and
+/// bulk frames, behind the frame already in flight -- and the drain right
+/// after sends it at once when the socket has room.  False = not queued (no
+/// socket, urgent lane full).
+pub fn client_send(client: &mut HubClient, cmd: u8, payload: &str) -> bool {
+    if client.sock.is_none() || client.internal {
+        return false;
+    }
+    if !queue::send_urgent(client, cmd, payload) {
+        return false;
+    }
+    queue::drain_writable(client);
+    true
+}
+
+/// send_cmd_to_bot(): one frame to one authenticated bot, through
+/// [`client_send`].  The queued copy is wiped when it is freed: a CHAN_REPLY
+/// carries a channel key.
 pub fn send_cmd_to_bot(client: &mut HubClient, cmd: u8, payload: &str) -> bool {
     if payload.len() + 5 > MAX_BUFFER {
         return false;
     }
-    let plain = Zeroizing::new(net::frame_plain(cmd, payload.as_bytes(), true));
-    let Some((body, tag)) = crypto::aes_gcm_encrypt(&plain, client.session_key.as_ref()) else {
-        return false;
-    };
-    let mut wire = body;
-    wire.extend_from_slice(&tag);
-    let Some(sock) = &mut client.sock else {
-        return false;
-    };
-    net::write_framed(sock, &wire)
+    client_send(client, cmd, payload)
 }
 
 /// send_cmd_to_bot_after_config(): for a frame that acts on config the bot
 /// may not have yet (a `mode` job reads the C| modes and c| key the console
 /// has just stored): send the owed config push now, past the coalescing
 /// window, and queue the frame behind it in the bulk lane --
-/// [`send_cmd_to_bot`] writes straight to the socket and would overtake a
+/// [`send_cmd_to_bot`] goes out on the urgent lane and would overtake a
 /// config still waiting in the bot's queue.
 pub fn send_cmd_to_bot_after_config(
     state: &mut HubState,
@@ -98,44 +106,57 @@ pub fn send_response(state: &mut HubState, ci: usize, msg: &str) -> bool {
         auth::disconnect_client(state, ci);
         return false;
     }
-    let ok = {
-        let c = &mut state.clients[ci];
-        match crypto::aes_gcm_encrypt(msg.as_bytes(), c.session_key.as_ref()) {
-            Some((body, tag)) => {
-                let mut wire = body;
-                wire.extend_from_slice(&tag);
-                match &mut c.sock {
-                    Some(sock) => net::write_framed(sock, &wire),
-                    None => false,
-                }
-            }
-            None => false,
-        }
-    };
-    if !ok {
-        auth::disconnect_client(state, ci);
-        return false;
-    }
+    // Admin replies go to SSH consoles only; a bot that sent an admin opcode
+    // gets none (a frame sealed here, outside the queue, would also break the
+    // link's sequence: review 6).
+    crate::hlog_debug!(
+        "[HUB] Admin reply to non-console {} dropped\n",
+        state.clients[ci].ip
+    );
     true
 }
 
-/// send_pong(): the keepalive answer.  Drops the client on a write failure.
+/// Review 6: start the sequenced framing on a link that just authenticated
+/// (a bot, or a peer whose uuid is `peer_uuid`): fix the direction bytes and
+/// send "offer".  A 2.5.1 node ignores it and the link stays as it is.
+pub fn link_offer(state: &mut HubState, ci: usize, peer_uuid: Option<&str>) {
+    let lower = peer_uuid.is_some_and(|pu| state.hub_uuid.as_str() < pu);
+    let c = &mut state.clients[ci];
+    if c.typ == ClientType::Hub {
+        c.link_dir_tx = if lower { b'L' } else { b'G' };
+        c.link_dir_rx = if lower { b'G' } else { b'L' };
+    } else {
+        c.link_dir_tx = b'H';
+        c.link_dir_rx = b'B';
+    }
+    queue::send_urgent(c, CMD_LINK_SEQ, "offer");
+}
+
+/// Review 6: CMD_LINK_SEQ from the other end.  Its "offer" is answered with
+/// our "go" (our frames after it are sequenced, see queue::encrypt_into_writing);
+/// its "go" says every frame it sends after it is.
+fn link_seq_recv(state: &mut HubState, ci: usize, what: &str) {
+    let c = &mut state.clients[ci];
+    if what == "offer" && !c.link_offered {
+        c.link_offered = true;
+        if !c.link_go_queued {
+            c.link_go_queued = true;
+            queue::send_urgent(c, CMD_LINK_SEQ, "go");
+        }
+    } else if what == "go" && c.link_offered && !c.link_rx_seq {
+        c.link_rx_seq = true;
+        c.link_rx_ctr = 0;
+        crate::hlog_debug!(
+            "[HUB] {}: sequenced link framing on\n",
+            state.who_client(ci)
+        );
+    }
+}
+
+/// send_pong(): the keepalive answer, through [`client_send`].  Drops the
+/// client when it cannot be queued.
 fn send_pong(state: &mut HubState, ci: usize) -> bool {
-    let plain = net::frame_plain(CMD_PING, &[], false);
-    let ok = {
-        let c = &mut state.clients[ci];
-        match crypto::aes_gcm_encrypt(&plain, c.session_key.as_ref()) {
-            Some((body, tag)) => {
-                let mut wire = body;
-                wire.extend_from_slice(&tag);
-                match &mut c.sock {
-                    Some(sock) => net::write_framed(sock, &wire),
-                    None => false,
-                }
-            }
-            None => true, // encryption failure was silently ignored in C
-        }
-    };
+    let ok = client_send(&mut state.clients[ci], CMD_PING, "");
     if !ok {
         auth::disconnect_client(state, ci);
         return false;
@@ -143,27 +164,12 @@ fn send_pong(state: &mut HubState, ci: usize) -> bool {
     true
 }
 
-/// send_ping(): the maintenance keepalive.  False means the connection is
-/// dead and the caller should drop it; a full socket buffer is not a death.
+/// send_ping(): the maintenance keepalive, queued like every frame after the
+/// handshake (a ping sent straight to the socket landed inside a part-sent
+/// sync frame and broke the link).  False = it could not be queued: the
+/// caller drops the connection.
 pub fn send_ping(client: &mut HubClient) -> bool {
-    let plain = net::frame_plain(CMD_PING, &[], false);
-    let Some((body, tag)) = crypto::aes_gcm_encrypt(&plain, client.session_key.as_ref()) else {
-        return true;
-    };
-    let mut wire = Vec::with_capacity(4 + body.len() + GCM_TAG_LEN);
-    wire.extend_from_slice(&((body.len() + GCM_TAG_LEN) as u32).to_be_bytes());
-    wire.extend_from_slice(&body);
-    wire.extend_from_slice(&tag);
-    let Some(sock) = &client.sock else {
-        return false;
-    };
-    match net::send_dontwait(sock, &wire) {
-        net::SendOutcome::Sent(n) => n == wire.len(),
-        // The peer's send buffer is full but the connection is alive; skip
-        // this ping.
-        net::SendOutcome::WouldBlock => true,
-        net::SendOutcome::Error(_) => false,
-    }
+    client_send(client, CMD_PING, "")
 }
 
 /// SHA-256 of a bot config, leaving out the pd| line: it is stamped with the
@@ -203,7 +209,10 @@ pub fn send_config_to_bot(state: &mut HubState, ci: usize, force: bool) {
     let id = state.clients[ci].id.clone();
     let payload = Zeroizing::new(storage::generate_bot_payload(state, &id));
     if payload.is_empty() {
-        crate::hlog_warning!("[HUB] No config to send to {id}\n");
+        crate::hlog_warning!(
+            "[HUB] No config to send to {id}\n",
+            id = state.who_client(ci)
+        );
         return;
     }
     let hash = bot_config_hash(&payload);
@@ -213,7 +222,8 @@ pub fn send_config_to_bot(state: &mut HubState, ci: usize, force: bool) {
     }
     crate::hlog_debug!(
         "[HUB-SYNC] Queueing config to {id} ({} bytes)\n",
-        payload.len()
+        payload.len(),
+        id = state.who_client(ci)
     );
 
     let coalesce = format!("{}|cfg_data|{id}", state.hub_uuid);
@@ -457,7 +467,10 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     }
     let id = state.clients[ci].id.clone();
     let fd = state.clients[ci].fd;
-    crate::hlog_debug!("[HUB] Processing config push from {id}\n");
+    crate::hlog_debug!(
+        "[HUB] Processing config push from {id}\n",
+        id = state.who_client(ci)
+    );
     // The bot's tables may now differ from what it was last sent (a push the
     // hub does not accept stays in them), so its next broadcast goes out.
     state.clients[ci].cfg_sent_hash = None;
@@ -482,14 +495,17 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     let hub_only_mutations = state.opt(OPT_HUB_ONLY_MUTATIONS);
 
     // Task 6 — opt 'F' (OPT_CONFIG_FROZEN): an upgrade run is open, so the
-    // store holds still entirely.  Dropping the whole push (rather than
-    // filtering it) is deliberate: a bot that restarts mid-roll re-pushes its
-    // config on reconnect, and nothing here is lost that the bot will not
-    // offer again once the freeze lifts.
-    if upgrade::config_frozen(state) {
-        let id = state.clients[ci].id.clone();
-        crate::hlog_warning!("[UPGRADE] config frozen: REJECTED config push from {id}\n");
-        return;
+    // store holds still: a bot that restarts mid-roll re-pushes its config on
+    // reconnect, and nothing is lost that it will not offer again once the
+    // freeze lifts.  Its own nick (n|) and hostmask (h|) are the exception —
+    // runtime identity, not config.  A bot that comes back from its upgrade
+    // under another nick is opped by its peers only once they learn the new
+    // mask, and the run waits for exactly that op (UPGRADE_OPS_WAIT).
+    let frozen = upgrade::config_frozen(state);
+    if frozen {
+        crate::hlog_warning!(
+            "[UPGRADE] config frozen: only nick/hostmask taken from config push from {id}\n"
+        );
     }
 
     // v|<proto>|<unused> (docs/passwordless.md §3.4) heads a bot's full
@@ -499,7 +515,8 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     let proto = push_proto(payload);
     if (0..i64::from(BOT_PROTO_USER_FLAGS)).contains(&proto) {
         crate::hlog_warning!(
-            "[HUB] Bot {id} pushes protocol v{proto} (below v{BOT_PROTO_USER_FLAGS}): refused; upgrade it by hand to {MESH_MIN_VERSION}\n"
+            "[HUB] {id} pushes protocol v{proto} (below v{BOT_PROTO_USER_FLAGS}): refused; upgrade it by hand to {MESH_MIN_VERSION}\n",
+            id = state.who_client(ci)
         );
         state.clients[ci].refused = true;
         return;
@@ -510,7 +527,10 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     let mut sync_buffer = String::new();
 
     for line in work_buf.split('\n') {
-        if line.len() < 2 || line.starts_with('#') {
+        if line.len() < 2
+            || line.starts_with('#')
+            || (frozen && !(line.starts_with("n|") || line.starts_with("h|")))
+        {
             continue;
         }
         // uf| / uc|: admin flags and oper channel bindings (access.rs).  A bot
@@ -525,14 +545,14 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 crate::hlog_warning!(
                     "[HUB] opt 'h' active: REJECTED bot-pushed '{}' record from {} (hub-authoritative)\n",
                     &line[..2],
-                    id
+                    state.who_client(ci)
                 );
             } else {
                 match access::ingest(state, kind, body, true) {
                     None => crate::hlog_warning!(
                         "[HUB] Ignored invalid '{}' record from {}\n",
                         &line[..2],
-                        id
+                        state.who_client(ci)
                     ),
                     Some(true) => {
                         updates += 1;
@@ -554,7 +574,10 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                     .map(|e| (e.value.clone(), e.timestamp))
             });
             if !storage::hublist_valid(v) {
-                crate::hlog_warning!("[HUB] Ignored invalid hub list from {id}\n");
+                crate::hlog_warning!(
+                    "[HUB] Ignored invalid hub list from {id}\n",
+                    id = state.who_client(ci)
+                );
             } else if let Some(cur) = cur
                 && cur.as_ref().is_none_or(|(cv, _)| cv != v)
             {
@@ -588,7 +611,8 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
         // admin change, and stays accepted (D43) -- see the 'c' branch below.
         if hub_only_mutations && matches!(typ, 'a' | 'o' | 'm') {
             crate::hlog_warning!(
-                "[HUB] opt 'h' active: REJECTED bot-pushed '{typ}' record from {id} (hub-authoritative — mutation must originate from the admin console)\n"
+                "[HUB] opt 'h' active: REJECTED bot-pushed '{typ}' record from {id} (hub-authoritative — mutation must originate from the admin console)\n",
+                id = state.who_client(ci)
             );
             continue;
         }
@@ -604,7 +628,8 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 if hub_only_mutations && (op != "add" || storage::chan_live(state, &chan).is_none())
                 {
                     crate::hlog_warning!(
-                        "[HUB] opt 'h' active: REJECTED bot-pushed 'c' {op} for {chan} from {id} (hub-authoritative)\n"
+                        "[HUB] opt 'h' active: REJECTED bot-pushed 'c' {op} for {chan} from {id} (hub-authoritative)\n",
+                        id = state.who_client(ci)
                     );
                     continue;
                 }
@@ -636,7 +661,8 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                     push_sync(state, &mut sync_buffer, fd, &format!("K|{data}\n"));
                 } else {
                     crate::hlog_debug!(
-                        "[HUB] K| from {id} not taken (channel not managed or not newer)\n"
+                        "[HUB] K| from {id} not taken (channel not managed or not newer)\n",
+                        id = state.who_client(ci)
                     );
                 }
             }
@@ -659,7 +685,8 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 // Channel settings and network defaults are written by the
                 // console only.
                 crate::hlog_warning!(
-                    "[HUB] Ignored bot-pushed '{typ}' record from {id} (console only)\n"
+                    "[HUB] Ignored bot-pushed '{typ}' record from {id} (console only)\n",
+                    id = state.who_client(ci)
                 );
             }
             'm' => {
@@ -683,6 +710,7 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 let mi = match found {
                     Some(i) => i,
                     None if state.mask_records.len() < MAX_HUB_USER_MASKS
+                        && !crate::state::ts_ahead(ts)
                         && (is_active || !crate::storage::purge_floor_blocks(state, ts)) =>
                     {
                         state.mask_records.push(crate::state::MaskRecord {
@@ -730,6 +758,7 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                 let ui = match found {
                     Some(i) => i,
                     None if state.user_records.len() < MAX_HUB_USER_RECORDS
+                        && !crate::state::ts_ahead(incoming.timestamp)
                         && (incoming.is_active
                             || !crate::storage::purge_floor_blocks(state, incoming.timestamp)) =>
                     {
@@ -834,12 +863,24 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
     if access::migrate(state) > 0 {
         updates += 1;
     }
+    // A hubless bot's removal may have left no +a admin: undo it everywhere.
+    if updates > 0 {
+        let from = state.who_client(ci);
+        if let Some((floor, _)) = access::admin_floor_restore(state, &from)
+            && !floor.is_empty()
+        {
+            mesh::broadcast_sync_to_peers(state, &floor, -1);
+        }
+    }
 
     let first_push = !state.clients[ci].pushed;
     state.clients[ci].pushed = true;
 
     if updates > 0 {
-        crate::hlog_debug!("[HUB] Applied {updates} updates from {id}\n");
+        crate::hlog_debug!(
+            "[HUB] Applied {updates} updates from {id}\n",
+            id = state.who_client(ci)
+        );
         // Update "seen" to track the last successful sync.
         storage::update_entry(state, &id, "seen", "", "", "", now());
         state.config_dirty = true;
@@ -874,7 +915,10 @@ fn process_bot_delta(state: &mut HubState, ci: usize, payload: &str) {
     );
     let id = state.clients[ci].id.clone();
     if conv.len() < 2 {
-        crate::hlog_warning!("[HUB] Invalid CMD_BOT_DELTA from {id} — ignoring\n");
+        crate::hlog_warning!(
+            "[HUB] Invalid CMD_BOT_DELTA from {id} — ignoring\n",
+            id = state.who_client(ci)
+        );
         return;
     }
     let key = conv[0].s().to_string();
@@ -891,16 +935,21 @@ fn process_bot_delta(state: &mut HubState, ci: usize, payload: &str) {
     // the flag is binding on every bot-write path.
     if state.opt(OPT_HUB_ONLY_MUTATIONS) && matches!(key.as_str(), "a" | "o" | "m" | "c" | "p") {
         crate::hlog_warning!(
-            "[HUB] opt 'h' active: REJECTED bot delta '{key}' from {id} (hub-authoritative)\n"
+            "[HUB] opt 'h' active: REJECTED bot delta '{key}' from {id} (hub-authoritative)\n",
+            id = state.who_client(ci)
         );
         return;
     }
 
     // Task 6 — opt 'F' (OPT_CONFIG_FROZEN): while an upgrade run is open the
-    // store does not move at all, or a node that restarts mid-roll comes back
-    // against a config its neighbours have not seen.
-    if upgrade::config_frozen(state) {
-        crate::hlog_warning!("[UPGRADE] config frozen: REJECTED bot delta '{key}' from {id}\n");
+    // store does not move, or a node that restarts mid-roll comes back
+    // against a config its neighbours have not seen.  The bot's nick and
+    // hostmask still move (see process_bot_config_push).
+    if upgrade::config_frozen(state) && key != "n" && key != "h" {
+        crate::hlog_warning!(
+            "[UPGRADE] config frozen: REJECTED bot delta '{key}' from {id}\n",
+            id = state.who_client(ci)
+        );
         return;
     }
 
@@ -910,7 +959,8 @@ fn process_bot_delta(state: &mut HubState, ci: usize, payload: &str) {
     // key/value simply returns "not accepted" below.
     crate::hlog_debug!(
         "[HUB] BOT_DELTA from {id}: key={key} val={} ts={ts}\n",
-        trunc_string(&val, 41)
+        trunc_string(&val, 41),
+        id = state.who_client(ci)
     );
     if !storage::update_entry(state, &id, &key, &val, "", "", ts) {
         return;
@@ -937,14 +987,10 @@ fn process_bot_delta(state: &mut HubState, ci: usize, payload: &str) {
         Some((&coalesce, seq)),
     );
 
-    // Also push a fresh config to the other locally connected bots so they
-    // learn the new hostmask / nick immediately, without waiting for
-    // anti-entropy.
-    for bi in state.bot_clients() {
-        if state.clients[bi].id != id {
-            send_config_to_bot(state, bi, false);
-        }
-    }
+    // The local bots learn the new hostmask / nick from the next coalesced
+    // push (within BOT_CONFIG_PUSH_COALESCE), not one full push per delta:
+    // a reconnect burst made that O(deltas x bots) frames of the same state.
+    broadcast_full_config_to_all_bots(state);
 }
 
 /// CMD_BOT_RELAY: `target_uuid|<sealed frame>` — forward to the target bot.
@@ -955,17 +1001,43 @@ fn process_bot_delta(state: &mut HubState, ci: usize, payload: &str) {
 fn process_bot_relay(state: &mut HubState, ci: usize, payload: &str) {
     let id = state.clients[ci].id.clone();
     let Some(bar) = payload.find('|') else {
-        crate::hlog_warning!("[HUB] Invalid CMD_BOT_RELAY payload from {id}\n");
+        crate::hlog_warning!(
+            "[HUB] Invalid CMD_BOT_RELAY payload from {id}\n",
+            id = state.who_client(ci)
+        );
         return;
     };
     let target_uuid = &payload[..bar];
     if target_uuid.is_empty() || target_uuid.len() >= 64 {
-        crate::hlog_warning!("[HUB] CMD_BOT_RELAY bad UUID len from {id}\n");
+        crate::hlog_warning!(
+            "[HUB] CMD_BOT_RELAY bad UUID len from {id}\n",
+            id = state.who_client(ci)
+        );
+        return;
+    }
+    let t = now();
+    let c = &mut state.clients[ci];
+    if c.relay_window != t {
+        c.relay_window = t;
+        c.relay_count = 0;
+    }
+    c.relay_count += 1;
+    if c.relay_count > BOT_RELAY_PER_SEC {
+        if c.relay_count == BOT_RELAY_PER_SEC + 1 {
+            crate::hlog_warning!(
+                "[HUB] CMD_BOT_RELAY: {id} sends over {BOT_RELAY_PER_SEC} a second — dropping the rest\n",
+                id = state.who_client(ci)
+            );
+        }
         return;
     }
     let target_uuid = target_uuid.to_string();
     let relay_payload = trunc_string(&payload[bar + 1..], MAX_BUFFER);
-    crate::hlog_debug!("[HUB] CMD_BOT_RELAY from {id} to {target_uuid}\n");
+    crate::hlog_debug!(
+        "[HUB] CMD_BOT_RELAY from {id} to {target_uuid}\n",
+        id = state.who_client(ci),
+        target_uuid = state.who('b', &target_uuid)
+    );
 
     if let Some(ti) = state.bot_client(&target_uuid) {
         bot_relay_deliver(state, ti, &id, &relay_payload);
@@ -980,7 +1052,10 @@ fn process_bot_relay(state: &mut HubState, ci: usize, payload: &str) {
         .iter()
         .any(|b| b.is_active && b.uuid == target_uuid)
     {
-        crate::hlog_warning!("[HUB] CMD_BOT_RELAY: target {target_uuid} is not a known bot\n");
+        crate::hlog_warning!(
+            "[HUB] CMD_BOT_RELAY: target {target_uuid} is not a known bot\n",
+            target_uuid = state.who('b', &target_uuid)
+        );
         return;
     }
     let request_id = opflow::generate_request_id();
@@ -996,11 +1071,13 @@ fn process_bot_relay(state: &mut HubState, ci: usize, payload: &str) {
     );
     if sent == 0 {
         crate::hlog_warning!(
-            "[HUB] CMD_BOT_RELAY: target {target_uuid} not connected and no peer to forward to\n"
+            "[HUB] CMD_BOT_RELAY: target {target_uuid} not connected and no peer to forward to\n",
+            target_uuid = state.who('b', &target_uuid)
         );
     } else {
         crate::hlog_debug!(
-            "[HUB] CMD_BOT_RELAY: {target_uuid} not local — forwarded (id:{request_id}) to {sent} peer(s)\n"
+            "[HUB] CMD_BOT_RELAY: {target_uuid} not local — forwarded (id:{request_id}) to {sent} peer(s)\n",
+            target_uuid = state.who('b', &target_uuid)
         );
     }
 }
@@ -1009,7 +1086,7 @@ fn process_bot_relay(state: &mut HubState, ci: usize, payload: &str) {
 /// `<sender>|<sealed frame>`.  The sender is the uuid the originating hub
 /// authenticated, which is what the bot binds the GCM AAD to.
 fn bot_relay_deliver(state: &mut HubState, ti: usize, sender: &str, sealed: &str) -> bool {
-    let target_uuid = state.clients[ti].id.clone();
+    let target_uuid = state.who_client(ti);
     let forwarded = format!("{sender}|{sealed}");
     if forwarded.len() + 5 > MAX_BUFFER {
         crate::hlog_warning!("[HUB] CMD_BOT_RELAY: forwarded payload too long\n");
@@ -1048,9 +1125,14 @@ fn bot_relay_forward(
         if c.typ != ClientType::Hub || !c.authenticated || c.fd == exclude_fd {
             continue;
         }
-        if queue::send_urgent(c, CMD_BOT_RELAY_FWD, &fwd) {
+        // DELTA, not URGENT: a full lane drops the oldest relay, while a full
+        // URGENT lane would take the peer link down with it.
+        if let Some(m) = QueuedMsg::new(CMD_BOT_RELAY_FWD, Lane::Delta, fwd.as_bytes())
+            && queue::enqueue(c, m)
+        {
             sent += 1;
         }
+        queue::drain_writable(c);
     }
     sent
 }
@@ -1084,7 +1166,8 @@ pub fn process_peer_bot_relay(state: &mut HubState, ci: usize, payload: &str) {
         return;
     }
     let origin_ts = atoll(f[1]);
-    let age = now() - origin_ts;
+    // atoll saturates: age only for a positive stamp (now - i64::MIN overflows)
+    let age = if origin_ts > 0 { now() - origin_ts } else { 0 };
     if origin_ts <= 0 || !(-BOT_RELAY_FWD_TTL..=BOT_RELAY_FWD_TTL).contains(&age) {
         crate::hlog_debug!("[HUB] Dropping stale BOT_RELAY_FWD (id:{id}, age={age}s)\n");
         return;
@@ -1105,7 +1188,7 @@ pub fn process_peer_bot_relay(state: &mut HubState, ci: usize, payload: &str) {
 /// and forward to the peers.
 fn process_invite_request(state: &mut HubState, ci: usize, payload: &str) {
     let conv = sscanf(payload, &[Fmt::Set(63, b"|"), Fmt::Lit("|"), Fmt::Word(63)]);
-    let id = state.clients[ci].id.clone();
+    let id = state.who_client(ci);
     let fd = state.clients[ci].fd;
     if conv.len() != 2 {
         crate::hlog_warning!("[HUB] Invalid INVITE_REQUEST payload from {id}\n");
@@ -1121,8 +1204,8 @@ fn process_invite_request(state: &mut HubState, ci: usize, payload: &str) {
         }
         if !send_cmd_to_bot(&mut state.clients[bi], CMD_INVITE_REQUEST, payload) {
             crate::hlog_warning!(
-                "[HUB] Failed to forward INVITE_REQUEST to bot {}\n",
-                state.clients[bi].id
+                "[HUB] Failed to forward INVITE_REQUEST to {}\n",
+                state.who_client(bi)
             );
         }
     }
@@ -1136,7 +1219,7 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
     match cmd {
         CMD_PING => {
             if !HIDEPINGPONG {
-                crate::hlog_debug!("[HUB] Bot {} PING\n", state.clients[ci].id);
+                crate::hlog_debug!("[HUB] {} PING\n", state.who_client(ci));
             }
         }
         CMD_BOT_PRESENCE => presence::process_bot_presence(state, ci, payload),
@@ -1146,7 +1229,7 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
         CMD_UPGRADE_RESULT => upgrade::bot_report(state, CMD_UPGRADE_RESULT, payload),
         CMD_CONFIG_PUSH => process_bot_config_push(state, ci, payload),
         CMD_CONFIG_PULL => {
-            crate::hlog_debug!("[HUB] Config PULL request from {}\n", state.clients[ci].id);
+            crate::hlog_debug!("[HUB] Config PULL request from {}\n", state.who_client(ci));
             send_config_to_bot(state, ci, true);
         }
         CMD_BOT_DELTA => process_bot_delta(state, ci, payload),
@@ -1169,7 +1252,69 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
 
 /// v3 hub peer authentication (Ed25519 signature, no password).
 /// Format: `HUBv3|<uuid>|<port>|<name>|<bind_ip>|<ts>|<sig_b64>`.
-fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
+/// Review 7b: true when a HUBv3 hello with this ephemeral key was accepted in
+/// the last HELLO_SEEN_SECS -- a replay, which would otherwise take over the
+/// live link -- else it is remembered.  Only verified, fresh hellos get here,
+/// so the ring holds real peers' hellos only.
+fn hello_replayed(state: &mut HubState, eph: &[u8; 32]) -> bool {
+    let t = now();
+    if state
+        .hello_seen
+        .iter()
+        .any(|(k, at)| *at != 0 && t - at <= HELLO_SEEN_SECS && crypto::ct_eq(k, eph))
+    {
+        return true;
+    }
+    let at = state.hello_seen_next;
+    if state.hello_seen.len() < HELLO_SEEN_MAX {
+        state.hello_seen.push((*eph, t));
+    } else {
+        state.hello_seen[at] = (*eph, t);
+    }
+    state.hello_seen_next = (at + 1) % HELLO_SEEN_MAX;
+    false
+}
+
+/// Review 7a: peer `pi` already has a live link when `ci`, a link it dialled,
+/// authenticates.  Both dialled by it: the new one is a reconnect and replaces
+/// the old.  One dialled each way (both hubs dialled at once): the link the
+/// lower uuid dialled stays, so the two hubs keep the same one without
+/// talking.  True when `ci` stays; the old link is then shut down and reaped
+/// on its EOF, as in auth::supersede_bot_sessions.
+fn peer_link_tie(state: &mut HubState, pi: usize, ci: usize) -> bool {
+    let peer_fd = state.peers[pi].fd;
+    let old = if state.peers[pi].connected {
+        (0..state.clients.len()).find(|&i| {
+            let c = &state.clients[i];
+            i != ci && c.typ == ClientType::Hub && c.fd >= 0 && c.fd == peer_fd
+        })
+    } else {
+        None
+    };
+    let Some(oi) = old else { return true };
+    let peer_uuid = state.peers[pi].uuid.clone();
+    let keep_new = state.clients[oi].inbound || peer_uuid.as_str() < state.hub_uuid.as_str();
+    if keep_new {
+        crate::hlog_info!(
+            "[MESH] {}: a second link (old one from {}) — keeping the new one\n",
+            state.who('h', &peer_uuid),
+            state.clients[oi].ip
+        );
+        let o = &mut state.clients[oi];
+        o.superseded = true;
+        if let Some(s) = o.sock.as_ref() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    } else {
+        crate::hlog_info!(
+            "[MESH] {} dialled while our link to it is up — ours stays (the lower uuid's link wins)\n",
+            state.who('h', &peer_uuid)
+        );
+    }
+    keep_new
+}
+
+fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str, eph: &[u8; 32]) -> bool {
     let ip = state.clients[ci].ip.clone();
     let fd = state.clients[ci].fd;
 
@@ -1196,7 +1341,8 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
         .filter(|&i| state.peers[i].has_pubkey)
     else {
         crate::hlog_warning!(
-            "[HUB] v3 peer auth: no pubkey on file for uuid {peer_uuid} (from {ip}) — add the peer with its 88-char pubkey.\n"
+            "[HUB] v3 peer auth: no pubkey on file for {peer_uuid} (from {ip}) — add the peer with its 88-char pubkey.\n",
+            peer_uuid = state.who('h', &peer_uuid)
         );
         ratelimit::record_failed_auth(state, &ip);
         auth::disconnect_client(state, ci);
@@ -1228,7 +1374,8 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
     );
     if !sig_ok {
         crate::hlog_warning!(
-            "[HUB] v3 peer auth: signature verify FAILED for uuid {peer_uuid} (from {ip})\n"
+            "[HUB] v3 peer auth: signature verify FAILED for {peer_uuid} (from {ip})\n",
+            peer_uuid = state.who('h', &peer_uuid)
         );
         ratelimit::record_failed_auth(state, &ip);
         auth::disconnect_client(state, ci);
@@ -1237,12 +1384,33 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
 
     // Freshness window (±60 s).
     let client_ts = atoll(&ts_str);
-    let skew = now() - client_ts;
+    // a negative stamp is as stale as it gets; for one >= 0 the difference
+    // cannot overflow
+    let skew = if client_ts < 0 {
+        i64::MAX
+    } else {
+        now() - client_ts
+    };
     if skew.abs() > 60 {
         crate::hlog_warning!(
-            "[HUB] v3 peer auth: timestamp skew {skew}s (max 60) for {peer_uuid}\n"
+            "[HUB] v3 peer auth: timestamp skew {skew}s (max 60) for {peer_uuid}\n",
+            peer_uuid = state.who('h', &peer_uuid)
         );
         ratelimit::record_failed_auth(state, &ip);
+        auth::disconnect_client(state, ci);
+        return false;
+    }
+    // Review 7b: the sealed box opens with the hello's ephemeral key (its
+    // first 32 bytes); seen inside the window, it is replayed.
+    if hello_replayed(state, eph) {
+        crate::hlog_warning!(
+            "[HUB] v3 peer auth: replayed hello for {} from {ip} — refused\n",
+            state.who('h', &peer_uuid)
+        );
+        auth::disconnect_client(state, ci);
+        return false;
+    }
+    if !peer_link_tie(state, pi, ci) {
         auth::disconnect_client(state, ci);
         return false;
     }
@@ -1255,6 +1423,7 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
         // D2: grow the buffers — peers exchange bulk anti-entropy sync.
         c.promote_buffers();
     }
+    crate::ratelimit::known_ip_note(state, &ip);
     state.peers[pi].connected = true;
     state.peers[pi].fd = fd;
     state.peers[pi].remote_ip = ip.clone();
@@ -1281,8 +1450,11 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str) -> bool {
             &ip
         } else {
             &peer_name
-        }
+        },
+        peer_uuid = state.who('h', &peer_uuid)
     );
+
+    link_offer(state, ci, Some(&peer_uuid));
 
     // Initial full-state sync to the newly authenticated peer.
     let init_sync = mesh::generate_sync_packet(state);
@@ -1332,7 +1504,9 @@ fn handle_unauthenticated(state: &mut HubState, ci: usize, data: &[u8]) -> bool 
         // v3 hub peer authentication.  Any other handshake (HUBv2 and older
         // included) is refused below.
         if payload.starts_with("HUBv3|") {
-            return handle_hubv3(state, ci, &payload);
+            let mut eph = [0u8; 32];
+            eph.copy_from_slice(&data[..32]);
+            return handle_hubv3(state, ci, &payload, &eph);
         }
         auth::disconnect_client(state, ci);
         return false;
@@ -1350,10 +1524,20 @@ fn handle_unauthenticated(state: &mut HubState, ci: usize, data: &[u8]) -> bool 
 fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
     let fd = state.clients[ci].fd;
     match cmd {
+        // Not read until this peer's version is known current:
+        // mesh::peer_sync_release asks for it again then.
+        CMD_PEER_SYNC | CMD_PEER_BCAST if mesh::peer_version_level(state, ci) != 2 => {
+            state.clients[ci].sync_held = true;
+        }
         CMD_PEER_SYNC => mesh::process_peer_sync(state, payload, fd, false),
         CMD_PEER_BCAST => mesh::process_peer_sync(state, payload, fd, true),
         CMD_MESH_STATE => mesh::process_mesh_state(state, ci, payload),
-        CMD_BOT_ROSTER => presence::process_bot_roster(state, ci, payload),
+        CMD_BOT_ROSTER => {
+            presence::process_bot_roster(state, ci, payload);
+            if !state.clients[ci].refused {
+                mesh::peer_sync_release(state, ci);
+            }
+        }
         CMD_OP_FORWARD_REQUEST => opflow::process_forward_op_request(state, ci, payload),
         CMD_OP_FORWARD_GRANT => opflow::process_forward_op_grant(state, payload),
         CMD_OP_FORWARD_FAILED => opflow::process_forward_op_failed(state, payload),
@@ -1456,16 +1640,17 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
         let Some(ci) = state.client_by_fd(fd) else {
             return false;
         };
-        if state.clients[ci].recv_buf.len() < 4 || packets_this_call >= 8 {
+        let off = state.clients[ci].recv_off;
+        if state.clients[ci].recv_buf.len() - off < 4 || packets_this_call >= 8 {
             return true;
         }
         packets_this_call += 1;
         let c = &state.clients[ci];
         let packet_len = i64::from(u32::from_be_bytes([
-            c.recv_buf[0],
-            c.recv_buf[1],
-            c.recv_buf[2],
-            c.recv_buf[3],
+            c.recv_buf[off],
+            c.recv_buf[off + 1],
+            c.recv_buf[off + 2],
+            c.recv_buf[off + 3],
         ]));
 
         // D2: bound against the client's actual buffer capacity, which is the
@@ -1482,16 +1667,18 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
             return false;
         }
         let packet_len = packet_len as usize;
-        if c.recv_buf.len() < 4 + packet_len {
+        if c.recv_buf.len() - off < 4 + packet_len {
             return true; // need more data
         }
-        let data: Vec<u8> = c.recv_buf[4..4 + packet_len].to_vec();
+        let frame = off + 4..off + 4 + packet_len;
 
         if state.clients[ci].internal {
+            let data = state.clients[ci].recv_buf[frame].to_vec();
             if !handle_console_frame(state, ci, &data) {
                 return false;
             }
         } else if !state.clients[ci].authenticated {
+            let data = state.clients[ci].recv_buf[frame].to_vec();
             if !handle_unauthenticated(state, ci, &data) {
                 return false;
             }
@@ -1500,13 +1687,33 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
             // can be far larger than MAX_BUFFER — recv_cap was promoted to
             // MAX_SYNC_PAYLOAD for it — so the plaintext is sized to the
             // frame, never to a fixed 16 KB buffer.
-            let (body, tag) = data.split_at(packet_len - GCM_TAG_LEN);
-            let plain = crypto::aes_gcm_decrypt(body, state.clients[ci].session_key.as_ref(), tag);
+            // Decrypted straight from the receive buffer: no copy of the
+            // ciphertext first (review 2026-10-25 #25).
+            // Review 6: on a sequenced link the frame must be the next one.
+            let seq = state.clients[ci].link_rx_seq;
+            let plain = {
+                let c = &state.clients[ci];
+                let (body, tag) = c.recv_buf[frame].split_at(packet_len - GCM_TAG_LEN);
+                let aad = if seq {
+                    queue::link_aad(c.link_dir_rx, c.link_rx_ctr).to_vec()
+                } else {
+                    Vec::new()
+                };
+                crypto::aes_gcm_decrypt_aad(body, &aad, c.session_key.as_ref(), tag)
+            };
+            if plain.is_some() && seq {
+                state.clients[ci].link_rx_ctr += 1;
+            }
 
             let Some(plain) = plain else {
                 let ip = state.clients[ci].ip.clone();
                 crate::hlog_warning!(
-                    "[HUB] GCM tag verification failed from authenticated client {ip}\n"
+                    "[HUB] GCM tag verification failed from authenticated client {ip}{}\n",
+                    if seq {
+                        " (replayed, reordered or forged frame)"
+                    } else {
+                        ""
+                    }
                 );
                 crate::hlog_warning!("[HUB] GCM decrypt failed from {ip}\n");
                 auth::disconnect_client(state, ci);
@@ -1546,7 +1753,11 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
                 } else {
                     String::new()
                 };
-                match state.clients[ci].typ {
+                let typ = state.clients[ci].typ;
+                match typ {
+                    ClientType::Bot | ClientType::Hub if cmd == CMD_LINK_SEQ => {
+                        link_seq_recv(state, ci, &payload);
+                    }
                     ClientType::Admin => {
                         let body_len = plain.len().saturating_sub(5);
                         if !admin::handle_admin_command(
@@ -1580,14 +1791,28 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
                     return false;
                 }
             }
+        } else {
+            // Too short to hold a GCM tag: never a frame we sent, so the
+            // stream is not ours (or is out of step) -- drop, as on a bad tag.
+            let ip = state.clients[ci].ip.clone();
+            crate::hlog_warning!(
+                "[HUB] Frame too short from authenticated client {ip} (len={packet_len}) — dropping\n"
+            );
+            auth::disconnect_client(state, ci);
+            return false;
         }
 
-        // Remove the processed packet from the buffer.
-        let consumed = 4 + packet_len;
+        // Step past the frame; the reader compacts the buffer only when it is
+        // full (a drain per frame made a backlog quadratic).
         let Some(ci) = state.client_by_fd(fd) else {
             return false;
         };
-        state.clients[ci].recv_buf.drain(..consumed);
+        let c = &mut state.clients[ci];
+        c.recv_off += 4 + packet_len;
+        if c.recv_off >= c.recv_buf.len() {
+            c.recv_buf.clear();
+            c.recv_off = 0;
+        }
     }
 }
 

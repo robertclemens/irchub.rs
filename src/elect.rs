@@ -53,7 +53,7 @@ fn bot(state: &HubState, uuid: &str) -> Option<usize> {
     state
         .clients
         .iter()
-        .position(|c| c.typ == ClientType::Bot && c.authenticated && c.id == uuid)
+        .position(|c| c.typ == ClientType::Bot && c.authenticated && !c.superseded && c.id == uuid)
 }
 
 fn send_peer(state: &mut HubState, fd: i32, cmd: u8, payload: &str) -> bool {
@@ -235,7 +235,11 @@ fn finish(
             "[CHANREQ] {kw} {who} on {} (id:{}): done by {} on {hub_name}\n",
             e.channel,
             e.id,
-            if by_nick.is_empty() { by_uuid } else { by_nick }
+            if by_uuid.is_empty() {
+                by_nick.to_string()
+            } else {
+                state.who('b', by_uuid)
+            }
         );
     } else {
         crate::hlog_info!(
@@ -633,7 +637,8 @@ pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
     let nick = f(5, MAX_NICK).unwrap_or_default();
     let hostmask = f(6, MAX_MASK_LEN).unwrap_or_default();
     let ts = crate::cstr::atoll(&f(7, 24).unwrap_or_default());
-    let age = now() - ts;
+    // atoll saturates: age only for a positive stamp
+    let age = if ts > 0 { now() - ts } else { 0 };
     if ts <= 0 || !(-CHAN_ELECT_TTL..=CHAN_ELECT_TTL).contains(&age) {
         return;
     }
@@ -681,13 +686,13 @@ pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
     );
 }
 
-/// ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|silent.  The origin records
+/// ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|0.  The origin records
 /// it; a relay remembers which peer leads to that hub and passes it on.
 pub fn process_elect_ack(state: &mut HubState, ci: usize, payload: &str) {
     let f = |i, cap| wire_field(payload, i, cap).unwrap_or_default();
     let (id, hub, name) = (f(0, 64), f(1, 64), f(2, 64));
     let num = |s: String| crate::cstr::atoi(&s).max(0) as i64;
-    let (a, r, s) = (num(f(3, 12)), num(f(4, 12)), num(f(5, 12)));
+    let (a, r) = (num(f(3, 12)), num(f(4, 12)));
     if id.is_empty() || hub.is_empty() {
         return;
     }
@@ -705,7 +710,6 @@ pub fn process_elect_ack(state: &mut HubState, ci: usize, payload: &str) {
         fd,
         asked: a,
         ready: r,
-        silent: s,
         tried: false,
     });
     if !e.origin {
@@ -713,8 +717,7 @@ pub fn process_elect_ack(state: &mut HubState, ci: usize, payload: &str) {
     }
 }
 
-/// ELECT_DO: eid|hub_uuid|elect.  Ours: act; else route it on.  "legacy"
-/// (from a 2.5.0 origin) is no longer acted on: see try_hub.
+/// ELECT_DO: eid|hub_uuid|elect.  Ours: act; else route it on.
 pub fn process_elect_do(state: &mut HubState, ci: usize, payload: &str) {
     let f = |i, cap| wire_field(payload, i, cap).unwrap_or_default();
     let (id, hub, mode) = (f(0, 64), f(1, 64), f(2, 8));
@@ -923,13 +926,13 @@ pub fn process_user_chan_request(state: &mut HubState, ci: usize, payload: &str)
             if c.uchan_req_count == USER_CHAN_REQ_MAX + 1 {
                 crate::hlog_warning!(
                     "[CHANREQ] {} sends too many user requests; dropping\n",
-                    c.id
+                    state.who_client(ci)
                 );
             }
             return;
         }
     }
-    let id = state.clients[ci].id.clone();
+    let id = state.who_client(ci);
     let f = |i: usize, cap: usize| crate::admin::wire_field(payload, i, cap);
     let fields = (
         f(0, USER_CHAN_RID_MAX + 1),
@@ -986,7 +989,8 @@ pub fn process_user_chan_request(state: &mut HubState, ci: usize, payload: &str)
     let who = u.as_ref().map_or(uuid.clone(), |u| u.name.clone());
     let Some(u) = u.filter(|_| allowed) else {
         crate::hlog_warning!(
-            "[CHANREQ] {id} asked {kind} {nick} on {chan} for {who}: refused (no rights there)\n"
+            "[CHANREQ] {id} asked {kind} {nick} on {chan} for {who}: refused (no rights there)\n",
+            who = state.who('u', &who)
         );
         let why = format!("no rights on {chan}");
         return fail(state, &why);

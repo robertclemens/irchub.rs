@@ -849,7 +849,8 @@ pub fn ban_bot_write(state: &mut HubState, bot_uuid: &str, value: &str, ts: i64)
     // Never over a trusted bot's or an admin's / oper's own mask.
     if ban_protected(state, &mask).0 != ModesStatus::Ok {
         crate::hlog_warning!(
-            "[BANS] ban {mask} in {chan} from bot {bot_uuid} refused (protected mask)\n"
+            "[BANS] ban {mask} in {chan} from {bot_uuid} refused (protected mask)\n",
+            bot_uuid = state.who('b', bot_uuid)
         );
         return false;
     }
@@ -869,7 +870,8 @@ pub fn ban_bot_write(state: &mut HubState, bot_uuid: &str, value: &str, ts: i64)
         }
         if mine >= BOT_BANS_PER_CHAN {
             crate::hlog_warning!(
-                "[BANS] ban in {chan} from bot {bot_uuid} refused ({mine} live bans)\n"
+                "[BANS] ban in {chan} from {bot_uuid} refused ({mine} live bans)\n",
+                bot_uuid = state.who('b', bot_uuid)
             );
             return false;
         }
@@ -907,7 +909,7 @@ pub fn bans_sweep(state: &mut HubState, now: i64) {
         // ban writes the same tombstone at the same stamp, so they agree
         // without talking, and any newer edit (an extension made on another
         // hub) wins.
-        let ts = e.timestamp + 1;
+        let ts = e.timestamp.saturating_add(1);
         if !storage::put_record(state, "B", &value, ts) {
             continue;
         }
@@ -955,6 +957,7 @@ fn no_ctrl(s: &str) -> bool {
 /// hub_chan_event_receive(): CMD_CHAN_EVENT from an authenticated bot
 /// (validate, rate-limit, log).  Hub local: never stored, never forwarded.
 pub fn chan_event_receive(state: &mut HubState, ci: usize, payload: &str) {
+    let who = state.who_client(ci);
     let c = &mut state.clients[ci];
     if c.typ != crate::state::ClientType::Bot || !c.authenticated {
         return;
@@ -966,7 +969,7 @@ pub fn chan_event_receive(state: &mut HubState, ci: usize, payload: &str) {
             crate::hlog_debug!(
                 "[CHAN] {} event(s) from {} dropped (rate limit)\n",
                 c.chan_ev_dropped,
-                c.id
+                who
             );
         }
         c.chan_ev_window = now;
@@ -979,7 +982,7 @@ pub fn chan_event_receive(state: &mut HubState, ci: usize, payload: &str) {
         return;
     }
     c.chan_ev_count += 1;
-    let id = c.id.clone();
+    let id = who.clone();
 
     // #chan|action|target|detail -- detail is the tail and may hold '|'.
     if payload.len() >= MAX_CHAN + 16 + CHAN_EVENT_TARGET_MAX + CHAN_EVENT_DETAIL_MAX + 8 {
@@ -1008,24 +1011,9 @@ pub fn chan_event_receive(state: &mut HubState, ci: usize, payload: &str) {
         crate::hlog_debug!("[CHAN] malformed event from {id} dropped\n");
         return;
     }
-    let nick: String = state
-        .bots
-        .iter()
-        .find(|b| b.uuid == id)
-        .and_then(|b| bot_entry_value(b, "n", MAX_NICK))
-        .unwrap_or_default()
-        .chars()
-        .map(|q| {
-            if (q as u32) < 0x21 || q as u32 == 0x7f {
-                '_'
-            } else {
-                q
-            }
-        })
-        .collect();
     crate::hlog_info!(
         "[CHAN] chan {chan} {action} {target} by {}: {detail}\n",
-        if nick.is_empty() { &id } else { &nick }
+        state.who_client(ci)
     );
 }
 

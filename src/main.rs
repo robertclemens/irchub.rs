@@ -309,6 +309,8 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
         c.promote_buffers();
     }
     hlog_info!("[PEER] Handshake complete with {}\n", state.clients[ci].ip);
+    let peer_uuid = state.peers[pi].uuid.clone();
+    irchub::client::link_offer(state, ci, Some(&peer_uuid));
     // If this process is the product of an upgrade a peer drove, close that
     // run out now that there is a peer to tell (no-op otherwise).
     upgrade::report_pending(state, ci);
@@ -341,12 +343,19 @@ fn check_peers(state: &mut HubState) {
     state.timers.last_peer_check = t;
 
     for pi in 0..state.peers.len() {
-        if state.peers[pi].connected {
+        let uuid = state.peers[pi].uuid.clone();
+        if state.peers[pi].connected
+            || state
+                .clients
+                .iter()
+                .any(|c| c.dialing && c.dial_uuid == uuid)
+        {
             continue;
         }
         let (ip, port) = (state.peers[pi].ip.clone(), state.peers[pi].port);
         hlog_debug!("[PEER] Attempting to connect to {ip}:{port}...\n");
-        let Ok(sock) = net::connect_peer(&ip, port) else {
+        // Review 16: non-blocking, finished by finish_dials from the main loop.
+        let Ok(sock) = net::start_connect(&ip, port) else {
             hlog_warning!("[PEER] Failed to connect to {ip}:{port}\n");
             continue;
         };
@@ -362,14 +371,80 @@ fn check_peers(state: &mut HubState) {
         // allocate full-size buffers up front.
         let mut c = HubClient::new(sock, fd, &ip, MAX_BUFFER);
         c.typ = ClientType::Hub;
+        // Named as an inbound peer is once it authenticates, so what logs a
+        // link's id names this one too.
+        c.id = trunc_string(
+            if state.peers[pi].friendly_name.is_empty() {
+                "HUB-PEER"
+            } else {
+                &state.peers[pi].friendly_name
+            },
+            64,
+        );
         c.last_pong_sent = 0;
+        c.dialing = true;
+        c.dial_started = t;
+        c.dial_uuid = uuid;
         state.clients.push(c);
-        let ci = state.clients.len() - 1;
+    }
+}
 
+/// Review 16: finish the dials check_peers started.  Ready (writable, or an
+/// error) means the connect is done: up, the HUBv3 handshake runs, unless the
+/// peer linked to us meanwhile (then this dial is not needed).  Past
+/// CONNECT_TIMEOUT it is given up, as the blocking connect gave up.
+fn finish_dials(state: &mut HubState, ready: &[(i32, bool, bool)]) {
+    let t = now();
+    let mut i = 0;
+    while i < state.clients.len() {
+        if !state.clients[i].dialing {
+            i += 1;
+            continue;
+        }
+        let fd = state.clients[i].fd;
+        let is_ready = ready.iter().any(|&(f, rd, wr)| f == fd && (rd || wr));
+        let pi = state
+            .peers
+            .iter()
+            .position(|p| p.uuid == state.clients[i].dial_uuid);
+        if !is_ready && t - state.clients[i].dial_started <= CONNECT_TIMEOUT as i64 && pi.is_some()
+        {
+            i += 1;
+            continue;
+        }
+        state.clients[i].dialing = false;
+        let Some(pi) = pi.filter(|&pi| !state.peers[pi].connected) else {
+            // the peer was deleted, or it linked to us first
+            auth::disconnect_client(state, i);
+            continue;
+        };
+        let res = if is_ready {
+            state.clients[i].sock.as_ref().map_or(
+                Err(std::io::Error::from(std::io::ErrorKind::NotConnected)),
+                net::finish_connect,
+            )
+        } else {
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        };
+        if let Err(e) = res {
+            let (ip, port) = (state.peers[pi].ip.clone(), state.peers[pi].port);
+            if is_ready {
+                hlog_warning!("[PEER] Failed to connect to {ip}:{port}: {e}\n");
+            } else {
+                hlog_warning!("[PEER] Failed to connect to {ip}:{port} (timed out)\n");
+            }
+            auth::disconnect_client(state, i);
+            continue;
+        }
+        state.clients[i].last_seen = t;
         state.peers[pi].connected = true;
         state.peers[pi].fd = fd;
         state.mesh_state_dirty = true;
-        peer_handshake(state, ci, pi);
+        let before = state.clients.len();
+        peer_handshake(state, i, pi);
+        if state.clients.len() == before {
+            i += 1; // else the handshake dropped it: the next client is at i
+        }
     }
 }
 
@@ -507,6 +582,20 @@ fn maintenance(state: &mut HubState) {
                 auth::disconnect_client(state, i);
                 continue;
             }
+            // Output queued and none of it taken for WRITE_STALL_TIMEOUT: the
+            // other end stopped reading (14b).  It reconnects once healthy.
+            if c.has_pending_writes()
+                && c.write_wait_since > 0
+                && t - c.write_wait_since > WRITE_STALL_TIMEOUT
+            {
+                hlog_warning!(
+                    "[HUB] {} took no output for {}s — dropping\n",
+                    state.who_client(i),
+                    t - c.write_wait_since
+                );
+                auth::disconnect_client(state, i);
+                continue;
+            }
             // D4: reap connections that never authenticated within the
             // pre-auth window.  Uses connected_at (not last_seen) so a
             // slowloris that dribbles bytes to keep last_seen fresh is still
@@ -518,9 +607,9 @@ fn maintenance(state: &mut HubState) {
             {
                 if c.bot_auth_state == irchub::state::BotAuthState::Quarantine {
                     hlog_info!(
-                        "[REVOKE] Revoked bot {} did not answer the wipe (an older build?); \
+                        "[REVOKE] Revoked {} did not answer the wipe (an older build?); \
                          closed\n",
-                        c.id
+                        state.who_client(i)
                     );
                 } else {
                     hlog_warning!(
@@ -535,8 +624,8 @@ fn maintenance(state: &mut HubState) {
             // A deleted bot told CMD_BOT_RETIRE that never answered.
             if c.retiring && t - c.retire_sent > RETIRE_GRACE_SEC {
                 hlog_info!(
-                    "[REVOKE] Deleted bot {} did not answer the wipe; closed\n",
-                    c.id
+                    "[REVOKE] Deleted {} did not answer the wipe; closed\n",
+                    state.who_client(i)
                 );
                 auth::disconnect_client(state, i);
                 continue;
@@ -810,6 +899,7 @@ fn run_setup(state: &mut HubState) -> i32 {
 
     config::write(state);
     state.config_pass.wipe();
+    state.config_key_forget();
     println!("Done.");
     state.hub_ed25519_priv.wipe();
     state.hub_x25519_priv.wipe();
@@ -832,6 +922,9 @@ fn accept_one(state: &mut HubState) {
     if !ratelimit::check_ip_access_lists(state, &incoming_ip) {
         hlog_warning!("[HUB] Connection from {incoming_ip} rejected (access control)\n");
         return;
+    }
+    if !ratelimit::startup_admit(state, &incoming_ip) {
+        return; // logged inside, at most once a minute
     }
     if !ratelimit::is_ip_allowed(state, &incoming_ip) {
         hlog_warning!("[HUB] Connection from {incoming_ip} rejected (rate limit)\n");
@@ -911,6 +1004,7 @@ fn sniff(state: &mut HubState) {
 
 /// One readable SSH console link: read what the socketpair has.
 fn read_console(state: &mut HubState, ci: usize) {
+    state.clients[ci].compact_recv();
     let space = state.clients[ci]
         .recv_cap
         .saturating_sub(state.clients[ci].recv_buf.len());
@@ -950,6 +1044,7 @@ fn read_one(state: &mut HubState, fd: i32) {
         read_console(state, ci);
         return;
     }
+    state.clients[ci].compact_recv();
     let space = state.clients[ci]
         .recv_cap
         .saturating_sub(state.clients[ci].recv_buf.len());
@@ -991,6 +1086,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     state.set_config_pass(&password);
     if !config::load(&mut state, &password) {
         state.config_pass.wipe();
+        state.config_key_forget();
         println!("Config load failed. Run -setup.");
         hlog_error!("[HUB] Config load failed.\n");
         let _ = fs::remove_file(HUB_PID_FILE);
@@ -1119,7 +1215,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
                     // poll would return writable for every idle socket and
                     // burn CPU — exactly the failure mode docs/cpu.md warned
                     // about.
-                    watches.push(net::watch(s, c.has_pending_writes()));
+                    watches.push(net::watch(s, c.dialing || c.has_pending_writes()));
                     fds.push(c.fd);
                 }
             }
@@ -1134,6 +1230,19 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
                 .collect();
             (lr, wr, ready)
         };
+
+        // Dials whose connect finished (or timed out) first: a finished one
+        // is a peer whose handshake goes out now.  What is still dialing is
+        // left out of the passes below.
+        finish_dials(&mut state, &ready);
+        let ready: Vec<(i32, bool, bool)> = ready
+            .into_iter()
+            .filter(|&(fd, _, _)| {
+                state
+                    .client_by_fd(fd)
+                    .is_some_and(|ci| !state.clients[ci].dialing)
+            })
+            .collect();
 
         // Drain writable peers FIRST.  This keeps URGENT op-flow traffic
         // prompt and prevents queues from accumulating across the read pass,
@@ -1196,6 +1305,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     state.hub_ed25519_priv.wipe();
     state.hub_x25519_priv.wipe();
     state.config_pass.wipe();
+    state.config_key_forget();
 
     let _ = fs::remove_file(HUB_PID_FILE);
     state.pid_file = None;
@@ -1242,6 +1352,7 @@ fn selftest() -> i32 {
     state.set_config_pass(&password);
     let ok = config::load(&mut state, &password);
     state.config_pass.wipe();
+    state.config_key_forget();
     if !ok {
         return fail("the config did not load (see the log)");
     }
@@ -1265,6 +1376,7 @@ fn identity(password: Zeroizing<String>) -> i32 {
     let ok = config::load(&mut state, &password);
     drop(password);
     state.config_pass.wipe();
+    state.config_key_forget();
     // The public key is derived from the private key, not taken from the
     // stored pub| copy: that is what peers and bots must pin.
     let pub64 = (ok && state.hub_keys_loaded)
@@ -1416,10 +1528,6 @@ fn main() {
     if identity_mode {
         std::process::exit(identity(password));
     }
-
-    // The pre-2.5.0 pass file 2.5.0 kept for its own rollback: nothing reads
-    // it any more.
-    let _ = fs::remove_file(HUB_PASS_PREV_FILE);
 
     daemonize();
 

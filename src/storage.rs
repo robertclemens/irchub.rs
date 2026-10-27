@@ -312,6 +312,9 @@ pub fn update_global_entry(
         return false;
     }
 
+    if crate::state::ts_ahead(ts) {
+        return false;
+    }
     if !global_value_active(&combined) && purge_floor_blocks(state, ts) {
         crate::hlog_debug!(
             "[STORAGE] Global {key}={value}: tombstone ts={ts} older than the last purge: not re-created\n"
@@ -430,6 +433,17 @@ pub fn hublist_valid(v: &str) -> bool {
     true
 }
 
+/// storage_field_ok(): a stored field is one '|'-separated slot of a
+/// newline-separated line: a control byte (a newline above all) or a '|'
+/// would split it into lines or fields of the sender's choosing once it is
+/// forwarded or saved.  A c/m/o global's value and extra are themselves
+/// '|'-separated (#chan|key|modes|op) and parsed by their own reader, so `bar`
+/// lets those through; never a control byte.
+fn field_ok(s: &str, bar: bool) -> bool {
+    s.bytes()
+        .all(|c| c >= 0x20 && c != 0x7f && (bar || c != b'|'))
+}
+
 fn update_entry_inner(
     state: &mut HubState,
     uuid: &str,
@@ -439,6 +453,30 @@ fn update_entry_inner(
     op: &str,
     ts: i64,
 ) -> bool {
+    let global = matches!(key, "c" | "m" | "o");
+    if !field_ok(uuid, false)
+        || !field_ok(key, false)
+        || !field_ok(value, global)
+        || !field_ok(extra, global)
+        || !field_ok(op, false)
+    {
+        let who = if field_ok(uuid, false) {
+            state.who('b', uuid)
+        } else {
+            "?".to_string()
+        };
+        crate::hlog_warning!(
+            "[STORAGE] REJECTED a record for {who}: control byte or '|' in a field\n"
+        );
+        return false;
+    }
+    if crate::state::ts_ahead(ts) {
+        crate::hlog_warning!(
+            "[STORAGE] REJECTED {key} for {}: stamp {ts} is ahead of this clock\n",
+            state.who('b', uuid)
+        );
+        return false;
+    }
     // Keys no writer may store as plain entries, whichever path (delta,
     // push, sync, load) offers them.
     if key == "p" || key == "a" {
@@ -461,7 +499,8 @@ fn update_entry_inner(
     // Reject bot-specific key names being used as a UUID.
     if matches!(uuid, "n" | "h" | "seen" | "pub" | "d" | "t") {
         crate::hlog_warning!(
-            "[STORAGE] REJECTED: Invalid UUID '{uuid}' (bot-specific key used as UUID)\n"
+            "[STORAGE] REJECTED: Invalid UUID '{uuid}' (bot-specific key used as UUID)\n",
+            uuid = state.who('b', uuid)
         );
         return false;
     }
@@ -484,7 +523,8 @@ fn update_entry_inner(
     // trees converge on the same config from the same input.
     if !matches!(key, "t" | "n" | "h" | "pub" | "seen" | "d" | "hl") {
         crate::hlog_warning!(
-            "[STORAGE] REJECTED per-bot key '{key}' for {uuid} (not in whitelist)\n"
+            "[STORAGE] REJECTED per-bot key '{key}' for {uuid} (not in whitelist)\n",
+            uuid = state.who('b', uuid)
         );
         return false;
     }
@@ -499,12 +539,16 @@ fn update_entry_inner(
         let vlen = value.len();
         if vlen > cap {
             crate::hlog_warning!(
-                "[STORAGE] REJECTED per-bot '{key}' for {uuid}: value too long ({vlen} > {cap})\n"
+                "[STORAGE] REJECTED per-bot '{key}' for {uuid}: value too long ({vlen} > {cap})\n",
+                uuid = state.who('b', uuid)
             );
             return false;
         }
         if key == "hl" && !hublist_valid(value) {
-            crate::hlog_warning!("[STORAGE] REJECTED per-bot 'hl' for {uuid}: not a hub list\n");
+            crate::hlog_warning!(
+                "[STORAGE] REJECTED per-bot 'hl' for {uuid}: not a hub list\n",
+                uuid = state.who('b', uuid)
+            );
             return false;
         }
     }
@@ -528,7 +572,8 @@ fn update_entry_inner(
     // protection matches bans against it, so a '*' here would shield everyone.
     if key == "h" && !value.is_empty() && !hostmask_literal(value) {
         crate::hlog_warning!(
-            "[STORAGE] REJECTED per-bot 'h' for {uuid}: not a literal nick!user@host\n"
+            "[STORAGE] REJECTED per-bot 'h' for {uuid}: not a literal nick!user@host\n",
+            uuid = state.who('b', uuid)
         );
         return false;
     }
@@ -543,7 +588,7 @@ fn update_entry_inner(
     // deleted bot's nick, or a config reload that read 'n' after 'd|1',
     // re-registered the bot.  A deleted bot cannot check in (auth needs
     // is_active), so nothing legitimate depended on it.
-    let is_singleton = matches!(key, "n" | "a" | "p" | "h" | "d" | "pub" | "seen");
+    let is_singleton = matches!(key, "n" | "a" | "p" | "h" | "d" | "pub" | "seen" | "hl");
 
     let found = state.bots[bi].entries.iter().position(|e| {
         if is_singleton {
@@ -593,7 +638,10 @@ fn update_entry_inner(
         return true;
     }
 
-    crate::hlog_warning!("[STORAGE] Bot {uuid} has reached MAX_BOT_ENTRIES\n");
+    crate::hlog_warning!(
+        "[STORAGE] {uuid} has reached MAX_BOT_ENTRIES\n",
+        uuid = state.who('b', uuid)
+    );
     false
 }
 
@@ -893,6 +941,9 @@ fn rec_accepts(
     cur_val: &str,
     cur_active: bool,
 ) -> bool {
+    if crate::state::ts_ahead(in_ts) {
+        return false;
+    }
     if in_ts != cur_ts {
         return in_ts > cur_ts;
     }
@@ -966,7 +1017,7 @@ fn ban_ceiling(chan: &str) -> usize {
 /// MAX_GLOBAL_BANS, MAX_BANS_TOTAL), keeps the stored spelling of the
 /// channel/mask.  False = rejected or not newer.
 pub fn put_record(state: &mut HubState, key: &str, value: &str, ts: i64) -> bool {
-    if !key_is_modes(key) || ts <= 0 {
+    if !key_is_modes(key) || ts <= 0 || crate::state::ts_ahead(ts) {
         return false;
     }
     if !record_valid(key, value) {
@@ -1169,6 +1220,7 @@ fn learned_key_ok(k: &str) -> bool {
 /// byte-wise greater "key|modes".
 pub fn learned_put(state: &mut HubState, chan: &str, key: &str, modes: i32, ts: i64) -> bool {
     if ts <= 0
+        || crate::state::ts_ahead(ts)
         || !rec_chan_ok(chan, false)
         || !learned_key_ok(key)
         || modes < 0
@@ -1378,6 +1430,28 @@ mod tests {
         assert!(!update_entry(&mut s, "bot-1", "p", "secret", "", "", 400));
         // A bot-specific key name is not a UUID.
         assert!(!update_entry(&mut s, "seen", "n", "x", "", "", 400));
+    }
+
+    #[test]
+    fn hublist_is_one_entry_per_bot() {
+        // A 10-hub list runs past the 256-byte list-key match; as a list key
+        // every push added an entry until the bot hit MAX_BOT_ENTRIES.
+        let mut s = st();
+        let hl = |n: usize| {
+            (0..n)
+                .map(|i| format!("127.0.0.1:{}/0123456789abcdef", 17100 + i))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for ts in 100..110 {
+            assert!(update_entry(&mut s, "bot-1", "hl", &hl(10), "", "", ts));
+        }
+        assert!(update_entry(&mut s, "bot-1", "hl", &hl(3), "", "", 200));
+        assert!(!update_entry(&mut s, "bot-1", "hl", &hl(10), "", "", 150));
+        let b = s.bots.iter().find(|b| b.uuid == "bot-1").unwrap();
+        let hls: Vec<_> = b.entries.iter().filter(|e| e.key == "hl").collect();
+        assert_eq!(hls.len(), 1);
+        assert_eq!(hls[0].value, hl(3));
     }
 
     #[test]

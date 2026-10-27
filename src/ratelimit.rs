@@ -18,23 +18,147 @@ use crate::cstr::now;
 
 use crate::state::{HubState, IpAcl, IpAclAdd, IpRateLimit};
 
-/// find_or_create_ip_limit(): the index of this IP's entry, or None when the
-/// table is full (which the caller treats as "cannot track, allow").
-fn find_or_create(state: &mut HubState, ip: &str) -> Option<usize> {
+/// The slot an address would take in the rate-limit table: its own entry
+/// (`Some((i, false))`), a free one or the entry idle longest (no
+/// connection open, not blocked) (`Some((i, true))`).  None when every
+/// entry is open or blocked.  Without the reuse, MAX_IP_RATE_LIMITS
+/// addresses inside the hourly prune left every new one untracked.
+fn ip_limit_slot(state: &HubState, ip: &str, t: i64) -> Option<(usize, bool)> {
     if let Some(i) = state.ip_limits.iter().position(|e| e.ip == ip) {
-        return Some(i);
+        return Some((i, false));
     }
     if state.ip_limits.len() < MAX_IP_RATE_LIMITS {
-        let t = now();
-        state.ip_limits.push(IpRateLimit {
-            ip: crate::cstr::trunc_string(ip, 64),
-            first_seen: t,
-            churn_window_start: t,
-            ..Default::default()
-        });
-        return Some(state.ip_limits.len() - 1);
+        return Some((state.ip_limits.len(), true));
     }
-    None
+    let mut slot: Option<(usize, i64)> = None;
+    for (i, e) in state.ip_limits.iter().enumerate() {
+        if e.active_connections > 0 || (e.blocked_until > 0 && t < e.blocked_until) {
+            continue;
+        }
+        let last = e
+            .first_seen
+            .max(e.last_failed_auth)
+            .max(e.churn_window_start);
+        if slot.is_none_or(|(_, oldest)| last < oldest) {
+            slot = Some((i, last));
+        }
+    }
+    slot.map(|(i, _)| (i, true))
+}
+
+/// find_or_create_ip_limit(): the index of this IP's entry, or None when the
+/// table is full of open or blocked entries.
+fn find_or_create(state: &mut HubState, ip: &str) -> Option<usize> {
+    let t = now();
+    let (i, fresh) = ip_limit_slot(state, ip, t)?;
+    if !fresh {
+        return Some(i);
+    }
+    let entry = IpRateLimit {
+        ip: crate::cstr::trunc_string(ip, 64),
+        first_seen: t,
+        churn_window_start: t,
+        ..Default::default()
+    };
+    if i == state.ip_limits.len() {
+        state.ip_limits.push(entry);
+    } else {
+        state.ip_limits[i] = entry;
+    }
+    Some(i)
+}
+
+/// 13b: a bot or peer authenticated from `ip`.
+pub fn known_ip_note(state: &mut HubState, ip: &str) {
+    if ip.is_empty() {
+        return;
+    }
+    let t = now();
+    if let Some(e) = state.known_ips.iter_mut().find(|e| e.0 == ip) {
+        e.1 = t;
+    } else if state.known_ips.len() < MAX_KNOWN_IPS {
+        state.known_ips.push((crate::cstr::trunc_string(ip, 64), t));
+    } else if let Some(e) = state.known_ips.iter_mut().min_by_key(|e| e.1) {
+        *e = (crate::cstr::trunc_string(ip, 64), t);
+    }
+}
+
+/// An address this hub has reason to trust: a configured peer, a bot in the
+/// roster (any hub's), a bot or peer that authenticated here lately, or a
+/// console login within SSH_SUCCESS_MEMORY.
+fn ip_known(state: &HubState, ip: &str, t: i64) -> bool {
+    if state.peers.iter().any(|p| p.ip == ip || p.remote_ip == ip) {
+        return true;
+    }
+    if let Some(e) = state.known_ips.iter().find(|e| e.0 == ip) {
+        return t - e.1 < KNOWN_IP_MEMORY;
+    }
+    if state.roster.iter().any(|r| r.ip == ip) {
+        return true;
+    }
+    connlimits::ssh_table_recent_ok(&state.ssh_ips, ip, t)
+}
+
+fn startup_refused(state: &mut HubState, t: i64, ip: &str, why: &str) {
+    if t - state.startup_logged >= STARTUP_LOG_EVERY {
+        if state.startup_unlogged > 0 {
+            crate::hlog_warning!(
+                "[RATE_LIMIT] Connection from {ip} refused ({why}); {} more refused in the last {}s\n",
+                state.startup_unlogged,
+                t - state.startup_logged
+            );
+        } else {
+            crate::hlog_warning!("[RATE_LIMIT] Connection from {ip} refused ({why})\n");
+        }
+        state.startup_logged = t;
+        state.startup_unlogged = 0;
+    } else {
+        state.startup_unlogged += 1;
+    }
+}
+
+/// hub_startup_admit() (13b): the gate before is_ip_allowed.  Known
+/// addresses always pass; an unknown one is refused while the rate-limit
+/// table has no room for it (rather than let through untracked), and
+/// otherwise goes through a random early drop on the connections not yet
+/// authenticated (`hub set conn startups`), so a flood of stalled
+/// handshakes cannot hold every slot.
+pub fn startup_admit(state: &mut HubState, ip: &str) -> bool {
+    if trusted_loopback(state, ip) {
+        return true;
+    }
+    let t = now();
+    if ip_known(state, ip, t) {
+        return true;
+    }
+    if ip_limit_slot(state, ip, t).is_none() {
+        startup_refused(state, t, ip, "unknown address, rate-limit table full");
+        return false;
+    }
+    let open = state
+        .clients
+        .iter()
+        .filter(|c| c.inbound && !c.authenticated)
+        .count() as i32;
+    let cc = state.conn_cfg;
+    let start = cc.startups_start;
+    let full = cc.startups_full.max(start);
+    if open < start {
+        return true;
+    }
+    let mut drop = true;
+    if open < full {
+        let p = cc.startups_rate + (100 - cc.startups_rate) * (open - start) / (full - start);
+        let mut r = [0u8; 4];
+        if crate::crypto::random_bytes(&mut r) {
+            drop = (u32::from_ne_bytes(r) % 100) < p as u32;
+        }
+    }
+    if drop {
+        let why = format!("unknown address, {open} connections not yet authenticated");
+        startup_refused(state, t, ip, &why);
+    }
+    !drop
 }
 
 /// D3: loopback is exempt only when explicitly trusted.  The default is to
@@ -50,7 +174,7 @@ pub fn is_ip_allowed(state: &mut HubState, ip: &str) -> bool {
     if trusted_loopback(state, ip) {
         return true;
     }
-    // If we cannot track it, allow (fail open — the ACLs are the hard gate).
+    // Untracked: only a known address gets here (13b, startup_admit).
     let Some(i) = find_or_create(state, ip) else {
         return true;
     };

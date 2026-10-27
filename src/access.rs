@@ -9,7 +9,7 @@
 
 use crate::consts::*;
 use crate::cstr::atoll;
-use crate::state::{HubState, UchanRecord, UflagRecord, UserRecord, lww_accepts};
+use crate::state::{HubState, UchanRecord, UflagRecord, lww_accepts};
 
 fn uuid_shape(u: &str) -> bool {
     let b = u.as_bytes();
@@ -90,6 +90,9 @@ pub fn uflags_edit(cur: &str, spec: &str) -> Option<String> {
 /// 'a' beats 'a', then the shorter string, then the byte-wise smaller), so
 /// every node picks the same side and a race never grants.
 pub fn uflags_accepts(in_ts: i64, input: &str, cur_ts: i64, cur: &str) -> bool {
+    if crate::state::ts_ahead(in_ts) {
+        return false;
+    }
     if in_ts != cur_ts {
         return in_ts > cur_ts;
     }
@@ -133,7 +136,7 @@ pub fn uflag_put(state: &mut HubState, uuid: &str, flags: &str, ts: i64) -> bool
     let Some(canon) = uflags_canon(flags) else {
         return false;
     };
-    if !uuid_shape(uuid) || ts <= 0 {
+    if !uuid_shape(uuid) || ts <= 0 || crate::state::ts_ahead(ts) {
         return false;
     }
     let i = match uflag_find(state, uuid) {
@@ -149,7 +152,7 @@ pub fn uflag_put(state: &mut HubState, uuid: &str, flags: &str, ts: i64) -> bool
                 crate::hlog_warning!(
                     "[ACCESS] Flag table full ({}): uf| for {} dropped\n",
                     MAX_HUB_USER_FLAGS,
-                    uuid
+                    state.who('u', uuid)
                 );
                 return false;
             }
@@ -160,6 +163,12 @@ pub fn uflag_put(state: &mut HubState, uuid: &str, flags: &str, ts: i64) -> bool
             state.uflag_records.len() - 1
         }
     };
+    // a drop of 'a' is remembered for the admin floor
+    if state.uflag_records[i].flags.contains('a') && !canon.contains('a') {
+        let k = state.adrop_next;
+        state.adrop_next = (k + 1) % ADMIN_DROP_LOG;
+        state.adrop[k] = (uuid.to_string(), ts);
+    }
     let r = &mut state.uflag_records[i];
     r.flags = canon;
     r.timestamp = ts;
@@ -169,7 +178,7 @@ pub fn uflag_put(state: &mut HubState, uuid: &str, flags: &str, ts: i64) -> bool
 
 /// Store a `uc|` if it wins LWW.  true = stored (a change).
 pub fn uchan_put(state: &mut HubState, uuid: &str, chan: &str, active: bool, ts: i64) -> bool {
-    if !uuid_shape(uuid) || !uchan_name_ok(chan) || ts <= 0 {
+    if !uuid_shape(uuid) || !uchan_name_ok(chan) || ts <= 0 || crate::state::ts_ahead(ts) {
         return false;
     }
     let i = match uchan_find(state, uuid, chan) {
@@ -190,7 +199,7 @@ pub fn uchan_put(state: &mut HubState, uuid: &str, chan: &str, active: bool, ts:
                     "[ACCESS] Binding table full ({}): uc| {} for {} dropped\n",
                     MAX_HUB_CHAN_BINDS,
                     chan,
-                    uuid
+                    state.who('u', uuid)
                 );
                 return false;
             }
@@ -243,21 +252,6 @@ pub fn user_chan_count(state: &HubState, uuid: &str) -> (usize, bool) {
     (n, global)
 }
 
-/// A user an older node would over-trust (§3.2): an admin whose `uf|` is
-/// not exactly "a", or an oper with `uc|` records but no live "*".  A user
-/// with no records yet is not: `migrate` makes it +a / * at the end of the
-/// batch that brought it, which is what an older node assumes anyway.
-pub fn user_restricted(state: &HubState, u: &UserRecord) -> bool {
-    if !u.is_active {
-        return false;
-    }
-    if u.typ == 'a' {
-        return uflag_find(state, &u.uuid).is_some_and(|i| state.uflag_records[i].flags != "a");
-    }
-    let any = state.uchan_records.iter().any(|r| r.uuid == u.uuid);
-    any && !user_chan_count(state, &u.uuid).1
-}
-
 pub fn format_uflag(r: &UflagRecord) -> String {
     format!("uf|{}|{}|{}\n", r.uuid, r.flags, r.timestamp)
 }
@@ -299,8 +293,9 @@ pub fn ingest(state: &mut HubState, kind: char, body: &str, need_user: bool) -> 
 }
 
 /// §3.3: every live admin without a `uf|` becomes "a", every live oper
-/// without any `uc|` becomes "*" -- what they could do before flags existed.
-/// Run after config load and after every ingest batch.  Stamped
+/// without any `uc|` becomes "*".  This is how a user written without access
+/// records gets its default (-setup's first admin is one); run after config
+/// load and after every ingest batch.  Stamped
 /// `USER_ACCESS_MIGRATE_TS` (1), never "now": see C `hub_access_migrate`.
 /// Returns how many records it wrote.
 pub fn migrate(state: &mut HubState) -> usize {
@@ -454,91 +449,6 @@ pub fn append(state: &HubState, out: &mut String, keep: Option<&dyn Fn(&str) -> 
     }
 }
 
-// ---- Older nodes (plan §3.2, T2) -------------------------------------------
-// See C hub_access.c: a peer hub whose version is not known yet (or older
-// than MESH_MIN_VERSION, its link being refused) never gets uf| / uc|, sees each
-// user at `user_ts`, gets a restricted user as a tombstone (a node known to be
-// older) or not at all (one whose version is not known yet), never with its
-// masks, and nothing it sends about a restricted user is taken in.
-
-/// The newest stamp of a user's own record and its uf| / uc| records.
-pub fn user_ts(state: &HubState, u: &UserRecord) -> i64 {
-    let f = uflag_find(state, &u.uuid).map_or(0, |i| state.uflag_records[i].timestamp);
-    let c = state
-        .uchan_records
-        .iter()
-        .filter(|r| r.uuid == u.uuid)
-        .map(|r| r.timestamp)
-        .max()
-        .unwrap_or(0);
-    u.timestamp.max(f).max(c)
-}
-
-/// u's a|/o| line for an older node; "" = left out (a restricted user and
-/// not `tomb`).
-pub fn format_user_for_old(state: &HubState, u: &UserRecord, tomb: bool) -> String {
-    let restricted = user_restricted(state, u);
-    if restricted && !tomb {
-        return String::new();
-    }
-    let mut c = u.clone();
-    c.timestamp = user_ts(state, u);
-    if restricted {
-        c.is_active = false;
-    }
-    crate::config::format_user_record(&c)
-}
-
-/// A record an older node sent about user `uuid` may be taken in: not about
-/// a restricted user.
-pub fn from_old_ok(state: &HubState, uuid: &str) -> bool {
-    state
-        .user_records
-        .iter()
-        .find(|u| u.uuid == uuid)
-        .is_none_or(|u| !user_restricted(state, u))
-}
-
-/// A sync payload rewritten for an older hub: uf| / uc| / rv| / hs| and a
-/// bot's b|<uuid>|hl| dropped (an older hub's parser turns an unknown rv| or
-/// hs| line into a phantom bot; its whitelist refuses hl), a| / o|
-/// re-stamped (`format_user_for_old`), m| of a restricted user dropped;
-/// every other line as it was.
-pub fn downgrade(state: &HubState, payload: &str, tomb: bool) -> String {
-    let mut out = String::with_capacity(payload.len());
-    for line in payload.split('\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let b = line.as_bytes();
-        if b.len() > 3 && b[0] == b'u' && (b[1] == b'f' || b[1] == b'c') && b[2] == b'|' {
-            continue;
-        }
-        if b.len() > 3 && (b.starts_with(b"rv") || b.starts_with(b"hs")) && b[2] == b'|' {
-            continue;
-        }
-        if b.len() > 41 && b[0] == b'b' && b[1] == b'|' && b[38] == b'|' && &b[39..42] == b"hl|" {
-            continue; // a bot's hub list: an older hub's whitelist refuses it
-        }
-        if b.len() > 38 && matches!(b[0], b'a' | b'o' | b'm') && b[1] == b'|' && b[38] == b'|' {
-            let uuid = &line[2..38];
-            if let Some(u) = state.user_records.iter().find(|u| u.uuid == uuid) {
-                if b[0] == b'm' {
-                    if user_restricted(state, u) {
-                        continue;
-                    }
-                } else {
-                    out.push_str(&format_user_for_old(state, u, tomb));
-                    continue;
-                }
-            }
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
 // ---- Console helpers (T4) --------------------------------------------------
 
 /// A user's live bindings as the console shows them: "*" when global, else
@@ -637,4 +547,115 @@ pub fn chan_change(
         return None;
     }
     Some(n)
+}
+
+fn adrop_match(state: &HubState, uuid: &str, ts: i64) -> bool {
+    state.adrop.iter().any(|(u, t)| *t == ts && u == uuid)
+}
+
+/// The admin floor.  A hub refuses to remove the last +a admin itself
+/// (`last_full_admin`), but two hubs can each remove a different one before
+/// they sync, and a hubless bot can push a removal.  When no active admin
+/// holds +a, every +a removal stamped within `ADMIN_FLOOR_WINDOW` of the
+/// newest one is undone: a deleted admin comes back with the masks dropped
+/// with it, an admin that lost 'a' is "a" again -- each at its removal stamp + 1.
+/// Every hub holds the same records by then, so each writes the same
+/// records and the mesh agrees; the stamps beat the removals everywhere.  A
+/// flag drop is known only from `adrop` (the `uf|` no longer says it held
+/// 'a').  Returns the sync lines for the peers (None when nothing was
+/// restored) and how many admins came back.  C `hub_admin_floor_restore`.
+pub fn admin_floor_restore(state: &mut HubState, from: &str) -> Option<(String, usize)> {
+    let mut cand: Vec<(usize, i64)> = Vec::new();
+    let mut newest = 0i64;
+    for (i, u) in state.user_records.iter().enumerate() {
+        if u.typ != 'a' {
+            continue;
+        }
+        let has_a = user_flags(state, &u.uuid).contains('a');
+        if u.is_active && has_a {
+            state.floor_warned = false;
+            return None; // a full admin is left
+        }
+        let fr = uflag_find(state, &u.uuid).map(|k| state.uflag_records[k].timestamp);
+        let dropped = !has_a && fr.is_some_and(|t| adrop_match(state, &u.uuid, t));
+        if !(dropped || (has_a && !u.is_active)) {
+            continue;
+        }
+        let mut t = if u.is_active { 0 } else { u.timestamp };
+        if dropped
+            && let Some(ft) = fr
+            && ft > t
+        {
+            t = ft;
+        }
+        cand.push((i, t));
+        newest = newest.max(t);
+    }
+    if cand.is_empty() {
+        if !state.floor_warned {
+            crate::hlog_warning!(
+                "[ADMIN] No full admin (+a) is left after {from}, and no recent +a removal to undo\n"
+            );
+        }
+        state.floor_warned = true;
+        return None;
+    }
+    let mut out = String::new();
+    let mut restored = 0usize;
+    for (ci, t) in cand {
+        if t < newest - ADMIN_FLOOR_WINDOW {
+            continue;
+        }
+        let was_del = !state.user_records[ci].is_active;
+        let mut lost_a = false;
+        let uuid = state.user_records[ci].uuid.clone();
+        if was_del {
+            let del_ts = state.user_records[ci].timestamp;
+            let u = &mut state.user_records[ci];
+            u.is_active = true;
+            u.timestamp = del_ts.saturating_add(1);
+            out.push_str(&crate::config::format_user_record(u));
+            // the masks this delete dropped (DEL_ADMIN stamps them with it)
+            for mr in state.mask_records.iter_mut() {
+                if mr.is_active
+                    || mr.uuid != uuid
+                    || mr.timestamp < del_ts - 2
+                    || mr.timestamp > del_ts.saturating_add(2)
+                {
+                    continue;
+                }
+                mr.is_active = true;
+                mr.timestamp = mr.timestamp.saturating_add(1);
+                out.push_str(&format!(
+                    "m|{}|{}|add|{}|{}\n",
+                    mr.uuid, mr.mask, mr.last_used, mr.timestamp
+                ));
+            }
+        }
+        if !user_flags(state, &uuid).contains('a')
+            && let Some(k) = uflag_find(state, &uuid)
+        {
+            // back to "a": it held 'a', which covers every other letter
+            let ts = state.uflag_records[k].timestamp;
+            if uflag_put(state, &uuid, "a", ts.saturating_add(1)) {
+                lost_a = true;
+                out.push_str(&format_uflag(&state.uflag_records[k]));
+            }
+        }
+        restored += 1;
+        crate::hlog_warning!(
+            "[ADMIN] No full admin (+a) was left after {from}: restored {} ({})\n",
+            state.who('u', &uuid),
+            if was_del && lost_a {
+                "deleted, lost +a"
+            } else if was_del {
+                "deleted"
+            } else {
+                "lost +a"
+            }
+        );
+    }
+    state.config_dirty = true;
+    state.floor_warned = false;
+    Some((out, restored))
 }

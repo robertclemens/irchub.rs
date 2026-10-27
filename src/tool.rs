@@ -62,7 +62,9 @@ pub fn read_pass_hidden(prompt: &str, cap: usize) -> Zeroizing<String> {
     print!("{prompt}");
     let _ = io::stdout().flush();
     let _guard = echo_off();
-    let mut line = Zeroizing::new(String::new());
+    // Room up front: a read_line that has to grow the String frees the old
+    // allocation unwiped, with the password in it (review 2026-10-25 L1).
+    let mut line = Zeroizing::new(String::with_capacity(4096));
     let n = io::stdin().read_line(&mut line).unwrap_or(0);
     println!();
     if n == 0 {
