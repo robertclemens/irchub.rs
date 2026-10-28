@@ -69,12 +69,12 @@ region = "4"
 memmap2 = "0.9"
 
 # The SSH admin console (src/console/, docs/console.md): the hub's only admin
-# interface.  russh 0.64 needs a crypto backend; `ring` is the lighter one
+# interface.  russh 0.65 needs a crypto backend; `ring` is the lighter one
 # (aws-lc-rs builds a large C library).  ring compiles a little C/asm, which
 # is why .cargo/config.toml names a C compiler for the musl target.  Pinned
 # exactly: this code runs before authentication.  russh runs on its own
 # single-threaded tokio runtime on the console thread.
-russh = { version = "0.64.1", default-features = false, features = ["ring"] }
+russh = { version = "0.65.0", default-features = false, features = ["ring"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "sync", "time", "macros", "io-util"] }
 signal-hook = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

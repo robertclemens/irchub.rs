@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use russh::keys::ssh_key::private::Ed25519Keypair;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
-use russh::server::{Auth, Config, Handle, Handler, Msg, Session};
+use russh::server::{
+    Auth, Config, Handle, Handler, Msg, PublicKeyOffer, Session, VerifiedPublicKey,
+};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Preferred};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -267,7 +269,7 @@ impl Handler for H {
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        key: &PublicKey,
+        offer: PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
         if let Ok(mut i) = self.info.lock() {
             if i.authed {
@@ -275,14 +277,18 @@ impl Handler for H {
             }
             i.user = user.to_string();
         }
-        if self.key_matches(user, key) {
+        if self.key_matches(user, offer.public_key) {
             return Ok(Auth::Accept);
         }
         self.refuse()
     }
 
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        if self.key_matches(user, key) {
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        if self.key_matches(user, key.public_key) {
             if let Ok(mut i) = self.info.lock() {
                 i.authed = true;
                 i.user = user.to_string();
