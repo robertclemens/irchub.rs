@@ -11,8 +11,8 @@
 //! machine: no russh, no HubState.
 
 use super::fmt::{
-    self, Ctx, Flines, RL_CMD, RL_DIM, RL_ERR, RL_HEAD, RL_NORMAL, RL_OK, RL_RULE, RL_TITLE,
-    RL_WARN,
+    self, Ctx, Flines, RL_CMD, RL_DIM, RL_ERR, RL_HEAD, RL_NORMAL, RL_OK, RL_RULE, RL_SEL,
+    RL_TITLE, RL_WARN,
 };
 use crate::connlimits::{SSH_DEF_CMDRATE_N, SSH_DEF_CMDRATE_S};
 use crate::consts::*;
@@ -509,6 +509,7 @@ enum Rq {
     Pre,
     ViewUpg,
     ViewStats,
+    ViewRun,
 }
 
 /// A read made before a confirmation so the question can name the object
@@ -607,6 +608,8 @@ pub struct Ui {
     input: Vec<u8>,
     in_cur: usize,
     in_scroll: i32,
+    /// Views 4 and 5: lines the last draw laid out.
+    view_lines: [std::cell::Cell<i64>; V_COUNT],
     hist: Vec<Vec<u8>>,
     hist_pos: usize,
     hist_stash: Vec<u8>,
@@ -655,6 +658,14 @@ pub struct Ui {
     /// rows, '\n'-separated; None until the first tree event
     tree: Option<Vec<u8>>,
     upg_text: Option<Vec<u8>>,
+    /// View 4: the history run picked with the arrows, and its details.
+    upg_sel: i32,
+    upg_runs: i32,
+    upg_sel_id: Vec<u8>,
+    run_text: Option<Vec<u8>>,
+    /// What run_text was last asked for.
+    run_id: Vec<u8>,
+    run_rev: i64,
     stats_text: Option<Vec<u8>>,
     upg_at: i64,
     stats_at: i64,
@@ -719,6 +730,8 @@ enum B {
     UserSet,
     UserMask,
     UpgReleases,
+    UpgHistory,
+    UpgKeep,
     UpgStart,
     Fixed,
     Local,
@@ -726,6 +739,7 @@ enum B {
     Ban,
     NetSet,
     UserChan,
+    ChanKick,
 }
 
 struct CmdDef {
@@ -777,12 +791,12 @@ const CMDS: &[CmdDef] = &[
     cmd!("bot", Some("kick"), CMD_ADMIN_DISCONNECT_BOT, B::Arg, 1, 0, Cf::Yn, Pre::BotKick, "", "bot kick <uuid|nick>", "drop its connection to this hub (asks y/N; it reconnects)", None),
     cmd!("bot", Some("rekey"), CMD_ADMIN_REKEY_BOT, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot rekey <uuid>", "how to rekey a bot (only the bot can)", None),
     cmd!("bot", Some("tree"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|tree", "bot tree", "every hub and bot as a tree", None),
-    cmd!("bot", Some("set"), CMD_ADMIN_NET_SET, B::NetSet, 0, 3, Cf::None, Pre::None, "", "bot set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default>]", "show the bot settings, or change one (every bot gets it)", None),
+    cmd!("bot", Some("set"), CMD_ADMIN_NET_SET, B::NetSet, 0, 3, Cf::None, Pre::None, "", "bot set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default> | cron <global|nick|uuid> <on|off>]", "show the bot settings, or change one (every bot gets it; cron: every bot, or one until the next global)", None),
     cmd!("hub", Some("show"), CMD_ADMIN_GET_PUBKEY, B::HubShow, 0, 1, Cf::None, Pre::None, "", "hub show [#|uuid|name]", "this hub (identity, key, listener, counts), or one linked hub in detail", None),
     cmd!("hub", Some("list"), CMD_ADMIN_LIST_PEERS, B::None, 0, 0, Cf::None, Pre::None, "", "hub list", "the other hubs, the mesh links and their health", None),
     cmd!("hub", Some("add"), CMD_ADMIN_ADD_PEER, B::PeerAdd, 5, 0, Cf::None, Pre::None, "", "hub add <ip> <port> <uuid> <name|-> <key>", "link another hub", Some("uuid and key: hub show or ./irchub -id on that hub")),
     cmd!("hub", Some("del"), CMD_ADMIN_DEL_PEER, B::Arg, 1, 0, Cf::Yn, Pre::PeerDel, "", "hub del <uuid|name>", "unlink a hub from this hub only (shows which hubs and bots still list it; asks y/N)", None),
-    cmd!("hub", Some("set"), 0, B::HubSet, 0, 3, Cf::None, Pre::None, "", "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>] | hub set <#|uuid|name> key <key>", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table); <hub> key: replace a linked hub's key", None),
+    cmd!("hub", Some("set"), 0, B::HubSet, 0, 3, Cf::None, Pre::None, "", "hub set <setting> <value> | hub set ssh|conn [<name> <value|default>] | hub set <#|uuid|name> key <key> | hub set cron <global|#|uuid|name> <on|off>", "name, bindip, port, pubkey or autopurge; ssh and conn: this hub's connection limits (alone: the table); <hub> key: replace a linked hub's key; cron: every hub, or one until the next global", None),
     cmd!("hub", Some("sync"), CMD_ADMIN_SYNC_MESH, B::None, 0, 0, Cf::None, Pre::None, "", "hub sync", "send a full sync to every linked hub", None),
     cmd!("hub", Some("stats"), CMD_ADMIN_STATS, B::None, 0, 0, Cf::None, Pre::None, "", "hub stats", "traffic, connections and maintenance timers", None),
     cmd!("hub", Some("rekey"), CMD_ADMIN_REGEN_KEYS, B::None, 0, 0, Cf::Type, Pre::None, "", "hub rekey", "new hub keypair; every other hub and bot must re-learn it", None),
@@ -812,13 +826,18 @@ const CMDS: &[CmdDef] = &[
     cmd!("channel", Some("set"), CMD_ADMIN_CHAN_SET, B::ChanSet, 1, 48, Cf::None, Pre::None, "", "channel set <#chan|default> [+opt|-opt|<name> <value>|flood <type> <N:S|off>]", "show a channel's settings, or change them (default = the network default)", None),
     cmd!("channel", Some("op"), CMD_ADMIN_OP_USER, B::ChanOp, 2, 0, Cf::None, Pre::None, "", "channel op <#chan> <nick>", "have one opped bot op a user", None),
     cmd!("channel", Some("invite"), CMD_ADMIN_INVITE_USER, B::ChanOp, 2, 0, Cf::None, Pre::None, "", "channel invite <#chan> <nick>", "have one opped bot invite a user", None),
+    cmd!("channel", Some("kick"), CMD_ADMIN_KICK_USER, B::ChanKick, 2, 0, Cf::None, Pre::None, "", "channel kick <#chan> <nick> [reason]", "have one opped bot kick a user (never a bot or authorised user)", None),
+    cmd!("channel", Some("ban"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "channel ban <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "the same as ban add: list a ban, and one opped bot sets it now", None),
     cmd!("ban", Some("list"), CMD_ADMIN_BAN, B::Ban, 0, 1, Cf::None, Pre::None, "", "ban list [#chan|*]", "the network's listed bans (one channel, or * = every channel)", None),
-    cmd!("ban", Some("add"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; the bots set it on the channel (never on a bot or user)", None),
+    cmd!("ban", Some("add"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; one opped bot sets it on the channel now (never on a bot or user)", None),
     cmd!("ban", Some("del"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban del <#chan|*> <mask>", "remove a listed ban", None),
     cmd!("upgrade", Some("status"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::None, Pre::None, "", "upgrade status", "the upgrade run on this hub", None),
     cmd!("upgrade", Some("releases"), CMD_ADMIN_UPGRADE_STATUS, B::UpgReleases, 0, 0, Cf::None, Pre::None, "", "upgrade releases", "releases both products offer, and the nodes", None),
+    cmd!("upgrade", Some("history"), CMD_ADMIN_UPGRADE_STATUS, B::UpgHistory, 0, 1, Cf::None, Pre::None, "", "upgrade history [<run>]", "the last upgrade runs; <run> shows one with every node", None),
+    cmd!("upgrade", Some("keep"), CMD_ADMIN_UPGRADE_STATUS, B::UpgKeep, 1, 1, Cf::None, Pre::None, "", "upgrade keep <1-20>", "how many runs every hub keeps (default 10)", None),
     cmd!("upgrade", Some("start"), CMD_ADMIN_UPGRADE_NET, B::UpgStart, 1, 4, Cf::Yn, Pre::UpgStart, "", "upgrade start bot=<ver> [hub=<ver>] [nodes=<a,b=c>]", "start a rolling network upgrade (shows the plan, asks y/N)", None),
     cmd!("upgrade", Some("abort"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, Pre::None, "abort", "upgrade abort", "stop the run and roll back", None),
+    cmd!("upgrade", Some("continue"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, Pre::None, "continue", "upgrade continue", "resume an upgrade on hold, leaving behind the node it waits for", None),
     cmd!("upgrade", Some("forget"), CMD_ADMIN_UPGRADE_STATUS, B::Fixed, 0, 0, Cf::Yn, Pre::None, "forget", "upgrade forget", "drop the roll-up plan on every hub", None),
     cmd!("display", Some("show"), 0, B::Local, 0, 0, Cf::None, Pre::None, "", "display show", "this session's display settings", None),
     cmd!("display", Some("view"), 0, B::Local, 1, 0, Cf::None, Pre::None, "", "display view <1-5>", "full screen: console, log, network, upgrades, stats", None),
@@ -860,8 +879,11 @@ const CMD_FLAGS: &[(&str, &str, &str)] = &[
     ("user", "mask", "a/o"), ("user", "chan", "o"),
     ("channel", "add", "c"), ("channel", "del", "c"), ("channel", "mode", "c"),
     ("channel", "set", "c"), ("channel", "op", "c"), ("channel", "invite", "c"),
+    ("channel", "kick", "c"), ("channel", "ban", "c"),
     ("ban", "add", "c"), ("ban", "del", "c"),
     ("upgrade", "start", "u"), ("upgrade", "abort", "u"), ("upgrade", "forget", "u"),
+    ("upgrade", "continue", "u"),
+    ("upgrade", "keep", "u"),
 ];
 
 fn cmd_flag(d: &CmdDef) -> Option<&'static str> {
@@ -1126,6 +1148,20 @@ const CMD_HELP: &[CmdHelp] = &[
      "channel op #ops alice"),
     ("channel", Some("invite"), Some("#chan\tthe channel\nnick\tthe user's current nick on IRC"),
      "channel invite #ops alice"),
+    ("channel", Some("kick"),
+     Some("#chan\tthe channel\nnick\tthe user's current nick on IRC (never a bot or an authorised \
+           user)\nreason\tthe rest of the line (120 bytes; default: kicked)"),
+     "channel kick #ops mallory\nchannel kick #ops mallory stop flooding"),
+    ("channel", Some("ban"),
+     Some("(alias)\tthe same command as ban add, with the same arguments\n\
+           #chan|*\tthe channel (one opped bot there sets the ban now), or * for every managed \
+           channel (the bots set it as they sweep)\n\
+           mask\tnick!user@host (* and ? match); refused if it would also match a bot or an \
+           authorised user\n\
+           min|perm\thow long it lasts (default perm)\n\
+           sticky\tthe bots put it back at once if an op removes it from the channel\n\
+           reason\tthe rest of the line (120 bytes)"),
+     "channel ban #ops *!*@203.0.113.7\nchannel ban #ops *!*@203.0.113.7 60 spam"),
     ("ban", Some("list"), Some("#chan|*\tonly that channel's bans, or * for the global ones (default: all)"),
      "ban list\nban list #ops\nban list *"),
     ("ban", Some("add"),
@@ -1140,6 +1176,10 @@ const CMD_HELP: &[CmdHelp] = &[
      "ban del #ops *!*@203.0.113.7"),
     ("upgrade", Some("status"), None, "upgrade status"),
     ("upgrade", Some("releases"), None, "upgrade releases"),
+    ("upgrade", Some("history"), Some("run\tthe run, as upgrade history lists it, or the start of its id (4 or more characters)"),
+     "upgrade history\nupgrade history 83aac614"),
+    ("upgrade", Some("keep"), Some("n\thow many runs every hub keeps, 1 to 20; the oldest go first"),
+     "upgrade keep 15"),
     ("upgrade", Some("start"),
      Some("bot=<ver>\tthe bot version to move to, as upgrade releases lists it (required)\n\
            hub=<ver>\talso move the hubs to this version (- or left out = leave them)\n\
@@ -1149,6 +1189,7 @@ const CMD_HELP: &[CmdHelp] = &[
      "upgrade start bot=2.4.5\nupgrade start bot=2.4.5 hub=2.4.4\n\
       upgrade start bot=2.4.5 nodes=alpha,beta=rs"),
     ("upgrade", Some("abort"), None, "upgrade abort"),
+    ("upgrade", Some("continue"), None, "upgrade continue"),
     ("upgrade", Some("forget"), None, "upgrade forget"),
     ("display", Some("show"), None, "display show"),
     ("display", Some("view"), Some("1-5\t1 console, 2 log, 3 network, 4 upgrades, 5 stats (Alt+1..5)"),
@@ -1223,6 +1264,9 @@ const ARG_COMP: &[ArgComp] = &[
     ("ban", Some("add"), Some(2), Ck::Words("perm sticky")),
     ("ban", Some("add"), Some(3), Ck::Words("sticky")),
     ("ban", Some("del"), Some(0), Ck::Words("*")),
+    ("channel", Some("ban"), Some(0), Ck::Words("*")),
+    ("channel", Some("ban"), Some(2), Ck::Words("perm sticky")),
+    ("channel", Some("ban"), Some(3), Ck::Words("sticky")),
     (
         "upgrade",
         Some("start"),
@@ -1522,6 +1566,7 @@ impl Ui {
             hubname: &self.hubname,
             mode,
             session_log: slog,
+            upg_sel: b"",
         }
     }
 
@@ -1804,11 +1849,28 @@ impl Ui {
             return; // nothing asked: ignore
         }
         let rq = self.rq.remove(0);
+        if rq.kind == Rq::ViewRun {
+            // Answers an older pick: dropped, and the current one is asked
+            // for next.
+            let t = cstr(text).to_vec();
+            let rep = fmt::creply_parse(&t);
+            let keep = rep
+                .res
+                .rv("id")
+                .is_none_or(|id| id == self.upg_sel_id.as_slice());
+            if keep {
+                self.run_text = Some(t);
+            }
+            self.upg_sync_sel();
+            self.dirty = true;
+            return;
+        }
         if rq.kind == Rq::ViewUpg || rq.kind == Rq::ViewStats {
             // read back as a C string
             let t = Some(cstr(text).to_vec());
             if rq.kind == Rq::ViewUpg {
                 self.upg_text = t;
+                self.upg_sync_sel();
             } else {
                 self.stats_text = t;
             }
@@ -1902,6 +1964,69 @@ impl Ui {
         } else {
             self.core_frame(CMD_ADMIN_STATS, b"");
             self.stats_at = now_ms;
+        }
+    }
+
+    /// View 4: ask for the details of the run picked.  False when it cannot
+    /// go out now; the next status or details reply tries again.
+    fn request_run(&mut self, id: &[u8]) -> bool {
+        if self.user_busy
+            || self.rq.len() >= MAX_PENDING_RQ
+            || self.rq.iter().any(|r| r.kind == Rq::ViewRun)
+        {
+            return false;
+        }
+        self.rq.push(PendingRq {
+            kind: Rq::ViewRun,
+            ..PendingRq::default()
+        });
+        let payload = [b"history|".as_slice(), id].concat();
+        self.core_frame(CMD_ADMIN_UPGRADE_STATUS, &payload);
+        true
+    }
+
+    /// Hold the pick to the runs the last status listed: the top row follows
+    /// the newest run, any other stays on its run while newer ones arrive.
+    fn upg_sync_sel(&mut self) {
+        self.upg_runs = 0;
+        let Some(text) = self.upg_text.as_deref() else {
+            return;
+        };
+        let rep = fmt::creply_parse(text);
+        let runs: Vec<&fmt::Crec> = rep.r.iter().filter(|x| x.typ == b"run").collect();
+        let n = runs.len() as i32;
+        let found = if self.upg_sel > 0 {
+            runs.iter()
+                .position(|r| r.rv("id") == Some(self.upg_sel_id.as_slice()))
+                .map(|p| p as i32)
+        } else {
+            None
+        };
+        let at = found.unwrap_or(if self.upg_sel < n {
+            self.upg_sel
+        } else {
+            n - 1
+        });
+        self.upg_runs = n;
+        self.upg_sel = at.max(0);
+        if n == 0 {
+            self.upg_sel_id.clear();
+            self.run_id.clear();
+            self.run_text = None;
+            return;
+        }
+        let r = runs[at as usize];
+        let Some(id) = r.rv("id").map(<[u8]>::to_vec) else {
+            return;
+        };
+        let rev = r.rvi("rev", 0);
+        if id != self.upg_sel_id {
+            self.upg_sel_id.clone_from(&id);
+            self.run_text = None;
+        }
+        if (id != self.run_id || rev != self.run_rev) && self.request_run(&id) {
+            self.run_id = id;
+            self.run_rev = rev;
         }
     }
 
@@ -2767,6 +2892,11 @@ fn build_payload(
             if na == 0 {
                 return Ok(b);
             }
+            if eq_ic(a(0), "cron") && na == 3 {
+                // a nick keeps its case
+                b.payload = fmtb(&[b"botcron|", a(1), b"|", a(2)]);
+                return Ok(b);
+            }
             let o = if eq_ic(a(0), "flood") && na == 3 {
                 fmtb(&[b"flood|", a(1), b"|", a(2)])
             } else if eq_ic(a(0), "ignoretime") && na == 2 {
@@ -2775,13 +2905,29 @@ fn build_payload(
                 fmtb(&[b"sendq|", a(1)])
             } else {
                 return bad(
-                    "bot set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, or sendq <B:I|default>",
+                    "bot set flood <cmd|msg|ctcp> <N:S|off|default>, ignoretime <min|default>, sendq <B:I|default>, or cron <global|nick|uuid> <on|off>",
                     hint,
                 );
             };
             o.to_ascii_lowercase()
         }
         B::ChanOp => fmtb(&[a(1), b"|", a(0)]), // the hub takes nick|chan
+        B::ChanKick => {
+            // kick <#chan> <nick> [reason...]: nick|chan|reason, the reason
+            // being the rest of the line as typed (as ban add's)
+            let mut reason: Vec<u8> = Vec::new();
+            if na > 2 {
+                let start = ws.w[argi + 2].0;
+                reason = c_cut(&ws.buf[start..], 256).to_vec();
+                while reason.last() == Some(&b' ') {
+                    reason.pop();
+                }
+                if reason.len() > 120 || reason.contains(&b'|') {
+                    return bad("a kick reason is at most 120 bytes and has no '|'", hint);
+                }
+            }
+            fmtb(&[a(1), b"|", a(0), b"|", &reason])
+        }
         B::OptSet => {
             if a(0) == b"-" {
                 Vec::new()
@@ -2852,6 +2998,14 @@ fn build_payload(
                 // the settings table: hub show's record, laid out as one
                 b.op = CMD_ADMIN_GET_PUBKEY;
                 b.mode = fmt::FMT_MODE_HUB_SETTINGS;
+                return Ok(b);
+            }
+            if eq_ic(a(0), "cron") {
+                if na != 3 {
+                    return bad("usage: hub set cron <global|#|uuid|name> <on|off>", hint);
+                }
+                b.op = CMD_ADMIN_NET_SET;
+                b.payload = fmtb(&[b"hubcron|", a(1), b"|", a(2)]);
                 return Ok(b);
             }
             if eq_ic(a(0), "ssh") || eq_ic(a(0), "conn") {
@@ -3000,6 +3154,14 @@ fn build_payload(
             fmtb(&[a(1), b"|", a(2)])
         }
         B::UpgReleases => b"releases".to_vec(),
+        B::UpgHistory => {
+            if na > 0 {
+                fmtb(&[b"history|", a(0)])
+            } else {
+                b"history".to_vec()
+            }
+        }
+        B::UpgKeep => fmtb(&[b"keep|", a(0)]),
         B::UpgStart => {
             let mut botv: &[u8] = b"";
             let (mut hubv, mut nodes): (&[u8], &[u8]) = (b"", b"");
@@ -3153,7 +3315,7 @@ impl Ui {
                     fmt::flines_add(
                         &mut f,
                         RL_DIM,
-                        b"       PgUp/PgDn/End scroll, Tab completes, Up/Down history, Ctrl-C cancels",
+                        b"       PgUp/PgDn/Home/End scroll, Tab completes, Up/Down history, Ctrl-C cancels",
                     );
                 }
             }
@@ -4013,6 +4175,88 @@ impl Ui {
                                 RL_DIM,
                             );
                         }
+                        // What history says, before anything is touched.
+                        let (mut src, mut prob, mut none, mut down) =
+                            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                        let mut secs = 0i64;
+                        let mut n_fast = 0;
+                        let add = |buf: &mut Vec<u8>, parts: &[&[u8]]| {
+                            if buf.len() + 2 < 256 {
+                                if !buf.is_empty() {
+                                    buf.extend_from_slice(b", ");
+                                }
+                                for p in parts {
+                                    buf.extend_from_slice(p);
+                                }
+                                buf.truncate(255);
+                            }
+                        };
+                        for nd in rep.r.iter().filter(|x| x.typ == b"past") {
+                            let cl = nd.rv("class").unwrap_or(b"u");
+                            let nm = nd.rv("name").unwrap_or(b"?");
+                            if let Some(b) = nd.rvs("blocked") {
+                                let v = fmtb(&[nm, b": ", b]);
+                                fmt::card_line(
+                                    &mut f,
+                                    8,
+                                    b"blocked",
+                                    Some(c_cut(&v, 512)),
+                                    RL_WARN,
+                                );
+                            }
+                            if nd.rvb("down") {
+                                add(
+                                    &mut down,
+                                    &[nm, b" (last on ", nd.rv("last").unwrap_or(b"?"), b")"],
+                                );
+                                continue;
+                            }
+                            let stage = nd.rvi("stage_src", 0);
+                            secs = secs.max(stage);
+                            if stage > 0 {
+                                add(
+                                    &mut src,
+                                    &[nm, b" (", stage.to_string().as_bytes(), b" s to build)"],
+                                );
+                            }
+                            secs += nd.rvi("restart", 0) / 4;
+                            match cl {
+                                b"f" => n_fast += 1,
+                                b"p" => match nd.rvs("code") {
+                                    Some(c) => add(&mut prob, &[nm, b": ", c]),
+                                    None => add(&mut prob, &[nm]),
+                                },
+                                b"u" => add(&mut none, &[nm]),
+                                _ => {}
+                            }
+                        }
+                        if secs > 0 {
+                            let v = format!("about {} min", secs / 60 + 1);
+                            fmt::card_line(&mut f, 8, b"time", Some(v.as_bytes()), RL_NORMAL);
+                        }
+                        if n_fast > 0 {
+                            let v = format!("{n_fast} node(s), quick last time");
+                            fmt::card_line(&mut f, 8, b"fast", Some(v.as_bytes()), RL_NORMAL);
+                        }
+                        if !src.is_empty() {
+                            fmt::card_line(&mut f, 8, b"source", Some(&src), RL_NORMAL);
+                        }
+                        if !prob.is_empty() {
+                            fmt::card_line(&mut f, 8, b"problem", Some(&prob), RL_WARN);
+                        }
+                        if !none.is_empty() {
+                            fmt::card_line(&mut f, 8, b"no record", Some(&none), RL_DIM);
+                        }
+                        if !down.is_empty() {
+                            fmt::card_line(&mut f, 8, b"down", Some(&down), RL_WARN);
+                            fmt::card_line(
+                                &mut f,
+                                8,
+                                b"",
+                                Some(b"walked up when they return; one the mesh has passed must be upgraded by hand"),
+                                RL_DIM,
+                            );
+                        }
                     }
                     self.emit_flines(f);
                 }
@@ -4124,7 +4368,8 @@ impl Ui {
         let words = c_cut(&cmd_words(c), 32).to_vec();
         let na = ws.n() - argi;
         let rest_arg = (c.build == B::Local && c.sub == Some("filter"))
-            || (c.build == B::Ban && c.sub == Some("add"));
+            || (c.build == B::Ban && c.sub != Some("list") && c.sub != Some("del"))
+            || c.build == B::ChanKick;
         if na < c.nargs || (!rest_arg && na > c.nargs + c.optargs) {
             let m = format!("usage: {}", c.usage);
             self.refuse(seq, "cmd.usage", c_cut(m.as_bytes(), 160), None);
@@ -4861,7 +5106,18 @@ impl Ui {
                     self.in_cur = next_char_off(&self.input, self.in_cur);
                 }
             }
-            K::Home => self.in_cur = 0,
+            K::Home => {
+                // With nothing typed, Home is End's opposite: the top of the view.
+                if empty && self.in_cur == 0 {
+                    if self.view == V_CONSOLE || self.view == V_LOG {
+                        self.anchor[self.view] = self.sb_floor(self.view, self.cols, self.rows - 3);
+                    } else if self.view == V_UPG || self.view == V_STATS {
+                        self.anchor[self.view] = -1;
+                    }
+                    self.dirty = true;
+                }
+                self.in_cur = 0;
+            }
             K::End => {
                 if empty || self.in_cur == self.input.len() {
                     self.anchor[self.view] = -1;
@@ -4880,6 +5136,20 @@ impl Ui {
                     }
                     if self.net_sel < 0 {
                         self.net_sel = 0;
+                    }
+                    return;
+                }
+                if self.view == V_UPG && empty && self.upg_runs > 0 {
+                    let sel = (self.upg_sel + if k.t == K::Up { -1 } else { 1 })
+                        .min(self.upg_runs - 1)
+                        .max(0);
+                    if sel != self.upg_sel {
+                        // The pick goes by index here: upg_sync_sel looks an
+                        // id up, so name the row first.
+                        self.upg_sel = sel;
+                        self.upg_sel_id.clear();
+                        self.anchor[V_UPG] = -1;
+                        self.upg_sync_sel();
                     }
                     return;
                 }
@@ -5099,6 +5369,7 @@ fn kind_sgr(kind: u8) -> &'static str {
         RL_HEAD => "0;1",
         RL_WARN => "0;33",
         RL_DIM => "0;90",
+        RL_SEL => SGR_SEL,
         _ => SGR_RESET,
     }
 }
@@ -5193,6 +5464,7 @@ struct TRow {
     ver: Vec<u8>,
     var: Vec<u8>,
     server: Vec<u8>,
+    cron: Vec<u8>,
     online: bool,
     started: i64,
 }
@@ -5206,7 +5478,7 @@ fn parse_tree(tree: &[u8]) -> Vec<TRow> {
             continue;
         }
         // keep empty fields
-        let f: Vec<&[u8]> = row.splitn(10, |&b| b == b'|').collect();
+        let f: Vec<&[u8]> = row.split(|&b| b == b'|').take(10).collect();
         let nf = f.len();
         let cut = |s: &[u8], cap: usize| cut_field(s, cap).to_vec();
         let mut t = TRow {
@@ -5221,6 +5493,9 @@ fn parse_tree(tree: &[u8]) -> Vec<TRow> {
             t.ver = cut(f[6], 24);
             t.var = cut(f[7], 8);
             t.started = fmt::atoll(f[8]);
+            if nf >= 10 {
+                t.cron = cut(f[9], 48);
+            }
             out.push(t);
         } else if t.typ == b'B' && nf >= 9 {
             t.depth = fmt::atoi(f[1]);
@@ -5230,6 +5505,9 @@ fn parse_tree(tree: &[u8]) -> Vec<TRow> {
             t.server = cut(f[5], 72);
             t.var = cut(f[7], 8);
             t.started = fmt::atoll(f[8]);
+            if nf >= 10 {
+                t.cron = cut(f[9], 48);
+            }
             t.online = true;
             out.push(t);
         } else if t.typ == b'D' && nf >= 4 {
@@ -5376,6 +5654,30 @@ impl Ui {
         next - 1
     }
 
+    /// The oldest line a pane may end on: the one that fills it with everything
+    /// older.  Ending higher up would draw a few lines and leave the rest blank,
+    /// or nothing at all when the oldest lines are filtered out.
+    fn sb_floor(&self, view: usize, w: i32, h: i32) -> i64 {
+        let Some(sb) = self.sb[view].as_ref() else {
+            return -1;
+        };
+        let mut last = sb.next - 1;
+        let mut rows = 0;
+        let mut s = sb.first;
+        while s < sb.next {
+            let l = sb.get(s);
+            if self.sb_visible(view, l) {
+                last = s;
+                rows += wrap_rows(&l.map(|l| l.text.clone()).unwrap_or_default(), w);
+                if rows >= h {
+                    break;
+                }
+            }
+            s += 1;
+        }
+        last
+    }
+
     /// The rows a scrollback view shows, top to bottom, ending at its bottom
     /// line.
     fn sb_layout(&self, view: usize, w: i32, h: usize) -> Vec<Seg> {
@@ -5383,7 +5685,9 @@ impl Ui {
             return Vec::new();
         };
         let mut rev: Vec<Seg> = Vec::new();
-        let mut s = self.sb_bottom(view);
+        let mut s =
+            self.sb_bottom(view)
+                .max(self.sb_floor(view, w, i32::try_from(h).unwrap_or(i32::MAX)));
         while s >= sb.first && rev.len() < h {
             let l = sb.get(s);
             if self.sb_visible(view, l) {
@@ -5453,7 +5757,7 @@ impl Ui {
                     moved += wrap_rows(&l.map(|l| l.text.clone()).unwrap_or_default(), w);
                 }
             }
-            self.anchor[v] = s;
+            self.anchor[v] = s.max(self.sb_floor(v, w, h));
         } else {
             let mut top = if self.anchor[v] < 0 {
                 0
@@ -5461,6 +5765,8 @@ impl Ui {
                 self.anchor[v]
             };
             top += dir * i64::from(h - 1);
+            // A one-page view has nowhere to go; a longer one stops at its last page.
+            top = top.min(self.view_lines[v].get() - i64::from(h));
             if top <= 0 {
                 top = -1;
             }
@@ -5495,10 +5801,34 @@ impl Ui {
                 } else {
                     b"hub stats"
                 };
+                let picking = view == V_UPG && !self.upg_sel_id.is_empty();
+                if picking {
+                    c.upg_sel = &self.upg_sel_id;
+                }
                 fmt::reply(&c, &rep, words, &mut f);
+                if picking {
+                    fmt::flines_add(&mut f, RL_NORMAL, b"");
+                    match self.run_text.as_deref() {
+                        Some(t) => {
+                            let one = fmt::creply_parse(t);
+                            fmt::reply(&c, &one, b"upgrade history", &mut f);
+                        }
+                        None => fmt::flines_add(&mut f, RL_DIM, b"(asking the hub...)"),
+                    }
+                }
             }
         }
-        let top = self.anchor[view].max(0);
+        self.view_lines[view].set(f.len() as i64);
+        let mut top = self.anchor[view].max(0);
+        // The reply can shrink under a scrolled view: never past its last page.
+        top = top.min(f.len().saturating_sub(h) as i64);
+        if self.anchor[view] < 0 && f.len() > h {
+            // Not scrolled by hand: show the pick and as much of its details
+            // as fit.
+            if let Some(sel) = f.iter().position(|l| l.role == RL_SEL) {
+                top = (f.len() - h).min(sel) as i64;
+            }
+        }
         let start = (top.min(f.len() as i64)) as usize;
         for (y, l) in f[start..].iter().take(h).enumerate() {
             rows[y].sgr(kind_sgr(l.role));
@@ -5533,7 +5863,8 @@ impl Ui {
         rows[0].sgr("0;1");
         rows[0].text(
             if n > 0 {
-                b"node                            version   base  up     server / uuid".as_slice()
+                b"node                            version   base  up     cron    server / uuid"
+                    .as_slice()
             } else {
                 b"(no tree yet)".as_slice()
             },
@@ -5571,6 +5902,20 @@ impl Ui {
                 &pad_bytes(dash_empty(&t.var), 5),
                 b" ",
                 format!("{age:<6} ").as_bytes(),
+                &pad_bytes(
+                    {
+                        let v: &[u8] = if t.cron.is_empty() || t.cron == b"-" {
+                            b"-"
+                        } else {
+                            &t.cron
+                        };
+                        let v = c_cut(v, 16);
+                        let end = v.iter().position(|b| *b == b':').unwrap_or(v.len());
+                        &v[..end]
+                    },
+                    7,
+                ),
+                b" ",
                 if t.typ == b'B' { &t.server } else { &t.uuid },
             ]);
             r.text(c_cut(&rest, 256), w - 32);
@@ -5607,7 +5952,17 @@ impl Ui {
             rows[y0 + 2].text(c_cut(&l2, 256), w);
             rows[y0 + 2].pad(col0 + w);
             let srv: &[u8] = if t.server.is_empty() { b"-" } else { &t.server };
-            let l3 = fmtb(&[b"version  ", &t.ver, b" ", &t.var, b"   server ", srv]);
+            let cr: &[u8] = if t.cron.is_empty() { b"-" } else { &t.cron };
+            let l3 = fmtb(&[
+                b"version  ",
+                &t.ver,
+                b" ",
+                &t.var,
+                b"   server ",
+                srv,
+                b"   cron ",
+                cr,
+            ]);
             rows[y0 + 3].text(c_cut(&l3, 256), w);
             rows[y0 + 3].pad(col0 + w);
             let l4 = fmtb(&[
@@ -6039,6 +6394,7 @@ impl Ui {
             input: Vec::new(),
             in_cur: 0,
             in_scroll: 0,
+            view_lines: Default::default(),
             hist: Vec::new(),
             hist_pos: 0,
             hist_stash: Vec::new(),
@@ -6080,6 +6436,12 @@ impl Ui {
             },
             tree: None,
             upg_text: None,
+            upg_sel: 0,
+            upg_runs: 0,
+            upg_sel_id: Vec::new(),
+            run_text: None,
+            run_id: Vec::new(),
+            run_rev: 0,
             stats_text: None,
             upg_at: 0,
             stats_at: 0,

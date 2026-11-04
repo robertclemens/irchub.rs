@@ -359,6 +359,12 @@ pub struct ChanElect {
     pub reply_fd: i32,
     pub reply_serial: u64,
     pub reply_rid: String,
+    /// kind "ban" (ban add / channel ban): the record just stored, for the
+    /// ban.added answer the console gets when the election ends.
+    pub ban_expires: i64,
+    pub ban_sticky: bool,
+    pub ban_existed: bool,
+    pub ban_reason: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -592,6 +598,31 @@ pub struct UpgradePlan {
     pub next_at: i64,
     /// Why it ended (kept after it stops).
     pub summary: String,
+    /// Volatile: stop waiting for the mesh then.
+    pub mesh_until: i64,
+    /// Who drives it, and how many times it has changed: every hub keeps a copy
+    /// (`HubState::splan`), and the highest (started, rev) is the truth.
+    pub driver: String,
+    /// Its name when it published, for logs: known even at boot.
+    pub driver_name: String,
+    pub rev: i64,
+    /// One plain run, published but with no steps.
+    pub single: bool,
+    /// A step cut off by restarts, and run again.
+    pub reruns: i32,
+    /// This hub's own swap is waiting to be seen.
+    pub self_target: String,
+    /// The step that closed: who to wait for.
+    pub last_run: String,
+    /// A plan on hold: the network sits at its last closed step, and says why.
+    pub hold: String,
+    /// Resuming runs this step again, else the next.
+    pub hold_rerun: bool,
+    /// It resumes itself once this node runs this version.
+    pub hold_uuid: String,
+    pub hold_ver: String,
+    /// Comma list: `upgrade continue` left these behind.
+    pub left: String,
 }
 
 impl UpgradePlan {
@@ -622,6 +653,11 @@ pub struct PendingRollup {
     pub step: String,
     pub started: i64,
     pub committed: bool,
+    /// READY came: the node has a moment to say it stages.
+    pub ready_at: i64,
+    /// Told to stage, and waiting for it.
+    pub staging: bool,
+    pub stage_last: i64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -629,6 +665,9 @@ pub struct RollupTry {
     pub uuid: String,
     pub last_try: i64,
     pub tries: i32,
+    /// The last attempt, for upgrade status.
+    pub step: String,
+    pub note: String,
 }
 
 /// One downstream node a FOLLOWER relays for.  A run reaches every hub in the
@@ -673,6 +712,8 @@ pub struct UpgradeNode {
     pub state: UpgradeNodeState,
     pub reason: String,
     pub committed_at: i64,
+    /// When it ended in the run (upgrade history).
+    pub done_at: i64,
     /// A hub node's READY says how many of ITS local bots it relayed PREPARE
     /// to; the driver holds PREPARE open until that many relayed READYs are
     /// in, so a peer's bots are never missed for answering a moment after it.
@@ -683,6 +724,26 @@ pub struct UpgradeNode {
     /// lands ahead of any hub it routes for: descending `ready_seq` is
     /// deepest-first along the COMMIT routes (see `upgrade::tick`).
     pub ready_seq: usize,
+    /// Staging: this node said it can stage, and how that is going.
+    pub can_stage: bool,
+    pub staged: bool,
+    pub is_src: bool,
+    pub left: bool,
+    pub stage_phase: String,
+    /// How far it has got: "~60%", "120 of 200 crates".
+    pub stage_pct: String,
+    pub stage_detail: String,
+    pub stage_code: String,
+    pub stage_sent: i64,
+    pub stage_last: i64,
+    pub staged_at: i64,
+    /// Its limits, from its history.
+    pub stage_limit: i64,
+    pub build_limit: i64,
+    /// f fast, s slow, p problem, u unknown; '\0' before the run has read history.
+    pub cls: char,
+    /// This failure has been weighed.
+    pub counted: bool,
     /// A committed bot seen back on the target (its presence, or a
     /// follower's "back"), still waiting for its own "ok" — sent once it is
     /// back in its channels with ops.  0 = not seen yet.  Past
@@ -701,6 +762,10 @@ pub enum UpgradePhase {
     Done,
     Failed,
     Aborted,
+    /// Nodes getting the build ready; nothing has changed yet.
+    Staging,
+    /// It ran, and some nodes did not take it.
+    Partial,
 }
 
 impl UpgradePhase {
@@ -709,6 +774,8 @@ impl UpgradePhase {
             Self::Idle => "idle",
             Self::Prepare => "preparing",
             Self::Rolling => "rolling",
+            Self::Staging => "staging",
+            Self::Partial => "partial",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Aborted => "aborted",
@@ -728,6 +795,13 @@ pub struct PendingUpgrade {
     pub active: bool,
     /// `opflow::generate_request_id()`.
     pub id: String,
+    /// The admin who typed it (upgrade history).
+    pub by: String,
+    /// Its plan's `started`; 0 = a one-step run.
+    pub plan_id: i64,
+    pub plan_step: i64,
+    pub plan_steps: i64,
+    pub rolling_at: i64,
     pub target_ver: String,
     /// "" = keep each node's own variant.
     pub variant: String,
@@ -755,6 +829,10 @@ pub struct PendingUpgrade {
     /// Selective run: only these (uuid, variant) nodes move; every other node
     /// answers into "not selected".  Empty = the whole network.
     pub select: Vec<(String, String)>,
+    /// A build was stopped: the plan holds.
+    pub build_stopped: bool,
+    /// A peer hub failed: no more hubs move.
+    pub hubs_stopped: bool,
     /// `uuid[=v],...` — the selection as a peer PREPARE carries it.
     pub sel_wire: String,
 }
@@ -784,6 +862,15 @@ pub struct MeshLink {
     pub online: bool,
 }
 
+/// A single node's production crontab setting.
+#[derive(Clone, Debug)]
+pub struct CronRec {
+    pub uuid: String,
+    pub kind: char,
+    pub on: i32,
+    pub ts: i64,
+}
+
 /// What this hub knows about another hub anywhere in the mesh, from that
 /// hub's own roster gossip — direct or relayed.  Volatile like the roster:
 /// dropped once nothing refreshed it within BOT_ROSTER_TTL.  `round` and
@@ -796,9 +883,12 @@ pub struct MeshHub {
     pub started: i64,
     pub version: String,
     pub variant: String,
+    pub cron: String,
     pub links: Vec<MeshLink>,
     /// It has sent an l| list (a hub that relays).
     pub have_links: bool,
+    /// Local clock: when that list was last applied.
+    pub links_at: i64,
     /// Newest gossip generation (round) seen from it.
     pub round: i64,
     /// Chunks of `gen` already applied (bit n).
@@ -823,6 +913,7 @@ pub struct BotRoster {
     pub version: String,
     /// Code base: "c" / "rs" / "".
     pub variant: String,
+    pub cron: String,
     /// The bot's IRC link.
     pub server: String,
     /// The bot's own start, for uptime.
@@ -833,6 +924,8 @@ pub struct BotRoster {
     pub ip: String,
     /// Local clock: drives the TTL.
     pub reported_at: i64,
+    /// The gossip round it came in (0 = none); C `gen`.
+    pub round: i64,
 }
 
 /// Loop-prevention seen-set: highest lamport_seq observed per (origin, bot).
@@ -986,6 +1079,8 @@ pub struct HubClient {
     pub drop_unlogged: i32,
     /// A newer session of this bot replaced it.
     pub superseded: bool,
+    /// This link's one relayed UPGRADE_RESULT has gone.
+    pub result_relayed: bool,
     /// Start of the hour replace_count is for.
     pub replace_window: i64,
     /// Live sessions of this bot replaced.
@@ -1087,6 +1182,13 @@ pub struct HubClient {
     pub bot_server: String,
     /// "c" / "rs", empty = unreported.
     pub bot_variant: String,
+    pub bot_cron: String,
+    /// Last CMD_CRON_SET + 1, 0 = none.
+    pub cron_sent: i32,
+    /// Joined a run in flight already.
+    pub late_prepared: bool,
+    /// A peer that speaks CMD_UPGRADE_PLAN.
+    pub plan_capable: bool,
     /// The bot's own start time, 0 = unreported.
     pub bot_started: i64,
     /// SHA-256 of the last full config queued to this bot (CMD_CONFIG_DATA),
@@ -1136,6 +1238,7 @@ impl HubClient {
             drop_logged: 0,
             drop_unlogged: 0,
             superseded: false,
+            result_relayed: false,
             replace_window: 0,
             replace_count: 0,
             link_offered: false,
@@ -1184,6 +1287,10 @@ impl HubClient {
             bot_version: String::new(),
             bot_server: String::new(),
             bot_variant: String::new(),
+            bot_cron: String::new(),
+            cron_sent: 0,
+            late_prepared: false,
+            plan_capable: false,
             bot_started: 0,
             cfg_sent_hash: None,
             pushed: false,
@@ -1356,6 +1463,23 @@ pub struct HubState {
 
     /// The network upgrade this hub is driving, if any (one at a time).
     pub upgrade: PendingUpgrade,
+    /// The last upgrade runs, newest first (`uhist`).
+    pub uhist: Vec<crate::uhist::UhistRec>,
+    /// hs|upgradehistory; 0 = UHIST_DEFAULT_KEEP.
+    pub uhist_keep_setting: i32,
+    pub uhist_keep_ts: i64,
+    /// Production crontab lines: off until an admin says otherwise.  The last
+    /// command wins by timestamp, a single node's or the global one.
+    pub bot_cron_setting: i32,
+    pub hub_cron_setting: i32,
+    pub bot_cron_ts: i64,
+    pub hub_cron_ts: i64,
+    pub cron_recs: Vec<CronRec>,
+    /// The plan as every hub knows it: this hub's own copy of what its driver
+    /// last published, and when it last heard the driver.
+    pub splan: UpgradePlan,
+    pub splan_seen: i64,
+    pub plan_beat: i64,
 
     /// The upgrade this hub has agreed to take from ANOTHER hub, if any.  The
     /// mesh is flat, so a hub is a follower and a driver at the same time and
@@ -1379,6 +1503,8 @@ pub struct HubState {
     /// Whether this hub itself can take the followed run.
     pub follow_self_ready: bool,
     pub follow_prepared: i64,
+    /// The run whose restart made this process.
+    pub upgrade_installed_id: String,
     /// Nodes below this hub in the followed run's fan-out tree (its own
     /// peers' subtrees).  Rebuilt for every run; see [`UpgradeRoute`].
     pub follow_routes: Vec<UpgradeRoute>,
@@ -1496,6 +1622,16 @@ pub struct HubState {
     pub roster_gen: i64,
     /// Peers linked at the last gossip (bit p).
     pub gossip_link_mask: u32,
+    /// A presence event waits for its gossip.
+    pub presence_event_due: bool,
+    /// No event gossip before then (damping).
+    pub presence_hold_until: i64,
+    /// The last event gossip.
+    pub presence_last_event: i64,
+    /// Event gossips in a row inside the window.
+    pub presence_burst: i32,
+    /// A link came up: gossip once more then.
+    pub gossip_again_at: i64,
     /// Ask peers for a sync then (0 = none).
     pub resync_due_at: i64,
 
@@ -1578,6 +1714,7 @@ impl HubState {
             follow_hub_target: String::new(),
             follow_self_ready: false,
             follow_prepared: 0,
+            upgrade_installed_id: String::new(),
             follow_routes: Vec::new(),
             rollup: PendingRollup::default(),
             rollup_tries: Vec::new(),
@@ -1596,6 +1733,17 @@ impl HubState {
             startup_unlogged: 0,
             purge_days_setting: 0,
             purge_days_ts: 0,
+            uhist: Vec::new(),
+            uhist_keep_setting: 0,
+            bot_cron_setting: 0,
+            hub_cron_setting: 0,
+            bot_cron_ts: 0,
+            hub_cron_ts: 0,
+            cron_recs: Vec::new(),
+            splan: Default::default(),
+            splan_seen: 0,
+            plan_beat: 0,
+            uhist_keep_ts: 0,
             trust_loopback: false,
             pid_file: None,
             running: true,
@@ -1628,6 +1776,11 @@ impl HubState {
             mesh_hubs: Vec::new(),
             roster_gen: 0,
             gossip_link_mask: 0,
+            presence_event_due: false,
+            presence_hold_until: 0,
+            presence_last_event: 0,
+            presence_burst: 0,
+            gossip_again_at: 0,
             resync_due_at: 0,
             console: None,
             timers: MaintTimers::default(),
@@ -1779,6 +1932,10 @@ impl HubState {
                 .find(|m| m.uuid == uuid && !m.name.is_empty())
             {
                 return ("hub", Some(&m.name));
+            }
+            // A plan's director, by the name it published: known even at boot.
+            if !self.splan.driver_name.is_empty() && self.splan.driver == uuid {
+                return ("hub", Some(&self.splan.driver_name));
             }
         }
         if (kind == '\0' || kind == 'u')

@@ -114,6 +114,13 @@ pub static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// them through.
 pub static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How many writes have reached the disk.  A write that fails keeps the old file
+/// and says nothing else, so an upgrade counts these to know its flush landed.
+static CONFIG_SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn saves() -> u64 {
+    CONFIG_SAVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn write(state: &mut HubState) {
     if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -163,6 +170,10 @@ pub fn write(state: &mut HubState) {
     if state.purge_days_setting > 0 {
         buf.push_str(&format!("purge_days|{}\n", state.purge_days_setting));
     }
+    // The last upgrade runs (uhist): one line each, already escaped.
+    for r in &state.uhist {
+        buf.push_str(&format!("uhist|{}\n", r.body));
+    }
     crate::revoke::gsetting_append(state, &mut buf);
     // When the leader last ran the scheduled purge: a restart does not push
     // it another day out.
@@ -204,48 +215,18 @@ pub fn write(state: &mut HubState) {
         }
     }
 
-    // A multi-step upgrade this hub drives (hub-local, never replicated):
-    // uplan|bot_target|hub_target|variant|kind|step|run_id|started|progressed|
-    //       bot_from|hub_from|bot_path|hub_path|sel
-    // The hub restarts onto each step itself; this line is how it carries on.
-    // Every field passed plan_field_ok when it was set and is checked again
-    // here, so the line can never split or inject another.
+    // The upgrade plan: uplan| when this hub drives it, uplanr| its copy of what
+    // the driver published.  A plan that will not format is left out, not half
+    // written.
+    if state.plan.active
+        && let Some(body) = crate::upgrade::plan_format(&state.plan)
     {
-        let p = &state.plan;
-        let fields = [
-            &p.bot_target,
-            &p.hub_target,
-            &p.variant,
-            &p.kind,
-            &p.run_id,
-            &p.bot_from,
-            &p.hub_from,
-            &p.sel,
-        ];
-        if p.active
-            && fields.iter().all(|f| crate::upgrade::plan_field_ok(f))
-            && p.bot_path
-                .iter()
-                .chain(&p.hub_path)
-                .all(|v| crate::upgrade::plan_field_ok(v))
-        {
-            buf.push_str(&format!(
-                "uplan|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
-                p.bot_target,
-                p.hub_target,
-                p.variant,
-                p.kind,
-                p.step,
-                p.run_id,
-                p.started,
-                p.progressed,
-                p.bot_from,
-                p.hub_from,
-                p.bot_path.join(","),
-                p.hub_path.join(","),
-                p.sel
-            ));
-        }
+        buf.push_str(&format!("uplan|{body}\n"));
+    }
+    if !state.splan.driver.is_empty()
+        && let Some(body) = crate::upgrade::plan_format(&state.splan)
+    {
+        buf.push_str(&format!("uplanr|{body}\n"));
     }
 
     for p in &state.peers {
@@ -421,6 +402,8 @@ pub fn write(state: &mut HubState) {
             let ok = ok && fs::rename(&tmp, HUB_CONFIG_FILE).is_ok();
             if !ok {
                 let _ = fs::remove_file(&tmp);
+            } else {
+                CONFIG_SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             ok
         }
@@ -804,6 +787,9 @@ fn load_inner(state: &mut HubState, password: &str) -> bool {
             }
             "log_level" => {
                 state.log_level = crate::cstr::atoi(v).clamp(LOG_NONE, LOG_DEBUG);
+                // Live from here on, as C's state->log_level is: what the rest
+                // of the load finds wrong reaches the log.
+                crate::logging::set_levels(state.log_level, state.console_log_level);
             }
             "console_log_level" => {
                 state.console_log_level = crate::cstr::atoi(v).clamp(LOG_NONE, LOG_DEBUG);
@@ -877,74 +863,30 @@ fn load_inner(state: &mut HubState, password: &str) -> bool {
                     crate::hlog_warning!("[CONFIG] Ignoring a malformed rollup| line\n");
                 }
             }
-            // uplan|… — see write().  Dropped whole when it does not parse:
-            // no plan is better than half of one, and the admin can start
-            // again.
-            "uplan" => {
-                let f: Vec<&str> = v.split('|').collect();
-                let caps = [
-                    64,
-                    64,
-                    8,
-                    8,
-                    0,
-                    64,
-                    0,
-                    0,
-                    64,
-                    64,
-                    0,
-                    0,
-                    MAX_UPGRADE_SELECT * 80,
-                ];
-                let path = |s: &str| -> Option<Vec<String>> {
-                    if s.is_empty() {
-                        return Some(Vec::new());
-                    }
-                    let p: Vec<String> = s.split(',').map(str::to_string).collect();
-                    (p.len() <= MAX_UPGRADE_STEPS
-                        && p.iter().all(|x| {
-                            !x.is_empty() && x.len() < 64 && crate::upgrade::plan_field_ok(x)
-                        }))
-                    .then_some(p)
-                };
-                let ok = f.len() == 13
-                    && !f[0].is_empty()
-                    && f.iter().zip(caps).all(|(x, cap)| {
-                        cap == 0 || (x.len() < cap && crate::upgrade::plan_field_ok(x))
-                    });
-                let paths = if ok {
-                    path(f[10]).zip(path(f[11]))
-                } else {
-                    None
-                };
-                let step = if ok { parse_uint(f[4], u64::MAX) } else { None };
-                match (paths, step) {
-                    (Some((bp, hp)), Some(step)) if (step as usize) < bp.len().max(hp.len()) => {
-                        state.plan = crate::state::UpgradePlan {
-                            active: true,
-                            bot_target: f[0].to_string(),
-                            hub_target: f[1].to_string(),
-                            variant: f[2].to_string(),
-                            kind: f[3].to_string(),
-                            step: step as usize,
-                            run_id: f[5].to_string(),
-                            started: crate::cstr::atoll(f[6]),
-                            progressed: crate::cstr::atoll(f[7]),
-                            bot_from: f[8].to_string(),
-                            hub_from: f[9].to_string(),
-                            bot_path: bp,
-                            hub_path: hp,
-                            sel: f[12].to_string(),
-                            ..Default::default()
-                        };
-                    }
-                    _ => {
-                        state.plan = Default::default();
-                        crate::hlog_warning!("[CONFIG] Ignoring a malformed uplan| line\n");
-                    }
+            "uhist" => {
+                if !crate::uhist::load_line(state, v) {
+                    crate::hlog_warning!("[CONFIG] Ignoring a malformed uhist| line\n");
                 }
             }
+            // Dropped whole when it does not parse: no plan is better than half
+            // of one, and the admin can start again.
+            "uplan" => match crate::upgrade::plan_parse(v) {
+                Some(mut p) => {
+                    p.active = true;
+                    state.plan = p;
+                }
+                None => {
+                    state.plan = Default::default();
+                    crate::hlog_warning!("[CONFIG] Ignoring a malformed uplan| line\n");
+                }
+            },
+            "uplanr" => match crate::upgrade::plan_parse(v) {
+                Some(p) => state.splan = p,
+                None => {
+                    state.splan = Default::default();
+                    crate::hlog_warning!("[CONFIG] Ignoring a malformed uplanr| line\n");
+                }
+            },
             "lamport_seq" => {
                 let loaded_seq = parse_uint(v.trim(), u64::MAX).unwrap_or(0);
                 // Bump past max(saved_seq, time_based_floor) so the seq stays

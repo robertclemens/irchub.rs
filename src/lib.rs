@@ -52,5 +52,6 @@ pub mod state;
 pub mod stats;
 pub mod storage;
 pub mod tool;
+pub mod uhist;
 pub mod update;
 pub mod upgrade;

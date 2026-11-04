@@ -93,7 +93,7 @@ pub(crate) fn linked_peer_count(state: &HubState) -> i64 {
         .count() as i64
 }
 
-fn local_bot_count(state: &HubState) -> i64 {
+pub(crate) fn local_bot_count(state: &HubState) -> i64 {
     state
         .clients
         .iter()
@@ -195,6 +195,7 @@ fn reply_bot(state: &HubState, r: &mut Reply, b: &BotConfig) {
     if let Some(c) = c {
         opt(r, "ver", &c.bot_version);
         opt(r, "base", &c.bot_variant);
+        opt(r, "cron", &c.bot_cron);
         if c.bot_started > 0 {
             r.kvi("started", c.bot_started);
         }
@@ -207,6 +208,7 @@ fn reply_bot(state: &HubState, r: &mut Reply, b: &BotConfig) {
     } else if let Some(e) = e {
         opt(r, "ver", &e.version);
         opt(r, "base", &e.variant);
+        opt(r, "cron", &e.cron);
         if e.connected_at > 0 {
             r.kvi("started", e.connected_at);
         }
@@ -320,6 +322,9 @@ fn reply_peer(state: &HubState, r: &mut Reply, i: usize, detail: bool) {
     };
     opt(r, "base", var);
     opt(r, "ver", ver);
+    if let Some(m) = mh {
+        opt(r, "cron", &m.cron);
+    }
     if c.is_some() && started > 0 {
         r.kvi("started", started);
     }
@@ -634,6 +639,11 @@ fn list_peers(state: &mut HubState, ci: usize, sel: &str) -> bool {
         },
     );
     r.kvi("port", i64::from(state.port));
+    let cron = crate::update::cron_status();
+    if !cron.is_empty() {
+        r.kv("cron", &cron);
+    }
+    r.kv("fp", &crypto::key_fingerprint(&state.hub_pub_combined()));
     for i in 0..state.peers.len() {
         reply_peer(state, &mut r, i, false);
     }
@@ -3096,7 +3106,107 @@ fn admin_chan_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
 }
 
 /// bot set (CMD_ADMIN_NET_SET): "" | flood|<cmd|msg|ctcp>|<N:S|off|default> | ignoretime|<min|default> | sendq|<B:I|default>
+/// bot set cron / hub set cron: "<botcron|hubcron>|<global|node>|<on|off>".
+fn admin_cron_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    let (prod, target, val) = (
+        wire_field(payload, 0, 8),
+        wire_field(payload, 1, 80),
+        wire_field(payload, 2, 8),
+    );
+    let (Some(prod), Some(target), Some(val)) = (prod, target, val) else {
+        return admin_err(
+            state,
+            ci,
+            "cron.usage",
+            "cron takes a node, or global, and on or off",
+            Some("bot set cron <global|nick> <on|off>"),
+        );
+    };
+    if val != "on" && val != "off" {
+        return admin_err(
+            state,
+            ci,
+            "cron.usage",
+            "cron takes a node, or global, and on or off",
+            Some("bot set cron <global|nick> <on|off>"),
+        );
+    }
+    let is_hub = prod == "hubcron";
+    let kind = if is_hub { 'h' } else { 'b' };
+    let on = val == "on";
+    let word = if is_hub {
+        "hub set cron <global|#|uuid|name> <on|off>"
+    } else {
+        "bot set cron <global|nick|uuid> <on|off>"
+    };
+    let mut r = Reply::new();
+    if target.eq_ignore_ascii_case("global") {
+        let name = if is_hub { "hubcron" } else { "botcron" };
+        crate::revoke::gsetting_set(state, name, i32::from(on));
+        crate::revoke::cron_prune(state, kind);
+        if let Some(line) = crate::revoke::gsetting_format(state, name) {
+            crate::mesh::broadcast_sync_to_peers(state, &line, -1);
+        }
+        r.ok("cron.set");
+        r.kv("scope", if is_hub { "every hub" } else { "every bot" });
+        r.kv("value", &val);
+        r.kvi("peers", linked_peer_count(state));
+        return send_reply(state, ci, &mut r);
+    }
+    let mut uuid = String::new();
+    let mut name = String::new();
+    // A hub's list number, as hub set <#> key takes.
+    if is_hub && !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit()) {
+        let n: usize = target.parse().unwrap_or(0);
+        if n >= 1 && n <= state.peers.len() && !state.peers[n - 1].uuid.is_empty() {
+            uuid = state.peers[n - 1].uuid.clone();
+            name = state.peers[n - 1].friendly_name.clone();
+        }
+    }
+    if uuid.is_empty() {
+        let cands = crate::upgrade::candidates(state);
+        match crate::upgrade::resolve(&cands, &target) {
+            Ok(c) if (c.kind == crate::state::UpgradeNodeKind::Bot) != is_hub => {
+                uuid = c.uuid.clone();
+                name = c.name.clone();
+            }
+            _ => {
+                return admin_err(
+                    state,
+                    ci,
+                    "cron.unknown_node",
+                    if is_hub { "no such hub" } else { "no such bot" },
+                    Some(word),
+                );
+            }
+        }
+    }
+    let Some(line) = crate::revoke::cron_set_one(state, kind, &uuid, on) else {
+        return admin_err(
+            state,
+            ci,
+            "cron.full",
+            "too many single-node cron settings",
+            Some(if is_hub {
+                "hub set cron global <on|off>"
+            } else {
+                "bot set cron global <on|off>"
+            }),
+        );
+    };
+    crate::mesh::broadcast_sync_to_peers(state, &line, -1);
+    r.ok("cron.set");
+    r.kv("scope", if name.is_empty() { &uuid } else { &name });
+    r.kv("uuid", &uuid);
+    r.kv("value", &val);
+    r.kvi("peers", linked_peer_count(state));
+    send_reply(state, ci, &mut r)
+}
+
 fn admin_net_set(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    if payload.starts_with("botcron|") || payload.starts_with("hubcron|") {
+        return admin_cron_set(state, ci, payload);
+    }
     let cur = modes::netset_get(state).unwrap_or_default();
     let mut r = Reply::new();
     if payload.is_empty() {
@@ -3508,6 +3618,19 @@ fn admin_ban(state: &mut HubState, ci: usize, payload: &str) -> bool {
     if st != ModesStatus::Ok {
         return mf_status_err(state, ci, st, Some(&chan));
     }
+    // One channel: one opped bot sets it now (election kind "ban"), and the
+    // answer goes out when it has.  `*` is left to every bot's sweep.
+    if !global {
+        let admin = Some((state.clients[ci].fd, state.clients[ci].conn_serial));
+        if let Some(ei) = crate::elect::start(state, "ban", &cname, "ADMIN", "", &mask, admin) {
+            let e = &mut state.chan_elections[ei];
+            e.ban_expires = expires;
+            e.ban_sticky = sticky == "1";
+            e.ban_existed = existed;
+            e.ban_reason = trunc_string(&reason, BAN_REASON_MAX + 1);
+            return true;
+        }
+    }
     r.ok("ban.added");
     r.kv("chan", bchan);
     r.kv("mask", &mask);
@@ -3517,6 +3640,11 @@ fn admin_ban(state: &mut HubState, ci: usize, payload: &str) -> bool {
     r.kvb("existed", existed);
     r.kvi("bots", local_bot_count(state));
     r.kvi("peers", linked_peer_count(state));
+    if !global {
+        // the election table was full: the sweep sets it
+        r.kvb("placed", false);
+        r.kv("why", "too many channel requests in flight");
+    }
     send_reply(state, ci, &mut r)
 }
 
@@ -3574,6 +3702,7 @@ fn admin_flag_needed(state: &HubState, me: Option<usize>, cmd: u8, payload: &str
         CMD_ADMIN_CREATE_BOT | CMD_ADMIN_DEL | CMD_ADMIN_DISCONNECT_BOT | CMD_ADMIN_REKEY_BOT => {
             Some('b')
         }
+        CMD_ADMIN_NET_SET if payload.starts_with("hubcron|") => Some('h'),
         CMD_ADMIN_NET_SET => mf_payload_mutates(cmd, payload).then_some('b'),
         CMD_ADMIN_ADD_PEER
         | CMD_ADMIN_DEL_PEER
@@ -3599,12 +3728,17 @@ fn admin_flag_needed(state: &HubState, me: Option<usize>, cmd: u8, payload: &str
         CMD_ADMIN_ADD_CHANNEL
         | CMD_ADMIN_DEL_CHANNEL
         | CMD_ADMIN_OP_USER
-        | CMD_ADMIN_INVITE_USER => Some('c'),
+        | CMD_ADMIN_INVITE_USER
+        | CMD_ADMIN_KICK_USER => Some('c'),
         CMD_ADMIN_CHAN_MODE | CMD_ADMIN_CHAN_SET | CMD_ADMIN_BAN => {
             mf_payload_mutates(cmd, payload).then_some('c')
         }
         CMD_ADMIN_UPGRADE_NET => Some('u'),
-        CMD_ADMIN_UPGRADE_STATUS => (payload == "abort" || payload == "forget").then_some('u'),
+        CMD_ADMIN_UPGRADE_STATUS => (payload == "abort"
+            || payload == "forget"
+            || payload == "continue"
+            || payload.starts_with("keep|"))
+        .then_some('u'),
         CMD_ADMIN_ADD_ADMIN => Some('a'),
         CMD_ADMIN_ADD_OPER_RECORD => Some('o'),
         // flags|… changes an admin, chan|… an oper
@@ -3892,6 +4026,7 @@ pub fn console_admin_op(cmd: u8) -> bool {
             | CMD_ADMIN_DEL_CHANNEL
             | CMD_ADMIN_OP_USER
             | CMD_ADMIN_INVITE_USER
+            | CMD_ADMIN_KICK_USER
             | CMD_ADMIN_CHAN_MODE
             | CMD_ADMIN_CHAN_SET
             | CMD_ADMIN_BAN
@@ -3915,9 +4050,75 @@ fn upgrade_status_cmd(state: &mut HubState, ci: usize, payload: &str) -> bool {
         upgrade::releases(state, payload, &mut r);
         return send_reply(state, ci, &mut r);
     }
+    // "history": the runs kept; "history|<id or prefix>": one with its nodes.
+    if payload == "history" {
+        let mut r = Reply::new();
+        r.ok("upg.history");
+        r.kvi("keep", crate::uhist::keep(state) as i64);
+        crate::uhist::reply_runs(state, &mut r);
+        return send_reply(state, ci, &mut r);
+    }
+    if let Some(pfx) = payload.strip_prefix("history|") {
+        let mut r = Reply::new();
+        return match crate::uhist::reply_one(state, pfx, &mut r) {
+            Ok(()) => send_reply(state, ci, &mut r),
+            Err(true) => admin_err(
+                state,
+                ci,
+                "upg.run.ambiguous",
+                "more than one run starts with that",
+                Some("upgrade history"),
+            ),
+            Err(false) => admin_err(
+                state,
+                ci,
+                "upg.run.unknown",
+                "no such run kept",
+                Some("upgrade history"),
+            ),
+        };
+    }
+    // "keep|<n>": how many runs every hub keeps (hs|upgradehistory).
+    if let Some(n) = payload.strip_prefix("keep|") {
+        let Some(n) = parse_uint(n, MAX_UPGRADE_HISTORY as u64).filter(|&v| v >= 1) else {
+            return admin_err(
+                state,
+                ci,
+                "upg.bad_keep",
+                "keep takes a number from 1 to 20",
+                Some("upgrade keep <n>"),
+            );
+        };
+        let old = crate::uhist::keep(state) as i64;
+        crate::revoke::gsetting_set(state, "upgradehistory", n as i32);
+        if let Some(line) = crate::revoke::gsetting_format(state, "upgradehistory") {
+            mesh::broadcast_sync_to_peers(state, &line, -1);
+        }
+        let mut r = Reply::new();
+        r.ok("upg.keep");
+        r.kvi("old", old);
+        r.kvi("new", n as i64);
+        r.kvi("peers", linked_peer_count(state));
+        return send_reply(state, ci, &mut r);
+    }
     // A payload of "abort" stops a run in flight and rolls the mesh back, and
     // stops a multi-step upgrade for good — here, and (flooded) on the hub
     // driving it if that is another one.
+    // A plan on hold, wherever its driver is.
+    if payload.eq_ignore_ascii_case("continue") {
+        if !upgrade::plan_continue_cmd(state) {
+            return admin_err(
+                state,
+                ci,
+                "upg.not_held",
+                "no upgrade is on hold",
+                Some("upgrade status"),
+            );
+        }
+        let mut r = Reply::new();
+        r.ok("upg.continued");
+        return send_reply(state, ci, &mut r);
+    }
     if payload.eq_ignore_ascii_case("abort") {
         let run = state.upgrade.active;
         let plan = state.plan.active;
@@ -3951,6 +4152,7 @@ fn upgrade_status_cmd(state: &mut HubState, ci: usize, payload: &str) -> bool {
             );
         }
         let told = upgrade::cancel_flood(state);
+        upgrade::plan_cancelled(state, crate::cstr::now());
         let Some(ci) = refind(state, admin_fd) else {
             return false;
         };
@@ -4013,7 +4215,7 @@ fn upgrade_status_cmd(state: &mut HubState, ci: usize, payload: &str) -> bool {
             ci,
             "upg.usage",
             "unknown upgrade request",
-            Some("upgrade status · releases · abort · forget"),
+            Some("upgrade status · releases · history · keep · abort · forget"),
         );
     }
     let mut r = Reply::new();
@@ -4025,11 +4227,12 @@ fn upgrade_status_cmd(state: &mut HubState, ci: usize, payload: &str) -> bool {
 /// (hub_maintenance), between the sync counters and the opcode rows.
 fn stats_load(state: &HubState, r: &mut Reply) {
     let t = now();
-    let (mut bots, mut peers, mut authing) = (0i64, 0i64, 0i64);
+    let (mut bots, mut peers, mut consoles, mut authing) = (0i64, 0i64, 0i64, 0i64);
     for c in &state.clients {
         match (c.typ, c.authenticated) {
             (ClientType::Bot, true) => bots += 1,
             (ClientType::Hub, true) => peers += 1,
+            (ClientType::Admin, true) => consoles += 1,
             _ => authing += 1,
         }
     }
@@ -4037,6 +4240,7 @@ fn stats_load(state: &HubState, r: &mut Reply) {
     r.kvi("clients", state.clients.len() as i64);
     r.kvi("bots", bots);
     r.kvi("peers", peers);
+    r.kvi("consoles", consoles);
     r.kvi("authing", authing);
     r.kvi("dirty", i64::from(state.config_dirty));
     let tm = &state.timers;
@@ -4158,6 +4362,42 @@ pub fn handle_admin_command(
                     fld[i].as_str()
                 }
             };
+            // One upgrade at a time, mesh-wide: every hub holds the copy of the one in
+            // flight, between its steps and on hold too, when no freeze says so.
+            if state.splan.active && state.splan.driver != state.hub_uuid {
+                let why = format!(
+                    "an upgrade to {} driven by {} is in progress",
+                    state.splan.bot_target,
+                    state.who('h', &state.splan.driver)
+                );
+                return admin_err(
+                    state,
+                    ci,
+                    "upg.busy",
+                    &why,
+                    Some("upgrade status; upgrade abort stops it"),
+                );
+            }
+            // An upgrade starts with every hub present.  One that drops later is the
+            // plan's business: every hub already holds it.
+            if !state.upgrade.active && !state.plan.active {
+                let gone = upgrade::hubs_missing(state);
+                if !gone.is_empty() {
+                    let why = format!(
+                        "{} hub{} not linked: {}",
+                        gone.len(),
+                        if gone.len() == 1 { "" } else { "s" },
+                        gone.join(", ")
+                    );
+                    return admin_err(
+                        state,
+                        ci,
+                        "upg.hubs_missing",
+                        &why,
+                        Some("bring it back, or remove it with hub del; then start again"),
+                    );
+                }
+            }
             let fd = state.clients[ci].fd;
             let msg = upgrade::plan_begin(
                 state,
@@ -4453,6 +4693,73 @@ pub fn handle_admin_command(
                 "ADMIN",
                 &nick,
                 "",
+                Some((admin_fd, state.clients[ci].conn_serial)),
+            )
+            .is_some()
+            {
+                return true;
+            }
+            admin_err(
+                state,
+                ci,
+                "channel.busy",
+                "too many channel requests in flight",
+                Some("try again in a few seconds"),
+            )
+        }
+
+        CMD_ADMIN_KICK_USER => {
+            // nick|#chan|reason: one opped bot kicks (election kind "kick",
+            // the reason in the hostmask slot).  The bot refuses a bot or an
+            // authorised member (fail|protected) and a nick not in the channel
+            // (fail|absent).
+            let nick = wire_field(payload, 0, MAX_NICK).unwrap_or_default();
+            let channel = wire_field(payload, 1, MAX_CHAN).unwrap_or_default();
+            let bad = nick.is_empty()
+                || !chan_name_valid(&channel)
+                || nick.bytes().any(|b| b <= 0x20 || b == 0x7f);
+            if bad {
+                return admin_err(
+                    state,
+                    ci,
+                    "channel.usage",
+                    "say which channel and nick",
+                    Some("channel kick <#chan> <nick> [reason]"),
+                );
+            }
+            let mut reason = String::new();
+            if mf_field_count(payload) > 2 {
+                match wire_tail(payload, 2, BAN_REASON_MAX + 8) {
+                    Some(t) if t.len() <= BAN_REASON_MAX && !t.contains('|') => reason = t,
+                    _ => {
+                        return admin_err(
+                            state,
+                            ci,
+                            "channel.bad_reason",
+                            "a kick reason is at most 120 bytes and has no '|'",
+                            None,
+                        );
+                    }
+                }
+            }
+            let reason: String = reason
+                .chars()
+                .map(|c| {
+                    if (c as u32) < 0x20 || c as u32 == 0x7f {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            let admin_fd = state.clients[ci].fd;
+            if crate::elect::start(
+                state,
+                "kick",
+                &channel,
+                "ADMIN",
+                &nick,
+                &reason,
                 Some((admin_fd, state.clients[ci].conn_serial)),
             )
             .is_some()

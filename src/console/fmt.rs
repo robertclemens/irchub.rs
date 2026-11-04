@@ -10,7 +10,7 @@
 //! time zone.  Text is bytes throughout — a C `char buf[N]` that truncates
 //! (`snp`) may cut a character in half, and the Rust side must cut the same.
 
-use super::ui::{next_char, sanitize, str_width, uprec};
+use super::ui::{next_char, sanitize, str_width, uprec, utf8_len};
 
 /// Line mode's output width unless "display width" says otherwise.
 pub const CONSOLE_LINE_WIDTH: i32 = 100;
@@ -27,6 +27,7 @@ pub const RL_WARN: u8 = 5;
 pub const RL_DIM: u8 = 6;
 pub const RL_HEAD: u8 = 7;
 pub const RL_RULE: u8 = 8;
+pub const RL_SEL: u8 = 9;
 
 pub const FMT_MODE_NORMAL: i32 = 0;
 /// "hub set" alone: the settings table.
@@ -350,15 +351,24 @@ pub struct Fline {
 pub type Flines = Vec<Fline>;
 
 pub fn flines_add(o: &mut Flines, role: u8, text: &[u8]) {
-    // trailing blanks never reach the screen
-    let mut n = text.len();
-    while n > 0 && text[n - 1] == b' ' {
-        n -= 1;
+    // A long name cut into a fixed buffer can end mid-character: the terminal
+    // only ever gets whole ones.
+    let mut t = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let k = utf8_len(&text[i..]);
+        if k == 0 {
+            i += 1;
+            continue;
+        }
+        t.extend_from_slice(&text[i..i + k]);
+        i += k;
     }
-    o.push(Fline {
-        text: text[..n].to_vec(),
-        role,
-    });
+    // trailing blanks never reach the screen
+    while t.last() == Some(&b' ') {
+        t.pop();
+    }
+    o.push(Fline { text: t, role });
 }
 
 /// The line builder: bytes and the display cells they take (each chunk is
@@ -444,15 +454,16 @@ pub const G_FULL: usize = 16;
 pub const G_EMPTY: usize = 17;
 pub const G_OPEN: usize = 18;
 pub const G_UNKNOWN: usize = 19;
-const G_COUNT: usize = 20;
+pub const G_MID: usize = 20;
+const G_COUNT: usize = 21;
 
 const GLYPH_U: [&str; G_COUNT] = [
     "─", "●", "○", "◐", "✓", "✗", "▲", "•", "…", "·", "→", "├", "└", "│", "—", "×", "█", "░", "▾",
-    "?",
+    "?", "▓",
 ];
 const GLYPH_A: [&str; G_COUNT] = [
     "-", "*", "o", "~", "+", "x", "!", "-", "~", "|", "->", "|", "`", "|", "-", "x", "#", ".", "v",
-    "?",
+    "?", "+",
 ];
 
 /// What a renderer needs to know about the session.
@@ -469,6 +480,8 @@ pub struct Ctx<'a> {
     pub mode: i32,
     /// log show: this session's log subscription
     pub session_log: &'a [u8],
+    /// view 4: the history run picked; empty = none
+    pub upg_sel: &'a [u8],
 }
 
 pub fn glyph(ctx: &Ctx, g: usize) -> &'static [u8] {
@@ -1119,6 +1132,13 @@ fn bot_last_seen(ctx: &Ctx, r: &Crec, cap: usize) -> Vec<u8> {
     }
 }
 
+/// The CRON column: the status without its reason; show has the whole of it.
+fn cron_word(r: &Crec) -> Vec<u8> {
+    let v: &[u8] = r.rvs("cron").unwrap_or(b"-");
+    let end = v.iter().position(|b| *b == b':').unwrap_or(v.len());
+    v[..end].to_vec()
+}
+
 fn render_bot_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let total = rep.res.rvi("total", 0);
     let online = rep.res.rvi("online", 0);
@@ -1148,13 +1168,14 @@ fn render_bot_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         );
         return;
     }
-    const COLS: [Col; 13] = [
+    const COLS: [Col; 14] = [
         col("", b'L', 1),
         col("NICK", b'L', 1),
         col("UUID", b'L', 1),
         col("VERSION", b'L', 1),
         col("CODE", b'L', 1),
         col("UPTIME", b'L', 1),
+        col("CRON", b'L', 1),
         col("SERVER", b'L', 2),
         col("HUB", b'L', 2),
         col("ADDRESS", b'L', 2),
@@ -1180,13 +1201,15 @@ fn render_bot_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         } else {
             b"(no key)"
         };
-        let cells: [Option<&[u8]>; 13] = [
+        let cron = cron_word(r);
+        let cells: [Option<&[u8]>; 14] = [
             Some(glyph(ctx, if on { G_ON } else { G_OFF })),
             r.rv("nick"),
             r.rv("uuid"),
             r.rv("ver"),
             r.rv("base"),
             Some(&up),
+            Some(&cron),
             r.rv("server"),
             r.rv("hub_name"),
             r.rv("ip"),
@@ -1788,7 +1811,7 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         ]),
     );
     title(ctx, out, b"Linked hubs", Some(&right));
-    const COLS: [Col; 11] = [
+    const COLS: [Col; 12] = [
         col("#", b'R', 1),
         col("NAME", b'L', 1),
         col("ADDRESS", b'L', 1),
@@ -1796,20 +1819,49 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         col("CODE", b'L', 2),
         col("VERSION", b'L', 2),
         col("UPTIME", b'L', 2),
+        col("CRON", b'L', 1),
         col("BOTS", b'R', 1),
         col("LINK", b'L', 1),
         col("KEY", b'L', 1),
         col("FROM", b'L', 2),
     ];
     let mut t = Tbl::new(&COLS, -1, 1, 1);
-    let mut selfr: Option<&Crec> = None;
+    let mut peers = 0;
+    // The hub this console is on: first, in the same columns, its LINK saying so.
+    if let Some(r) = rep.r.iter().find(|r| r.is("self")) {
+        let addr = snp(
+            96,
+            cat(&[
+                r.rv("bind_ip").unwrap_or(b"?"),
+                b":",
+                &num(r.rvi("port", 0)),
+            ]),
+        );
+        let bots = snp(16, num(r.rvi("bots", 0)));
+        let link = snp(64, cat(&[glyph(ctx, G_DOT), b" this hub"]));
+        let upt = snp(32, span_since(ctx, r.rvi("started", 0)));
+        let cron = cron_word(r);
+        let cells = [
+            Some(&b""[..]),
+            Some(peer_name(r)),
+            Some(&addr),
+            r.rv("uuid"),
+            r.rv("base"),
+            r.rv("ver"),
+            Some(&upt),
+            Some(&cron),
+            Some(&bots),
+            Some(&link),
+            r.rv("fp"),
+            None,
+        ];
+        t.row(ctx, RL_NORMAL, Some(b"self"), &cells);
+    }
     for r in &rep.r {
-        if r.is("self") {
-            selfr = Some(r);
-        }
         if !r.is("peer") {
             continue;
         }
+        peers += 1;
         let nn = snp(16, num(r.rvi("n", 0)));
         let addr = addr_of(r, 96);
         let bots = if r.rv("bots").is_some() {
@@ -1823,6 +1875,7 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             (Some(a), Some(b)) if a != b => Some(a),
             _ => None,
         };
+        let cron = cron_word(r);
         let cells = [
             Some(nn.as_slice()),
             r.rvs("name"),
@@ -1831,6 +1884,7 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             r.rv("base"),
             r.rv("ver"),
             Some(&upt),
+            Some(&cron),
             Some(&bots),
             Some(&link),
             r.rv("fp"),
@@ -1845,33 +1899,14 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             &cells,
         );
     }
-    if t.nr() == 0 {
+    if t.nr() > 0 {
+        t.render(ctx, out);
+    }
+    if peers == 0 {
         empty_note(
             out,
             "no other hubs linked: this hub runs alone",
             Some("hub add <ip> <port> <uuid> <name|-> <key>"),
-        );
-    } else {
-        t.render(ctx, out);
-    }
-    if let Some(sf) = selfr {
-        line(
-            out,
-            RL_DIM,
-            &[
-                b"  this hub: ",
-                peer_name(sf),
-                b"  ",
-                sf.rvs("uuid").unwrap_or(glyph(ctx, G_DASH)),
-                b"  ",
-                sf.rvs("base").unwrap_or(b"?"),
-                b" ",
-                sf.rvs("ver").unwrap_or(b"?"),
-                b"  ",
-                &num(sf.rvi("bots", 0)),
-                b" bots  port ",
-                &num(sf.rvi("port", 0)),
-            ],
         );
     }
     if conf == 0 {
@@ -3095,6 +3130,12 @@ fn opname(op: u64) -> Option<&'static str> {
         0x81 => "CMD_ADMIN_LIST_REVOKED",
         0x82 => "CMD_ADMIN_PEER_REFS",
         0x83 => "CMD_LINK_SEQ",
+        0x84 => "CMD_ADMIN_KICK_USER",
+        0x87 => "CMD_UPGRADE_HISTORY",
+        0x88 => "CMD_UPGRADE_STAGE",
+        0x89 => "CMD_UPGRADE_PROGRESS",
+        0x8A => "CMD_UPGRADE_PLAN",
+        0x8B => "CMD_CRON_SET",
         _ => return None,
     })
 }
@@ -3188,7 +3229,8 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         count_kv(&mut b, "  total", ld.rvu("clients"), 0);
         count_kv(&mut b, "bots", ld.rvu("bots"), 24);
         count_kv(&mut b, "hubs", ld.rvu("peers"), 40);
-        count_kv(&mut b, "authing", ld.rvu("authing"), 60);
+        count_kv(&mut b, "consoles", ld.rvu("consoles"), 60);
+        count_kv(&mut b, "authing", ld.rvu("authing"), 80);
         b.emit(out, RL_NORMAL);
     }
     render_timers(ctx, rep, ld, out);
@@ -3634,8 +3676,13 @@ const OPT_FLAGS: [(u8, &str); 2] = [
 
 fn render_option_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let flags = rep.res.rv("flags").unwrap_or(b"");
-    let fp = flags_phrase(Some(flags), 40);
-    let right = snp(64, cat(&[b"flags: ", &fp]));
+    // the state reads without colour too: a mark and a word per row, and a
+    // line saying which flags are set (or that none is)
+    let right = if flags.is_empty() {
+        snp(64, b"no flags set".to_vec())
+    } else {
+        snp(64, cat(&[b"set: ", flags]))
+    };
     title(ctx, out, b"Network options", Some(&right));
     const COLS: [Col; 3] = [
         col("FLAG", b'L', 1),
@@ -3643,12 +3690,18 @@ fn render_option_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         col("MEANING", b'L', 2),
     ];
     let mut t = Tbl::new(&COLS, -1, 0, 1);
+    let st_on = snp(24, cat(&[glyph(ctx, G_ON), b" on"]));
+    let st_off = snp(24, cat(&[glyph(ctx, G_OFF), b" off"]));
     for (f, meaning) in OPT_FLAGS {
         let on = flags.contains(&f);
         let fb = [f];
         let cells = [
             Some(fb.as_slice()),
-            Some(if on { b"on".as_slice() } else { b"off" }),
+            Some(if on {
+                st_on.as_slice()
+            } else {
+                st_off.as_slice()
+            }),
             Some(s(meaning)),
         ];
         t.row(ctx, if on { RL_NORMAL } else { RL_DIM }, None, &cells);
@@ -3660,12 +3713,18 @@ fn render_option_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         let pb = [p];
         let cells = [
             Some(pb.as_slice()),
-            Some(b"on".as_slice()),
+            Some(st_on.as_slice()),
             Some(b"(unknown flag)".as_slice()),
         ];
         t.row(ctx, RL_WARN, None, &cells);
     }
     t.render(ctx, out);
+    if flags.is_empty() {
+        effect(ctx, out, b"no flags are set: every option above is off");
+    } else {
+        let ph = snp(96, cat(&[b"set: ", flags, b"   (every other flag is off)"]));
+        effect(ctx, out, &ph);
+    }
     line(
         out,
         RL_DIM,
@@ -4313,6 +4372,7 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         effect(ctx, out, &ph);
     } else {
         let inv = code == b"channel.invite";
+        let kick = code == b"channel.kick";
         let nick = r.rv("nick").unwrap_or(b"?");
         let chan = r.rv("chan").unwrap_or(b"?");
         let subj = snp(256, cat(&[nick, b" on ", chan]));
@@ -4322,7 +4382,13 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             // one bot was picked and did it
             ok(
                 ctx,
-                if inv { b"Invited" } else { b"Opped" },
+                if kick {
+                    b"Kicked"
+                } else if inv {
+                    b"Invited"
+                } else {
+                    b"Opped"
+                },
                 Some(&subj),
                 out,
             );
@@ -4337,6 +4403,10 @@ fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 if detail.is_some() { b")" } else { b"" },
             ]);
             effect(ctx, out, &snp(160, ph));
+            if kick {
+                let reason = r.rvs("reason").unwrap_or(b"kicked");
+                effect(ctx, out, &snp(160, cat(&[b"reason: ", reason])));
+            }
             let ph = cat(&[
                 &num(asked),
                 b" bot",
@@ -5098,6 +5168,38 @@ fn render_ban_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         effect(ctx, out, &snp(256, cat(&[b"reason: ", reason])));
     }
     push_effects(ctx, r, out);
+    // one channel: whether one elected bot set it now (hub 2.5.3)
+    if r.rv("placed").is_some() && r.rvb("placed") {
+        let detail = r.rvs("detail");
+        let ph = cat(&[
+            b"set on ",
+            chan,
+            b" now by ",
+            r.rvs("by").unwrap_or(b"?"),
+            b" on ",
+            r.rvs("hub_name").unwrap_or(b"?"),
+            if detail.is_some() { b" (" } else { b"" },
+            detail.unwrap_or(b""),
+            if detail.is_some() { b")" } else { b"" },
+        ]);
+        effect(ctx, out, &snp(256, ph));
+    } else if r.rv("placed").is_some() && r.rvb("dynamic") {
+        let ph = cat(&[
+            b"not on ",
+            chan,
+            b" now: +dynamicbans sets it only while someone it matches is there",
+        ]);
+        effect(ctx, out, &snp(256, ph));
+    } else if r.rv("placed").is_some() {
+        let ph = cat(&[
+            b"not set on ",
+            chan,
+            b" yet: ",
+            r.rvs("why").unwrap_or(b"no bot could"),
+            b"; the bots set it once one is opped there",
+        ]);
+        warn(ctx, out, &snp(256, ph));
+    }
 }
 
 /// The settings a channel overrides ("bitch=1,flood join=5:60") as a person
@@ -5235,11 +5337,67 @@ fn plan_path_line(ctx: &Ctx, pl: &Crec, p: &str) -> Vec<u8> {
     out
 }
 
+/// Every failure code has one next step.
+fn upg_code_hint(code: &[u8]) -> Option<&'static str> {
+    Some(match code {
+        b"disk" => "free some space, then upgrade start again",
+        b"dir" => "make the instance directory writable, then upgrade start again",
+        b"exe" => "the binary must belong to this user and not be immutable",
+        b"exec" => "remount the instance directory without noexec",
+        b"tool" => "install the missing tool on that host",
+        b"net" => "check that host can reach the release site",
+        b"build" => "see the build error on that host, or use a prebuilt",
+        b"selftest" => "this build cannot run on that host: try the other variant",
+        b"sig" => "the release is not what was signed: do not retry; check the release",
+        b"hash" => "the artifact does not match its manifest: do not retry; check the release",
+        b"late" => "see that host's log; it may still come back",
+        _ => return None,
+    })
+}
+
+fn upg_hints(rep: &Creply, out: &mut Flines) {
+    let mut seen: Vec<&[u8]> = Vec::new();
+    for n in rep.r.iter().filter(|x| x.is("node")) {
+        let Some(code) = n.rvs("code") else {
+            continue;
+        };
+        let Some(hint) = upg_code_hint(code) else {
+            continue;
+        };
+        if seen.contains(&code) || seen.len() >= 16 {
+            continue;
+        }
+        seen.push(code);
+        line(out, RL_DIM, &[b"  ", code, b": ", hint.as_bytes()]);
+    }
+}
+
+/// Roll-ups are outside history: each node's last one, here.
+fn upg_rolled(ctx: &Ctx, rep: &Creply, l: i32, out: &mut Flines) {
+    for n in rep.r.iter().filter(|x| x.is("rolled")) {
+        let a = when(n.rvi("when", 0), ctx.now);
+        let v = cat(&[
+            n.rv("name").unwrap_or(b"?"),
+            b" to ",
+            n.rv("step").unwrap_or(b"?"),
+            b", ",
+            &a,
+            b", ",
+            &num(n.rvi("tries", 0)),
+            b" tries: ",
+            n.rv("note").unwrap_or(b""),
+        ]);
+        card(out, l, "roll-up", &snp(320, v), RL_DIM);
+    }
+}
+
 /// The multi-step plan card lines (view 4 and `upgrade status`).
 fn render_upg_plan(ctx: &Ctx, pl: &Crec, l: i32, out: &mut Flines) {
     let (step, steps) = (pl.rvi("step", 0), pl.rvi("steps", 0));
     let active = pl.rvb("active");
-    let v = if active && pl.rv("state") == Some(b"running") {
+    let v = if active && pl.rv("state") == Some(b"held") {
+        format!("on hold at step {step}/{steps}").into_bytes()
+    } else if active && pl.rv("state") == Some(b"running") {
         format!("step {step}/{steps} running").into_bytes()
     } else if active {
         let nx = pl.rvi("next", 0) - ctx.now;
@@ -5257,6 +5415,19 @@ fn render_upg_plan(ctx: &Ctx, pl: &Crec, l: i32, out: &mut Flines) {
         &v,
         if active { RL_NORMAL } else { RL_DIM },
     );
+    if let Some(d) = pl.rvs("driver_name") {
+        let b = span(ctx.now.wrapping_sub(pl.rvi("heard", 0)));
+        card(
+            out,
+            l,
+            "  driver",
+            &cat(&[d, b", last heard ", &b, b" ago"]),
+            RL_NORMAL,
+        );
+    }
+    if let Some(h) = pl.rvs("hold") {
+        card(out, l, "  why", h, RL_WARN);
+    }
     let v = plan_path_line(ctx, pl, "bot");
     if !v.is_empty() {
         card(out, l, "  bots", &snp(512, v), RL_NORMAL);
@@ -5281,6 +5452,15 @@ fn render_upg_plan(ctx: &Ctx, pl: &Crec, l: i32, out: &mut Flines) {
     if let Some(s) = pl.rvs("summary") {
         card(out, l, "  ended", s, RL_DIM);
     }
+    if active && pl.rv("state") == Some(b"held") {
+        card(
+            out,
+            l,
+            "",
+            b"fix it and it resumes by itself; upgrade continue goes on without it",
+            RL_DIM,
+        );
+    }
     if active {
         card(
             out,
@@ -5292,7 +5472,272 @@ fn render_upg_plan(ctx: &Ctx, pl: &Crec, l: i32, out: &mut Flines) {
     }
 }
 
+fn upg_run_result(r: &Crec) -> &[u8] {
+    if r.rvb("stale") {
+        return b"no result";
+    }
+    r.rv("result").unwrap_or(b"?")
+}
+
+fn upg_target_cell(ctx: &Ctx, r: &Crec, key: &str) -> Vec<u8> {
+    match r.rvs(key) {
+        Some(v) => cat(&[glyph(ctx, G_ARROW), b" ", v]),
+        None => b"-".to_vec(),
+    }
+}
+
+/// "13 ok, 1 failed": what the nodes of a run came to.
+fn upg_nodes_cell(r: &Crec) -> Vec<u8> {
+    let aborted = r.rv("result") == Some(b"aborted");
+    let parts: [(&str, &[u8]); 5] = [
+        ("done", if aborted { b"rollback" } else { b"ok" }),
+        ("failed", b"failed"),
+        ("unable", b"unable"),
+        ("already", b"on target"),
+        ("open", b"open"),
+    ];
+    let mut o = Vec::new();
+    for (key, label) in parts {
+        let n = r.rvi(key, 0);
+        if n == 0 {
+            continue;
+        }
+        if !o.is_empty() {
+            o.extend_from_slice(b", ");
+        }
+        o.extend_from_slice(&cat(&[&num(n), b" ", label]));
+    }
+    if o.is_empty() {
+        o.extend_from_slice(b"-");
+    }
+    snp(128, o)
+}
+
+fn render_upg_runs(ctx: &Ctx, rep: &Creply, keep: i64, out: &mut Flines) {
+    const COLS: [Col; 9] = [
+        col("WHEN", b'L', 1),
+        col("RUN", b'L', 1),
+        col("RESULT", b'L', 1),
+        col("BOTS", b'L', 1),
+        col("HUBS", b'L', 1),
+        col("NODES", b'L', 1),
+        col("STEP", b'L', 2),
+        col("BY", b'L', 2),
+        col("DRIVER", b'L', 2),
+    ];
+    let mut t = Tbl::new(&COLS, -1, 1, 1);
+    for r in rep.r.iter().filter(|x| x.is("run")) {
+        let w = when(r.rvi("started", 0), ctx.now);
+        let id = r.rv("id").unwrap_or(b"?");
+        let run = &id[..id.len().min(8)];
+        let bots = upg_target_cell(ctx, r, "bot_ver");
+        let hubs = upg_target_cell(ctx, r, "hub_ver");
+        let nodes = upg_nodes_cell(r);
+        let step = if r.rvi("steps", 0) > 0 {
+            cat(&[&num(r.rvi("step", 0)), b"/", &num(r.rvi("steps", 0))])
+        } else {
+            Vec::new()
+        };
+        let res = upg_run_result(r);
+        let cells = [
+            Some(w.as_slice()),
+            Some(run),
+            Some(res),
+            Some(bots.as_slice()),
+            Some(hubs.as_slice()),
+            Some(nodes.as_slice()),
+            Some(step.as_slice()),
+            r.rv("by"),
+            r.rv("driver"),
+        ];
+        let bad = [
+            &b"failed"[..],
+            b"partial",
+            b"aborted",
+            b"interrupted",
+            b"no result",
+        ]
+        .contains(&res);
+        let picked = !ctx.upg_sel.is_empty() && r.rv("id") == Some(ctx.upg_sel);
+        let role = if picked {
+            RL_SEL
+        } else if bad {
+            RL_WARN
+        } else {
+            RL_NORMAL
+        };
+        t.row(ctx, role, Some(res), &cells);
+    }
+    if t.nr() > 0 {
+        let right = cat(&[b"keeping ", &num(keep)]);
+        flines_add(out, RL_NORMAL, b"");
+        title(ctx, out, b"History", Some(&right));
+        t.render(ctx, out);
+        hint(
+            out,
+            if ctx.upg_sel.is_empty() {
+                b"upgrade history <run> shows every node"
+            } else {
+                b"up/down picks a run; its details are below"
+            },
+        );
+    }
+}
+
 fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    render_upg_current(ctx, rep, out);
+    render_upg_runs(ctx, rep, rep.res.rvi("keep", 0), out);
+}
+
+fn render_upg_history(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let keep = rep.res.rvi("keep", 0);
+    if rep.r.iter().any(|x| x.is("run")) {
+        render_upg_runs(ctx, rep, keep, out);
+        return;
+    }
+    let right = cat(&[b"keeping ", &num(keep)]);
+    title(ctx, out, b"History", Some(&right));
+    line(out, RL_DIM, &[b"  (no upgrade runs kept)"]);
+}
+
+fn render_upg_run(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    const L: i32 = 12;
+    let dot = glyph(ctx, G_DOT);
+    let arrow = glyph(ctx, G_ARROW);
+    let head = cat(&[b"Upgrade ", r.rv("id").unwrap_or(b"?")]);
+    let right = cat(&[
+        b"bots ",
+        &upg_target_cell(ctx, r, "bot_ver"),
+        b" ",
+        dot,
+        b" hubs ",
+        &upg_target_cell(ctx, r, "hub_ver"),
+        b" ",
+        dot,
+        b" ",
+        upg_run_result(r),
+    ]);
+    title(ctx, out, &head, Some(&right));
+    let started = r.rvi("started", 0);
+    let v = cat(&[
+        &when(started, ctx.now),
+        b" ",
+        dot,
+        b" ",
+        &span(ctx.now - started),
+        b" ago",
+    ]);
+    card(out, L, "started", &v, RL_NORMAL);
+    if r.rvi("ended", 0) > 0 {
+        card(
+            out,
+            L,
+            "took",
+            &span(r.rvi("ended", 0) - started),
+            RL_NORMAL,
+        );
+    }
+    let v = cat(&[
+        r.rvs("by").unwrap_or(b"(not known)"),
+        b" on ",
+        r.rv("driver").unwrap_or(b"?"),
+    ]);
+    card(out, L, "by", &v, RL_NORMAL);
+    card(
+        out,
+        L,
+        "scope",
+        r.rvs("sel").unwrap_or(b"whole network"),
+        RL_NORMAL,
+    );
+    if r.rvi("steps", 0) > 0 {
+        let v = cat(&[
+            b"step ",
+            &num(r.rvi("step", 0)),
+            b" of ",
+            &num(r.rvi("steps", 0)),
+        ]);
+        card(out, L, "plan", &v, RL_NORMAL);
+    }
+    if let Some(sm) = r.rvs("summary") {
+        card(out, L, "outcome", sm, RL_NORMAL);
+    }
+    let aborted = r.rv("result") == Some(b"aborted");
+    const COLS: [Col; 11] = [
+        col("KIND", b'L', 1),
+        col("NODE", b'L', 1),
+        col("STATE", b'L', 1),
+        col("FROM", b'L', 1),
+        col("TO", b'L', 1),
+        col("CODE", b'L', 2),
+        col("ARCH", b'L', 2),
+        col("LIBC", b'L', 2),
+        col("TOOK", b'L', 2),
+        col("NOTE", b'L', 2),
+        col("UUID", b'L', 2),
+    ];
+    let mut t = Tbl::new(&COLS, -1, 1, 1);
+    let mut hidden = 0i64;
+    for n in rep.r.iter().filter(|x| x.is("node")) {
+        let mut st: &[u8] = n.rv("state").unwrap_or(b"?");
+        if st == b"idle" || st == b"skipped" {
+            hidden += 1;
+            continue;
+        }
+        if aborted && (st == b"done" || st == b"committing") {
+            st = b"rollback";
+        } else if st == b"already" {
+            st = b"on target";
+        }
+        let code = match n.rvs("want") {
+            Some(w) if n.rvs("base") != Some(w) => {
+                cat(&[n.rvs("base").unwrap_or(b"?"), b" ", arrow, b" ", w])
+            }
+            _ => n.rvs("base").unwrap_or(b"").to_vec(),
+        };
+        let code = snp(32, code);
+        let took = if n.rvi("done", 0) > 0 && n.rvi("committed", 0) > 0 {
+            span(n.rvi("done", 0) - n.rvi("committed", 0))
+        } else {
+            Vec::new()
+        };
+        let cells = [
+            n.rv("kind"),
+            n.rvs("name").or_else(|| n.rv("uuid")),
+            Some(st),
+            n.rv("from"),
+            n.rv("to"),
+            Some(code.as_slice()),
+            n.rv("arch"),
+            n.rv("libc"),
+            Some(took.as_slice()),
+            n.rv("reason"),
+            n.rv("uuid"),
+        ];
+        let role = if st == b"failed" { RL_WARN } else { RL_NORMAL };
+        t.row(ctx, role, Some(st), &cells);
+    }
+    if t.nr() > 0 {
+        flines_add(out, RL_NORMAL, b"");
+        t.render(ctx, out);
+    }
+    if hidden > 0 {
+        line(
+            out,
+            RL_DIM,
+            &[
+                b"  ",
+                &num(hidden),
+                b" node",
+                pl(hidden),
+                b" not moved by this run",
+            ],
+        );
+    }
+}
+
+fn render_upg_current(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let r = &rep.res;
     let ru = rep.r.iter().rfind(|x| x.is("rollup"));
     let plan_rec = rep.r.iter().rfind(|x| x.is("plan"));
@@ -5404,6 +5849,7 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     // target (already) is a no-op, counted apart from the failures.
     let (mut done, mut failed, mut waiting, mut total) = (0i32, 0i32, 0i32, 0i32);
     let (mut already, mut idle) = (0i32, 0i32);
+    let (mut staged, mut staging, mut left) = (0i32, 0i32, 0i32);
     for n in rep.r.iter().filter(|x| x.is("node")) {
         if n.rvb("idle") {
             idle += 1;
@@ -5414,36 +5860,47 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             continue;
         }
         total += 1;
+        let ph = n.rvs("phase").unwrap_or(b"");
         if n.rvb("already") {
             already += 1;
         } else if k == 3 {
             done += 1;
+        } else if ph == b"left" {
+            left += 1;
         } else if k == 1 {
             failed += 1;
+        } else if ph == b"staged" {
+            staged += 1;
+        } else if !ph.is_empty() {
+            staging += 1;
         } else {
             waiting += 1;
         }
     }
     let mut sb = Sb::default();
+    // Whole nodes only, so an estimate can never move it: done, then staged and ready
+    // to swap.  A node that left the run stays empty, and the bar stops short of full.
     let bar = 24;
     let fill = if total != 0 { done * bar / total } else { 0 };
+    let mid = if total != 0 { staged * bar / total } else { 0 };
     sb.rep(glyph(ctx, G_FULL), fill);
-    sb.rep(glyph(ctx, G_EMPTY), bar - fill);
+    sb.rep(glyph(ctx, G_MID), mid);
+    sb.rep(glyph(ctx, G_EMPTY), bar - fill - mid);
     sb.a(&cat(&[b"  ", &num(done), b" / ", &num(total), b" done"]));
     if already > 0 {
         sb.a(&cat(&[b" ", dot, b" ", &num(already), b" already on it"]));
     }
-    sb.a(&cat(&[
-        b" ",
-        dot,
-        b" ",
-        &num(failed),
-        b" failed ",
-        dot,
-        b" ",
-        &num(waiting),
-        b" waiting",
-    ]));
+    for (count, word) in [
+        (staged, &b" staged"[..]),
+        (staging, b" staging"),
+        (left, b" left"),
+        (failed, b" failed"),
+        (waiting, b" waiting"),
+    ] {
+        if count > 0 {
+            sb.a(&cat(&[b" ", dot, b" ", &num(count), word]));
+        }
+    }
     card(out, L, "progress", &sb.p, RL_NORMAL);
     if idle > 0 {
         let one = idle == 1;
@@ -5466,10 +5923,11 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     if r.rvb("frozen") {
         card(out, L, "frozen", b"yes (until the run ends)", RL_WARN);
     }
-    const COLS: [Col; 8] = [
+    const COLS: [Col; 9] = [
         col("KIND", b'L', 1),
         col("NODE", b'L', 1),
         col("STATE", b'L', 1),
+        col("TIME", b'R', 1),
         col("FROM", b'L', 1),
         col("TO", b'L', 1),
         col("CODE", b'L', 2),
@@ -5490,17 +5948,30 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             let st = if n.rvb("already") {
                 Some(&b"on target"[..])
             } else {
-                n.rv("state")
+                n.rvs("phase").or_else(|| n.rv("state"))
+            };
+            // How far a node has got belongs with what it is doing.
+            let st_pct = match (st, n.rvs("pct")) {
+                (Some(b"fetching"), Some(p)) => Some(snp(32, cat(&[b"download ", p]))),
+                (Some(b"building"), Some(p)) => Some(snp(32, cat(&[b"build ", p]))),
+                _ => None,
+            };
+            let st = st_pct.as_deref().or(st);
+            let secs = if n.rv("secs").is_some() {
+                format!("{}s", n.rvi("secs", 0)).into_bytes()
+            } else {
+                Vec::new()
             };
             let cells = [
                 n.rv("kind"),
                 n.rvs("name").or_else(|| n.rv("uuid")),
                 st,
+                Some(secs.as_slice()),
                 n.rv("from"),
                 n.rv("to"),
                 Some(code.as_slice()),
                 n.rv("uuid"),
-                n.rv("reason"),
+                n.rvs("reason").or_else(|| n.rv("detail")),
             ];
             let role = if rank == 1 {
                 RL_WARN
@@ -5516,6 +5987,8 @@ fn render_upg_status(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         flines_add(out, RL_NORMAL, b"");
         t.render(ctx, out);
     }
+    upg_hints(rep, out);
+    upg_rolled(ctx, rep, L, out);
 }
 
 /// Version order for the releases list: a leading v is ignored, digit runs
@@ -5827,6 +6300,31 @@ fn render_upg_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             );
             effect(ctx, out, ph.as_bytes());
         }
+    } else if rep.code == b"upg.continued" {
+        ok(ctx, b"The upgrade on hold resumes", None, out);
+    } else if rep.code == b"cron.set" {
+        line(
+            out,
+            RL_NORMAL,
+            &[
+                b"Crontab line ",
+                r.rv("value").unwrap_or(b"?"),
+                b": ",
+                r.rv("scope").unwrap_or(b"?"),
+            ],
+        );
+    } else if rep.code == b"upg.keep" {
+        line(
+            out,
+            RL_NORMAL,
+            &[
+                b"Upgrade history: keeping ",
+                &num(r.rvi("new", 0)),
+                b" runs (was ",
+                &num(r.rvi("old", 0)),
+                b")",
+            ],
+        );
     } else if rep.code == b"upg.abort_sent" {
         let peers = r.rvi("peers", 0);
         ok(ctx, b"No upgrade runs on this hub", None, out);
@@ -6413,6 +6911,10 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
         render_upg_status(ctx, rep, out);
     } else if c == b"upg.releases" {
         render_upg_releases(ctx, rep, out);
+    } else if c == b"upg.history" {
+        render_upg_history(ctx, rep, out);
+    } else if c == b"upg.run" {
+        render_upg_run(ctx, rep, out);
     } else if has(b"upg.") {
         render_upg_change(ctx, rep, out);
     } else if c == b"network.tree" {

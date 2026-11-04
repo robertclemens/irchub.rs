@@ -419,6 +419,8 @@ pub fn peer_sync_release(state: &mut HubState, ci: usize) {
         Some(("handshake_sync", seq)),
     );
     queue::send_urgent(&mut state.clients[ci], CMD_SYNC_REQUEST, "");
+    crate::uhist::send_digest(state, ci);
+    crate::upgrade::plan_send_digest(state, ci);
     crate::hlog_debug!(
         "[MESH] Peer {} is current: held sync sent, its own requested\n",
         state.clients[ci].ip
@@ -429,26 +431,40 @@ pub fn peer_sync_release(state: &mut HubState, ci: usize) {
 /// now, if its link report is fresh enough to trust for a split horizon (sent
 /// the moment a link changes, refreshed every BOT_PRESENCE_INTERVAL).  It
 /// sent its flood to each of them directly.
+/// The list must be fresh and have come over this link: one from before it came
+/// up describes the mesh before a cut.  A listed peer counts only when its own
+/// list, when fresh, lists the sender online too: a link one side still lists may
+/// already be down.
 pub fn split_horizon_links(state: &HubState, from_fd: i32) -> Option<Vec<String>> {
     let now_ts = now();
-    state
+    let ci = state
         .peer_clients()
         .into_iter()
-        .find(|&ci| state.clients[ci].fd == from_fd)
-        .map(|ci| crate::upgrade::peer_uuid_of(state, ci))
-        .filter(|u| !u.is_empty())
-        .and_then(|u| {
-            state.mesh_hubs.iter().find(|h| {
-                h.uuid == u && h.have_links && now_ts - h.reported_at <= SYNC_SPLIT_HORIZON_FRESH
-            })
-        })
-        .map(|h| {
-            h.links
-                .iter()
-                .filter(|l| l.online)
-                .map(|l| l.uuid.clone())
-                .collect()
-        })
+        .find(|&ci| state.clients[ci].fd == from_fd)?;
+    let since = state.clients[ci].connected_at;
+    let u = crate::upgrade::peer_uuid_of(state, ci);
+    if u.is_empty() {
+        return None;
+    }
+    let fresh =
+        |h: &crate::state::MeshHub| h.have_links && now_ts - h.links_at <= SYNC_SPLIT_HORIZON_FRESH;
+    let h = state
+        .mesh_hubs
+        .iter()
+        .find(|h| h.uuid == u && fresh(h) && h.links_at >= since)?;
+    Some(
+        h.links
+            .iter()
+            .filter(|l| l.online)
+            .filter(
+                |l| match state.mesh_hubs.iter().find(|p| p.uuid == l.uuid) {
+                    Some(p) if fresh(p) => p.links.iter().any(|x| x.uuid == h.uuid && x.online),
+                    _ => true,
+                },
+            )
+            .map(|l| l.uuid.clone())
+            .collect(),
+    )
 }
 
 // Sync tracing (debug): a delta's path through the mesh, record by record,
@@ -1557,22 +1573,25 @@ mod tests {
     #[test]
     fn a_bcast_forward_skips_the_peers_the_sender_reaches_itself() {
         let (mut s, _keep) = three_peers();
-        // s says it is linked to x; x knows CMD_PEER_BCAST, y has sent no links.
+        let link = |u: &str, online: bool| crate::state::MeshLink {
+            uuid: u.into(),
+            name: String::new(),
+            online,
+        };
+        // s says it is linked to x and x agrees; x knows CMD_PEER_BCAST, y has
+        // sent no links.
         s.mesh_hubs.push(crate::state::MeshHub {
             uuid: "s".into(),
             have_links: true,
-            reported_at: now(),
-            links: vec![crate::state::MeshLink {
-                uuid: "x".into(),
-                name: String::new(),
-                online: true,
-            }],
+            links_at: now(),
+            links: vec![link("x", true)],
             ..Default::default()
         });
         s.mesh_hubs.push(crate::state::MeshHub {
             uuid: "x".into(),
             have_links: true,
-            reported_at: now(),
+            links_at: now(),
+            links: vec![link("s", true)],
             ..Default::default()
         });
         sync_forward_to_peers(&mut s, "b|bot|n|nick|5\n", 10, true);
@@ -1587,10 +1606,21 @@ mod tests {
         // the opcode each one understands.
         sync_forward_to_peers(&mut s, "b|bot|n|nick|6\n", 10, false);
         assert_eq!(queued(&s, 11), vec![CMD_PEER_BCAST]);
-        // So does a bcast forward once the sender's link report goes stale.
-        s.mesh_hubs[0].reported_at = now() - SYNC_SPLIT_HORIZON_FRESH - 1;
+        // x's own fresh list says its link to s is down: forward after all.
+        s.mesh_hubs[1].links = vec![link("s", false)];
         sync_forward_to_peers(&mut s, "b|bot|n|nick|7\n", 10, true);
         assert_eq!(queued(&s, 11).len(), 2);
+        s.mesh_hubs[1].links = vec![link("s", true)];
+        // A list from before our link to s came up describes the mesh before it.
+        let ci = s.clients.iter().position(|c| c.fd == 10).unwrap();
+        s.clients[ci].connected_at = now() + 5;
+        sync_forward_to_peers(&mut s, "b|bot|n|nick|8\n", 10, true);
+        assert_eq!(queued(&s, 11).len(), 3);
+        s.clients[ci].connected_at = 0;
+        // So does a bcast forward once the sender's link report goes stale.
+        s.mesh_hubs[0].links_at = now() - SYNC_SPLIT_HORIZON_FRESH - 1;
+        sync_forward_to_peers(&mut s, "b|bot|n|nick|9\n", 10, true);
+        assert_eq!(queued(&s, 11).len(), 4);
     }
 
     #[test]

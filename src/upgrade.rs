@@ -18,8 +18,8 @@ use crate::consts::*;
 use crate::cstr::{now, trunc_string};
 use crate::reply::Reply;
 use crate::state::{
-    ClientType, HubState, RollupTry, UpgradeNode, UpgradeNodeKind, UpgradeNodeState, UpgradePhase,
-    UpgradePlan, UpgradeRoute, lww_next_ts,
+    ClientType, HubState, PendingUpgrade, RollupTry, UpgradeNode, UpgradeNodeKind,
+    UpgradeNodeState, UpgradePhase, UpgradePlan, UpgradeRoute, lww_next_ts,
 };
 use crate::{client, mesh, opflow, queue, update};
 
@@ -210,7 +210,7 @@ fn cand_add(c: &mut Vec<Cand>, uuid: &str, name: &str, kind: UpgradeNodeKind) {
 }
 
 /// Every node this hub could name.
-fn candidates(state: &HubState) -> Vec<Cand> {
+pub fn candidates(state: &HubState) -> Vec<Cand> {
     let mut c = Vec::new();
     cand_add(
         &mut c,
@@ -334,6 +334,133 @@ fn strip_version_v(v: &str) -> &str {
 
 /// End the run: lift the freeze and record why it stopped.  The table stays
 /// behind so `CMD_ADMIN_UPGRADE_STATUS` can still explain what happened.
+fn history_node_state(u: &PendingUpgrade, ni: usize) -> &'static str {
+    let n = &u.nodes[ni];
+    let to = node_target(u, ni);
+    let want = node_variant(u, ni);
+    if n.kind != UpgradeNodeKind::Bot
+        && u.hub_ver.is_empty()
+        && (n.not_selected || n.state == UpgradeNodeState::Unable)
+    {
+        return "idle";
+    }
+    if n.not_selected {
+        return "skipped";
+    }
+    if n.state == UpgradeNodeState::Unable
+        && !to.is_empty()
+        && !n.cur_version.is_empty()
+        && update::version_cmp(&n.cur_version, to) == std::cmp::Ordering::Equal
+        && (want.is_empty() || want == n.variant)
+    {
+        return "already";
+    }
+    n.state.name()
+}
+
+fn history_result(u: &PendingUpgrade) -> &'static str {
+    if u.active {
+        return "running";
+    }
+    match u.phase {
+        UpgradePhase::Aborted => return "aborted",
+        UpgradePhase::Failed => return "failed",
+        _ => {}
+    }
+    let (mut moved, mut missed) = (0, 0);
+    for ni in 0..u.nodes.len() {
+        let st = history_node_state(u, ni);
+        if st == "done" || (u.nodes[ni].kind == UpgradeNodeKind::SelfHub && st == "committing") {
+            moved += 1;
+        } else if st == "failed" || st == "unable" {
+            missed += 1;
+        }
+    }
+    if moved == 0 {
+        "noop"
+    } else if missed > 0 {
+        "partial"
+    } else {
+        "done"
+    }
+}
+
+/// The run this hub drives, as a history record.  See `uhist`.
+fn history_note(state: &mut HubState) {
+    use crate::uhist::{UhistNode, UhistView};
+    let u = &state.upgrade;
+    let mut nodes = Vec::with_capacity(u.nodes.len());
+    for (ni, n) in u.nodes.iter().enumerate() {
+        // The nick now: the bot may be gone by the time anyone reads this.
+        let name = if !n.name.is_empty() {
+            n.name.clone()
+        } else {
+            match n.kind {
+                UpgradeNodeKind::Bot => crate::presence::bot_nick_from_config(state, &n.uuid),
+                UpgradeNodeKind::SelfHub => state.hub_friendly_name.clone(),
+                UpgradeNodeKind::PeerHub => String::new(),
+            }
+        };
+        nodes.push(UhistNode {
+            kind: match n.kind {
+                UpgradeNodeKind::Bot => "b",
+                UpgradeNodeKind::PeerHub => "h",
+                UpgradeNodeKind::SelfHub => "s",
+            }
+            .to_string(),
+            state: history_node_state(u, ni).to_string(),
+            uuid: trunc_string(&n.uuid, 64),
+            name: trunc_string(&name, 64),
+            from: trunc_string(&n.cur_version, 64),
+            to: trunc_string(node_target(u, ni), 64),
+            base: trunc_string(&n.variant, 8),
+            want: trunc_string(&n.want_variant, 8),
+            arch: trunc_string(&n.arch, 32),
+            libc: trunc_string(&n.libc, 16),
+            committed: n.committed_at,
+            back: n.back_at,
+            done: n.done_at,
+            reason: trunc_string(&n.reason, 128),
+            code: trunc_string(&n.stage_code, 16),
+            build: if n.is_src {
+                "src".to_string()
+            } else if n.staged {
+                "bin".to_string()
+            } else {
+                String::new()
+            },
+            stage_s: if n.staged_at > 0 && n.stage_sent > 0 {
+                n.staged_at - n.stage_sent
+            } else {
+                0
+            },
+        });
+    }
+    let mut v = UhistView {
+        id: u.id.clone(),
+        rev: 0,
+        driver_uuid: trunc_string(&state.hub_uuid, 64),
+        driver_name: trunc_string(&state.hub_friendly_name, 64),
+        by: trunc_string(&u.by, 64),
+        started: u.started,
+        rolling_at: u.rolling_at,
+        ended: if u.active { 0 } else { now() },
+        result: history_result(u).to_string(),
+        bot_ver: trunc_string(&u.target_ver, 64),
+        hub_ver: trunc_string(&u.hub_ver, 64),
+        variant: trunc_string(&u.variant, 8),
+        kind: trunc_string(&u.kind, 8),
+        min_from: trunc_string(&u.min_from, 64),
+        plan_id: u.plan_id,
+        step: u.plan_step,
+        steps: u.plan_steps,
+        sel: trunc_string(&u.sel_wire, MAX_UPGRADE_SELECT * 72),
+        summary: trunc_string(&u.summary, 192),
+        nodes,
+    };
+    crate::uhist::put_own(state, &mut v);
+}
+
 fn finish(state: &mut HubState, phase: UpgradePhase, summary: &str) {
     // Keep the plan of a run that actually got somewhere: a node that was down
     // or homed elsewhere while it went through is walked up to this target
@@ -345,7 +472,7 @@ fn finish(state: &mut HubState, phase: UpgradePhase, summary: &str) {
     // A run where nothing actually moved must not replace a good plan either.
     if !state.upgrade.select.is_empty() {
         // no roll-up plan change
-    } else if phase == UpgradePhase::Done
+    } else if (phase == UpgradePhase::Done || phase == UpgradePhase::Partial)
         && (count(state, UpgradeNodeState::Done, None) > 0
             // commit_self finishes the run just before this hub execs.
             || state.upgrade.nodes.iter().any(|n| {
@@ -368,6 +495,7 @@ fn finish(state: &mut HubState, phase: UpgradePhase, summary: &str) {
     state.upgrade.active = false;
     state.upgrade.phase = phase;
     state.upgrade.summary = clean(summary, 192);
+    history_note(state); // before this hub can replace itself
     opt_flag_set(state, OPT_CONFIG_FROZEN, false);
     crate::hlog_info!(
         "[UPGRADE] Run {} {}: {}\n",
@@ -375,6 +503,7 @@ fn finish(state: &mut HubState, phase: UpgradePhase, summary: &str) {
         phase.name(),
         state.upgrade.summary
     );
+    plan_single_end(state);
     // A step of a multi-step upgrade: decide whether the next one follows.
     // Before this hub restarts onto the step itself, so the decision is on
     // disk when the new build boots.
@@ -393,7 +522,12 @@ pub fn abort(state: &mut HubState, reason: &str) {
         .upgrade
         .nodes
         .iter()
-        .filter(|n| n.state == UpgradeNodeState::Committed || n.state == UpgradeNodeState::Done)
+        // Ready too: still staging, nothing changed for them, and nothing will.
+        .filter(|n| {
+            n.state == UpgradeNodeState::Committed
+                || n.state == UpgradeNodeState::Done
+                || n.state == UpgradeNodeState::Ready
+        })
         .map(|n| (n.uuid.clone(), n.kind, n.via.clone()))
         .collect();
 
@@ -430,6 +564,7 @@ pub fn abort(state: &mut HubState, reason: &str) {
             UpgradeNodeKind::SelfHub => {}
         }
     }
+    update::stage_clear();
     crate::hlog_info!(
         "[UPGRADE] Abort {} sent to {} node(s): {}\n",
         state.upgrade.id,
@@ -544,6 +679,10 @@ fn commit_self(state: &mut HubState, ni: usize) -> bool {
         count(state, UpgradeNodeState::Done, None),
         state.upgrade.target_ver
     );
+    // The step is not over until this hub is seen on it: the next boot decides.
+    if state.plan.active {
+        state.plan.self_target = state.upgrade.hub_ver.clone();
+    }
     finish(state, UpgradePhase::Done, &done_msg);
 
     let (id, ver, variant) = (
@@ -562,13 +701,20 @@ fn commit_self(state: &mut HubState, ni: usize) -> bool {
                 let node = &mut state.upgrade.nodes[ni];
                 node.state = UpgradeNodeState::Failed;
                 node.reason = e.clone();
+                node.done_at = now();
             }
             state.upgrade.summary = clean(
                 &format!("{done} node(s) upgraded, but this hub stayed on {HUB_VERSION}: {e}"),
                 192,
             );
             state.upgrade.phase = UpgradePhase::Failed;
+            history_note(state);
             crate::hlog_warning!("[UPGRADE] This hub could not take {ver}: {e}\n");
+            if state.plan.active {
+                state.plan.self_target.clear();
+                let why = state.upgrade.summary.clone();
+                plan_hold(state, &why, true, "", "");
+            }
             false
         }
     }
@@ -701,8 +847,33 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
+    // Who typed it: the console connection, or a plan's earlier step.
+    let (plan_id, plan_step, plan_steps) = if state.plan.active {
+        (
+            state.plan.started,
+            state.plan.step as i64 + 1,
+            state.plan.steps() as i64,
+        )
+    } else {
+        (0, 0, 0)
+    };
+    let by = state
+        .clients
+        .iter()
+        .find(|c| c.fd == origin_fd && origin_fd >= 0)
+        .and_then(|c| c.id.strip_prefix("ADMIN:"))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if plan_id != 0 {
+                crate::uhist::plan_by(state, plan_id)
+            } else {
+                String::new()
+            }
+        });
     let u = &mut state.upgrade;
     *u = crate::state::PendingUpgrade {
+        build_stopped: false,
+        hubs_stopped: false,
         active: true,
         id: run_id,
         target_ver: target_ver.to_string(),
@@ -717,6 +888,11 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         origin_fd,
         started: now(),
         phase_started: now(),
+        by,
+        plan_id,
+        plan_step,
+        plan_steps,
+        rolling_at: 0,
         phase: UpgradePhase::Prepare,
         nodes: Vec::new(),
         last_added: now(),
@@ -728,6 +904,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
             .collect(),
         sel_wire,
     };
+    plan_single_start(state);
 
     // Freeze first: a config change that lands between PREPARE and the last
     // COMMIT would reach half the mesh on one build and half on another.
@@ -937,7 +1114,7 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
         u.sel_wire,
         self_state.name()
     );
-    if !u.select.is_empty() {
+    let msg = if !u.select.is_empty() {
         format!(
             "OK:upgrade {} started for {} selected node(s) -> {}{}{}; config frozen until it \
              finishes",
@@ -957,7 +1134,9 @@ pub fn start(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
              hub last; config frozen until it finishes",
             u.id, u.target_ver, bots, peers
         )
-    }
+    };
+    history_note(state);
+    msg
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +1233,17 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
         state.upgrade.nodes[ni].ready_seq = state.upgrade.ready_seq_next;
     }
     let plan_fixed = state.upgrade.phase != UpgradePhase::Prepare;
+    let hop_moving = {
+        let via = &state.upgrade.nodes[ni].via;
+        !via.is_empty()
+            && state.upgrade.nodes.iter().any(|h| {
+                &h.uuid == via
+                    && matches!(
+                        h.state,
+                        UpgradeNodeState::Committed | UpgradeNodeState::Done
+                    )
+            })
+    };
     let is_selected = selected(&state.upgrade, uuid).is_some();
     let who = state.who('\0', uuid);
     let node = &mut state.upgrade.nodes[ni];
@@ -1075,8 +1265,14 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
     // restarting, and a COMMIT sent through it would come back as a failure
     // that aborts a healthy run (run 83aac614).
     if node.state == UpgradeNodeState::Ready && plan_fixed {
-        node.state = UpgradeNodeState::Unable;
-        node.reason = "answered after the plan was fixed — run again to include it".to_string();
+        // Only if the hub it sits behind may be restarting.  Otherwise it joins: it
+        // could not stage, so it takes the old path at COMMIT.
+        if hop_moving {
+            node.state = UpgradeNodeState::Unable;
+            node.reason = "answered after the plan was fixed — run again to include it".to_string();
+        } else {
+            node.can_stage = false;
+        }
     }
     // A whole-network follower (or an older one) asks every bot it has; a
     // selective run only moves what the admin named.
@@ -1107,7 +1303,7 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
 /// run reached through us — forward the frame up to the driver unchanged so it
 /// records the bot as a remote node.  Otherwise it belongs to a run this hub
 /// drives itself (or none), and is noted locally.
-pub fn bot_report(state: &mut HubState, cmd: u8, payload: &str) {
+pub fn bot_report(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
     let id = payload.split('|').next().unwrap_or("");
     if !state.follow_id.is_empty() && !id.is_empty() && state.follow_id == id {
         let origin = state.follow_origin.clone();
@@ -1119,9 +1315,61 @@ pub fn bot_report(state: &mut HubState, cmd: u8, payload: &str) {
     }
     if cmd == CMD_UPGRADE_READY {
         note_ready(state, payload, None);
-    } else {
-        note_result(state, payload);
+        return;
     }
+    if cmd == CMD_UPGRADE_PROGRESS {
+        note_progress(state, payload);
+        return;
+    }
+    // A bot reports for itself, and once per link: a bot sends one RESULT after
+    // a restart, so one relay per link bounds what it can make the mesh carry.
+    let uuid = payload.split('|').nth(1).unwrap_or("");
+    if !state.clients[ci].result_relayed
+        && uuid == state.clients[ci].id
+        && result_relay(state, None, payload)
+    {
+        state.clients[ci].result_relayed = true;
+    }
+    note_result(state, payload);
+}
+
+/// A bot restarted by a roll-up can come back on any hub, and its done report
+/// reaches only that one.  An id that is not this hub's to answer is passed on,
+/// once, to every other peer, so the hub that asked hears it.  False = not
+/// relayed.  A peer on an older build ignores it, and the attempt times out.
+pub fn result_relay(state: &mut HubState, from: Option<usize>, payload: &str) -> bool {
+    let mut f = payload.split('|');
+    let (id, uuid, status) = (
+        f.next().unwrap_or(""),
+        f.next().unwrap_or(""),
+        f.next().unwrap_or(""),
+    );
+    if payload.len() > UPGRADE_RESULT_RELAY_MAX
+        || id.is_empty()
+        || id.len() >= 64
+        || uuid.is_empty()
+        || uuid.len() >= 64
+        || status.is_empty()
+        || status.len() >= 32
+    {
+        return false;
+    }
+    if state.follow_id == id
+        || state.upgrade.id == id
+        || (state.rollup.active && state.rollup.id == id)
+    {
+        return false;
+    }
+    let key = format!("ur:{}", id.get(..59).unwrap_or(id));
+    if opflow::forward_seen_check_and_add(state, &key) {
+        return false;
+    }
+    for pi in state.peer_clients() {
+        if Some(pi) != from {
+            queue::send_urgent(&mut state.clients[pi], CMD_UPGRADE_RESULT, payload);
+        }
+    }
+    true
 }
 
 /// `CMD_UPGRADE_RESULT`: `id|uuid|status|version|detail`
@@ -1175,6 +1423,7 @@ pub fn note_result(state: &mut HubState, payload: &str) {
         return;
     }
     node.reason = detail;
+    node.done_at = now();
     node.state = match status {
         "ok" => UpgradeNodeState::Done,
         // Nothing on that node changed and it is healthy on its current
@@ -1224,6 +1473,7 @@ pub fn note_presence(state: &mut HubState, uuid: &str, version: &str, variant: &
     if node.state == UpgradeNodeState::Done {
         if !on_target && node.kind == UpgradeNodeKind::Bot {
             node.state = UpgradeNodeState::Failed;
+            node.done_at = now();
             node.reason = format!(
                 "came back on {} after reporting done",
                 trunc_string(version, 41)
@@ -1233,6 +1483,17 @@ pub fn note_presence(state: &mut HubState, uuid: &str, version: &str, variant: &
                 uuid = state.who('\0', uuid)
             );
         }
+        return;
+    }
+    // Failed for lateness, and here it is on the target: the record says so.
+    if node.state == UpgradeNodeState::Failed
+        && on_target
+        && node.kind == UpgradeNodeKind::Bot
+        && node.staged_at == 0
+    {
+        node.state = UpgradeNodeState::Done;
+        node.done_at = now();
+        node.reason = "came back late".to_string();
         return;
     }
     if node.state != UpgradeNodeState::Committed {
@@ -1261,6 +1522,7 @@ pub fn note_presence(state: &mut HubState, uuid: &str, version: &str, variant: &
         return;
     }
     node.state = UpgradeNodeState::Done;
+    node.done_at = now();
     crate::hlog_info!(
         "[UPGRADE] {} is back on {}\n",
         state.who('\0', uuid),
@@ -1337,9 +1599,15 @@ pub fn peer_forget(state: &mut HubState, ci: usize, payload: &str) {
         state.upgrade_cancel_id = f[0].to_string();
         state.upgrade_cancel_issued = issued;
         state.upgrade_cancel_seen = now();
-        if state.upgrade.active && state.upgrade.started <= issued {
+        // A run that carries on a plan begun before the abort is stopped too: a hub
+        // that took the plan over after the admin typed it still drives that plan.
+        if state.upgrade.active
+            && (state.upgrade.started <= issued
+                || (state.plan.active && state.plan.started <= issued))
+        {
             abort(state, "aborted by an admin on another hub");
         }
+        plan_cancelled(state, issued);
         if state.plan.active && state.plan.started <= issued {
             plan_stop(state, "aborted by an admin on another hub");
         }
@@ -1375,9 +1643,33 @@ fn rollup_end(state: &mut HubState, why: &str, charge: bool) {
                 uuid,
                 last_try: now(),
                 tries: 1,
+                ..Default::default()
             });
         }
     }
+    // The last attempt, charged or not, for upgrade status.
+    {
+        let uuid = state.rollup.uuid.clone();
+        let step = state.rollup.step.clone();
+        if !state.rollup_tries.iter().any(|t| t.uuid == uuid) {
+            if state.rollup_tries.len() >= MAX_ROLLUP_TRIES {
+                state.rollup_tries.remove(0);
+            }
+            state.rollup_tries.push(RollupTry {
+                uuid: uuid.clone(),
+                ..Default::default()
+            });
+        }
+        if let Some(t) = state.rollup_tries.iter_mut().find(|t| t.uuid == uuid) {
+            t.step = step;
+            t.note = clean(why, 128);
+            if !charge {
+                t.last_try = now();
+            }
+        }
+    }
+    state.rollup.staging = false;
+    state.rollup.ready_at = 0;
     crate::hlog_info!(
         "[ROLLUP] {} -> {}: {}\n",
         state.who('\0', &state.rollup.uuid),
@@ -1436,7 +1728,15 @@ fn rollup_may_try(state: &HubState, uuid: &str, node_kind: UpgradeNodeKind, vers
     }
     // ...and so does a multi-step upgrade between its steps: the next step
     // moves every node anyway, and a straggler is caught up after the last.
-    if state.plan.active {
+    if state.plan.active && (state.plan.hold_uuid.is_empty() || state.plan.hold_uuid != uuid) {
+        return false;
+    }
+    // Any hub, while a plan is out: the freeze lifts between steps, this does not.
+    // The one exception is the node a plan is on hold for.
+    if state.splan.active
+        && !state.splan.single
+        && (state.splan.hold_uuid.is_empty() || state.splan.hold_uuid != uuid)
+    {
         return false;
     }
     // The freeze is the mesh-wide "a run is in flight" signal: it is set at
@@ -1587,7 +1887,16 @@ fn rollup_note_ready(state: &mut HubState, payload: &str) -> bool {
         rollup_end(state, &why, true);
         return true;
     }
+    // Its progress frame says whether it can stage; one that says nothing is an older
+    // build, and rollup_tick commits it the old way.
+    state.rollup.ready_at = now();
+    true
+}
 
+/// The node is ready, staged or never able to be: go.
+fn rollup_commit(state: &mut HubState) {
+    state.rollup.ready_at = 0;
+    state.rollup.staging = false;
     let (id, step, variant, uuid) = (
         state.rollup.id.clone(),
         state.rollup.step.clone(),
@@ -1608,7 +1917,7 @@ fn rollup_note_ready(state: &mut HubState, payload: &str) -> bool {
     };
     if !sent {
         rollup_end(state, "disconnected before commit", true);
-        return true;
+        return;
     }
     state.rollup.committed = true;
     state.rollup.started = now();
@@ -1616,6 +1925,44 @@ fn rollup_note_ready(state: &mut HubState, payload: &str) -> bool {
         "[ROLLUP] COMMIT {id} -> {uuid} ({step})\n",
         uuid = state.who('\0', &uuid)
     );
+}
+
+/// CMD_UPGRADE_PROGRESS carrying a roll-up id.  True when it was one.
+fn rollup_note_progress(state: &mut HubState, payload: &str) -> bool {
+    let f: Vec<&str> = payload.splitn(6, '|').collect();
+    let id = f.first().copied().unwrap_or("");
+    if !state.rollup.active || id.is_empty() || state.rollup.id != id {
+        return false;
+    }
+    if f.get(1).copied().unwrap_or("") != state.rollup.uuid {
+        return true;
+    }
+    let phase = f.get(2).copied().unwrap_or("");
+    state.rollup.stage_last = now();
+    if phase == "ready" {
+        let (rid, uuid) = (state.rollup.id.clone(), state.rollup.uuid.clone());
+        let sent = if state.rollup.node_kind == UpgradeNodeKind::PeerHub {
+            find_client_hub(state, &uuid).is_some_and(|pi| {
+                queue::send_urgent(&mut state.clients[pi], CMD_UPGRADE_STAGE, &rid)
+            })
+        } else {
+            find_client(state, &uuid, ClientType::Bot).is_some_and(|ci| {
+                client::send_cmd_to_bot(&mut state.clients[ci], CMD_UPGRADE_STAGE, &rid)
+            })
+        };
+        if sent {
+            state.rollup.staging = true;
+            state.rollup.ready_at = 0;
+            state.rollup.started = now();
+        }
+    } else if phase == "staged" {
+        rollup_commit(state);
+    } else if phase == "failed" {
+        let code = f.get(3).copied().unwrap_or("");
+        let note = f.get(4).copied().unwrap_or("");
+        let why = format!("{}: {note}", if code.is_empty() { "stage" } else { code });
+        rollup_end(state, &why, true);
+    }
     true
 }
 
@@ -1626,32 +1973,48 @@ fn rollup_note_result(state: &mut HubState, payload: &str) -> bool {
     if !state.rollup.active || id.is_empty() || state.rollup.id != id {
         return false;
     }
+    let uuid = f.get(1).copied().unwrap_or("");
+    if state.rollup.uuid != uuid {
+        return true; // not the node we asked
+    }
     let status = f.get(2).copied().unwrap_or("");
+    let ver = f.get(3).copied().unwrap_or("");
     let detail = f.get(4).copied().unwrap_or("");
-    if status == "ok" {
-        rollup_end(state, "node reports it installed the step", false);
-    } else {
+    if status != "ok" {
         rollup_end(state, if detail.is_empty() { status } else { detail }, true);
+        return true;
+    }
+    // "ok" with a detail: the bot waited UPGRADE_OPS_WAIT and is on the step, but
+    // not back on IRC or not re-opped everywhere.
+    if !detail.is_empty() {
+        let who = state.who('\0', uuid);
+        crate::hlog_warning!(
+            "[ROLLUP] {} installed {}: {}\n",
+            who,
+            state.rollup.step,
+            detail
+        );
+        rollup_end(state, "reports done, with a problem", false);
+    } else {
+        rollup_end(state, "reports done", false);
+    }
+    // A walk of several releases keeps going from the new version, here if the
+    // bot came back here; else the hub it is on takes it from its presence.
+    if !ver.is_empty() && find_client(state, uuid, ClientType::Bot).is_some() {
+        rollup_consider(state, uuid, UpgradeNodeKind::Bot, ver);
     }
     true
 }
 
-/// A node's presence is the authoritative signal here too: it came back on the
-/// step, so this attempt succeeded and the NEXT one (if the target is further
-/// on) may start straight away.
+/// An attempt on a bot ends on its done report (`rollup_note_result`), not on
+/// its presence: presence comes as soon as it has a hub link, and "done" means
+/// back on IRC and re-opped.  Presence only starts the next attempt.
 pub fn rollup_note_presence(
     state: &mut HubState,
     uuid: &str,
     node_kind: UpgradeNodeKind,
     version: &str,
 ) {
-    if state.rollup.active
-        && state.rollup.uuid == uuid
-        && !version.is_empty()
-        && update::version_cmp(version, &state.rollup.step) != std::cmp::Ordering::Less
-    {
-        rollup_end(state, "back on the step it was given", false);
-    }
     rollup_consider(state, uuid, node_kind, version);
 }
 
@@ -1802,7 +2165,40 @@ fn rollup_scan_hubs(state: &mut HubState) {
 fn rollup_tick(state: &mut HubState, t_now: i64) {
     rollup_settle(state, t_now);
     rollup_scan_hubs(state);
-    if !state.rollup.active || t_now - state.rollup.started <= ROLLUP_TIMEOUT {
+    if !state.rollup.active {
+        return;
+    }
+    // READY, and no word that it can stage: an older build.
+    if state.rollup.ready_at > 0 && t_now - state.rollup.ready_at >= ROLLUP_STAGE_WAIT {
+        rollup_commit(state);
+        return;
+    }
+    if state.rollup.staging {
+        if t_now - state.rollup.stage_last > UPGRADE_STAGE_SILENCE {
+            rollup_end(state, "stage: no word from it", true);
+        } else if t_now - state.rollup.started > UPGRADE_BUILD_SECS as i64 {
+            rollup_end(state, "stage: past its limit", true);
+        }
+        return;
+    }
+    if t_now - state.rollup.started <= ROLLUP_TIMEOUT {
+        return;
+    }
+    // On the step, but no done report: it came through a hub that cannot relay
+    // it, or was lost.  The bot is not behind, so charge it nothing.
+    let on_step = state.rollup.committed
+        && state.rollup.node_kind == UpgradeNodeKind::Bot
+        && rollup_bot_version(state, &state.rollup.uuid).is_some_and(|v| {
+            update::version_cmp(v, &state.rollup.step) != std::cmp::Ordering::Less
+        });
+    if on_step {
+        let who = state.who('\0', &state.rollup.uuid);
+        crate::hlog_warning!(
+            "[ROLLUP] {} is on {}, but no done report reached this hub\n",
+            who,
+            state.rollup.step
+        );
+        rollup_end(state, "on the step, no done report", false);
         return;
     }
     let why = if state.rollup.committed {
@@ -1992,7 +2388,831 @@ pub fn plan_stop(state: &mut HubState, summary: &str) {
         state.plan.hub_target,
         state.plan.summary
     );
+    plan_publish(state);
     crate::config::write(state);
+}
+
+/// One plan as a line, for uplan|, uplanr| and CMD_UPGRADE_PLAN alike:
+///   bot_target|hub_target|variant|kind|step|run_id|started|progressed|bot_from|
+///   hub_from|bot_path|hub_path|sel|reruns|self_target|hold_rerun|hold_uuid|
+///   hold_ver|last_run|driver|rev|single|active|left|hold|summary|driver_name
+/// Every field but hold and summary passes plan_field_ok, here and on the way in,
+/// so the line can never split or inject another; hold and summary are free text.
+/// driver_name is written empty when it would not pass, so a name can never keep a
+/// plan off the wire.  A 13-field line is a 2.5.1 roll-up plan.
+pub fn plan_format(p: &UpgradePlan) -> Option<String> {
+    let fields = [
+        &p.bot_target,
+        &p.hub_target,
+        &p.variant,
+        &p.kind,
+        &p.run_id,
+        &p.bot_from,
+        &p.hub_from,
+        &p.sel,
+        &p.self_target,
+        &p.hold_uuid,
+        &p.hold_ver,
+        &p.last_run,
+        &p.driver,
+        &p.left,
+    ];
+    if !fields.iter().all(|f| plan_field_ok(f))
+        || !p
+            .bot_path
+            .iter()
+            .chain(&p.hub_path)
+            .all(|v| plan_field_ok(v))
+        || p.hold.contains(['|', '\r', '\n'])
+        || p.summary.contains(['|', '\r', '\n'])
+    {
+        return None;
+    }
+    let dn = if p.driver_name.len() < 64 && plan_field_ok(&p.driver_name) {
+        p.driver_name.as_str()
+    } else {
+        ""
+    };
+    Some(format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        p.bot_target,
+        p.hub_target,
+        p.variant,
+        p.kind,
+        p.step,
+        p.run_id,
+        p.started,
+        p.progressed,
+        p.bot_from,
+        p.hub_from,
+        p.bot_path.join(","),
+        p.hub_path.join(","),
+        p.sel,
+        p.reruns,
+        p.self_target,
+        i32::from(p.hold_rerun),
+        p.hold_uuid,
+        p.hold_ver,
+        p.last_run,
+        p.driver,
+        p.rev,
+        i32::from(p.single),
+        i32::from(p.active),
+        p.left,
+        p.hold,
+        p.summary,
+        dn
+    ))
+}
+
+/// None unless the whole line is sound.
+pub fn plan_parse(body: &str) -> Option<UpgradePlan> {
+    let f: Vec<&str> = body.split('|').collect();
+    // 13 fields: a 2.5.1 roll-up plan; 25: before the stop reason; 26: before the
+    // driver's name; 27: now.
+    if !matches!(f.len(), 13 | 25 | 26 | 27) || f[0].is_empty() {
+        return None;
+    }
+    let caps: [(usize, usize); 15] = [
+        (0, 64),
+        (1, 64),
+        (2, 8),
+        (3, 8),
+        (5, 64),
+        (8, 64),
+        (9, 64),
+        (12, MAX_UPGRADE_SELECT * 80),
+        (14, 64),
+        (16, 64),
+        (17, 64),
+        (18, 64),
+        (19, 64),
+        (23, MAX_PLAN_LEFT * 37 + 1),
+        (26, 64),
+    ];
+    for (at, cap) in caps {
+        if let Some(x) = f.get(at)
+            && (x.len() >= cap || !plan_field_ok(x))
+        {
+            return None;
+        }
+    }
+    let path = |s: &str| -> Option<Vec<String>> {
+        if s.is_empty() {
+            return Some(Vec::new());
+        }
+        let p: Vec<String> = s.split(',').map(str::to_string).collect();
+        (p.len() <= MAX_UPGRADE_STEPS
+            && p.iter()
+                .all(|x| !x.is_empty() && x.len() < 64 && plan_field_ok(x)))
+        .then_some(p)
+    };
+    let get = |i: usize| f.get(i).copied().unwrap_or("").to_string();
+    let mut p = UpgradePlan {
+        active: true,
+        bot_target: get(0),
+        hub_target: get(1),
+        variant: get(2),
+        kind: get(3),
+        run_id: get(5),
+        started: crate::cstr::atoll(f[6]),
+        progressed: crate::cstr::atoll(f[7]),
+        bot_from: get(8),
+        hub_from: get(9),
+        bot_path: path(f[10])?,
+        hub_path: path(f[11])?,
+        sel: get(12),
+        ..Default::default()
+    };
+    if f.len() >= 25 {
+        p.reruns = crate::cstr::atoll(f[13]) as i32;
+        p.self_target = get(14);
+        p.hold_rerun = f[15].starts_with('1');
+        p.hold_uuid = get(16);
+        p.hold_ver = get(17);
+        p.last_run = get(18);
+        p.driver = get(19);
+        p.rev = crate::cstr::atoll(f[20]);
+        p.single = f[21].starts_with('1');
+        p.active = f[22].starts_with('1');
+        p.left = get(23);
+        if f[24].len() >= 192 || f[24].contains(['\r', '\n']) {
+            return None;
+        }
+        p.hold = get(24);
+    }
+    if f.len() >= 26 {
+        if f[25].len() >= 192 || f[25].contains(['\r', '\n']) {
+            return None;
+        }
+        p.summary = get(25);
+        p.driver_name = get(26);
+    }
+    let step = crate::state::parse_uint(f[4], u64::MAX)? as usize;
+    if p.single {
+        return (step == 0).then_some(p);
+    }
+    if step >= p.bot_path.len().max(p.hub_path.len()) {
+        return None;
+    }
+    p.step = step;
+    Some(p)
+}
+
+/// A plan on hold: the network stays at the last closed step, every hub says why,
+/// and it resumes when the named node reaches the step or on upgrade continue.
+fn plan_hold(state: &mut HubState, why: &str, rerun: bool, uuid: &str, ver: &str) {
+    if !state.plan.active {
+        return;
+    }
+    state.plan.hold = clean(why, 192).replace('|', "/");
+    state.plan.hold_rerun = rerun;
+    state.plan.hold_uuid = uuid.to_string();
+    state.plan.hold_ver = ver.to_string();
+    state.plan.run_id.clear();
+    state.plan.progressed = now();
+    state.plan.next_at = 0;
+    crate::hlog_warning!(
+        "[UPGRADE] Upgrade to {} on hold at step {}/{}: {}\n",
+        state.plan.bot_target,
+        state.plan.step + 1,
+        state.plan.steps(),
+        state.plan.hold
+    );
+    plan_publish(state);
+    crate::config::write(state);
+}
+
+/// The step is really finished: move on, or end.
+fn plan_close_step(state: &mut HubState) {
+    let steps = state.plan.steps();
+    state.plan.reruns = 0;
+    state.plan.progressed = now();
+    if state.plan.step + 1 >= steps {
+        plan_stop(state, &format!("done: all {steps} steps completed"));
+        return;
+    }
+    state.plan.step += 1;
+    state.plan.next_at = now() + UPGRADE_PLAN_SETTLE;
+    state.plan.mesh_until = 0;
+    plan_publish(state);
+    crate::config::write(state);
+    crate::hlog_info!(
+        "[UPGRADE] Step {}/{steps} done; step {} starts in {UPGRADE_PLAN_SETTLE} s\n",
+        state.plan.step,
+        state.plan.step + 1
+    );
+}
+
+/// What the mesh says a node runs right now, "" if it is not here.
+/// What a candidate runs right now: this hub's own build, else what the mesh says.
+fn node_version_now(state: &HubState, c: &Cand) -> String {
+    if c.kind == UpgradeNodeKind::SelfHub {
+        crate::consts::HUB_VERSION.to_string()
+    } else {
+        plan_node_version(state, &c.uuid)
+    }
+}
+
+fn plan_node_version(state: &HubState, uuid: &str) -> String {
+    for ci in state.bot_clients() {
+        if state.clients[ci].id == uuid {
+            return state.clients[ci].bot_version.clone();
+        }
+    }
+    // A bot that moved hubs has an entry under each until the old one ages out: the
+    // newest report is what it runs now.
+    if let Some(e) = state
+        .roster
+        .iter()
+        .filter(|e| e.bot_uuid == uuid)
+        .max_by_key(|e| e.reported_at)
+    {
+        return e.version.clone();
+    }
+    state
+        .peers
+        .iter()
+        .find(|p| p.uuid == uuid)
+        .map_or(String::new(), |p| p.remote_version.clone())
+}
+
+/// How many nodes the last step finished have not come back.  It reads the step's
+/// record, because the run table went with this hub's own restart.
+fn plan_mesh_missing(state: &HubState) -> usize {
+    let mut missing = state
+        .peers
+        .iter()
+        .filter(|p| !p.uuid.is_empty() && !crate::presence::peer_is_linked(state, p))
+        .count();
+    if !state.plan.last_run.is_empty()
+        && let Some(at) = crate::uhist::find(state, &state.plan.last_run)
+        && let Some(v) = crate::uhist::parse(&state.uhist[at].body)
+    {
+        missing += v
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.kind == "b" && n.state == "done" && plan_node_version(state, &n.uuid).is_empty()
+            })
+            .count();
+    }
+    missing
+}
+
+/// What history says about one node: its class and its usual times, newest record
+/// first.  History orders and times.  It never decides: preflight asks the host.
+#[derive(Default)]
+struct NodePast {
+    records: usize,
+    bad: usize,
+    restart: i64,
+    stage_bin: i64,
+    stage_src: i64,
+    code: String,
+    arch: String,
+    libc: String,
+    base: String,
+    last: String,
+}
+
+fn node_past(state: &HubState, uuid: &str) -> NodePast {
+    let mut p = NodePast::default();
+    for rec in state.uhist.iter().rev() {
+        if p.records >= UPGRADE_CLASS_RECORDS {
+            break;
+        }
+        let Some(v) = crate::uhist::parse(&rec.body) else {
+            continue;
+        };
+        let Some(n) = v.nodes.iter().find(|n| n.uuid == uuid) else {
+            continue;
+        };
+        if matches!(n.state.as_str(), "already" | "skipped" | "idle") {
+            continue;
+        }
+        if p.records == 0 {
+            p.arch = n.arch.clone();
+            p.libc = n.libc.clone();
+            p.base = n.base.clone();
+            p.last = trunc_string(if n.state == "done" { &n.to } else { &n.from }, 31);
+        }
+        p.records += 1;
+        if p.records <= 3 {
+            if n.state == "failed" || !n.code.is_empty() {
+                p.bad += 1;
+                if p.code.is_empty() {
+                    p.code = n.code.clone();
+                }
+            }
+            if n.back > n.committed && n.committed > 0 {
+                p.restart = p.restart.max(n.back - n.committed);
+            }
+            if n.build == "src" {
+                p.stage_src = p.stage_src.max(n.stage_s);
+            } else {
+                p.stage_bin = p.stage_bin.max(n.stage_s);
+            }
+        }
+    }
+    p
+}
+
+fn node_class(p: &NodePast) -> char {
+    if p.bad > 0 {
+        'p'
+    } else if p.restart > UPGRADE_SLOW_RESTART || p.stage_src > 0 {
+        's'
+    } else if p.records >= 3 {
+        'f'
+    } else {
+        'u'
+    }
+}
+
+/// Limits from its own record: 3x its slowest, between a floor and the agreed
+/// ceiling.  With too little to go on, the ceiling.  A known slow host is not failed
+/// for being slow, and a fast host's failure shows sooner.
+fn apply_history(state: &mut HubState) {
+    for ni in 0..state.upgrade.nodes.len() {
+        let p = node_past(state, &state.upgrade.nodes[ni].uuid);
+        let n = &mut state.upgrade.nodes[ni];
+        n.cls = node_class(&p);
+        n.stage_limit = if p.stage_bin == 0 {
+            UPGRADE_STAGE_GATE
+        } else {
+            (p.stage_bin * 3).clamp(UPGRADE_STAGE_FLOOR, UPGRADE_STAGE_GATE)
+        };
+        n.build_limit = if p.stage_src == 0 {
+            UPGRADE_BUILD_SECS as i64
+        } else {
+            (p.stage_src * 3).clamp(UPGRADE_BUILD_FLOOR, UPGRADE_BUILD_SECS as i64)
+        };
+    }
+}
+
+/// Does every step have a build for this node's shape?  Only a shape history has seen
+/// can be checked; anything else finds out at its PREPARE.  A step the node already
+/// runs, or is past, needs nothing from it.
+fn plan_node_blocked(is_bot: bool, p: &NodePast, cur: &str, pl: &UpgradePlan) -> Option<String> {
+    if p.arch.is_empty() || p.base.is_empty() {
+        return None;
+    }
+    let root = if is_bot {
+        update::bot_root()
+    } else {
+        String::new()
+    };
+    let path = if is_bot { &pl.bot_path } else { &pl.hub_path };
+    path.iter()
+        .filter(|ver| cur.is_empty() || update::version_cmp(cur, ver).is_lt())
+        .find(|ver| !update::has_build(&root, &p.base, ver, &p.arch, &p.libc))
+        .map(|ver| format!("no {ver} build for {}/{}, and no source", p.arch, p.libc))
+}
+
+// ---- The shared plan ------------------------------------------------------
+//
+// Every hub keeps what the driver last published, so any of them can say what is
+// going on, a restarted hub can carry on, and no hub chases a straggler between
+// steps.  The driver alone changes it while it lives.  Older hubs drop the opcode
+// and behave as they did, and are never asked to take over.
+
+fn plan_send_all(state: &mut HubState, frame: &str, skip: Option<i32>) {
+    for ci in 0..state.clients.len() {
+        let c = &mut state.clients[ci];
+        if c.typ == ClientType::Hub && c.authenticated && Some(c.fd) != skip {
+            queue::send_urgent(c, CMD_UPGRADE_PLAN, frame);
+        }
+    }
+}
+
+fn plan_flood(state: &mut HubState, pl: &UpgradePlan, skip: Option<i32>) {
+    if let Some(body) = plan_format(pl) {
+        plan_send_all(state, &format!("P|{body}"), skip);
+    }
+}
+
+/// This hub directs `pl`.  Its name rides along: a hub that boots mid-plan logs the
+/// director before any link has told it who that is.
+fn plan_stamp_driver(state: &HubState, pl: &mut UpgradePlan) {
+    pl.driver = state.hub_uuid.clone();
+    pl.driver_name =
+        if state.hub_friendly_name.len() < 64 && plan_field_ok(&state.hub_friendly_name) {
+            state.hub_friendly_name.clone()
+        } else {
+            String::new()
+        };
+}
+
+fn plan_publish(state: &mut HubState) {
+    let mut pl = std::mem::take(&mut state.plan);
+    plan_stamp_driver(state, &mut pl);
+    state.plan = pl;
+    // Clock-based: a driver the failback rolled back has an older config and an older
+    // rev.  A plain +1 could land on one the mesh already holds, and the hold it is
+    // reporting would be dropped as old news.
+    let t_now = now();
+    state.plan.rev = if t_now > state.plan.rev {
+        t_now
+    } else {
+        state.plan.rev + 1
+    };
+    state.splan = state.plan.clone();
+    state.splan_seen = now();
+    let p = state.plan.clone();
+    plan_flood(state, &p, None);
+}
+
+/// A plain run is published too, so a lost driver cannot leave the mesh frozen.
+fn plan_single_start(state: &mut HubState) {
+    if state.plan.active {
+        return;
+    }
+    let u = &state.upgrade;
+    let mut s = UpgradePlan {
+        active: true,
+        single: true,
+        bot_target: u.target_ver.clone(),
+        hub_target: u.hub_ver.clone(),
+        variant: u.variant.clone(),
+        kind: u.kind.clone(),
+        run_id: u.id.clone(),
+        started: u.started,
+        rev: state.splan.rev + 1,
+        ..Default::default()
+    };
+    plan_stamp_driver(state, &mut s);
+    state.splan = s.clone();
+    state.splan_seen = now();
+    plan_flood(state, &s, None);
+}
+
+fn plan_single_end(state: &mut HubState) {
+    if !state.splan.active || !state.splan.single || state.splan.driver != state.hub_uuid {
+        return;
+    }
+    state.splan.active = false;
+    state.splan.rev += 1;
+    let s = state.splan.clone();
+    plan_flood(state, &s, None);
+}
+
+/// `upgrade abort` from anywhere ends the shared copy too: its driver may be gone.
+/// Stop this hub's copy of a plan another hub drives, and say so to the rest.  The
+/// director hears it too, on the next digest if not now: a stopped copy beats a
+/// running one, so it stops as well.  Nothing is rolled back and nobody takes over.
+fn splan_stop(state: &mut HubState, why: &str) {
+    if !state.splan.active {
+        return;
+    }
+    let t_now = now();
+    state.splan.active = false;
+    state.splan.rev = if t_now > state.splan.rev {
+        t_now
+    } else {
+        state.splan.rev + 1
+    };
+    state.splan.summary = clean(why, 192);
+    state.splan_seen = t_now;
+    state.follow_id.clear();
+    if config_frozen(state) {
+        opt_flag_set(state, OPT_CONFIG_FROZEN, false);
+    }
+    crate::hlog_warning!(
+        "[UPGRADE] The upgrade to {} driven by {} stopped here: {}\n",
+        state.splan.bot_target,
+        state.who('h', &state.splan.driver),
+        state.splan.summary
+    );
+    let s = state.splan.clone();
+    plan_flood(state, &s, None);
+    crate::config::write(state);
+}
+
+pub fn plan_cancelled(state: &mut HubState, issued: i64) {
+    if !state.splan.active || state.splan.started > issued || state.splan.driver == state.hub_uuid {
+        return;
+    }
+    splan_stop(state, "aborted by an admin");
+}
+
+pub fn plan_send_digest(state: &mut HubState, ci: usize) {
+    let frame = format!("D|{}|{}", state.splan.started, state.splan.rev);
+    queue::send_urgent(&mut state.clients[ci], CMD_UPGRADE_PLAN, &frame);
+}
+
+/// Which copy of a plan stands, `a` over `b`.  The same plan (same start): a stopped
+/// copy beats a running one, since a stop is final wherever it was decided, then the
+/// higher rev.  Two different plans both running, only from a race or a split: the one
+/// begun first stands.  Otherwise the later plan replaces an older one.
+fn plan_beats(a: &UpgradePlan, b: &UpgradePlan) -> bool {
+    if b.driver.is_empty() {
+        return true;
+    }
+    if a.started == b.started {
+        if a.active != b.active {
+            return !a.active;
+        }
+        return a.rev > b.rev;
+    }
+    if a.active && b.active {
+        return a.started < b.started;
+    }
+    a.started > b.started
+}
+
+/// A restarted hub picks up the run its copy names: it can carry COMMITs and "back"
+/// reports again with no fresh PREPARE.
+pub fn plan_boot(state: &mut HubState) {
+    state.splan_seen = now();
+    let s = state.splan.clone();
+    if !s.active
+        || s.run_id.is_empty()
+        || s.driver.is_empty()
+        || s.driver == state.hub_uuid
+        || !state.follow_id.is_empty()
+    {
+        return;
+    }
+    let (bot, hub) = if s.single {
+        (s.bot_target.clone(), s.hub_target.clone())
+    } else {
+        plan_step_targets(&s, s.step)
+    };
+    state.follow_id = s.run_id.clone();
+    state.follow_origin = s.driver.clone();
+    state.follow_target = bot;
+    state.follow_hub_target = hub;
+    state.follow_variant = s.variant.clone();
+    state.follow_bot_variant = s.variant.clone();
+    state.follow_self_ready = false;
+    state.follow_prepared = now();
+    crate::hlog_info!(
+        "[UPGRADE] Back in run {}, driven by {}\n",
+        s.run_id,
+        state.who('h', &s.driver)
+    );
+}
+
+/// Start or resume after an admin's word, on the driver.
+fn plan_left_has(pl: &UpgradePlan, uuid: &str) -> bool {
+    !uuid.is_empty() && pl.left.split(',').any(|u| u == uuid)
+}
+
+/// Remember the admin's word for the rest of the plan.  A list that is full, or a
+/// uuid that does not fit, only means that node can hold the plan again.
+fn plan_left_add(pl: &mut UpgradePlan, uuid: &str) {
+    let count = if pl.left.is_empty() {
+        0
+    } else {
+        pl.left.split(',').count()
+    };
+    if uuid.is_empty()
+        || plan_left_has(pl, uuid)
+        || count >= MAX_PLAN_LEFT
+        || pl.left.len() + uuid.len() + 2 > MAX_PLAN_LEFT * 37 + 1
+    {
+        return;
+    }
+    if !pl.left.is_empty() {
+        pl.left.push(',');
+    }
+    pl.left.push_str(uuid);
+}
+
+fn plan_continue(state: &mut HubState, by_admin: bool) {
+    if !state.plan.active || state.plan.hold.is_empty() {
+        return;
+    }
+    let rerun = state.plan.hold_rerun;
+    crate::hlog_info!(
+        "[UPGRADE] Upgrade to {} resumes: {}\n",
+        state.plan.bot_target,
+        if rerun {
+            "running the step again"
+        } else if by_admin {
+            "leaving that node behind"
+        } else {
+            "that node reached the step"
+        }
+    );
+    if by_admin && !rerun {
+        let uuid = state.plan.hold_uuid.clone();
+        plan_left_add(&mut state.plan, &uuid);
+    }
+    state.plan.hold.clear();
+    state.plan.hold_uuid.clear();
+    state.plan.hold_ver.clear();
+    state.plan.hold_rerun = false;
+    state.plan.reruns = 0;
+    if rerun {
+        state.plan.next_at = now() + UPGRADE_PLAN_SETTLE;
+        state.plan.mesh_until = 0;
+        plan_publish(state);
+        crate::config::write(state);
+    } else {
+        plan_close_step(state);
+    }
+}
+
+/// `upgrade continue`: the hold, wherever its driver is.  False if none is held.
+pub fn plan_continue_cmd(state: &mut HubState) -> bool {
+    let known = if state.plan.active {
+        &state.plan
+    } else {
+        &state.splan
+    };
+    if !known.active || known.single || known.hold.is_empty() {
+        return false;
+    }
+    let id = known.started;
+    let t = now();
+    crate::opflow::forward_seen_check_and_add(state, &format!("pc:{id}:{t}"));
+    if state.plan.active {
+        plan_continue(state, true);
+    }
+    plan_send_all(state, &format!("C|{id}|{t}"), None);
+    true
+}
+
+/// CMD_UPGRADE_PLAN from a peer.
+pub fn plan_process(state: &mut HubState, ci: usize, payload: &str) {
+    state.clients[ci].plan_capable = true;
+    let peer_fd = state.clients[ci].fd;
+    let Some((kind, rest)) = payload.split_once('|') else {
+        return;
+    };
+    let f: Vec<&str> = rest.splitn(4, '|').collect();
+    let at = |i: usize| crate::cstr::atoll(f.get(i).copied().unwrap_or(""));
+    match kind {
+        // A different copy: send ours, and they send theirs.  Each keeps what
+        // plan_beats() says stands, so both ends settle on the same one.
+        "D" => {
+            if !state.splan.driver.is_empty()
+                && (state.splan.started != at(0) || state.splan.rev != at(1))
+            {
+                let s = state.splan.clone();
+                plan_flood(state, &s, None);
+            }
+        }
+        "B" => {
+            if state.splan.started != at(0) || state.splan.rev != at(1) {
+                return;
+            }
+            let key = format!(
+                "pb:{}:{}",
+                state.splan.driver,
+                f.get(2).copied().unwrap_or("")
+            );
+            if crate::opflow::forward_seen_check_and_add(state, &key) {
+                return;
+            }
+            state.splan_seen = now();
+            plan_send_all(state, payload, Some(peer_fd));
+        }
+        "C" => {
+            let key = format!(
+                "pc:{}:{}",
+                f.first().copied().unwrap_or(""),
+                f.get(1).copied().unwrap_or("")
+            );
+            if crate::opflow::forward_seen_check_and_add(state, &key) {
+                return;
+            }
+            if state.plan.started == at(0) {
+                plan_continue(state, true);
+            }
+            plan_send_all(state, payload, Some(peer_fd));
+        }
+        "P" => {
+            let Some(t) = plan_parse(rest) else {
+                return;
+            };
+            if t.driver.is_empty() || !plan_beats(&t, &state.splan) {
+                return;
+            }
+            if state.plan.active {
+                if state.plan.started == t.started && !t.active {
+                    // Stopped elsewhere (an admin, or the director given up for lost):
+                    // stopped here too.  A run in flight finishes; no next step follows it.
+                    crate::hlog_warning!(
+                        "[UPGRADE] The upgrade to {} was stopped elsewhere ({}); it stops here too\n",
+                        state.plan.bot_target,
+                        t.summary
+                    );
+                    state.plan = Default::default();
+                } else if state.plan.started != t.started && t.active {
+                    // Two plans begun at once: the first one stands, and this one goes back.
+                    crate::hlog_warning!(
+                        "[UPGRADE] An upgrade to {} from {} began first; the upgrade to {} stops\n",
+                        t.bot_target,
+                        state.who('h', &t.driver),
+                        state.plan.bot_target
+                    );
+                    state.plan = Default::default();
+                    if state.upgrade.active {
+                        abort(state, "another upgrade began first");
+                    }
+                }
+            }
+            state.splan = t.clone();
+            state.splan_seen = now();
+            crate::config::write(state);
+            plan_flood(state, &t, Some(peer_fd));
+        }
+        _ => {}
+    }
+}
+
+/// The driver has gone quiet: the reachable hub with the lowest uuid carries on.  A
+/// partition can make one on each side, both walking the same path; rev settles it.
+fn plan_watch(state: &mut HubState, t_now: i64) {
+    if !state.splan.active || state.splan.driver.is_empty() {
+        return;
+    }
+    if state.splan.driver == state.hub_uuid {
+        if t_now - state.plan_beat >= UPGRADE_PLAN_BEAT {
+            state.plan_beat = t_now;
+            let frame = format!("B|{}|{}|{t_now}", state.splan.started, state.splan.rev);
+            plan_send_all(state, &frame, None);
+        }
+        return;
+    }
+    #[cfg(feature = "test-hooks")]
+    // A sandbox cannot wait 15 minutes for each run of its test.
+    let silence = std::env::var("IRCHUB_TEST_DRIVER_SILENCE")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(UPGRADE_DRIVER_SILENCE);
+    #[cfg(not(feature = "test-hooks"))]
+    let silence = UPGRADE_DRIVER_SILENCE;
+    if state.plan.active || t_now - state.splan_seen < silence {
+        return;
+    }
+    // Linked to the director after all: its beats are only late.
+    if hubs_reached(state).contains(&state.splan.driver) {
+        return;
+    }
+    // One director: nobody takes over.  The plan stops; upgrade start carries on.
+    let who = trunc_string(&state.who('h', &state.splan.driver), 60);
+    let why = if state.splan.single {
+        format!("director {who} lost")
+    } else {
+        format!(
+            "director {who} lost at step {}/{}; upgrade start carries on",
+            state.splan.step + 1,
+            state.splan.steps()
+        )
+    };
+    splan_stop(state, &why);
+}
+
+/// A bot that links during a run joins it, wherever it landed.  One still further
+/// back answers unable, and the end of the step deals with that.
+pub fn prepare_late(state: &mut HubState, ci: usize, version: &str) {
+    if state.clients[ci].late_prepared || version.is_empty() {
+        return;
+    }
+    let id = state.clients[ci].id.clone();
+    let fd = state.clients[ci].fd;
+    let u = &state.upgrade;
+    if u.active
+        && u.select.is_empty()
+        && matches!(u.phase, UpgradePhase::Prepare | UpgradePhase::Rolling)
+    {
+        if find_node(state, &id).is_some()
+            || update::version_cmp(version, &u.target_ver) != std::cmp::Ordering::Less
+        {
+            return;
+        }
+        let frame = format!(
+            "{}|{}|{}|{}|{}|",
+            u.id, u.target_ver, u.variant, u.kind, u.min_from
+        );
+        state.clients[ci].late_prepared = true;
+        state.upgrade.nodes.push(UpgradeNode {
+            uuid: id,
+            kind: UpgradeNodeKind::Bot,
+            state: UpgradeNodeState::Pending,
+            fd,
+            cur_version: version.to_string(),
+            ..Default::default()
+        });
+        client::send_cmd_to_bot(&mut state.clients[ci], CMD_UPGRADE_PREPARE, &frame);
+    } else if !state.follow_id.is_empty()
+        && config_frozen(state)
+        && state.follow_sel.is_empty()
+        && !state.follow_target.is_empty()
+        && update::version_cmp(version, &state.follow_target) == std::cmp::Ordering::Less
+    {
+        let frame = format!(
+            "{}|{}|{}||*|",
+            state.follow_id, state.follow_target, state.follow_bot_variant
+        );
+        state.clients[ci].late_prepared = true;
+        client::send_cmd_to_bot(&mut state.clients[ci], CMD_UPGRADE_PREPARE, &frame);
+    }
 }
 
 /// Start step `plan.step` as an ordinary run.  Returns the run's message
@@ -2022,6 +3242,8 @@ fn plan_start_step(state: &mut HubState, origin_fd: i32, min_from: &str) -> Stri
     state.plan.run_id = state.upgrade.id.clone();
     state.plan.progressed = now();
     state.plan.next_at = 0;
+    state.plan.mesh_until = 0;
+    plan_publish(state);
     crate::config::write(state);
     crate::hlog_info!(
         "[UPGRADE] Step {}/{} of the upgrade to {}: run {} (bots -> {bot}{}{hub})\n",
@@ -2037,6 +3259,65 @@ fn plan_start_step(state: &mut HubState, origin_fd: i32, min_from: &str) -> Stri
 /// CMD_ADMIN_UPGRADE_NET: plan the path, then start its first step.  A
 /// one-step path is exactly the run `upgrade start` always was, and keeps no
 /// plan.  Returns the run's message ("OK..." or "ERROR: ...").
+/// The hubs an upgrade would miss: every hub known here, from its own peers and from what
+/// the others report, less those reached over live links from here.  Returns their names.
+/// The hubs reached from here over live links, direct or through other hubs, by what
+/// each reports of its own links.
+pub fn hubs_reached(state: &HubState) -> Vec<String> {
+    let usable = |u: &str| !u.is_empty() && u != "-" && u != state.hub_uuid;
+    let mut reached: Vec<String> = state
+        .peers
+        .iter()
+        .filter(|p| !p.uuid.is_empty() && crate::presence::peer_is_linked(state, p))
+        .map(|p| p.uuid.clone())
+        .collect();
+    let mut r = 0;
+    while r < reached.len() {
+        if let Some(mh) = state.mesh_hubs.iter().find(|m| m.uuid == reached[r]) {
+            for l in &mh.links {
+                if l.online && usable(&l.uuid) && !reached.contains(&l.uuid) {
+                    reached.push(l.uuid.clone());
+                }
+            }
+        }
+        r += 1;
+    }
+    reached
+}
+
+pub fn hubs_missing(state: &HubState) -> Vec<String> {
+    let usable = |u: &str| !u.is_empty() && u != "-" && u != state.hub_uuid;
+    let reached = hubs_reached(state);
+    let mut named: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for p in &state.peers {
+        if !p.uuid.is_empty() && reached.contains(&p.uuid) {
+            continue;
+        }
+        if !p.uuid.is_empty() {
+            named.push(&p.uuid);
+        }
+        out.push(if p.friendly_name.is_empty() {
+            p.ip.clone()
+        } else {
+            p.friendly_name.clone()
+        });
+    }
+    for mh in &state.mesh_hubs {
+        for l in &mh.links {
+            if usable(&l.uuid) && !reached.contains(&l.uuid) && !named.contains(&l.uuid.as_str()) {
+                named.push(&l.uuid);
+                out.push(if l.name.is_empty() {
+                    l.uuid.clone()
+                } else {
+                    l.name.clone()
+                });
+            }
+        }
+    }
+    out
+}
+
 pub fn plan_begin(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String {
     if state.plan.active {
         return format!(
@@ -2060,6 +3341,25 @@ pub fn plan_begin(state: &mut HubState, origin_fd: i32, a: &StartArgs) -> String
         Ok(p) => p,
         Err(why) => return format!("ERROR: {why}"),
     };
+    // A build missing for a host history knows: refused now, not part way up.
+    if a.sel.is_empty() {
+        for c in candidates(state) {
+            let is_bot = c.kind == UpgradeNodeKind::Bot;
+            if !is_bot && a.hub_ver.is_empty() {
+                continue;
+            }
+            let cur = node_version_now(state, &c);
+            if let Some(why) = plan_node_blocked(is_bot, &node_past(state, &c.uuid), &cur, &np) {
+                let who = if c.name.is_empty() { &c.uuid } else { &c.name };
+                let on = if cur.is_empty() { "?" } else { cur.as_str() };
+                return format!(
+                    "ERROR: {} (on {}): {why}",
+                    trunc_string(who, 60),
+                    trunc_string(on, 24)
+                );
+            }
+        }
+    }
     if np.steps() <= 1 {
         return start(state, origin_fd, a);
     }
@@ -2094,60 +3394,145 @@ fn plan_note_run_end(state: &mut HubState, phase: UpgradePhase) {
     }
     let steps = state.plan.steps();
     let step = state.plan.step;
+    state.plan.last_run = state.plan.run_id.clone();
     state.plan.run_id.clear();
     state.plan.progressed = now();
-    if phase != UpgradePhase::Done {
+    if (phase != UpgradePhase::Done && phase != UpgradePhase::Partial)
+        || state.upgrade.build_stopped
+    {
         let why = format!(
             "step {}/{steps} {}: {}",
             step + 1,
             phase.name(),
             state.upgrade.summary
         );
-        plan_stop(state, &why);
+        state.plan.self_target.clear();
+        plan_hold(state, &why, true, "", "");
         return;
     }
-    let u = &state.upgrade;
-    let behind: Vec<usize> = (0..u.nodes.len())
-        .filter(|&ni| {
-            let n = &u.nodes[ni];
-            let to = node_target(u, ni);
-            n.state == UpgradeNodeState::Unable
-                && !n.not_selected
-                && !n.cur_version.is_empty()
-                && !to.is_empty()
-                && update::version_cmp(&n.cur_version, to) == std::cmp::Ordering::Less
-        })
-        .collect();
-    if let Some(&first) = behind.first() {
-        let n = &u.nodes[first];
-        let who = if n.name.is_empty() { &n.uuid } else { &n.name };
-        let why = format!(
-            "step {}/{steps} left {} node(s) behind ({}: {}); fix it and start the upgrade again",
-            step + 1,
-            behind.len(),
-            trunc_string(who, 40),
-            trunc_string(&n.reason, 60)
-        );
-        plan_stop(state, &why);
+    if step + 1 < steps {
+        let (next_bot, next_hub) = plan_step_targets(&state.plan, step + 1);
+        for ni in 0..state.upgrade.nodes.len() {
+            let n = state.upgrade.nodes[ni].clone();
+            if n.not_selected
+                || plan_left_has(&state.plan, &n.uuid)
+                || !matches!(n.state, UpgradeNodeState::Unable | UpgradeNodeState::Failed)
+            {
+                continue;
+            }
+            let is_bot = n.kind == UpgradeNodeKind::Bot;
+            if n.cur_version.is_empty() && n.state == UpgradeNodeState::Unable {
+                crate::hlog_warning!(
+                    "[UPGRADE] {} never answered step {}/{steps}; if the next step leaves it below its floor it must be upgraded by hand\n",
+                    state.who(if is_bot { 'b' } else { 'h' }, &n.uuid),
+                    step + 1
+                );
+                continue;
+            }
+            let to = node_target(&state.upgrade, ni).to_string();
+            if to.is_empty() || update::version_cmp(&n.cur_version, &to) != std::cmp::Ordering::Less
+            {
+                continue;
+            }
+            let want = if is_bot { &next_bot } else { &next_hub };
+            let final_ver = if is_bot {
+                state.plan.bot_target.clone()
+            } else {
+                state.plan.hub_target.clone()
+            };
+            let root = if is_bot {
+                update::bot_root()
+            } else {
+                String::new()
+            };
+            let variant = if !state.plan.variant.is_empty() {
+                state.plan.variant.clone()
+            } else if !n.variant.is_empty() {
+                n.variant.clone()
+            } else {
+                "c".to_string()
+            };
+            let reach = !want.is_empty()
+                && update::next_step(&root, &variant, &n.cur_version, &final_ver).is_ok_and(|v| {
+                    update::version_cmp(strip_version_v(&v), want) != std::cmp::Ordering::Less
+                });
+            if !reach {
+                let why = format!(
+                    "step {}/{steps} left {} behind on {} ({}), and the next step would lock it out",
+                    step + 1,
+                    trunc_string(if n.name.is_empty() { &n.uuid } else { &n.name }, 40),
+                    trunc_string(&n.cur_version, 20),
+                    trunc_string(&n.reason, 60)
+                );
+                plan_hold(state, &why, false, &n.uuid, &to);
+                return;
+            }
+        }
+    }
+    if !state.plan.self_target.is_empty() {
+        plan_publish(state);
+        crate::config::write(state);
         return;
     }
-    if step + 1 >= steps {
-        plan_stop(state, &format!("done: all {steps} steps completed"));
-        return;
-    }
-    state.plan.step += 1;
-    state.plan.next_at = now() + UPGRADE_PLAN_SETTLE;
-    crate::config::write(state);
-    crate::hlog_info!(
-        "[UPGRADE] Step {}/{steps} done; step {} starts in {UPGRADE_PLAN_SETTLE} s\n",
-        step + 1,
-        step + 2
-    );
+    plan_close_step(state);
 }
 
 /// Drive the plan between its steps (maintenance clock).
 fn plan_tick(state: &mut HubState, t_now: i64) {
+    plan_watch(state, t_now);
     if !state.plan.active || state.upgrade.active {
+        return;
+    }
+    if !state.plan.self_target.is_empty() {
+        // This hub restarted onto the step.  Its first link confirms it; the
+        // failback undoes it if none comes, and then this is the old build,
+        // reading this.
+        let linked = state.peers.is_empty()
+            || state
+                .peers
+                .iter()
+                .any(|p| crate::presence::peer_is_linked(state, p));
+        let same =
+            update::version_cmp(HUB_VERSION, &state.plan.self_target) == std::cmp::Ordering::Equal;
+        if same && !linked && t_now - state.plan.progressed < UPGRADE_CONFIRM_SECS as i64 {
+            return;
+        }
+        let want = std::mem::take(&mut state.plan.self_target);
+        if !same {
+            let note = update::failback_note().unwrap_or_else(|| "no reason left".to_string());
+            let why = format!(
+                "this hub is back on {HUB_VERSION}, not {want}: {}",
+                trunc_string(&note, 180)
+            );
+            plan_hold(state, &why, true, "", "");
+            return;
+        }
+        if state.plan.hold.is_empty() {
+            plan_close_step(state);
+        } else {
+            crate::config::write(state);
+        }
+        return;
+    }
+    if !state.plan.hold.is_empty() {
+        if state.plan.progressed > 0 && t_now - state.plan.progressed > UPGRADE_PLAN_TTL {
+            let why = format!(
+                "stopped at step {} of {}: {}",
+                state.plan.step + 1,
+                state.plan.steps(),
+                trunc_string(&state.plan.hold, 200)
+            );
+            plan_stop(state, &why);
+            return;
+        }
+        if !state.plan.hold_uuid.is_empty() && !state.plan.hold_ver.is_empty() {
+            let v = plan_node_version(state, &state.plan.hold_uuid);
+            if !v.is_empty()
+                && update::version_cmp(&v, &state.plan.hold_ver) != std::cmp::Ordering::Less
+            {
+                plan_continue(state, false);
+            }
+        }
         return;
     }
     if !state.plan.run_id.is_empty() {
@@ -2164,6 +3549,17 @@ fn plan_tick(state: &mut HubState, t_now: i64) {
             opt_flag_set(state, OPT_CONFIG_FROZEN, false);
         }
         state.plan.run_id.clear();
+        state.plan.reruns += 1;
+        if state.plan.reruns > UPGRADE_PLAN_RERUNS {
+            let why = format!(
+                "step {}/{} was cut off by a restart {} times",
+                state.plan.step + 1,
+                state.plan.steps(),
+                state.plan.reruns
+            );
+            plan_hold(state, &why, true, "", "");
+            return;
+        }
         state.plan.next_at = t_now + UPGRADE_PLAN_SETTLE;
         crate::config::write(state);
         return;
@@ -2180,6 +3576,48 @@ fn plan_tick(state: &mut HubState, t_now: i64) {
     if t_now < state.plan.next_at || config_frozen(state) || state.rollup.active {
         return;
     }
+    // Steps wait for the mesh, not a clock: a bot still relinking would otherwise
+    // miss the next run's table.
+    #[cfg(feature = "test-hooks")]
+    // As for the driver silence: a sandbox cannot sit out the whole wait on each step.
+    let mesh_wait = std::env::var("IRCHUB_TEST_PLAN_MESH_WAIT")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(UPGRADE_PLAN_MESH_WAIT);
+    #[cfg(not(feature = "test-hooks"))]
+    let mesh_wait = UPGRADE_PLAN_MESH_WAIT;
+    if state.plan.mesh_until == 0 {
+        state.plan.mesh_until = t_now + mesh_wait;
+    }
+    // A step starts with every hub, as the plan did.  One still gone after the wait
+    // ends the plan here; upgrade start carries on from this step later.
+    let gone = hubs_missing(state);
+    if !gone.is_empty() {
+        if t_now < state.plan.mesh_until {
+            return;
+        }
+        let why = format!(
+            "step {}/{} needs every hub; {} not linked: {}; upgrade start carries on",
+            state.plan.step + 1,
+            state.plan.steps(),
+            gone.len(),
+            trunc_string(&gone.join(", "), 319)
+        );
+        plan_stop(state, &why);
+        return;
+    }
+    let missing = plan_mesh_missing(state);
+    if missing > 0 {
+        if t_now < state.plan.mesh_until {
+            return;
+        }
+        crate::hlog_warning!(
+            "[UPGRADE] {missing} node(s) still missing after {mesh_wait} s; step {}/{} starts without them\n",
+            state.plan.step + 1,
+            state.plan.steps()
+        );
+    }
     let msg = plan_start_step(state, -1, "");
     if !msg.starts_with("OK") {
         let why = format!(
@@ -2188,7 +3626,7 @@ fn plan_tick(state: &mut HubState, t_now: i64) {
             state.plan.steps(),
             trunc_string(msg.strip_prefix("ERROR: ").unwrap_or(&msg), 140)
         );
-        plan_stop(state, &why);
+        plan_hold(state, &why, true, "", "");
     }
 }
 
@@ -2233,6 +3671,31 @@ fn plan_preview(state: &HubState, payload: &str, r: &mut Reply) {
         return;
     }
     let res = plan_compute(state, bot, hub, "", sel);
+    // What is known before anything is touched: who is who, and whether every step
+    // has a build for every host history knows the shape of.
+    if let Ok(pl) = &res {
+        for c in candidates(state) {
+            let is_bot = c.kind == UpgradeNodeKind::Bot;
+            if !is_bot && hub.is_empty() {
+                continue;
+            }
+            let p = node_past(state, &c.uuid);
+            r.rec("past");
+            r.kv("name", if c.name.is_empty() { &c.uuid } else { &c.name });
+            r.kv("class", &node_class(&p).to_string());
+            r.kvi("restart", p.restart);
+            r.kvi("stage_bin", p.stage_bin);
+            r.kvi("stage_src", p.stage_src);
+            opt(r, "code", &p.code);
+            if is_bot && plan_node_version(state, &c.uuid).is_empty() {
+                r.kvb("down", true);
+                opt(r, "last", &p.last);
+            }
+            if let Some(why) = plan_node_blocked(is_bot, &p, &node_version_now(state, &c), pl) {
+                r.kv("blocked", &why);
+            }
+        }
+    }
     r.rec("path");
     r.kv("product", "bot");
     match &res {
@@ -2285,14 +3748,377 @@ fn ops_grace(state: &mut HubState, now_ts: i64) {
             let who = state.who('\0', &n.uuid);
             let n = &mut state.upgrade.nodes[ni];
             n.state = UpgradeNodeState::Done;
+            n.done_at = now_ts;
             n.reason = "back on target; no ready report".to_string();
             crate::hlog_info!("[UPGRADE] {who} back on target; no ready report\n");
         }
     }
 }
 
+/// Production crontab lines: this hub's own, and each of its bots' orders.
+fn cron_tick(state: &mut HubState) {
+    update::cron_set(crate::revoke::cron_wanted(state, 'h', &state.hub_uuid));
+    let exe = state.executable_path.clone();
+    if update::cron_tick(&exe) {
+        state.tree_dirty = true;
+    }
+    for ci in state.bot_clients() {
+        let c = &state.clients[ci];
+        if c.retiring || c.bot_version.is_empty() {
+            continue;
+        }
+        let want = i32::from(crate::revoke::cron_wanted(state, 'b', &c.id));
+        if c.cron_sent == want + 1 {
+            continue;
+        }
+        let text = if want == 1 { "on" } else { "off" };
+        if crate::client::send_cmd_to_bot(&mut state.clients[ci], CMD_CRON_SET, text) {
+            state.clients[ci].cron_sent = want + 1;
+        }
+    }
+}
+
+/// The next bot to swap: staged (or with nothing to stage), and in class order.
+fn next_bot(u: &crate::state::PendingUpgrade) -> Option<usize> {
+    for c in ['f', 'u', 's', 'p'] {
+        if let Some(i) = u.nodes.iter().position(|n| {
+            n.state == UpgradeNodeState::Ready
+                && n.kind == UpgradeNodeKind::Bot
+                && (!n.can_stage || n.staged)
+                && (if n.cls == '\0' { 'u' } else { n.cls }) == c
+        }) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn same_build(a: &UpgradeNode, b: &UpgradeNode) -> bool {
+    a.kind == b.kind && a.variant == b.variant && a.arch == b.arch && a.libc == b.libc
+}
+
+/// No node of this build has come through yet: the next goes alone.  A problem host
+/// always goes alone.
+fn build_unproven(u: &crate::state::PendingUpgrade, ni: usize) -> bool {
+    let n = &u.nodes[ni];
+    if n.cls == 'p' {
+        return true;
+    }
+    !u.nodes
+        .iter()
+        .enumerate()
+        .any(|(i, o)| i != ni && o.state == UpgradeNodeState::Done && same_build(o, n))
+}
+
+/// Who has left the stage, and is the release itself bad?  True when the run ended.
+fn stage_watch(state: &mut HubState, t_now: i64) -> bool {
+    let mut left = 0;
+    let mut touched = 0;
+    for ni in 0..state.upgrade.nodes.len() {
+        let n = &state.upgrade.nodes[ni];
+        if !n.not_selected && n.state != UpgradeNodeState::Unable {
+            touched += 1;
+        }
+        if n.left {
+            left += 1;
+            touched += 1;
+        }
+        if n.state != UpgradeNodeState::Ready || !n.can_stage || n.staged {
+            continue;
+        }
+        let limit = if n.is_src {
+            if n.build_limit > 0 {
+                n.build_limit
+            } else {
+                UPGRADE_BUILD_SECS as i64
+            }
+        } else {
+            n.stage_limit
+        };
+        let silent =
+            n.kind != UpgradeNodeKind::SelfHub && t_now - n.stage_last > UPGRADE_STAGE_SILENCE;
+        if !silent && t_now - n.stage_sent <= limit {
+            continue;
+        }
+        let who = state.who(
+            if n.kind == UpgradeNodeKind::Bot {
+                '\0'
+            } else {
+                'h'
+            },
+            &n.uuid,
+        );
+        let id = state.upgrade.id.clone();
+        let n = &mut state.upgrade.nodes[ni];
+        n.state = UpgradeNodeState::Unable;
+        n.left = true;
+        left += 1;
+        n.stage_code = if silent { "silent" } else { "limit" }.to_string();
+        n.reason = if silent {
+            format!("stage: no word for {UPGRADE_STAGE_SILENCE} s")
+        } else {
+            format!(
+                "stage: still {} at its {limit} s limit",
+                if n.stage_phase.is_empty() {
+                    "going"
+                } else {
+                    &n.stage_phase
+                }
+            )
+        };
+        crate::hlog_warning!("[UPGRADE] {who} left run {id}: {}\n", n.reason);
+    }
+    if left >= 2 && left * 100 > touched * UPGRADE_STOP_PERCENT {
+        abort(
+            state,
+            &format!(
+                "{left} of {touched} nodes could not stage it: something is wrong beyond one host, and nothing has changed"
+            ),
+        );
+        return true;
+    }
+    false
+}
+
+/// What failures mean.  One host failing leaves the run; the rest go on.  Two on one
+/// build stop that build and undo it.  A quarter of the network stops everything, and
+/// a peer hub failing stops the hubs.  A host with a bad history counts for nothing:
+/// its failure says little about the build.  True when the run ended.
+fn weigh_failures(state: &mut HubState) -> bool {
+    let (mut failed, mut touched) = (0, 0);
+    for n in state.upgrade.nodes.iter().filter(|n| !n.not_selected) {
+        if n.state != UpgradeNodeState::Unable {
+            touched += 1;
+        }
+        if n.state == UpgradeNodeState::Failed && n.cls != 'p' {
+            failed += 1;
+        }
+    }
+    if failed >= 2 && failed * 100 > touched * UPGRADE_STOP_PERCENT {
+        abort(state, "too many nodes failed: stopping everything");
+        return true;
+    }
+    for ni in 0..state.upgrade.nodes.len() {
+        if state.upgrade.nodes[ni].state != UpgradeNodeState::Failed
+            || state.upgrade.nodes[ni].counted
+        {
+            continue;
+        }
+        state.upgrade.nodes[ni].counted = true;
+        let n = state.upgrade.nodes[ni].clone();
+        crate::hlog_warning!(
+            "[UPGRADE] {} failed: {}\n",
+            state.who(
+                if n.kind == UpgradeNodeKind::Bot {
+                    '\0'
+                } else {
+                    'h'
+                },
+                &n.uuid
+            ),
+            n.reason
+        );
+        if n.kind == UpgradeNodeKind::PeerHub {
+            state.upgrade.hubs_stopped = true;
+            for o in &mut state.upgrade.nodes {
+                if o.state == UpgradeNodeState::Ready && o.kind != UpgradeNodeKind::Bot {
+                    o.state = UpgradeNodeState::Unable;
+                    o.reason = "a peer hub failed: no more hubs move".to_string();
+                }
+            }
+            continue;
+        }
+        if n.cls == 'p' {
+            continue;
+        }
+        let same = state
+            .upgrade
+            .nodes
+            .iter()
+            .filter(|o| o.state == UpgradeNodeState::Failed && o.cls != 'p' && same_build(o, &n))
+            .count();
+        if same < 2 {
+            continue;
+        }
+        // Stop this build: nothing more of it moves, and what moved comes back.
+        state.upgrade.build_stopped = true;
+        let why = format!(
+            "{same} nodes of the {} {}/{} build failed",
+            n.variant, n.arch, n.libc
+        );
+        let id = state.upgrade.id.clone();
+        crate::hlog_warning!("[UPGRADE] {why}: stopping that build\n");
+        for ki in 0..state.upgrade.nodes.len() {
+            let o = state.upgrade.nodes[ki].clone();
+            if !same_build(&o, &n) {
+                continue;
+            }
+            if o.state == UpgradeNodeState::Ready {
+                state.upgrade.nodes[ki].state = UpgradeNodeState::Unable;
+                state.upgrade.nodes[ki].reason = why.clone();
+            } else if matches!(
+                o.state,
+                UpgradeNodeState::Done | UpgradeNodeState::Committed
+            ) {
+                if !o.via.is_empty() {
+                    if let Some(pi) = find_client_hub(state, &o.via) {
+                        queue::send_urgent(
+                            &mut state.clients[pi],
+                            CMD_UPGRADE_ABORT,
+                            &format!("{id}|{}|{why}", o.uuid),
+                        );
+                    }
+                } else if let Some(ci) = find_client(state, &o.uuid, ClientType::Bot) {
+                    client::send_cmd_to_bot(
+                        &mut state.clients[ci],
+                        CMD_UPGRADE_ABORT,
+                        &format!("{id}|{why}"),
+                    );
+                }
+                let k = &mut state.upgrade.nodes[ki];
+                k.state = UpgradeNodeState::Failed;
+                k.counted = true;
+                k.reason = format!("rolled back: {}", trunc_string(&why, 100));
+            }
+        }
+    }
+    false
+}
+
+/// CMD_UPGRADE_PROGRESS: id|uuid|phase|code|note
+/// A note of "72%", "40% 18 of 45 files" or "~60% 120 of 200 crates", while a node
+/// fetches or builds.  Anything else is no measure of how far it has got.
+fn stage_note_read(phase: &str, note: &str) -> (String, String) {
+    let none = (String::new(), String::new());
+    if phase != "fetching" && phase != "building" {
+        return none;
+    }
+    let at = usize::from(note.starts_with('~'));
+    let b = note.as_bytes();
+    let digits = b[at..]
+        .iter()
+        .take(4)
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    if digits == 0 || digits > 3 || b.get(at + digits) != Some(&b'%') {
+        return none;
+    }
+    if crate::cstr::atoll(&note[at..at + digits]) > 100 {
+        return none;
+    }
+    let rest = &note[at + digits + 1..];
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    (note[..=at + digits].to_string(), clean(rest, 48))
+}
+
+pub fn note_progress(state: &mut HubState, payload: &str) {
+    if rollup_note_progress(state, payload) {
+        return;
+    }
+    let f: Vec<&str> = payload.splitn(6, '|').collect();
+    if f.len() < 3 {
+        return;
+    }
+    let (id, uuid, phase) = (f[0], f[1], f[2]);
+    let code = f.get(3).copied().unwrap_or("");
+    let note = f.get(4).copied().unwrap_or("");
+    if !state.upgrade.active || state.upgrade.id != id {
+        return;
+    }
+    let Some(ni) = find_node(state, uuid) else {
+        return;
+    };
+    let plan_open = state.upgrade.phase == UpgradePhase::Prepare;
+    let n = &mut state.upgrade.nodes[ni];
+    if phase == "ready" {
+        n.can_stage = plan_open; // too late to stage: the old path
+        return;
+    }
+    n.stage_last = now();
+    n.stage_phase = trunc_string(phase, 16);
+    (n.stage_pct, n.stage_detail) = stage_note_read(phase, note);
+    if phase == "building" || code == "src" {
+        n.is_src = true;
+    }
+    if n.state != UpgradeNodeState::Ready {
+        return;
+    }
+    if phase == "staged" {
+        n.staged = true;
+        n.staged_at = now();
+    } else if phase == "failed" {
+        n.stage_code = trunc_string(code, 16);
+        let why = format!("{}: {note}", if code.is_empty() { "stage" } else { code });
+        n.state = UpgradeNodeState::Unable;
+        n.reason = clean(&why, 128);
+        // A signature or hash that does not hold is the release's fault, not this
+        // host's.
+        if code == "sig" || code == "hash" {
+            abort(
+                state,
+                &format!("the release is bad: {}", trunc_string(&why, 200)),
+            );
+            return;
+        }
+        n.left = true;
+        let r = n.reason.clone();
+        let who = state.who('\0', uuid);
+        crate::hlog_warning!("[UPGRADE] {who} left run {id}: {r}\n");
+    }
+}
+
+/// A hub's STAGE: on to its own bots and peers, and itself if it is in the run.
+pub fn process_peer_stage(state: &mut HubState, ci: usize, payload: &str) {
+    let id = payload.split('|').next().unwrap_or("");
+    if id.is_empty()
+        || crate::opflow::forward_seen_check_and_add(state, &format!("st:{}", trunc_string(id, 60)))
+    {
+        return;
+    }
+    for i in 0..state.clients.len() {
+        let c = &mut state.clients[i];
+        if i == ci || !c.authenticated {
+            continue;
+        }
+        if c.typ == ClientType::Bot {
+            client::send_cmd_to_bot(c, CMD_UPGRADE_STAGE, id);
+        } else if c.typ == ClientType::Hub {
+            queue::send_urgent(c, CMD_UPGRADE_STAGE, id);
+        }
+    }
+    if state.follow_id == id && state.follow_self_ready && !state.follow_hub_target.is_empty() {
+        let (ver, variant) = (
+            state.follow_hub_target.clone(),
+            state.follow_variant.clone(),
+        );
+        update::stage_start(id, &ver, &variant);
+    }
+}
+
+/// This hub's own stage: into the run it drives, or up to whoever does.
+fn stage_tick(state: &mut HubState) {
+    let Some((id, status)) = update::stage_tick() else {
+        return;
+    };
+    let payload = format!("{id}|{}|{status}", state.hub_uuid);
+    if state.follow_id == id {
+        let origin = state.follow_origin.clone();
+        if let Some(oi) = find_client_hub(state, &origin) {
+            queue::send_urgent(&mut state.clients[oi], CMD_UPGRADE_PROGRESS, &payload);
+            return;
+        }
+    }
+    note_progress(state, &payload);
+}
+
 /// One step per maintenance tick.  A no-op unless a run is active.
 pub fn tick(state: &mut HubState, now_ts: i64) {
+    // A hub with no peers to link to has nothing more to prove than being up.
+    if state.peers.is_empty() {
+        update::failback_confirm();
+    }
+    cron_tick(state);
+    stage_tick(state);
     rollup_tick(state, now_ts);
     plan_tick(state, now_ts);
     if !state.upgrade.active {
@@ -2319,12 +4145,91 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
             finish(state, UpgradePhase::Done, "no node needed the upgrade");
             return;
         }
+        // Get the build ready everywhere first, while nothing has changed.  A node
+        // that never said it can stage takes the old path at COMMIT.
+        apply_history(state);
+        let mut staging = 0;
+        let (id, hub_ver) = (state.upgrade.id.clone(), state.upgrade.hub_ver.clone());
+        for ni in 0..state.upgrade.nodes.len() {
+            let is_self = state.upgrade.nodes[ni].kind == UpgradeNodeKind::SelfHub;
+            let n = &mut state.upgrade.nodes[ni];
+            if is_self && n.state == UpgradeNodeState::Ready {
+                n.can_stage = true;
+            }
+            if n.state != UpgradeNodeState::Ready || !n.can_stage {
+                continue;
+            }
+            n.stage_sent = now_ts;
+            n.stage_last = now_ts;
+            if n.stage_limit == 0 {
+                n.stage_limit = UPGRADE_STAGE_GATE;
+            }
+            staging += 1;
+            if is_self {
+                let variant = node_variant(&state.upgrade, ni).to_string();
+                update::stage_start(&id, &hub_ver, &variant);
+            }
+        }
+        if staging > 0 {
+            crate::opflow::forward_seen_check_and_add(
+                state,
+                &format!("st:{}", trunc_string(&id, 60)),
+            );
+            for ci in 0..state.clients.len() {
+                let c = &mut state.clients[ci];
+                if !c.authenticated {
+                    continue;
+                }
+                if c.typ == ClientType::Bot {
+                    client::send_cmd_to_bot(c, CMD_UPGRADE_STAGE, &id);
+                } else if c.typ == ClientType::Hub {
+                    queue::send_urgent(c, CMD_UPGRADE_STAGE, &id);
+                }
+            }
+            state.upgrade.phase = UpgradePhase::Staging;
+            state.upgrade.phase_started = now_ts;
+            history_note(state);
+            crate::hlog_info!("[UPGRADE] Run {id} staging on {staging} node(s)\n");
+            return;
+        }
         state.upgrade.phase = UpgradePhase::Rolling;
         state.upgrade.phase_started = now_ts;
+        state.upgrade.rolling_at = now_ts;
+        history_note(state);
         crate::hlog_info!(
             "[UPGRADE] Run {} rolling: {} node(s) ready\n",
             state.upgrade.id,
             ready
+        );
+        return;
+    }
+
+    if matches!(
+        state.upgrade.phase,
+        UpgradePhase::Staging | UpgradePhase::Rolling
+    ) && stage_watch(state, now_ts)
+    {
+        return;
+    }
+    if state.upgrade.phase == UpgradePhase::Staging {
+        // A source build gets its time, but the rest of the run does not wait on it.
+        if state
+            .upgrade
+            .nodes
+            .iter()
+            .any(|n| n.state == UpgradeNodeState::Ready && n.can_stage && !n.staged && !n.is_src)
+        {
+            return;
+        }
+        state.upgrade.phase = UpgradePhase::Rolling;
+        state.upgrade.phase_started = now_ts;
+        state.upgrade.rolling_at = now_ts;
+        history_note(state);
+        crate::hlog_info!(
+            "[UPGRADE] Run {} rolling: {} node(s) ready, {} staged\n",
+            state.upgrade.id,
+            count(state, UpgradeNodeState::Ready, None),
+            state.upgrade.nodes.iter().filter(|n| n.staged).count()
         );
         return;
     }
@@ -2335,25 +4240,31 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
 
     ops_grace(state, now_ts);
 
-    // A committed node that never came back fails the whole run: the rest of
-    // the mesh must not keep marching onto a build that does not come up.  A
-    // node already seen back is governed by the grace above instead.
-    let stalled = state.upgrade.nodes.iter().position(|n| {
-        n.state == UpgradeNodeState::Committed
-            && n.back_at == 0
-            && now_ts - n.committed_at > UPGRADE_COMMIT_TIMEOUT
-    });
-    if let Some(ni) = stalled {
+    // A committed node that did not come back has failed.  A staged one had only a
+    // swap to do; one that took the old path may still be fetching.  If it turns up
+    // later on the target, the record says so.  Whether the run goes on is decided
+    // below: one bad host must not roll back a healthy network.
+    for ni in 0..state.upgrade.nodes.len() {
+        let n = &state.upgrade.nodes[ni];
+        if n.state != UpgradeNodeState::Committed || n.back_at != 0 {
+            continue;
+        }
+        let limit = if n.staged {
+            UPGRADE_SWAP_BACK
+        } else {
+            UPGRADE_COMMIT_TIMEOUT
+        };
+        if now_ts - n.committed_at <= limit {
+            continue;
+        }
         let target = node_target(&state.upgrade, ni).to_string();
-        let uuid = state.upgrade.nodes[ni].uuid.clone();
         let node = &mut state.upgrade.nodes[ni];
         node.state = UpgradeNodeState::Failed;
+        node.done_at = now_ts;
+        node.stage_code = "late".to_string();
         node.reason = format!("did not return on {target} in time");
-        abort(state, &format!("{uuid} did not come back on {target}"));
-        return;
     }
-    if count(state, UpgradeNodeState::Failed, None) > 0 {
-        abort(state, "a node reported the upgrade failed");
+    if weigh_failures(state) {
         return;
     }
 
@@ -2372,16 +4283,29 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
             )
             + count(state, UpgradeNodeState::Done, Some(UpgradeNodeKind::Bot));
         let wave = (touched / UPGRADE_BOT_WAVE_DIVISOR).clamp(1, UPGRADE_BOT_WAVE_MAX);
-        for ni in 0..state.upgrade.nodes.len() {
+        // A source build still staging holds no one else up, only the hubs after.
+        for _ in 0..state.upgrade.nodes.len() {
             if in_flight >= wave {
                 break;
             }
-            let n = &state.upgrade.nodes[ni];
-            if n.state != UpgradeNodeState::Ready || n.kind != UpgradeNodeKind::Bot {
-                continue;
+            let Some(ni) = next_bot(&state.upgrade) else {
+                break;
+            };
+            // Each build's first node goes alone: a bad build costs one restart.
+            let alone = build_unproven(&state.upgrade, ni);
+            if alone && in_flight > 0 {
+                break;
             }
             if commit_node(state, ni) {
                 in_flight += 1;
+            } else {
+                // a refused commit leaves the node out of the run
+                if state.upgrade.nodes[ni].state == UpgradeNodeState::Ready {
+                    break;
+                }
+            }
+            if alone {
+                break;
             }
         }
         return;
@@ -2397,6 +4321,16 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
     // goes after every peer hub: it restarts last and its run table goes
     // with it.
     if in_flight > 0 {
+        return;
+    }
+    // A hub still staging is waited for: order matters here, and the ring relies on
+    // the deepest going first.
+    if state.upgrade.nodes.iter().any(|n| {
+        n.state == UpgradeNodeState::Ready
+            && n.can_stage
+            && !n.staged
+            && n.kind != UpgradeNodeKind::Bot
+    }) {
         return;
     }
     let ready =
@@ -2427,12 +4361,31 @@ pub fn tick(state: &mut HubState, now_ts: i64) {
         .iter()
         .filter(|n| n.state == UpgradeNodeState::Unable && !n.not_selected)
         .count();
-    let done_msg = format!(
-        "{} node(s) now on the target, {} could not take it",
-        count(state, UpgradeNodeState::Done, None),
-        unable
+    let failed = count(state, UpgradeNodeState::Failed, None);
+    let partial = failed > 0 || state.upgrade.build_stopped;
+    let done_msg = if partial {
+        format!(
+            "{} node(s) now on the target, {} could not take it, {} failed",
+            count(state, UpgradeNodeState::Done, None),
+            unable,
+            failed
+        )
+    } else {
+        format!(
+            "{} node(s) now on the target, {} could not take it",
+            count(state, UpgradeNodeState::Done, None),
+            unable
+        )
+    };
+    finish(
+        state,
+        if partial {
+            UpgradePhase::Partial
+        } else {
+            UpgradePhase::Done
+        },
+        &done_msg,
     );
-    finish(state, UpgradePhase::Done, &done_msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -2761,6 +4714,13 @@ pub fn peer_prepare(state: &mut HubState, ci: usize, payload: &str) {
     }
 
     answer_ready(state, ci, &id, ready, &why, relayed);
+    // A frame an older driver drops: this hub can get a build ready before COMMIT.
+    if ready {
+        let pr = format!("{id}|{}|ready|", state.hub_uuid);
+        if let Some(c) = state.clients.get_mut(ci) {
+            queue::send_urgent(c, CMD_UPGRADE_PROGRESS, &pr);
+        }
+    }
 }
 
 /// A frame this hub is only relaying: an answer from somewhere below it in the
@@ -2971,7 +4931,7 @@ pub fn peer_abort(state: &mut HubState, ci: usize, payload: &str) {
     crate::hlog_info!(
         "[UPGRADE] Abort {id} from {}{}{}: {reason}\n",
         state.who_client(ci),
-        if uuid.is_empty() { "" } else { " for bot " },
+        if uuid.is_empty() { "" } else { " for " },
         state.who('b', &uuid)
     );
 
@@ -2991,10 +4951,22 @@ pub fn peer_abort(state: &mut HubState, ci: usize, payload: &str) {
         return;
     }
 
+    // Whether it names this hub or nobody, the run is over here: a staged build
+    // must not stay behind.
+    update::stage_clear();
     state.follow_id.clear();
     state.follow_prepared = 0;
     state.follow_self_ready = false;
-    state.follow_routes.clear();
+    // The routes stay until the next PREPARE: the driver's aborts for the nodes behind
+    // this hub may still be on their way, and they travel by this table.
+    // Only the run that installed the build we are running may take it back.  A hub
+    // still staging never moved, and its <exe>.prev is the build from before an
+    // earlier, completed run: going back to it would walk a healthy hub off the
+    // version the rest of the mesh is on.
+    if id != state.upgrade_installed_id {
+        answer_result(state, ci, &id, "aborted", "this hub did not move");
+        return;
+    }
     // A successful rollback execs; the driver sees the old version reappear.
     if !update::rollback(state, &reason) {
         answer_result(
@@ -3029,6 +5001,7 @@ pub fn report_pending(state: &mut HubState, ci: usize) {
     let Some((id, want, want_variant)) = update::take_pending() else {
         return;
     };
+    state.upgrade_installed_id = id.clone();
     let host = update::host_variant();
     let ok = update::version_cmp(HUB_VERSION, &want) == std::cmp::Ordering::Equal
         && (want_variant.is_empty() || want_variant == host);
@@ -3042,9 +5015,10 @@ pub fn report_pending(state: &mut HubState, ci: usize) {
     );
     let status = if ok { "ok" } else { "version-mismatch" };
     let detail = if ok {
+        update::failback_confirm();
         String::new()
     } else {
-        format!("wanted {wanted}")
+        update::failback_note().unwrap_or_else(|| format!("wanted {wanted}"))
     };
     answer_result(state, ci, &id, status, &detail);
 }
@@ -3183,6 +5157,19 @@ pub fn status(state: &HubState, r: &mut Reply) {
         }
     }
     r.kvb("frozen", config_frozen(state));
+    if !state.uhist.is_empty() {
+        r.kvi("keep", crate::uhist::keep(state) as i64);
+    }
+    // The roll-ups are outside history, so what each node's last one did is here.
+    for t in state.rollup_tries.iter().filter(|t| !t.note.is_empty()) {
+        r.rec("rolled");
+        r.kv("uuid", &t.uuid);
+        r.kv("name", &state.who('\0', &t.uuid));
+        r.kv("step", &t.step);
+        r.kvi("tries", i64::from(t.tries));
+        r.kvi("when", t.last_try);
+        r.kv("note", &t.note);
+    }
     // The roll-up plan this hub holds, if any: what a bot that comes back is
     // walked up to, until an admin's "forget" drops it.
     let ru = &state.rollup;
@@ -3197,10 +5184,28 @@ pub fn status(state: &HubState, r: &mut Reply) {
     }
     // A multi-step upgrade: the whole path, where it is, and — once it has
     // stopped — why (kept until this hub restarts).
-    let pl = &state.plan;
+    // Not this hub's to drive: what its driver last said, or why it stopped.
+    let sp = &state.splan;
+    let pl = if !state.plan.active
+        && !sp.single
+        && (sp.active || !sp.summary.is_empty())
+        && sp.started >= state.plan.started
+    {
+        &state.splan
+    } else {
+        &state.plan
+    };
     if pl.active || !pl.summary.is_empty() {
         r.rec("plan");
         r.kvb("active", pl.active);
+        if !pl.driver.is_empty() {
+            r.kv("driver", &pl.driver);
+            if pl.driver != state.hub_uuid {
+                r.kv("driver_name", &state.who('h', &pl.driver));
+                r.kvi("heard", state.splan_seen);
+            }
+        }
+        opt(r, "hold", &pl.hold);
         r.kvi("step", pl.step as i64 + 1);
         r.kvi("steps", pl.steps() as i64);
         r.kv("bot_final", &pl.bot_target);
@@ -3214,7 +5219,9 @@ pub fn status(state: &HubState, r: &mut Reply) {
         if pl.active {
             r.kv(
                 "state",
-                if pl.run_id.is_empty() {
+                if !pl.hold.is_empty() {
+                    "held"
+                } else if pl.run_id.is_empty() {
                     "waiting"
                 } else {
                     "running"
@@ -3227,6 +5234,13 @@ pub fn status(state: &HubState, r: &mut Reply) {
         r.kvi("started", pl.started);
         opt(r, "summary", &pl.summary);
     }
+    status_nodes(state, r);
+    crate::uhist::reply_runs(state, r);
+}
+
+/// The current run's node table, if this hub holds one.
+fn status_nodes(state: &HubState, r: &mut Reply) {
+    let u = &state.upgrade;
     if u.id.is_empty() {
         return;
     }
@@ -3273,6 +5287,47 @@ pub fn status(state: &HubState, r: &mut Reply) {
         if !n.reason.is_empty() {
             r.kv("reason", &n.reason);
         }
+        opt(r, "code", &n.stage_code);
+        if n.cls != '\0' {
+            r.kv("class", &n.cls.to_string());
+        }
+        // Where it is in the run, and for how long.
+        let t = now();
+        if n.state == UpgradeNodeState::Ready && n.can_stage && u.active {
+            r.kv(
+                "phase",
+                if n.staged {
+                    "staged"
+                } else if !n.stage_phase.is_empty() {
+                    &n.stage_phase
+                } else {
+                    "staging"
+                },
+            );
+            if !n.staged && !n.stage_pct.is_empty() {
+                r.kv("pct", &n.stage_pct);
+                if !n.stage_detail.is_empty() {
+                    r.kv("detail", &n.stage_detail);
+                }
+            }
+            if n.stage_sent > 0 {
+                r.kvi(
+                    "secs",
+                    (if n.staged_at > 0 { n.staged_at } else { t }) - n.stage_sent,
+                );
+            }
+        } else if n.left {
+            r.kv("phase", "left");
+        } else if n.committed_at > 0 {
+            let end = if n.back_at > 0 {
+                n.back_at
+            } else if n.done_at > 0 {
+                n.done_at
+            } else {
+                t
+            };
+            r.kvi("secs", end - n.committed_at);
+        }
         // idle: a hub a bots-only run never moves (it only relays the run to
         // its bots).  already: a node that declined because it already runs
         // the target build -- a no-op, not a failure.
@@ -3291,11 +5346,38 @@ pub fn status(state: &HubState, r: &mut Reply) {
             r.kvb("already", true);
         }
     }
+    // The kept runs, under the current one (view 4 and `upgrade status`).
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The director's name rides as field 27; a 26-field line still parses, and a
+    /// name that would not pass is sent empty rather than keeping the plan off the wire.
+    #[test]
+    fn plan_line_carries_driver_name() {
+        let mut p = UpgradePlan {
+            active: true,
+            bot_target: "3.0.2".into(),
+            bot_path: vec!["3.0.0".into(), "3.0.2".into()],
+            driver: "d-uuid".into(),
+            driver_name: "tnhub1".into(),
+            started: 100,
+            ..Default::default()
+        };
+        let line = plan_format(&p).expect("formats");
+        assert_eq!(line.split('|').count(), 27);
+        let back = plan_parse(&line).expect("parses");
+        assert_eq!(back.driver_name, "tnhub1");
+        let old: Vec<&str> = line.split('|').take(26).collect();
+        let back = plan_parse(&old.join("|")).expect("26 fields parse");
+        assert!(back.driver_name.is_empty());
+        p.driver_name = "bad name;x".into();
+        let line = plan_format(&p).expect("still formats");
+        assert!(line.ends_with('|'));
+        assert!(plan_parse(&format!("{line}a b")).is_none());
+    }
 
     /// A driver mid-PREPARE for run "r1".
     fn driver() -> HubState {
@@ -3350,10 +5432,27 @@ mod tests {
     fn late_ready_is_never_committed() {
         let mut s = driver();
         s.upgrade.phase = UpgradePhase::Rolling;
+        // The hub it sits behind may be restarting: it stays out.
+        s.upgrade.nodes.push(UpgradeNode {
+            uuid: "eb04".to_string(),
+            state: UpgradeNodeState::Committed,
+            kind: UpgradeNodeKind::PeerHub,
+            ..UpgradeNode::default()
+        });
         note_ready(&mut s, "r1|bot-7209|2.4.3|rs|x86_64|musl|1|", Some("eb04"));
         let n = node(&s, "bot-7209");
         assert_eq!(n.state, UpgradeNodeState::Unable);
         assert!(n.reason.starts_with("answered after the plan was fixed"));
+    }
+
+    #[test]
+    fn late_ready_joins_the_old_way() {
+        let mut s = driver();
+        s.upgrade.phase = UpgradePhase::Rolling;
+        note_ready(&mut s, "r1|bot-7|2.4.3|rs|x86_64|musl|1|", Some("peer-a"));
+        let n = node(&s, "bot-7");
+        assert_eq!(n.state, UpgradeNodeState::Ready);
+        assert!(!n.can_stage);
     }
 
     #[test]

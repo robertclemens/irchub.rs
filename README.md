@@ -162,6 +162,10 @@ crontab -e
 
 Replace `/full/path/to/irchub` with the absolute path to the binary. irchub always works in its own directory, whatever directory it is started from: `.irchub.cnf`, `.irchub.pass`, `.irchub.pid`, `.irchub.log` and `hub_upgrade.sh` live beside the binary, so no `cd` is needed. Run one binary per hub, in a directory owned by you and not writable by group or others — irchub refuses to start otherwise.
 
+During a hub-driven upgrade, the node adds one temporary line to its own user's crontab, tagged `# irchub:failback:<dir>:`, where `<dir>` is the directory holding the binary. It restores the previous build if the new one never proves itself, even after a reboot, and is removed along with its script (`.upgrade.failback`) once the upgrade settles, at most about 40 minutes later (about 65 for a source build). If `crontab` is missing or unreadable, the upgrade goes ahead without this cover and logs that it did.
+
+A node can also keep a permanent keepalive line, tagged `# irchub:production:<dir>:`. This is off unless an admin turns it on from a hub with `bot set cron` or `hub set cron`, for every node (`global`) or one; the last command wins. It needs the `.pass` file. The node only ever changes its own tagged lines, and `bot del` removes a bot's. An upgrade leaves the line in place: a start while an upgrade installs exits quietly.
+
 ## Admin Console
 
 The hub serves an SSH console on its **own listening port** (the first bytes of a connection tell SSH apart from bots and peers). There is no system `sshd`, no OS account and no password: you log in with the admin record's **name** and its **key**.

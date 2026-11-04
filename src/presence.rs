@@ -113,10 +113,82 @@ pub fn peer_is_linked(state: &HubState, p: &PeerConfig) -> bool {
 /// Upsert one reported bot.  Keyed on (reporting hub, bot) so the same bot
 /// briefly reported by two hubs mid-migration shows up once per hub rather
 /// than flapping — the stale one expires on its own.
+/// A bot has one hub link at a time: entries for it under any other hub than
+/// `keep_hub` that linked before `since` describe where it was.  `since` 0 drops
+/// them all (the bot is linked here now).
+pub fn roster_evict_moved(state: &mut HubState, bot_uuid: &str, keep_hub: &str, since: i64) {
+    let mut i = 0;
+    while i < state.roster.len() {
+        let e = &state.roster[i];
+        if e.bot_uuid == bot_uuid
+            && e.hub_uuid != keep_hub
+            && (since == 0 || (e.link_since > 0 && e.link_since < since))
+        {
+            crate::hlog_debug!(
+                "[PRESENCE] {} moved off {}\n",
+                state.who('b', &e.bot_uuid),
+                state.who('h', &e.hub_uuid)
+            );
+            state.roster.swap_remove(i);
+            state.tree_dirty = true;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Every chunk 0..`last_chunk` of hub `mi`'s round has been applied: its bots the
+/// round did not list have left it.
+fn roster_round_done(state: &mut HubState, mi: usize, last_chunk: u32) {
+    if last_chunk >= 64 {
+        return;
+    }
+    let all = if last_chunk == 63 {
+        u64::MAX
+    } else {
+        (1u64 << (last_chunk + 1)) - 1
+    };
+    let (uuid, round) = {
+        let h = &state.mesh_hubs[mi];
+        if h.chunks_seen & all != all {
+            return;
+        }
+        (h.uuid.clone(), h.round)
+    };
+    let mut i = 0;
+    while i < state.roster.len() {
+        let e = &state.roster[i];
+        if e.hub_uuid == uuid && e.round != round {
+            crate::hlog_debug!(
+                "[PRESENCE] {} left {}\n",
+                state.who('b', &e.bot_uuid),
+                state.who('h', &e.hub_uuid)
+            );
+            state.roster.swap_remove(i);
+            state.tree_dirty = true;
+            continue;
+        }
+        i += 1;
+    }
+}
+
 fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
     // A deleted bot, reported by a hub that has not heard yet.
     if crate::revoke::is_revoked(state, &incoming.bot_uuid) {
         return;
+    }
+    // Linked here since before that report: it is where the bot was.
+    if incoming.link_since > 0
+        && state.bot_clients().into_iter().any(|ci| {
+            state.clients[ci].id == incoming.bot_uuid
+                && incoming.link_since <= state.clients[ci].connected_at
+        })
+    {
+        return;
+    }
+    if incoming.link_since > 0 {
+        let (b, h) = (incoming.bot_uuid.clone(), incoming.hub_uuid.clone());
+        roster_evict_moved(state, &b, &h, incoming.link_since);
     }
     if let Some(i) = state
         .roster
@@ -151,18 +223,19 @@ fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
 /// process_bot_presence(): this bot just told us what it is running.  Per
 /// connection and volatile.
 pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
-    // "<version>|<server>|<started>|<variant>" — a short, fixed shape.  The
+    // "<version>|<server>|<started>|<variant>[|<cron>]" — a short, fixed shape.  The
     // variant (code base, c / rs) is the newest field; a bot that predates it
     // sends three and simply shows no code base.  Anything longer than the
     // field caps is truncated by roster_clean, never rejected, so a newer bot
     // advertising more never drops off the tree entirely.
     let work = trunc_string(
         payload,
-        ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + ROSTER_VARIANT_MAX + 64,
+        ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + ROSTER_VARIANT_MAX + CRON_STATUS_MAX + 64,
     );
     let mut version_src = work.as_str();
     let mut server = String::new();
     let mut variant = String::new();
+    let mut cron = String::new();
     let mut started = 0i64;
     if let Some(p1) = work.find('|') {
         version_src = &work[..p1];
@@ -173,8 +246,9 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
                 started = atoll(tail);
                 if let Some(p3) = tail.find('|') {
                     // Room for fields after it: stop at the next '|'.
-                    let v = tail[p3 + 1..].split('|').next().unwrap_or("");
-                    variant = roster_clean(v, ROSTER_VARIANT_MAX + 1);
+                    let mut more = tail[p3 + 1..].split('|');
+                    variant = roster_clean(more.next().unwrap_or(""), ROSTER_VARIANT_MAX + 1);
+                    cron = roster_clean(more.next().unwrap_or(""), CRON_STATUS_MAX + 1);
                 }
                 &rest[..p2]
             }
@@ -227,6 +301,11 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
     c.bot_server = server.clone();
     c.bot_variant = variant.clone();
     c.bot_started = started;
+    let cron_changed = c.bot_cron != cron;
+    c.bot_cron = cron;
+    if cron_changed {
+        state.tree_dirty = true;
+    }
 
     if changed {
         let id = state.who_client(ci);
@@ -241,7 +320,7 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
             }
         );
         roster_mark_dirty(state, true);
-        state.last_presence_gossip = 0; // gossip the change on the next tick
+        presence_event(state); // gossip the change now, damped
     }
 
     // A committed node coming back on the target version is the authoritative
@@ -250,6 +329,7 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
     let uuid = state.clients[ci].id.clone();
     upgrade::note_presence(state, &uuid, &version, &variant);
     upgrade::rollup_note_presence(state, &uuid, UpgradeNodeKind::Bot, &version);
+    upgrade::prepare_late(state, ci, &version);
 
     // If this hub is following a run another hub drives, a local bot
     // reappearing on the followed target is that bot's authoritative success:
@@ -328,7 +408,8 @@ fn roster_send_to_peers(
                 continue;
             }
         }
-        let Some(m) = QueuedMsg::new(CMD_BOT_ROSTER, Lane::Bulk, frame.as_bytes()) else {
+        // Ahead of bulk syncs: after a heal the link list must not wait behind one.
+        let Some(m) = QueuedMsg::new(CMD_BOT_ROSTER, Lane::Delta, frame.as_bytes()) else {
             continue;
         };
         if !queue::enqueue(&mut state.clients[ci], m) {
@@ -342,9 +423,9 @@ fn roster_send_to_peers(
 
 /// Start one gossip frame: the header lines every frame repeats, the relay
 /// line, and — on the first chunk only — this hub's peer links.
-fn roster_frame_begin(state: &HubState, round: i64, chunk: u32) -> String {
+fn roster_frame_begin(state: &HubState, round: i64, chunk: u32, last: bool) -> String {
     let mut f = format!(
-        "h|{}|{}|{}|{HUB_VERSION}\nv|{HUB_UPDATE_VARIANT}\ng|{round}|{chunk}|{ROSTER_RELAY_HOPS}\n",
+        "h|{}|{}|{}|{HUB_VERSION}\nv|{HUB_UPDATE_VARIANT}\ng|{round}|{chunk}|{ROSTER_RELAY_HOPS}|{}\n",
         if state.hub_uuid.is_empty() {
             "-"
         } else {
@@ -355,8 +436,14 @@ fn roster_frame_begin(state: &HubState, round: i64, chunk: u32) -> String {
         } else {
             &state.hub_friendly_name
         },
-        state.hub_started
+        state.hub_started,
+        i32::from(last)
     );
+    // A line of its own, like v|: older hubs skip a line they do not know.
+    let cron = crate::update::cron_status();
+    if !cron.is_empty() {
+        f.push_str(&format!("c|{cron}\n"));
+    }
     if chunk != 0 {
         return f;
     }
@@ -387,7 +474,8 @@ fn roster_frame_begin(state: &HubState, round: i64, chunk: u32) -> String {
 /// ```text
 /// h|<hub_uuid>|<name>|<started>|<hub_version>
 /// v|<hub_variant>                          (this hub's code base: c / rs)
-/// g|<round>|<chunk>|<ttl>                    (relay control, see below)
+/// g|<round>|<chunk>|<ttl>|<last>             (relay control, see below; last=1 on
+///                                            the round's final chunk)
 /// l|<peer_uuid>|<peer_name>|<online>       (first chunk only, per peer)
 /// b|<bot_uuid>|<nick>|<version>|<server>|<started>|<variant>
 /// ```
@@ -403,23 +491,17 @@ fn roster_frame_begin(state: &HubState, round: i64, chunk: u32) -> String {
 /// (origin, round, chunk) passes it on with ttl-1, so every hub hears every
 /// other hub however the peers are wired.  l| is what lets a receiver draw
 /// the mesh deeper than its own peers.
-fn gossip_bot_roster(state: &mut HubState) {
-    if state.peers.is_empty() {
-        return;
-    }
-    let now_ts = now();
-    // Generations only ever grow, across restarts too (wall-clock based), so
-    // a receiver can tell a new round from a late copy of an old one.
-    let round = (now_ts * 1000).max(state.roster_gen + 1);
-    state.roster_gen = round;
-
+/// One gossip round, chunked: its frames, the one numbered `total`-1 marked last
+/// (`None` only counts them).  None if a header cannot fit.
+fn roster_round(state: &HubState, round: i64, total: Option<usize>) -> Option<Vec<String>> {
+    let is_last = |chunk: u32| total == Some(chunk as usize + 1);
+    let mut out = Vec::new();
     let mut chunk = 0u32;
-    let mut frame = roster_frame_begin(state, round, chunk);
+    let mut frame = roster_frame_begin(state, round, chunk, is_last(chunk));
     if frame.len() >= ROSTER_FRAME_BUDGET {
-        return;
+        return None;
     }
     let mut rows = 0;
-    let mut frames = 0;
 
     for ci in state.bot_clients() {
         let c = &state.clients[ci];
@@ -432,7 +514,7 @@ fn gossip_bot_roster(state: &mut HubState) {
             // 7th field: when the bot linked to this hub; 8th: the bot's
             // address as this hub sees it (a hub that predates either stops
             // reading before it).
-            "b|{}|{}|{}|{}|{}|{}|{}|{}\n",
+            "b|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
             c.id,
             if nick.is_empty() { "-" } else { &nick },
             if c.bot_version.is_empty() {
@@ -452,18 +534,24 @@ fn gossip_bot_roster(state: &mut HubState) {
                 &c.bot_variant
             },
             c.connected_at,
-            if c.ip.is_empty() { "-" } else { &c.ip }
+            if c.ip.is_empty() { "-" } else { &c.ip },
+            if c.bot_cron.is_empty() {
+                "-"
+            } else {
+                &c.bot_cron
+            }
         );
-        if row.len() >= TREE_ROW_MAX {
+        if row.len() >= TREE_ROW_MAX + CRON_STATUS_MAX + 16 {
             continue; // an unrepresentable row
         }
         if frame.len() + row.len() >= ROSTER_FRAME_BUDGET && rows > 0 {
             // Full: flush and start the next chunk.
             chunk += 1;
-            let next = roster_frame_begin(state, round, chunk);
-            let f = std::mem::replace(&mut frame, next);
-            roster_send_to_peers(state, &f, None, None);
-            frames += 1;
+            let next = roster_frame_begin(state, round, chunk, is_last(chunk));
+            if next.len() >= ROSTER_FRAME_BUDGET {
+                return None;
+            }
+            out.push(std::mem::replace(&mut frame, next));
             rows = 0;
         }
         if frame.len() + row.len() >= ROSTER_FRAME_BUDGET {
@@ -476,15 +564,41 @@ fn gossip_bot_roster(state: &mut HubState) {
     // Always send a final frame, even carrying no bots: the header doubles as
     // this hub's liveness and uptime beacon, which is what lets a peer show
     // an empty hub in the tree with a real uptime instead of a blank.
-    if rows > 0 || frames == 0 {
-        roster_send_to_peers(state, &frame, None, None);
+    if rows > 0 || out.is_empty() {
+        out.push(frame);
     }
-    state.last_presence_gossip = now_ts;
+    Some(out)
 }
 
+/// Gossip the bots connected to THIS hub out to the peers, as one round: the
+/// receivers drop this hub's bots the round no longer lists (see roster_round_done).
+fn gossip_bot_roster(state: &mut HubState) {
+    if state.peers.is_empty() {
+        return;
+    }
+    let now_ts = now();
+    // Generations only ever grow, across restarts too (wall-clock based), so
+    // a receiver can tell a new round from a late copy of an old one.
+    let round = (now_ts * 1000).max(state.roster_gen + 1);
+    state.roster_gen = round;
+    let total = roster_round(state, round, None).map_or(0, |f| f.len());
+    if total > 0
+        && let Some(frames) = roster_round(state, round, Some(total))
+    {
+        for f in frames {
+            roster_send_to_peers(state, &f, None, None);
+        }
+    }
+    state.last_presence_gossip = now_ts;
+    state.presence_event_due = false;
+}
+
+/// The g| relay control of a roster frame: `(round, chunk, ttl, last)`.
+type RosterRelay = (i64, u32, i32, bool);
+
 /// The relay control of a roster frame: origin uuid and start time from its
-/// h| line, and `(round, chunk, ttl)` from its g| line if it has one.
-fn roster_frame_peek(payload: &str) -> (String, i64, Option<(i64, u32, i32)>) {
+/// h| line, and `(round, chunk, ttl, last)` from its g| line if it has one.
+fn roster_frame_peek(payload: &str) -> (String, i64, Option<RosterRelay>) {
     let mut origin = String::new();
     let mut started = 0;
     let mut g = None;
@@ -504,6 +618,7 @@ fn roster_frame_peek(payload: &str) -> (String, i64, Option<(i64, u32, i32)>) {
                     atoll(f[0]),
                     atoll(f[1]).clamp(0, u32::MAX as i64) as u32,
                     atoll(f[2]).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                    f.get(3).is_some_and(|l| l.starts_with('1')),
                 ));
             }
         }
@@ -512,11 +627,11 @@ fn roster_frame_peek(payload: &str) -> (String, i64, Option<(i64, u32, i32)>) {
 }
 
 /// The same frame with its g| ttl replaced, for the next hop.
-fn roster_frame_rettl(payload: &str, round: i64, chunk: u32, ttl: i32) -> String {
+fn roster_frame_rettl(payload: &str, round: i64, chunk: u32, ttl: i32, last: bool) -> String {
     let mut out = String::with_capacity(payload.len() + 8);
     for line in payload.split('\n').filter(|l| !l.is_empty()) {
         if line.starts_with("g|") {
-            out.push_str(&format!("g|{round}|{chunk}|{ttl}\n"));
+            out.push_str(&format!("g|{round}|{chunk}|{ttl}|{}\n", i32::from(last)));
         } else {
             out.push_str(line);
             out.push('\n');
@@ -542,7 +657,7 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
         return; // our own gossip, back around a cycle
     }
     let mh = mesh_hub_get(state, &origin);
-    if let (Some((round, chunk, _)), Some(mi)) = (g, mh) {
+    if let (Some((round, chunk, _, _)), Some(mi)) = (g, mh) {
         let h = &mut state.mesh_hubs[mi];
         // A restarted origin starts its generations over from its clock, so a
         // new start time resets the window rather than reading as stale.
@@ -564,13 +679,13 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
         h.chunks_seen |= bit;
     }
     let relay = match (g, mh) {
-        (Some((round, chunk, ttl)), Some(_)) if ttl > 1 && ttl <= ROSTER_RELAY_HOPS => {
-            let r = roster_frame_rettl(payload, round, chunk, ttl - 1);
+        (Some((round, chunk, ttl, last)), Some(_)) if ttl > 1 && ttl <= ROSTER_RELAY_HOPS => {
+            let r = roster_frame_rettl(payload, round, chunk, ttl - 1, last);
             (r.len() <= ROSTER_FRAME_BUDGET + 64).then_some(r)
         }
         _ => None,
     };
-    let first_chunk = matches!(g, Some((_, 0, _)));
+    let first_chunk = matches!(g, Some((_, 0, _, _)));
     let mut links_reset = false;
     // The link list this frame replaces: re-rendering every bot's tree is
     // only worth it when the list really changed, not on every gossip round.
@@ -683,6 +798,17 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
             upgrade::note_presence(state, &hub_uuid, &hub_ver, "");
             continue;
         }
+        if let Some(v) = line.strip_prefix("c|") {
+            // The production crontab line of the hub whose h| header opened it.
+            let hc = roster_clean(v, CRON_STATUS_MAX + 1);
+            if let Some(m) = state.mesh_hubs.iter_mut().find(|m| m.uuid == hub_uuid)
+                && m.cron != hc
+            {
+                m.cron = hc;
+                state.tree_dirty = true;
+            }
+            continue;
+        }
         if let Some(v) = line.strip_prefix("v|") {
             // The code base of the hub whose h| header this frame opened with.
             if hub_uuid.is_empty() || hub_uuid == "-" {
@@ -719,6 +845,7 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 old_links = h.have_links.then(|| std::mem::take(&mut h.links));
                 h.links.clear();
                 h.have_links = true;
+                h.links_at = now_ts;
                 links_reset = true;
             }
             let f: Vec<&str> = body.split('|').collect();
@@ -754,7 +881,7 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
         // Five fields from any hub; a sixth (the bot's code base), a seventh
         // (when it linked to that hub) and an eighth (its address) from one
         // that knows them.
-        let f = crate::cstr::split_fields(body, 8);
+        let f = crate::cstr::split_fields(body, 9);
         if f.len() < 5 || f[0].is_empty() {
             continue;
         }
@@ -785,6 +912,11 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 String::new()
             } else {
                 roster_clean(f[5], ROSTER_VARIANT_MAX + 1)
+            },
+            cron: if f.len() < 9 || f[8] == "-" {
+                String::new()
+            } else {
+                roster_clean(f[8], CRON_STATUS_MAX + 1)
             },
             server: if f[3] == "-" {
                 String::new()
@@ -817,8 +949,15 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 _ => String::new(),
             },
             reported_at: now_ts,
+            round: match g {
+                Some((round, ..)) if mh.is_some() && hub_uuid == origin => round,
+                _ => 0,
+            },
         };
         roster_upsert(state, e);
+    }
+    if let (Some((_, chunk, _, true)), Some(mi)) = (g, mh) {
+        roster_round_done(state, mi, chunk);
     }
 
     if let Some(mi) = mh.filter(|_| links_reset)
@@ -865,7 +1004,7 @@ pub fn build_tree(state: &HubState) -> String {
     // tree that says the same thing is then the same bytes, and an unchanged
     // tree is not pushed again (push_tree_to_bots).
     let mut out = format!(
-        "H|0|{}|{}|1|0|{HUB_VERSION}|{HUB_UPDATE_VARIANT}|{}\n",
+        "H|0|{}|{}|1|0|{HUB_VERSION}|{HUB_UPDATE_VARIANT}|{}|{}\n",
         if state.hub_friendly_name.is_empty() {
             "hub"
         } else {
@@ -876,7 +1015,11 @@ pub fn build_tree(state: &HubState) -> String {
         } else {
             &state.hub_uuid
         },
-        state.hub_started
+        state.hub_started,
+        {
+            let c = crate::update::cron_status();
+            if c.is_empty() { "-".to_string() } else { c }
+        }
     );
     if out.len() >= max_len {
         return String::new();
@@ -890,7 +1033,7 @@ pub fn build_tree(state: &HubState) -> String {
         let c = &state.clients[ci];
         let nick = bot_nick_from_config(state, &c.id);
         out.push_str(&format!(
-            "B|1|{}|{}|{}|{}|0|{}|{}\n",
+            "B|1|{}|{}|{}|{}|0|{}|{}|{}\n",
             if nick.is_empty() { "-" } else { &nick },
             c.id,
             if c.bot_version.is_empty() {
@@ -908,7 +1051,12 @@ pub fn build_tree(state: &HubState) -> String {
             } else {
                 &c.bot_variant
             },
-            c.bot_started
+            c.bot_started,
+            if c.bot_cron.is_empty() {
+                "-"
+            } else {
+                &c.bot_cron
+            }
         ));
     }
 
@@ -1027,14 +1175,19 @@ pub fn build_tree(state: &HubState) -> String {
             }
         }
         out.push_str(&format!(
-            "H|{}|{}|{}|{}|0|{}|{}|{}\n",
+            "H|{}|{}|{}|{}|0|{}|{}|{}|{}\n",
             t.depth,
             if t.name.is_empty() { "peer" } else { &t.name },
             if puuid.is_empty() { "-" } else { puuid },
             i32::from(t.online),
             if ver.is_empty() { "-" } else { ver },
             if var.is_empty() { "-" } else { var },
-            started
+            started,
+            state
+                .mesh_hubs
+                .iter()
+                .find(|m| m.uuid == puuid && !m.cron.is_empty())
+                .map_or("-", |m| m.cron.as_str())
         ));
 
         if !puuid.is_empty() {
@@ -1043,7 +1196,7 @@ pub fn build_tree(state: &HubState) -> String {
                     break;
                 }
                 out.push_str(&format!(
-                    "B|{}|{}|{}|{}|{}|0|{}|{}\n",
+                    "B|{}|{}|{}|{}|{}|0|{}|{}|{}\n",
                     t.depth + 1,
                     if e.nick.is_empty() { "-" } else { &e.nick },
                     e.bot_uuid,
@@ -1058,7 +1211,8 @@ pub fn build_tree(state: &HubState) -> String {
                     } else {
                         &e.variant
                     },
-                    e.connected_at
+                    e.connected_at,
+                    if e.cron.is_empty() { "-" } else { &e.cron }
                 ));
             }
         }
@@ -1147,6 +1301,21 @@ fn push_tree_to_bots(state: &mut HubState, force: bool) {
 /// BOT_PRESENCE_INTERVAL and pushes a refreshed tree down to the bots when
 /// the roster changed (or every BOT_TREE_REFRESH regardless, so a bot that
 /// missed a frame — or connected between changes — still converges).
+/// How long event gossip holds after `burst` event gossips in a row: 1, 2, 4, 8,
+/// 16, then PRESENCE_HOLD_MAX seconds.
+pub fn presence_hold(burst: i32) -> i64 {
+    if burst >= 5 {
+        return PRESENCE_HOLD_MAX;
+    }
+    (1i64 << burst.max(0)).min(PRESENCE_HOLD_MAX)
+}
+
+/// A bot linked or left, or a peer link changed: gossip it as soon as the damping
+/// allows (presence_tick).
+pub fn presence_event(state: &mut HubState) {
+    state.presence_event_due = true;
+}
+
 pub fn presence_tick(state: &mut HubState, now_ts: i64) {
     if state.hub_started == 0 {
         state.hub_started = now_ts;
@@ -1169,8 +1338,15 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
             state.resync_due_at = now_ts + SYNC_RESYNC_AFTER_LINK_LOSS;
         }
         state.gossip_link_mask = mask;
-        state.last_presence_gossip = 0;
+        presence_event(state);
+        // Once more shortly: the first round can go out on a duplicate link the
+        // far end then closes (both ends dialled).
+        state.gossip_again_at = now_ts + PRESENCE_LINK_REGOSSIP;
         state.tree_dirty = true;
+    }
+    if state.gossip_again_at != 0 && now_ts >= state.gossip_again_at {
+        state.gossip_again_at = 0;
+        presence_event(state);
     }
     if state.resync_due_at != 0 && now_ts >= state.resync_due_at {
         state.resync_due_at = 0;
@@ -1179,6 +1355,18 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
 
     if now_ts - state.last_presence_gossip >= BOT_PRESENCE_INTERVAL {
         gossip_bot_roster(state);
+    } else if state.presence_event_due && now_ts >= state.presence_hold_until {
+        gossip_bot_roster(state);
+        // Damping: an event gossip close on the last one doubles the next hold.
+        state.presence_burst = if state.presence_last_event != 0
+            && now_ts - state.presence_last_event < PRESENCE_FLAP_WINDOW
+        {
+            state.presence_burst + 1
+        } else {
+            0
+        };
+        state.presence_last_event = now_ts;
+        state.presence_hold_until = now_ts + presence_hold(state.presence_burst);
     }
 
     // Push on change (only to bots whose tree it changes), with an
@@ -1328,8 +1516,8 @@ mod tests {
     fn relay_rewrites_only_the_ttl() {
         let f = "h|far|Far|0|2.4.1\ng|7|0|16\nb|x|-|-|-|0\n";
         assert_eq!(
-            roster_frame_rettl(f, 7, 0, 15),
-            "h|far|Far|0|2.4.1\ng|7|0|15\nb|x|-|-|-|0\n"
+            roster_frame_rettl(f, 7, 0, 15, true),
+            "h|far|Far|0|2.4.1\ng|7|0|15|1\nb|x|-|-|-|0\n"
         );
     }
 
@@ -1408,6 +1596,95 @@ mod tests {
         assert_eq!(roster_clean("a\u{7f}b", 32), "ab");
         // cap is the C buffer size, so cap-1 bytes survive.
         assert_eq!(roster_clean("abcdef", 4), "abc");
+    }
+
+    #[test]
+    fn presence_hold_doubles_to_the_cap() {
+        let holds: Vec<i64> = (0..8).map(presence_hold).collect();
+        assert_eq!(holds, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(presence_hold(-1), 1);
+    }
+
+    #[test]
+    fn presence_events_are_damped_and_coalesced() {
+        let mut s = HubState::new();
+        s.hub_uuid = "me".into();
+        s.peers.push(PeerConfig {
+            uuid: "p".into(),
+            ..Default::default()
+        });
+        let t = now();
+        s.hub_started = t;
+        s.last_presence_gossip = t; // no periodic round due
+        s.last_tree_push = t;
+        presence_event(&mut s);
+        presence_tick(&mut s, t);
+        assert!(!s.presence_event_due, "the first event goes at once");
+        assert_eq!(s.presence_hold_until, t + 1);
+        presence_event(&mut s);
+        presence_event(&mut s);
+        presence_tick(&mut s, t);
+        assert!(s.presence_event_due, "inside the hold: waits, coalesced");
+        presence_tick(&mut s, t + 1);
+        assert!(!s.presence_event_due);
+        assert_eq!(s.presence_hold_until, t + 1 + 2, "a burst doubles the hold");
+        // A quiet window resets it.
+        let q = t + 1 + PRESENCE_FLAP_WINDOW;
+        s.last_presence_gossip = q;
+        presence_event(&mut s);
+        presence_tick(&mut s, q);
+        assert_eq!(s.presence_hold_until, q + 1);
+    }
+
+    fn row(hub: &str, bot: &str, since: i64, round: i64) -> BotRoster {
+        BotRoster {
+            hub_uuid: hub.into(),
+            bot_uuid: bot.into(),
+            link_since: since,
+            reported_at: now(),
+            round,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_complete_round_drops_the_bots_it_no_longer_lists() {
+        let mut s = HubState::new();
+        s.mesh_hubs.push(MeshHub {
+            uuid: "h1".into(),
+            round: 20,
+            chunks_seen: 0b11,
+            ..Default::default()
+        });
+        s.roster.push(row("h1", "kept", 0, 20));
+        s.roster.push(row("h1", "left", 0, 10));
+        s.roster.push(row("h2", "other", 0, 10));
+        roster_round_done(&mut s, 0, 2);
+        assert_eq!(s.roster.len(), 3, "chunk 2 not seen yet: nothing goes");
+        roster_round_done(&mut s, 0, 1);
+        let mut left: Vec<&str> = s.roster.iter().map(|e| e.bot_uuid.as_str()).collect();
+        left.sort_unstable();
+        assert_eq!(left, vec!["kept", "other"]);
+    }
+
+    #[test]
+    fn a_bot_that_moved_hubs_is_shown_on_the_new_one_only() {
+        let mut s = HubState::new();
+        s.roster.push(row("old", "b", 100, 1));
+        roster_upsert(&mut s, row("new", "b", 200, 1));
+        assert_eq!(s.roster.len(), 1);
+        assert_eq!(s.roster[0].hub_uuid, "new");
+        // A late report from where it was does not evict the newer one.
+        roster_upsert(&mut s, row("old", "b", 100, 2));
+        assert!(s.roster.iter().any(|e| e.hub_uuid == "new"));
+        // Unknown link times keep today's behaviour.
+        roster_upsert(&mut s, row("third", "b", 0, 1));
+        assert!(s.roster.iter().any(|e| e.hub_uuid == "third"));
+        roster_evict_moved(&mut s, "b", "me", 0);
+        assert!(
+            s.roster.is_empty(),
+            "linked here now: every other entry goes"
+        );
     }
 
     #[test]
@@ -1512,7 +1789,7 @@ mod tests {
         // tree built later is the same bytes.
         assert_eq!(
             lines[0],
-            format!("H|0|Me|me|1|0|{HUB_VERSION}|{HUB_UPDATE_VARIANT}|1700000000")
+            format!("H|0|Me|me|1|0|{HUB_VERSION}|{HUB_UPDATE_VARIANT}|1700000000|-")
         );
         assert_eq!(lines[1], "D|offbot|bot-1|4242");
     }

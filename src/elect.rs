@@ -133,17 +133,28 @@ fn try_local(state: &mut HubState, ei: usize) -> bool {
                 MAX_MASK_LEN + 256,
             )
         } else {
+            let ban = e.kind == "ban";
             trunc_string(
                 &format!(
                     "{}|{}|{}|{}|{}|{}",
-                    e.id, e.kind, e.channel, e.requester, e.nick, e.hostmask
+                    e.id,
+                    e.kind,
+                    e.channel,
+                    e.requester,
+                    if ban && e.nick.is_empty() {
+                        "*"
+                    } else {
+                        &e.nick
+                    },
+                    e.hostmask
                 ),
                 MAX_MASK_LEN + 256,
             )
         };
         let uuid = e.bots[bi].uuid.clone();
         state.chan_elections[ei].bots[bi].st = b't';
-        let mode = state.chan_elections[ei].kind == "mode";
+        // mode and ban act on records the bot must hold first (C|/c|, B|)
+        let mode = matches!(state.chan_elections[ei].kind.as_str(), "mode" | "ban");
         let sent = match bot(state, &uuid) {
             Some(ci) if mode => client::send_cmd_to_bot_after_config(state, ci, CMD_CHAN_DO, &act),
             Some(ci) => client::send_cmd_to_bot(&mut state.clients[ci], CMD_CHAN_DO, &act),
@@ -197,6 +208,8 @@ fn kind_word(kind: &str) -> &'static str {
         "invite" => "invite",
         "unban" => "unban",
         "mode" => "mode",
+        "kick" => "kick",
+        "ban" => "ban",
         _ => "key",
     }
 }
@@ -218,10 +231,17 @@ fn finish(
     let hubs = 1 + e.hubs.len() as i64;
     let ok = status == "ok";
     let bitch = status == "bitch";
-    let who = if e.nick.is_empty() {
-        &e.requester
-    } else {
+    // a kick's target not in the channel, or a bot / authorised member: the
+    // answer is about the nick, so no other bot was tried
+    let absent = status == "absent";
+    let prot = status == "protected";
+    let ban = e.kind == "ban";
+    let who = if !e.nick.is_empty() {
         &e.nick
+    } else if ban && !e.hostmask.is_empty() {
+        &e.hostmask
+    } else {
+        &e.requester
     };
     let kw = kind_word(&e.kind);
     if bitch {
@@ -229,6 +249,17 @@ fn finish(
             "[CHANREQ] {kw} {who} on {} (id:{}): refused, not authorised and +bitch is on\n",
             e.channel,
             e.id
+        );
+    } else if absent || prot {
+        crate::hlog_info!(
+            "[CHANREQ] {kw} {who} on {} (id:{}): refused, {}\n",
+            e.channel,
+            e.id,
+            if absent {
+                "not in the channel"
+            } else {
+                "a bot or an authorised member"
+            }
         );
     } else if ok {
         crate::hlog_info!(
@@ -298,7 +329,74 @@ fn finish(
     } else {
         None
     };
-    if let (Some(ai), true) = (admin, bitch) {
+    if let (Some(ai), true) = (admin, ban) {
+        // ban add / channel ban: the ban is stored whatever happened; the
+        // answer says whether one bot set it now (placed) or why not (the
+        // bots' sweep keeps trying)
+        let mut r = Reply::new();
+        r.ok("ban.added");
+        r.kv("chan", &e.channel);
+        r.kv("mask", &e.hostmask);
+        r.kvi("expires", e.ban_expires);
+        r.kvb("sticky", e.ban_sticky);
+        r.kv("reason", &e.ban_reason);
+        r.kvb("existed", e.ban_existed);
+        r.kvi("bots", crate::admin::local_bot_count(state));
+        r.kvi("peers", linked_peer_count(state));
+        r.kvb("placed", ok);
+        if status == "dynamic" {
+            r.kvb("dynamic", true);
+        }
+        if ok {
+            r.kv("by", if by_nick.is_empty() { by_uuid } else { by_nick });
+            r.kv("by_uuid", by_uuid);
+            r.kv("hub_name", hub_name);
+            if !detail.is_empty() {
+                r.kv("detail", detail);
+            }
+        } else {
+            let mut why = reasons(&e, 160);
+            if status == "dynamic" {
+                why = "+dynamicbans: it goes on while someone it matches is there".into();
+            }
+            if why.is_empty() && !detail.is_empty() {
+                why = detail.to_string();
+            }
+            if why.is_empty() {
+                why = "no bot is in the channel and opped".into();
+            }
+            r.kv("why", &why);
+        }
+        r.kvi("asked", asked);
+        r.kvi("hubs", hubs);
+        send_reply(state, ai, &mut r);
+    } else if let (Some(ai), true) = (admin, absent || prot) {
+        let (msg, hint) = if absent {
+            (
+                format!(
+                    "{} is not in {}",
+                    crate::cstr::trunc(&e.nick, 32),
+                    crate::cstr::trunc(&e.channel, 65)
+                ),
+                "check the nick: the bots see the channel's members",
+            )
+        } else {
+            (
+                format!(
+                    "{} is a bot or an authorised user in {}",
+                    crate::cstr::trunc(&e.nick, 32),
+                    crate::cstr::trunc(&e.channel, 65)
+                ),
+                "the bots never kick their own or a known user",
+            )
+        };
+        let code = if absent {
+            "channel.not_present"
+        } else {
+            "channel.protected"
+        };
+        admin_err(state, ai, code, &msg, Some(hint));
+    } else if let (Some(ai), true) = (admin, bitch) {
         // A bot answered fail|bitch: the nick is not authorised on a +bitch
         // channel (D12).  Deterministic for that nick, so no other bot is
         // tried.
@@ -326,6 +424,9 @@ fn finish(
             r.kv("hub_name", hub_name);
             if !detail.is_empty() {
                 r.kv("detail", detail);
+            }
+            if e.kind == "kick" {
+                r.kv("reason", &e.hostmask);
             }
             r.kvi("asked", asked);
             r.kvi("hubs", hubs);
@@ -562,6 +663,18 @@ pub fn process_probe_ack(state: &mut HubState, ci: usize, payload: &str) {
     }
 }
 
+/// A failure that is about the target, not the bot: no other bot is tried.
+/// A ban's "dynamic": +dynamicbans keeps a non-sticky ban off the channel
+/// while no member it matches is there.
+fn final_fail(e: &ChanElect, detail: &str) -> bool {
+    match e.kind.as_str() {
+        "op" => detail == "bitch",
+        "kick" => detail == "absent" || detail == "protected",
+        "ban" => detail == "dynamic",
+        _ => false,
+    }
+}
+
 /// The bot we handed the action to reports: eid|ok|detail or eid|fail|detail.
 pub fn process_done(state: &mut HubState, ci: usize, payload: &str) {
     let id = wire_field(payload, 0, 64).unwrap_or_default();
@@ -592,12 +705,13 @@ pub fn process_done(state: &mut HubState, ci: usize, payload: &str) {
         }
         return;
     }
-    // fail|bitch: not authorised on a +bitch channel.  The answer is about
-    // the nick, not the bot, so it ends the election (D12).
-    if status == "fail" && clean == "bitch" && state.chan_elections[ei].kind == "op" {
+    // fail|bitch: not authorised on a +bitch channel (D12); a kick's
+    // fail|absent / fail|protected.  The answer is about the nick, not the
+    // bot, so it ends the election.
+    if status == "fail" && final_fail(&state.chan_elections[ei], &clean) {
         if state.chan_elections[ei].origin {
             let hn = hub_display_name(state).to_string();
-            finish(state, ei, "bitch", &from, &nick, &hn, &clean);
+            finish(state, ei, &clean, &from, &nick, &hn, &clean);
         } else {
             done_up(state, ei, &from, &nick, "fail", &clean);
             state.chan_elections[ei].phase = ChanElectPhase::Acked;
@@ -628,7 +742,11 @@ pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
         return;
     };
     if id.is_empty()
-        || !(chan_kind_valid(&kind) || kind == "op" || kind == "mode")
+        || !(chan_kind_valid(&kind)
+            || kind == "op"
+            || kind == "mode"
+            || kind == "kick"
+            || kind == "ban")
         || !(channel.starts_with('#') || channel.starts_with('&'))
     {
         crate::hlog_warning!("[CHANREQ] Malformed CHAN_ELECT_FWD from peer fd={fd}\n");
@@ -778,14 +896,12 @@ pub fn process_elect_done(state: &mut HubState, _ci: usize, payload: &str) {
             &cn,
             &roster_clean(&detail, 96),
         );
-    } else if status == "fail"
-        && roster_clean(&detail, 96) == "bitch"
-        && state.chan_elections[ei].kind == "op"
+    } else if status == "fail" && final_fail(&state.chan_elections[ei], &roster_clean(&detail, 96))
     {
         finish(
             state,
             ei,
-            "bitch",
+            &roster_clean(&detail, 96),
             &roster_clean(&bot_uuid, 64),
             &roster_clean(&nick, MAX_NICK),
             &cn,

@@ -1225,8 +1225,9 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
         CMD_BOT_PRESENCE => presence::process_bot_presence(state, ci, payload),
         CMD_ACTIVITY => crate::activity::process(state, ci, payload),
         CMD_ACTIVITY_QUERY => crate::activity::process_query(state, ci, payload),
-        CMD_UPGRADE_READY => upgrade::bot_report(state, CMD_UPGRADE_READY, payload),
-        CMD_UPGRADE_RESULT => upgrade::bot_report(state, CMD_UPGRADE_RESULT, payload),
+        CMD_UPGRADE_READY => upgrade::bot_report(state, ci, CMD_UPGRADE_READY, payload),
+        CMD_UPGRADE_RESULT => upgrade::bot_report(state, ci, CMD_UPGRADE_RESULT, payload),
+        CMD_UPGRADE_PROGRESS => upgrade::bot_report(state, ci, CMD_UPGRADE_PROGRESS, payload),
         CMD_CONFIG_PUSH => process_bot_config_push(state, ci, payload),
         CMD_CONFIG_PULL => {
             crate::hlog_debug!("[HUB] Config PULL request from {}\n", state.who_client(ci));
@@ -1433,6 +1434,8 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str, eph: &[u8; 32]) 
     // If this process is the product of an upgrade this peer drove, close that
     // run out now that there is a peer to tell.
     upgrade::report_pending(state, ci);
+    crate::uhist::send_digest(state, ci);
+    crate::upgrade::plan_send_digest(state, ci);
     state.clients[ci].id = trunc_string(
         if !state.peers[pi].friendly_name.is_empty() {
             &state.peers[pi].friendly_name
@@ -1543,6 +1546,8 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         CMD_OP_FORWARD_FAILED => opflow::process_forward_op_failed(state, payload),
         CMD_BOT_RELAY_FWD => process_peer_bot_relay(state, ci, payload),
         CMD_ACTIVITY => crate::activity::process(state, ci, payload),
+        CMD_UPGRADE_HISTORY => crate::uhist::process(state, ci, payload),
+        CMD_UPGRADE_PLAN => upgrade::plan_process(state, ci, payload),
         CMD_UPGRADE_FORGET => upgrade::peer_forget(state, ci, payload),
         CMD_CHAN_FWD_REQUEST => opflow::process_forward_chan_request(state, ci, payload),
         CMD_CHAN_FWD_REPLY => opflow::process_forward_chan_reply(state, ci, payload),
@@ -1569,9 +1574,16 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         }
         CMD_UPGRADE_RESULT => {
             if !upgrade::relay_upstream(state, ci, CMD_UPGRADE_RESULT, payload) {
+                upgrade::result_relay(state, Some(ci), payload);
                 upgrade::note_result(state, payload);
             }
         }
+        CMD_UPGRADE_PROGRESS => {
+            if !upgrade::relay_upstream(state, ci, CMD_UPGRADE_PROGRESS, payload) {
+                upgrade::note_progress(state, payload);
+            }
+        }
+        CMD_UPGRADE_STAGE => upgrade::process_peer_stage(state, ci, payload),
         // v3: per-bot independent keys.  A peer-forwarded bot rekey would
         // carry a private key, so it is rejected.
         CMD_PEER_REKEY_BOT => crate::hlog_warning!(

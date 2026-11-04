@@ -23,10 +23,24 @@ struct Gsetting {
     max: i32,
 }
 
-const GSET: &[Gsetting] = &[Gsetting {
-    name: "autopurge",
-    max: 36500,
-}];
+const GSET: &[Gsetting] = &[
+    Gsetting {
+        name: "autopurge",
+        max: 36500,
+    },
+    Gsetting {
+        name: "upgradehistory",
+        max: MAX_UPGRADE_HISTORY as i32,
+    },
+    Gsetting {
+        name: "botcron",
+        max: 1,
+    },
+    Gsetting {
+        name: "hubcron",
+        max: 1,
+    },
+];
 const _: () = assert!(GSET.len() <= HUB_GSETTINGS_MAX);
 
 fn gs_find(name: &str) -> Option<&'static Gsetting> {
@@ -36,6 +50,9 @@ fn gs_find(name: &str) -> Option<&'static Gsetting> {
 fn gs_get(state: &HubState, name: &str) -> (i32, i64) {
     match name {
         "autopurge" => (state.purge_days_setting, state.purge_days_ts),
+        "upgradehistory" => (state.uhist_keep_setting, state.uhist_keep_ts),
+        "botcron" => (state.bot_cron_setting, state.bot_cron_ts),
+        "hubcron" => (state.hub_cron_setting, state.hub_cron_ts),
         _ => (0, 0),
     }
 }
@@ -44,7 +61,120 @@ fn gs_put(state: &mut HubState, name: &str, v: i32, ts: i64) {
     if name == "autopurge" {
         state.purge_days_setting = v;
         state.purge_days_ts = ts;
+    } else if name == "upgradehistory" {
+        state.uhist_keep_setting = v;
+        state.uhist_keep_ts = ts;
+    } else if name == "botcron" {
+        state.bot_cron_setting = v;
+        state.bot_cron_ts = ts;
+    } else if name == "hubcron" {
+        state.hub_cron_setting = v;
+        state.hub_cron_ts = ts;
     }
+}
+
+// ---- Production crontab settings ------------------------------------------
+//
+// A single node's setting travels as an hs| line of its own name,
+// cr.<b|h>.<uuid>, and is compared the same way.  A node follows whichever is
+// newer, its own or the global one; in the same second its own wins.
+
+fn cron_global(state: &HubState, kind: char) -> (i32, i64) {
+    if kind == 'h' {
+        (state.hub_cron_setting, state.hub_cron_ts)
+    } else {
+        (state.bot_cron_setting, state.bot_cron_ts)
+    }
+}
+
+/// hub_cron_wanted().
+pub fn cron_wanted(state: &HubState, kind: char, uuid: &str) -> bool {
+    let (global, gts) = cron_global(state, kind);
+    match state
+        .cron_recs
+        .iter()
+        .find(|r| r.kind == kind && r.uuid == uuid)
+    {
+        Some(r) if r.ts >= gts => r.on != 0,
+        _ => global != 0,
+    }
+}
+
+/// hub_cron_prune(): single-node settings a newer global one has replaced.
+pub fn cron_prune(state: &mut HubState, kind: char) {
+    let gts = cron_global(state, kind).1;
+    state.cron_recs.retain(|r| r.kind != kind || r.ts >= gts);
+}
+
+fn cron_rec_put(state: &mut HubState, kind: char, uuid: &str, on: i32, ts: i64) -> Option<bool> {
+    if ts < cron_global(state, kind).1 {
+        return Some(false); // replaced by a newer global setting
+    }
+    let i = state
+        .cron_recs
+        .iter()
+        .position(|r| r.kind == kind && r.uuid == uuid);
+    match i {
+        None => {
+            if state.cron_recs.len() >= MAX_CRON_RECS {
+                return None;
+            }
+            state.cron_recs.push(crate::state::CronRec {
+                uuid: uuid.to_string(),
+                kind,
+                on,
+                ts,
+            });
+        }
+        Some(i) => {
+            let r = &mut state.cron_recs[i];
+            if ts < r.ts || (ts == r.ts && on <= r.on) {
+                return Some(false);
+            }
+            r.on = on;
+            r.ts = ts;
+        }
+    }
+    state.config_dirty = true;
+    Some(true)
+}
+
+/// hub_cron_set_one(): an admin's command for one node.  The line for the peers.
+pub fn cron_set_one(state: &mut HubState, kind: char, uuid: &str, on: bool) -> Option<String> {
+    let gts = cron_global(state, kind).1;
+    let last = state
+        .cron_recs
+        .iter()
+        .find(|r| r.kind == kind && r.uuid == uuid)
+        .map_or(gts, |r| r.ts.max(gts));
+    let ts = lww_next_ts(last);
+    let v = i32::from(on);
+    cron_rec_put(state, kind, uuid, v, ts)?;
+    Some(format!("hs|cr.{kind}.{uuid}|{v}|{ts}\n"))
+}
+
+fn cron_ingest(state: &mut HubState, name: &str, after: &str) -> Option<bool> {
+    let kind = name.as_bytes().get(3).map(|b| *b as char)?;
+    if (kind != 'b' && kind != 'h') || name.as_bytes().get(4) != Some(&b'.') {
+        return None;
+    }
+    let uuid = &name[5..];
+    if uuid.is_empty()
+        || uuid.len() >= 64
+        || !uuid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    let (v, n) = cstr::strtoll(after);
+    if n == 0 || !after[n..].starts_with('|') || !(0..=1).contains(&v) {
+        return None;
+    }
+    let ts_s = &after[n + 1..];
+    let (ts, m) = cstr::strtoll(ts_s);
+    if m == 0 || m != ts_s.len() || ts <= 0 || crate::state::ts_ahead(ts) {
+        return None;
+    }
+    cron_rec_put(state, kind, uuid, v as i32, ts)
 }
 
 /// hub_gsetting_format(): `hs|<name>|<value>|<ts>\n`, or None for an unknown
@@ -64,6 +194,7 @@ pub fn gsetting_set(state: &mut HubState, name: &str, value: i32) -> bool {
     let (_, ts) = gs_get(state, g.name);
     gs_put(state, g.name, value, lww_next_ts(ts));
     state.config_dirty = true;
+    crate::uhist::trim(state);
     true
 }
 
@@ -71,6 +202,9 @@ pub fn gsetting_set(state: &mut HubState, name: &str, value: i32) -> bool {
 /// not parse or names a setting this hub does not have, else whether it won.
 pub fn gsetting_ingest(state: &mut HubState, rest: &str) -> Option<bool> {
     let p1 = rest.find('|')?;
+    if rest.starts_with("cr.") && rest.is_char_boundary(5) && p1 > 5 {
+        return cron_ingest(state, &rest[..p1], &rest[p1 + 1..]);
+    }
     let g = gs_find(&rest[..p1])?;
     let after = &rest[p1 + 1..];
     let (v, n) = cstr::strtoll(after);
@@ -87,6 +221,12 @@ pub fn gsetting_ingest(state: &mut HubState, rest: &str) -> Option<bool> {
     if ts > cur_ts || (ts == cur_ts && v > cur) {
         gs_put(state, g.name, v, ts);
         state.config_dirty = true;
+        crate::uhist::trim(state);
+        if g.name == "botcron" {
+            cron_prune(state, 'b');
+        } else if g.name == "hubcron" {
+            cron_prune(state, 'h');
+        }
         return Some(true);
     }
     Some(false)
@@ -101,6 +241,9 @@ pub fn gsetting_append(state: &HubState, out: &mut String) {
         {
             out.push_str(&l);
         }
+    }
+    for r in &state.cron_recs {
+        out.push_str(&format!("hs|cr.{}.{}|{}|{}\n", r.kind, r.uuid, r.on, r.ts));
     }
 }
 

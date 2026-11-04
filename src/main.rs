@@ -314,6 +314,8 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
     // If this process is the product of an upgrade a peer drove, close that
     // run out now that there is a peer to tell (no-op otherwise).
     upgrade::report_pending(state, ci);
+    irchub::uhist::send_digest(state, ci);
+    irchub::upgrade::plan_send_digest(state, ci);
 
     // Send a full config sync immediately via the BULK queue.  The queue
     // enforces a per-peer byte budget (BULK_SOFT_BUDGET_BPS) so the
@@ -501,6 +503,7 @@ fn maintenance(state: &mut HubState) {
         if !state.peers.is_empty() {
             let full_sync = mesh::generate_sync_packet(state);
             mesh::broadcast_sync_to_peers(state, &full_sync, -1);
+            irchub::uhist::digest_all(state);
         }
     }
 
@@ -1092,6 +1095,8 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
         let _ = fs::remove_file(HUB_PID_FILE);
         return 1;
     }
+    irchub::uhist::boot(&mut state);
+    irchub::upgrade::plan_boot(&mut state);
     drop(password);
     logging::set_levels(state.log_level, state.console_log_level);
     logging::set_max_size(state.log_max_size);
@@ -1529,6 +1534,11 @@ fn main() {
         std::process::exit(identity(password));
     }
 
+    if irchub::update::install_in_progress() {
+        eprintln!("An upgrade is installing here; not starting");
+        return;
+    }
+    irchub::update::stage_boot_clean();
     daemonize();
 
     // A stop signal sets the flag; the poll loop notices within its 250 ms

@@ -340,7 +340,10 @@ pub const CMD_CHAN_FWD_REPLY: u8 = 0x5D;
 //              is a reserved slot, always 0 and never read)
 //   ELECT_DO   hub->hub  eid|hub_uuid|elect
 //   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
-// kind = op / invite / unban / key; requester = a bot uuid, or ADMIN.
+// kind = op / invite / unban / key / mode / kick / ban; requester = a bot
+// uuid, or ADMIN.  kick: nick = the target, hostmask = the reason (may be
+// empty).  ban: hostmask = the mask, nick empty on the hubs and "*" in DO
+// (the bot's DO parser needs a field there).
 pub const CMD_CHAN_PROBE: u8 = 0x6D;
 pub const CMD_CHAN_PROBE_ACK: u8 = 0x6E;
 pub const CMD_CHAN_DO: u8 = 0x6F;
@@ -409,6 +412,20 @@ pub const CMD_ADMIN_PEER_REFS: u8 = 0x82;
 /// HUB_LINK_SEQ_VERSION or newer without having offered is dropped (a stripped
 /// offer).  2.5.3 drops the old framing.
 pub const CMD_LINK_SEQ: u8 = 0x83;
+/// channel kick (2.5.3): console -> hub "nick|#chan|reason"; one elected bot
+/// kicks (CMD_CHAN_PROBE kind "kick", the reason riding the hostmask slot).
+pub const CMD_ADMIN_KICK_USER: u8 = 0x84;
+/// Hub<->hub: `R|<body>` one upgrade history record, `D|keep|id:rev:started,...`
+/// what the sender holds.  See `uhist`.
+pub const CMD_UPGRADE_HISTORY: u8 = 0x87;
+/// Hub -> all: id, get the build ready while the old one runs.
+pub const CMD_UPGRADE_STAGE: u8 = 0x88;
+/// node -> Hub: id|uuid|phase|code|note.
+pub const CMD_UPGRADE_PROGRESS: u8 = 0x89;
+/// Hub <-> Hub: P|plan, D|started|rev, B|started|rev|ts, C|started|ts.
+pub const CMD_UPGRADE_PLAN: u8 = 0x8A;
+/// Hub -> Bot: on|off, its production crontab line.
+pub const CMD_CRON_SET: u8 = 0x8B;
 pub const HUB_LINK_AAD_LEN: usize = 13;
 pub const HUB_LINK_SEQ_VERSION: &str = "2.5.2";
 /// Review 7: ephemeral keys of the HUBv3 hellos accepted in the last
@@ -454,6 +471,8 @@ pub const CMD_UPGRADE_PREPARE: u8 = 0x5E;
 pub const CMD_UPGRADE_READY: u8 = 0x5F;
 pub const CMD_UPGRADE_COMMIT: u8 = 0x60;
 pub const CMD_UPGRADE_RESULT: u8 = 0x61;
+/// Longest UPGRADE_RESULT passed between hubs.
+pub const UPGRADE_RESULT_RELAY_MAX: usize = 640;
 pub const CMD_UPGRADE_ABORT: u8 = 0x62;
 pub const CMD_ADMIN_UPGRADE_NET: u8 = 0x63;
 pub const CMD_ADMIN_UPGRADE_STATUS: u8 = 0x64;
@@ -648,6 +667,16 @@ pub const MAX_UPGRADE_STEPS: usize = 16;
 pub const UPGRADE_PLAN_SETTLE: i64 = 60;
 /// A plan with no progress for this long is dropped.
 pub const UPGRADE_PLAN_TTL: i64 = 86400;
+/// How long a next step waits for the mesh to relink.
+pub const UPGRADE_PLAN_MESH_WAIT: i64 = 300;
+/// A step cut off this often goes on hold.
+pub const UPGRADE_PLAN_RERUNS: i32 = 3;
+/// Nodes one plan remembers leaving behind; then it holds again.
+pub const MAX_PLAN_LEFT: usize = 12;
+/// The driver says it is alive this often.
+pub const UPGRADE_PLAN_BEAT: i64 = 60;
+/// Then another hub takes the plan over.
+pub const UPGRADE_DRIVER_SILENCE: i64 = 900;
 /// An `upgrade abort` is re-sent to every peer link that comes up for this
 /// long, so a planner restarting onto a step when it was typed still gets it.
 pub const UPGRADE_CANCEL_HOLD: i64 = 600;
@@ -774,6 +803,10 @@ pub const USER_ACCESS_RECORDS_MAX: usize =
 pub const RV_LINE_MAX: usize = 256;
 /// hs|<name>|<value>|<ts>
 pub const HS_LINE_MAX: usize = 96;
+/// Single-node cron settings: hs|cr.<b|h>.<uuid>.
+pub const MAX_CRON_RECS: usize = 128;
+/// yes, silent, manual, no, failed:<why>.
+pub const CRON_STATUS_MAX: usize = 31;
 /// hs| settings the registry may hold.
 pub const HUB_GSETTINGS_MAX: usize = 8;
 /// hl|<addr>/<fp>,...: the hubs a bot dials, pushed by the bot, stored as its
@@ -787,7 +820,8 @@ pub const HL_VALUE_MAX: usize = HL_ENTRIES_MAX * (HL_ADDR_MAX + 1 + HL_FP_LEN + 
 /// b|<uuid>|hl|<value>|<ts>
 pub const HL_LINE_MAX: usize = HL_VALUE_MAX + 64;
 /// What rv| and hs| add to a bulk payload at their caps.
-pub const REVOKE_RECORDS_MAX: usize = MAX_REVOKED * RV_LINE_MAX + HUB_GSETTINGS_MAX * HS_LINE_MAX;
+pub const REVOKE_RECORDS_MAX: usize =
+    MAX_REVOKED * RV_LINE_MAX + (HUB_GSETTINGS_MAX + MAX_CRON_RECS) * HS_LINE_MAX;
 pub const PAYLOAD_SLACK: usize = 8192;
 
 /// Bot config payload (`storage::generate_bot_payload`): globals + users +
@@ -822,8 +856,20 @@ pub const MAX_SYNC_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
 pub const ROLLUP_LINE_MAX: usize = 1536;
 /// The persisted multi-step plan (see `UpgradePlan`): `uplan|` + the fixed
 /// fields, both paths (MAX_UPGRADE_STEPS versions each) and the selection.
-pub const PLAN_LINE_MAX: usize = 512 + 2 * MAX_UPGRADE_STEPS * 65 + MAX_UPGRADE_SELECT * 80;
+pub const PLAN_LINE_MAX: usize =
+    512 + 2 * MAX_UPGRADE_STEPS * 65 + MAX_UPGRADE_SELECT * 80 + MAX_PLAN_LEFT * 37;
+// Upgrade history (`uhist`): the last runs, one uhist| line each.
+// UHIST_NODE_MAX holds a node with every string field fully %XX-escaped; the
+// 6144 holds the header the same way.
+pub const MAX_UPGRADE_HISTORY: usize = 20;
+pub const UHIST_DEFAULT_KEEP: usize = 10;
+pub const UHIST_NODE_FIELDS: usize = 14;
+pub const UHIST_HEADER_FIELDS: usize = 20;
+pub const UHIST_NODE_MAX: usize = 1280;
+pub const UHIST_LINE_MAX: usize = 6144 + MAX_UPGRADE_NODES * UHIST_NODE_MAX;
+pub const UHIST_MIN_PREFIX: usize = 4;
 pub const HUB_CONFIG_FIXED_MAX: usize = 8192
+    + MAX_UPGRADE_HISTORY * UHIST_LINE_MAX
     + ROLLUP_LINE_MAX
     + PLAN_LINE_MAX
     + MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
@@ -884,6 +930,15 @@ pub const MAX_TREE_DEPTH: i32 = 30;
 /// only while the report is this fresh: past one missed gossip round it
 /// forwards to everyone, as a hub that never reported links is.
 pub const SYNC_SPLIT_HORIZON_FRESH: i64 = 2 * BOT_PRESENCE_INTERVAL + 10;
+/// Presence events (a bot linked or left, a peer link came up or went down) gossip
+/// at once; a burst is damped: each event gossip within PRESENCE_FLAP_WINDOW of the
+/// last doubles the hold before the next (1, 2, 4 ... PRESENCE_HOLD_MAX s), and a
+/// quiet window resets it.  Events inside a hold coalesce into one round.  A link
+/// that comes up gossips again PRESENCE_LINK_REGOSSIP later: the first round can be
+/// lost to the duplicate-link race (both ends dial, one link closes).
+pub const PRESENCE_FLAP_WINDOW: i64 = 30;
+pub const PRESENCE_HOLD_MAX: i64 = 30;
+pub const PRESENCE_LINK_REGOSSIP: i64 = 3;
 pub const MAX_TREE_ROWS: usize = MAX_MESH_HUBS + MAX_PEERS + 1 + MAX_BOT_ROSTER + MAX_BOTS;
 pub const MAX_TREE_PAYLOAD: usize = MAX_TREE_ROWS * TREE_ROW_MAX + PAYLOAD_SLACK;
 
@@ -916,3 +971,41 @@ pub const IP_ACL_PATTERN_MAX: usize = 19; // "255.255.255.255/32" + NUL
 pub const IP_ACL_LINE_MAX: usize = 48; // w|<pattern>|<ts>\n
 
 pub const CONFIG_WRITE_DEBOUNCE_S: i64 = 5;
+
+/// What preflight asks of the disk, in bytes.  A build's own needs come from
+/// the manifest's size column; these cover what it cannot say.
+pub const UPGRADE_SPACE_MARGIN: u64 = 16 * 1024 * 1024;
+pub const UPGRADE_SPACE_BIN_DEFAULT: u64 = 64 * 1024 * 1024; // no size column
+pub const UPGRADE_SPACE_BUILD_C: u64 = 256 * 1024 * 1024; // objects, make
+pub const UPGRADE_SPACE_BUILD_RS: u64 = 1536 * 1024 * 1024; // cargo's target dir
+pub const UPGRADE_MIN_INODES: u64 = 64;
+
+/// The failback's limits, in seconds (see FAILBACK_BODY).  A source build's limit
+/// and the confirm window are the reliability plan's agreed values.
+pub const UPGRADE_INSTALL_SECS: u64 = 120;
+pub const UPGRADE_BUILD_SECS: u64 = 1800;
+pub const UPGRADE_CONFIRM_SECS: u64 = 300;
+pub const UPGRADE_FAILBACK_EXPIRY: u64 = 1800;
+pub const CRON_HELPER_TIMEOUT: u64 = 60; // a crontab edit that takes longer is killed
+pub const CRON_CHECK_SECS: u64 = 3600; // how often a node looks at its line
+pub const CRON_SILENT_SECS: u64 = 900; // no stamp for this long: no cron daemon
+/// A node says it is staging this often, and one silent this long has left the run.
+pub const UPGRADE_STAGE_BEAT: u64 = 20;
+pub const UPGRADE_STAGE_SILENCE: i64 = 90;
+/// A prebuilt's stage limit.
+pub const UPGRADE_STAGE_GATE: i64 = 180;
+/// A stage no COMMIT came for is removed.
+pub const UPGRADE_STAGE_KEEP: u64 = 900;
+/// A staged node must be back by now.
+pub const UPGRADE_SWAP_BACK: i64 = 90;
+/// More than this share failing stops everything.
+pub const UPGRADE_STOP_PERCENT: usize = 25;
+/// How far back a node's history is read.
+pub const UPGRADE_CLASS_RECORDS: usize = 5;
+/// Slower than this usually: a slow host.
+pub const UPGRADE_SLOW_RESTART: i64 = 120;
+/// The least a known prebuilt stage, and a known source build, gets.
+pub const UPGRADE_STAGE_FLOOR: i64 = 60;
+pub const UPGRADE_BUILD_FLOOR: i64 = 300;
+/// READY, then this long to say it can stage.
+pub const ROLLUP_STAGE_WAIT: i64 = 3;
