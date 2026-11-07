@@ -895,6 +895,56 @@ pub struct MeshHub {
     pub chunks_seen: u64,
     /// Local clock: drives the TTL.
     pub reported_at: i64,
+    /// Its gossip carries k|rollcall: it answers one.
+    pub rollcall: bool,
+}
+
+/// What a roll call is for (see CMD_HUB_ROLLCALL).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RollcallPurpose {
+    #[default]
+    None,
+    Start,
+    Step,
+}
+
+/// One roll call.  As the asking hub: the hubs it waits on and which have
+/// answered.  As a relay: the link to route answers back on.
+#[derive(Clone, Debug, Default)]
+pub struct HubRollcall {
+    pub active: bool,
+    pub origin: bool,
+    pub id: String,
+    pub started: i64,
+    /// Relay: the peer it came from, and that link's conn_serial.
+    pub from_fd: i32,
+    pub from_serial: u64,
+    pub purpose: RollcallPurpose,
+    /// Origin: (uuid, name, answered) of every hub asked.
+    pub want: Vec<(String, String, bool)>,
+}
+
+/// The upgrade start waiting on its roll call (one at a time); the console is
+/// answered when the roll call ends.
+#[derive(Clone, Debug, Default)]
+pub struct UpgStartWait {
+    pub active: bool,
+    pub rc: String,
+    pub admin_fd: i32,
+    pub admin_serial: u64,
+    pub payload: String,
+}
+
+/// A plan step's roll call: rc while it runs, then the outcome until the step
+/// gate reads it.
+#[derive(Clone, Debug, Default)]
+pub struct StepRollcall {
+    pub rc: String,
+    /// 0 none or running, 1 every hub answered, 2 some did not.
+    pub outcome: i32,
+    pub gone: Vec<String>,
+    /// When the outcome came: a stale one is not read.
+    pub at: i64,
 }
 
 /// One bot's live presence, as reported by the hub it is connected to.
@@ -1460,6 +1510,9 @@ pub struct HubState {
     pub pending_op_requests: Vec<PendingOpRequest>,
     pub pending_chan_requests: Vec<PendingChanRequest>,
     pub chan_elections: Vec<ChanElect>,
+    pub rollcalls: Vec<HubRollcall>,
+    pub upg_start_wait: UpgStartWait,
+    pub step_rollcall: StepRollcall,
 
     /// The network upgrade this hub is driving, if any (one at a time).
     pub upgrade: PendingUpgrade,
@@ -1704,6 +1757,9 @@ impl HubState {
             pending_op_requests: vec![PendingOpRequest::default(); MAX_PENDING_OP_REQUESTS],
             pending_chan_requests: vec![PendingChanRequest::default(); MAX_PENDING_CHAN_REQUESTS],
             chan_elections: vec![ChanElect::default(); MAX_CHAN_ELECTIONS],
+            rollcalls: vec![HubRollcall::default(); MAX_ROLLCALLS],
+            upg_start_wait: UpgStartWait::default(),
+            step_rollcall: StepRollcall::default(),
             upgrade: PendingUpgrade::default(),
             follow_id: String::new(),
             follow_origin: String::new(),

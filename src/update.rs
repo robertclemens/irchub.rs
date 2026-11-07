@@ -1293,7 +1293,8 @@ restore() { # reason
 }
 
 tick() {
-  read_state || finish
+  # Another upgrade's state: it is about to replace this script, so leave it be.
+  read_state || { [ -n "$rid" ] && exit 1; finish; }
   now=$(date +%s); age=$((now - since))
   if [ "$now" -ge "$HARD" ]; then
     case "$phase" in
@@ -1335,7 +1336,9 @@ case "${1:-tick}" in
   phase) take_lock "$LOCK" 20 && set_state "$2" "$3" "" ;;
   restore) take_lock "$LOCK" 20 && restore "$2" ;;
   done) take_lock "$LOCK" 20; finish ;;
-  tick) take_lock "$LOCK" 2 || exit 0; tick ;;
+  # A loop names its upgrade: a loop that outlived it stops here, touching nothing.
+  tick) [ -n "${2:-}" ] && [ "$2" != "$ID" ] && exit 1
+    take_lock "$LOCK" 2 || exit 0; tick ;;
   cron-status) cron_status; rc=$?; rm -f "$SELF"; exit "$rc" ;;
   cron-on)
     cron_status; rc=$?
@@ -1707,8 +1710,21 @@ fn failback_stage(
     script: &str,
     note: &str,
 ) -> bool {
-    let wrote = failback_write(
-        FAILBACK_FILE,
+    // The state first: a tick that finds none takes the script away again, and
+    // the previous upgrade's loop may still tick.  Its script, finding this
+    // upgrade's state, leaves it be.
+    let now = cron_now();
+    let _ = std::fs::remove_file(FAILBACK_CONFIRM);
+    let tmp = format!("{FAILBACK_STATE}.tmp");
+    let state = format!("{id}|installing|{now}|{}|\n", std::process::id());
+    if std::fs::write(&tmp, state).is_err() || std::fs::rename(&tmp, FAILBACK_STATE).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    // Then the script, whole or not at all: a tick never runs a half-written one.
+    let stmp = format!("{FAILBACK_FILE}.tmp");
+    if !failback_write(
+        &stmp,
         exe,
         id,
         is_bin,
@@ -1717,17 +1733,10 @@ fn failback_stage(
         script,
         note,
         FAILBACK_FILE,
-    );
-    let now = cron_now();
-    let _ = std::fs::remove_file(FAILBACK_CONFIRM);
-    let tmp = format!("{FAILBACK_STATE}.tmp");
-    let state = format!("{id}|installing|{now}|{}|\n", std::process::id());
-    if !wrote
-        || std::fs::write(&tmp, state).is_err()
-        || std::fs::rename(&tmp, FAILBACK_STATE).is_err()
+    ) || std::fs::rename(&stmp, FAILBACK_FILE).is_err()
     {
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(FAILBACK_FILE);
+        let _ = std::fs::remove_file(&stmp);
+        let _ = std::fs::remove_file(FAILBACK_STATE);
         return false;
     }
     true
@@ -2203,11 +2212,12 @@ rollback() {{
   ./{FAILBACK_FILE} restore "$1"
   rm -rf "$UPGRADE_DIR" "{archive}"
   wait
-  rm -f "./{HUB_UPGRADE_SCRIPT}"
+  grep -qx "OLD_PID=$OLD_PID" ./{HUB_UPGRADE_SCRIPT} 2>/dev/null && rm -f ./{HUB_UPGRADE_SCRIPT}
   exit 0
 }}
 ./{FAILBACK_FILE} phase installing $$
-( while ./{FAILBACK_FILE} tick; do sleep 10; done ) </dev/null >/dev/null 2>&1 &
+FB_ID=$(cut -d'|' -f1 <"{FAILBACK_STATE}" 2>/dev/null)
+( while ./{FAILBACK_FILE} tick "$FB_ID"; do sleep 10; done ) </dev/null >/dev/null 2>&1 &
 {tar}{build}
 mv -f "$NEW_BIN" "{exe}" || rollback "could not install new binary"
 chmod 700 "{exe}"
@@ -2217,7 +2227,7 @@ rm -rf {STAGE_DIR} 2>/dev/null
 ./{FAILBACK_FILE} phase started $$
 "{exe}" </dev/null >/dev/null 2>&1
 wait
-rm -f "./{HUB_UPGRADE_SCRIPT}"
+grep -qx "OLD_PID=$OLD_PID" ./{HUB_UPGRADE_SCRIPT} 2>/dev/null && rm -f ./{HUB_UPGRADE_SCRIPT}
 exit 0
 "#
     )
@@ -2312,6 +2322,13 @@ pub fn commit(
         (row.kind.clone(), archive)
     };
 
+    // End the previous upgrade's failback before laying down anything of this
+    // one.  Its loop may be inside finish(), which edits cron for a second or
+    // more before removing the state, the script and upgrade.sh: whatever this
+    // upgrade had written by then would go with them (nightly 2026-11-06).
+    // "done" waits on the lock a tick holds, so that tick is over when it returns.
+    failback_clear();
+
     // Flush the live config, then snapshot the pair we may have to restore.
     // The config is copied (this hub still needs it); the binary is renamed,
     // which is atomic and leaves <exe>.prev ready for a rollback.
@@ -2349,10 +2366,14 @@ pub fn commit(
             .create(true)
             .truncate(true)
             .mode(0o700)
-            .open(HUB_UPGRADE_SCRIPT)
+            .open(format!("{HUB_UPGRADE_SCRIPT}.tmp"))
             .and_then(|mut f| {
                 f.write_all(script.as_bytes())?;
                 f.set_permissions(std::fs::Permissions::from_mode(0o700))
+            })
+            .and_then(|_| std::fs::rename(format!("{HUB_UPGRADE_SCRIPT}.tmp"), HUB_UPGRADE_SCRIPT))
+            .map_err(|_| {
+                let _ = std::fs::remove_file(format!("{HUB_UPGRADE_SCRIPT}.tmp"));
             })
             .is_ok()
         && failback_stage(
@@ -2384,6 +2405,7 @@ pub fn commit(
     std::thread::sleep(std::time::Duration::from_secs(1));
     let err = Command::new(format!("./{HUB_UPGRADE_SCRIPT}")).exec();
     // exec failed: <exe> was never moved.
+    crate::hlog_info!("[UPGRADE] Could not run {HUB_UPGRADE_SCRIPT}: {err}\n");
     failback_clear();
     let _ = std::fs::remove_file(&prev_exe);
     let _ = std::fs::remove_file(HUB_UPGRADE_MARKER_FILE);

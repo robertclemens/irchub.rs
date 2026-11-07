@@ -179,12 +179,28 @@ enum Ev {
     Close,
 }
 
+/// Why a key was refused, most telling last.  Only the hub's log says this:
+/// the client is told no more than "denied", whatever the reason.
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Refuse {
+    #[default]
+    None,
+    KeyType,
+    Unknown,
+    WrongKey,
+    OthersKey,
+}
+
 /// State the handler and the connection task share.
 #[derive(Default)]
 struct Info {
     user: String,
     authed: bool,
     refused: u32,
+    /// How telling `refuse_why` is (`Refuse` order).
+    refuse_rank: Refuse,
+    /// The most telling refusal, for the hub's log only.
+    refuse_why: String,
     fail_sent: bool,
     shell: bool,
     drop_why: Option<String>,
@@ -216,33 +232,81 @@ fn violation(info: &Mutex<Info>, why: &str) -> russh::Error {
 }
 
 impl H {
+    fn refuse_note(&self, rank: Refuse, why: String) {
+        if let Ok(mut i) = self.info.lock()
+            && rank >= i.refuse_rank
+        {
+            i.refuse_rank = rank;
+            i.refuse_why = why;
+        }
+    }
+
     fn key_matches(&self, user: &str, key: &PublicKey) -> bool {
         let offered: Option<[u8; 32]> = key.key_data().ed25519().map(|k| k.0);
-        // Same work for every name: an unknown one is compared against a dummy.
+        // Same work for every name: an unknown one is compared against a dummy,
+        // and the offered key against every admin's (whose it is, for the log).
         let mut want = [0u8; 32];
         let mut known = false;
-        if let Ok(p) = self.ctx.shared.lock()
-            && let Some(c) = p.creds.iter().find(|c| c.name == user)
-        {
-            want = c.ed_pub;
-            known = true;
+        let mut owner = String::new();
+        if let Ok(p) = self.ctx.shared.lock() {
+            for c in &p.creds {
+                if !known && c.name == user {
+                    want = c.ed_pub;
+                    known = true;
+                }
+                if let Some(o) = &offered
+                    && owner.is_empty()
+                    && crate::crypto::ct_eq(&c.ed_pub, o)
+                {
+                    owner = clean_name(&c.name);
+                }
+            }
         }
         let eq = crate::crypto::ct_eq(&want, &offered.unwrap_or([0u8; 32]));
-        offered.is_some() && known && eq
+        if offered.is_some() && known && eq {
+            return true;
+        }
+        if offered.is_none() {
+            self.refuse_note(Refuse::KeyType, "not an Ed25519 key".into());
+        } else if !owner.is_empty() {
+            self.refuse_note(
+                Refuse::OthersKey,
+                if known {
+                    format!("the key offered belongs to admin '{owner}', not to this one")
+                } else {
+                    format!("no such admin; the key offered belongs to admin '{owner}'")
+                },
+            );
+        } else if known {
+            self.refuse_note(
+                Refuse::WrongKey,
+                "the key offered is not this admin's".into(),
+            );
+        } else {
+            self.refuse_note(
+                Refuse::Unknown,
+                "no such admin, and no admin has the key offered".into(),
+            );
+        }
+        false
     }
 
     fn report_fail(&self, why: &str) {
-        let (name, send) = {
+        let (name, send, detail) = {
             let Ok(mut i) = self.info.lock() else { return };
             let send = !i.fail_sent;
             i.fail_sent = true;
-            (clean_name(&i.user), send)
+            (clean_name(&i.user), send, i.refuse_why.clone())
         };
         if send {
             self.ctx.notify(FromConsole::Fail {
                 ip: self.ip.clone(),
                 name: if name.is_empty() { "?".into() } else { name },
-                reason: why.to_string(),
+                reason: if detail.is_empty() {
+                    why.to_string()
+                } else {
+                    format!("{why} ({detail})")
+                },
             });
         }
     }

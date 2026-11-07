@@ -3136,6 +3136,8 @@ fn opname(op: u64) -> Option<&'static str> {
         0x89 => "CMD_UPGRADE_PROGRESS",
         0x8A => "CMD_UPGRADE_PLAN",
         0x8B => "CMD_CRON_SET",
+        0x8C => "CMD_HUB_ROLLCALL",
+        0x8D => "CMD_HUB_ROLLCALL_ACK",
         _ => return None,
     })
 }

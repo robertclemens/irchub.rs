@@ -1549,6 +1549,8 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         CMD_UPGRADE_HISTORY => crate::uhist::process(state, ci, payload),
         CMD_UPGRADE_PLAN => upgrade::plan_process(state, ci, payload),
         CMD_UPGRADE_FORGET => upgrade::peer_forget(state, ci, payload),
+        CMD_HUB_ROLLCALL => crate::rollcall::peer_rollcall(state, ci, payload),
+        CMD_HUB_ROLLCALL_ACK => crate::rollcall::peer_rollcall_ack(state, ci, payload),
         CMD_CHAN_FWD_REQUEST => opflow::process_forward_chan_request(state, ci, payload),
         CMD_CHAN_FWD_REPLY => opflow::process_forward_chan_reply(state, ci, payload),
         CMD_CHAN_ELECT_FWD => crate::elect::process_elect_fwd(state, ci, payload),

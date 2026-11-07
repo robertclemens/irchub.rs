@@ -47,6 +47,7 @@ pub mod queue;
 pub mod ratelimit;
 pub mod reply;
 pub mod revoke;
+pub mod rollcall;
 pub mod secret;
 pub mod state;
 pub mod stats;

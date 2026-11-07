@@ -476,6 +476,9 @@ fn maintenance(state: &mut HubState) {
     // Channel-request elections: probe windows and hand-off timeouts.
     irchub::elect::tick(state, t);
 
+    // Hub roll calls (the upgrade gates): end the ones whose wait ran out.
+    irchub::rollcall::tick(state, t);
+
     // Expired bans: one `del` per ban, self-throttled to BAN_SWEEP_INTERVAL.
     irchub::modes::bans_sweep(state, t);
 

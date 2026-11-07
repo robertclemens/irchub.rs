@@ -651,9 +651,9 @@ dependencies = [
 
 [[package]]
 name = "graviola"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0b1b23c921e2b08241ad0d705659d3bfe942c6aac90bd94008652198f650def"
+checksum = "a1a15622a211648cbf64f485e0369791466d133eb6578fd99e4a61230c88a6aa"
 dependencies = [
  "cfg-if",
  "getrandom 0.4.3",

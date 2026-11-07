@@ -4277,6 +4277,150 @@ fn stats_timer(r: &mut Reply, name: &str, every: i64, last: i64, t: i64) {
     r.kvi("in", left.max(0));
 }
 
+/// upgrade start (CMD_ADMIN_UPGRADE_NET).  `roll_called`: the hubs have just
+/// answered a roll call, so the gate is passed.
+pub(crate) fn upgrade_start(
+    state: &mut HubState,
+    ci: usize,
+    payload: &str,
+    roll_called: bool,
+) -> bool {
+    // Payload: target_ver|variant|kind|min_from|base|hub_ver|hub_base
+    // |sel — everything past the version is optional ("" = let each
+    // node decide).  target_ver is the bots' (ircbot-releases);
+    // hub_ver is the hubs' own (irchub-releases), and an empty hub_ver
+    // leaves every hub where it is.  The two base slots are no longer
+    // read: every node fetches from its own compiled-in root, the only
+    // tree its pinned key verifies.  Only the last field — the
+    // selection ("" = whole network), comma-separated
+    // name-or-uuid[=c|rs] tokens — is a tail.
+    // wire_field: a field that does not fit its buffer reads as ""
+    let caps = [64, 8, 8, 64, 512, 64, 512];
+    let fld: Vec<String> = (0..7)
+        .map(|i| wire_field(payload, i, caps[i]).unwrap_or_default())
+        .collect();
+    let sel = wire_tail(payload, 7, MAX_UPGRADE_SELECT * 80).unwrap_or_default();
+    let at = |i: usize| {
+        if i == 7 {
+            sel.as_str()
+        } else {
+            fld[i].as_str()
+        }
+    };
+    // One upgrade at a time, mesh-wide: every hub holds the copy of the one in
+    // flight, between its steps and on hold too, when no freeze says so.
+    if state.splan.active && state.splan.driver != state.hub_uuid {
+        let why = format!(
+            "an upgrade to {} driven by {} is in progress",
+            state.splan.bot_target,
+            state.who('h', &state.splan.driver)
+        );
+        return admin_err(
+            state,
+            ci,
+            "upg.busy",
+            &why,
+            Some("upgrade status; upgrade abort stops it"),
+        );
+    }
+    // An upgrade starts with every hub present.  One that drops later is the
+    // plan's business: every hub already holds it.  The hubs are asked (a roll
+    // call); the console is answered once they have, or ROLLCALL_WAIT ran out.
+    if !state.upgrade.active && !state.plan.active && !roll_called {
+        if state.upg_start_wait.active {
+            return admin_err(
+                state,
+                ci,
+                "upg.busy",
+                "another upgrade start is asking the hubs",
+                Some("start again in a few seconds"),
+            );
+        }
+        if payload.len() < MAX_UPGRADE_SELECT * 80 + 512
+            && let Some(rc) = crate::rollcall::begin(state, crate::state::RollcallPurpose::Start)
+        {
+            state.upg_start_wait = crate::state::UpgStartWait {
+                active: true,
+                rc,
+                admin_fd: state.clients[ci].fd,
+                admin_serial: state.clients[ci].conn_serial,
+                payload: payload.to_string(),
+            };
+            return true;
+        }
+        // No roll call possible (an older hub, a peer that never linked): the
+        // gossip decides, as before.
+        let gone = upgrade::hubs_missing(state);
+        if !gone.is_empty() {
+            let why = format!(
+                "{} hub{} not linked: {}",
+                gone.len(),
+                if gone.len() == 1 { "" } else { "s" },
+                gone.join(", ")
+            );
+            return admin_err(
+                state,
+                ci,
+                "upg.hubs_missing",
+                &why,
+                Some("bring it back, or remove it with hub del; then start again"),
+            );
+        }
+    }
+    let fd = state.clients[ci].fd;
+    let msg = upgrade::plan_begin(
+        state,
+        fd,
+        &upgrade::StartArgs {
+            target_ver: at(0),
+            variant: at(1),
+            kind: at(2),
+            min_from: at(3),
+            hub_ver: at(5),
+            sel: at(7),
+        },
+    );
+    let Some(ci) = refind(state, fd) else {
+        return false;
+    };
+    if !msg.starts_with("OK") {
+        return admin_err(
+            state,
+            ci,
+            "upg.refused",
+            msg.strip_prefix("ERROR: ").unwrap_or(&msg),
+            Some("upgrade status · upgrade releases"),
+        );
+    }
+    let u = &state.upgrade;
+    let bots = u
+        .nodes
+        .iter()
+        .filter(|n| n.kind == crate::state::UpgradeNodeKind::Bot)
+        .count() as i64;
+    let hubs = u
+        .nodes
+        .iter()
+        .filter(|n| n.kind == crate::state::UpgradeNodeKind::PeerHub)
+        .count() as i64;
+    let mut r = Reply::new();
+    r.ok("upg.started");
+    r.kv("id", &u.id);
+    r.kv("bot_ver", &u.target_ver);
+    opt(&mut r, "hub_ver", &u.hub_ver);
+    r.kvi("selected", u.select.len() as i64);
+    r.kvi("bots", bots);
+    r.kvi("peers", hubs);
+    let pl = &state.plan;
+    if pl.active && pl.run_id == u.id {
+        r.kvi("step", pl.step as i64 + 1);
+        r.kvi("steps", pl.steps() as i64);
+        r.kv("bot_final", &pl.bot_target);
+        opt(&mut r, "hub_final", &pl.hub_target);
+    }
+    send_reply(state, ci, &mut r)
+}
+
 /// handle_admin_command().
 ///
 /// `payload` is the NUL-terminated text for the text opcodes; `raw` and
@@ -4339,118 +4483,7 @@ pub fn handle_admin_command(
     }
 
     match cmd {
-        CMD_ADMIN_UPGRADE_NET => {
-            // Payload: target_ver|variant|kind|min_from|base|hub_ver|hub_base
-            // |sel — everything past the version is optional ("" = let each
-            // node decide).  target_ver is the bots' (ircbot-releases);
-            // hub_ver is the hubs' own (irchub-releases), and an empty hub_ver
-            // leaves every hub where it is.  The two base slots are no longer
-            // read: every node fetches from its own compiled-in root, the only
-            // tree its pinned key verifies.  Only the last field — the
-            // selection ("" = whole network), comma-separated
-            // name-or-uuid[=c|rs] tokens — is a tail.
-            // wire_field: a field that does not fit its buffer reads as ""
-            let caps = [64, 8, 8, 64, 512, 64, 512];
-            let fld: Vec<String> = (0..7)
-                .map(|i| wire_field(payload, i, caps[i]).unwrap_or_default())
-                .collect();
-            let sel = wire_tail(payload, 7, MAX_UPGRADE_SELECT * 80).unwrap_or_default();
-            let at = |i: usize| {
-                if i == 7 {
-                    sel.as_str()
-                } else {
-                    fld[i].as_str()
-                }
-            };
-            // One upgrade at a time, mesh-wide: every hub holds the copy of the one in
-            // flight, between its steps and on hold too, when no freeze says so.
-            if state.splan.active && state.splan.driver != state.hub_uuid {
-                let why = format!(
-                    "an upgrade to {} driven by {} is in progress",
-                    state.splan.bot_target,
-                    state.who('h', &state.splan.driver)
-                );
-                return admin_err(
-                    state,
-                    ci,
-                    "upg.busy",
-                    &why,
-                    Some("upgrade status; upgrade abort stops it"),
-                );
-            }
-            // An upgrade starts with every hub present.  One that drops later is the
-            // plan's business: every hub already holds it.
-            if !state.upgrade.active && !state.plan.active {
-                let gone = upgrade::hubs_missing(state);
-                if !gone.is_empty() {
-                    let why = format!(
-                        "{} hub{} not linked: {}",
-                        gone.len(),
-                        if gone.len() == 1 { "" } else { "s" },
-                        gone.join(", ")
-                    );
-                    return admin_err(
-                        state,
-                        ci,
-                        "upg.hubs_missing",
-                        &why,
-                        Some("bring it back, or remove it with hub del; then start again"),
-                    );
-                }
-            }
-            let fd = state.clients[ci].fd;
-            let msg = upgrade::plan_begin(
-                state,
-                fd,
-                &upgrade::StartArgs {
-                    target_ver: at(0),
-                    variant: at(1),
-                    kind: at(2),
-                    min_from: at(3),
-                    hub_ver: at(5),
-                    sel: at(7),
-                },
-            );
-            let Some(ci) = refind(state, fd) else {
-                return false;
-            };
-            if !msg.starts_with("OK") {
-                return admin_err(
-                    state,
-                    ci,
-                    "upg.refused",
-                    msg.strip_prefix("ERROR: ").unwrap_or(&msg),
-                    Some("upgrade status · upgrade releases"),
-                );
-            }
-            let u = &state.upgrade;
-            let bots = u
-                .nodes
-                .iter()
-                .filter(|n| n.kind == crate::state::UpgradeNodeKind::Bot)
-                .count() as i64;
-            let hubs = u
-                .nodes
-                .iter()
-                .filter(|n| n.kind == crate::state::UpgradeNodeKind::PeerHub)
-                .count() as i64;
-            let mut r = Reply::new();
-            r.ok("upg.started");
-            r.kv("id", &u.id);
-            r.kv("bot_ver", &u.target_ver);
-            opt(&mut r, "hub_ver", &u.hub_ver);
-            r.kvi("selected", u.select.len() as i64);
-            r.kvi("bots", bots);
-            r.kvi("peers", hubs);
-            let pl = &state.plan;
-            if pl.active && pl.run_id == u.id {
-                r.kvi("step", pl.step as i64 + 1);
-                r.kvi("steps", pl.steps() as i64);
-                r.kv("bot_final", &pl.bot_target);
-                opt(&mut r, "hub_final", &pl.hub_target);
-            }
-            send_reply(state, ci, &mut r)
-        }
+        CMD_ADMIN_UPGRADE_NET => upgrade_start(state, ci, payload, false),
 
         CMD_ADMIN_UPGRADE_STATUS => upgrade_status_cmd(state, ci, payload),
 

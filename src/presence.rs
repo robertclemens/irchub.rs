@@ -444,6 +444,8 @@ fn roster_frame_begin(state: &HubState, round: i64, chunk: u32, last: bool) -> S
     if !cron.is_empty() {
         f.push_str(&format!("c|{cron}\n"));
     }
+    // This hub answers CMD_HUB_ROLLCALL: the upgrade gates may ask it.
+    f.push_str("k|rollcall\n");
     if chunk != 0 {
         return f;
     }
@@ -664,6 +666,7 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
         if o_started > 0 && h.started > 0 && o_started != h.started {
             h.round = -1;
             h.chunks_seen = 0;
+            h.rollcall = false; // a build that lost it says so by leaving out k|
         }
         if round < h.round {
             return; // a late copy of an older round
@@ -796,6 +799,15 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
             // No variant here: it follows on the v| line, so a hub asked to
             // switch build at the same version is proven by its RESULT alone.
             upgrade::note_presence(state, &hub_uuid, &hub_ver, "");
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("k|") {
+            // What the hub whose h| header opened it can do (see CMD_HUB_ROLLCALL).
+            if v == "rollcall"
+                && let Some(m) = state.mesh_hubs.iter_mut().find(|m| m.uuid == hub_uuid)
+            {
+                m.rollcall = true;
+            }
             continue;
         }
         if let Some(v) = line.strip_prefix("c|") {

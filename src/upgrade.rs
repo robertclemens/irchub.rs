@@ -3592,13 +3592,15 @@ fn plan_tick(state: &mut HubState, t_now: i64) {
     }
     // A step starts with every hub, as the plan did.  One still gone after the wait
     // ends the plan here; upgrade start carries on from this step later.
-    let gone = hubs_missing(state);
+    let Some(gone) = crate::rollcall::plan_hubs_answered(state) else {
+        return; // the hubs are being asked
+    };
     if !gone.is_empty() {
         if t_now < state.plan.mesh_until {
             return;
         }
         let why = format!(
-            "step {}/{} needs every hub; {} not linked: {}; upgrade start carries on",
+            "step {}/{} needs every hub; {} missing: {}; upgrade start carries on",
             state.plan.step + 1,
             state.plan.steps(),
             gone.len(),

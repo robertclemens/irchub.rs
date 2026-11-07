@@ -426,6 +426,36 @@ pub const CMD_UPGRADE_PROGRESS: u8 = 0x89;
 pub const CMD_UPGRADE_PLAN: u8 = 0x8A;
 /// Hub -> Bot: on|off, its production crontab line.
 pub const CMD_CRON_SET: u8 = 0x8B;
+
+// ---- Hub roll call (the upgrade gates) ----------------------------------
+// An upgrade starts, and each step of a multi-step plan starts, only with every
+// hub present.  The gossip that says which hubs are linked is second-hand and,
+// with damped event gossip, up to 30 s old: a hub that has just died can still
+// look linked (nightly 2026-11-06, test_95 "hub5 down").  So the gate asks the
+// hubs themselves.  The asking hub floods ROLLCALL to its peers; each hub passes
+// it on (once: the shared seen_forwards ring), remembers the link it arrived on,
+// and answers ROLLCALL_ACK back down that link; a relay routes every ACK of that
+// roll call the same way.  A hub that has not answered within ROLLCALL_WAIT is
+// missing.  An unanswered ACK can only make the gate refuse, never pass it.
+//   ROLLCALL      hub->hub  rid|origin_uuid|origin_ts
+//   ROLLCALL_ACK  hub->hub  rid|hub_uuid
+// Hub <-> hub only.  A hub that can answer says so with a k|rollcall line in
+// its roster gossip (older hubs skip a line they do not know).  While any hub
+// known here has not said so, the gate keeps to the gossip it used before: an
+// older hub neither answers nor passes the probe on, and refusing every start
+// would leave the mesh unable to upgrade it.  Mirrors irchub/hub.h.
+pub const CMD_HUB_ROLLCALL: u8 = 0x8C;
+pub const CMD_HUB_ROLLCALL_ACK: u8 = 0x8D;
+/// Seconds the asking hub waits for the answers.
+pub const ROLLCALL_WAIT: i64 = 3;
+/// A relayed roll call older than this is dropped.
+pub const ROLLCALL_TTL: i64 = 30;
+/// Seconds a relay routes the answers back.
+pub const ROLLCALL_KEEP: i64 = 10;
+/// Roll calls in flight here, asked or relayed.
+pub const MAX_ROLLCALLS: usize = 16;
+/// 16 random bytes in hex + NUL.
+pub const ROLLCALL_ID_LEN: usize = 33;
 pub const HUB_LINK_AAD_LEN: usize = 13;
 pub const HUB_LINK_SEQ_VERSION: &str = "2.5.2";
 /// Review 7: ephemeral keys of the HUBv3 hellos accepted in the last
