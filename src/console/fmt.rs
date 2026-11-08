@@ -579,6 +579,24 @@ pub fn when(ts: i64, now: i64) -> Vec<u8> {
     }
 }
 
+/// Nov 08 14:02Z this year, 2025-12-30 14:02Z before; never for 0.  Always
+/// dated: upgrade runs span days and "today" in UTC is not the admin's day.
+pub fn when_dated(ts: i64, now: i64) -> Vec<u8> {
+    if ts <= 0 {
+        return b"never".to_vec();
+    }
+    let day = floordiv(ts, 86400);
+    let sec = ts - day * 86400;
+    let (y, m, d) = civil(day);
+    let (ny, _, _) = civil(floordiv(now, 86400));
+    let (hh, mm) = (sec / 3600, sec / 60 % 60);
+    if y == ny {
+        format!("{} {d:02} {hh:02}:{mm:02}Z", MONTH[(m - 1) as usize]).into_bytes()
+    } else {
+        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}Z").into_bytes()
+    }
+}
+
 /// 42s, 7m, 3h 12m, 5d 03h
 pub fn span(s: i64) -> Vec<u8> {
     let s = s.max(0);
@@ -5377,7 +5395,7 @@ fn upg_hints(rep: &Creply, out: &mut Flines) {
 /// Roll-ups are outside history: each node's last one, here.
 fn upg_rolled(ctx: &Ctx, rep: &Creply, l: i32, out: &mut Flines) {
     for n in rep.r.iter().filter(|x| x.is("rolled")) {
-        let a = when(n.rvi("when", 0), ctx.now);
+        let a = when_dated(n.rvi("when", 0), ctx.now);
         let v = cat(&[
             n.rv("name").unwrap_or(b"?"),
             b" to ",
@@ -5441,7 +5459,7 @@ fn render_upg_plan(ctx: &Ctx, pl: &Crec, l: i32, out: &mut Flines) {
         }
         card(out, l, "  hubs", &snp(512, v), RL_NORMAL);
     }
-    let a = when(pl.rvi("started", 0), ctx.now);
+    let a = when_dated(pl.rvi("started", 0), ctx.now);
     let b = span(ctx.now.wrapping_sub(pl.rvi("started", 0)));
     let dot = glyph(ctx, G_DOT);
     card(
@@ -5529,7 +5547,7 @@ fn render_upg_runs(ctx: &Ctx, rep: &Creply, keep: i64, out: &mut Flines) {
     ];
     let mut t = Tbl::new(&COLS, -1, 1, 1);
     for r in rep.r.iter().filter(|x| x.is("run")) {
-        let w = when(r.rvi("started", 0), ctx.now);
+        let w = when_dated(r.rvi("started", 0), ctx.now);
         let id = r.rv("id").unwrap_or(b"?");
         let run = &id[..id.len().min(8)];
         let bots = upg_target_cell(ctx, r, "bot_ver");
@@ -5623,7 +5641,7 @@ fn render_upg_run(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     title(ctx, out, &head, Some(&right));
     let started = r.rvi("started", 0);
     let v = cat(&[
-        &when(started, ctx.now),
+        &when_dated(started, ctx.now),
         b" ",
         dot,
         b" ",
@@ -5771,7 +5789,7 @@ fn render_upg_current(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             render_upg_plan(ctx, p, L, out);
         }
         if let Some(ru) = ru {
-            let a = when(ru.rvi("set", 0), ctx.now);
+            let a = when_dated(ru.rvi("set", 0), ctx.now);
             let b = span(ctx.now.wrapping_sub(ru.rvi("set", 0)));
             let v = cat(&[&plan, b"  (set ", &a, b" ", dot, b" ", &b, b" ago)"]);
             card(out, L, "roll-up plan", &snp(512, v), RL_NORMAL);
@@ -5827,7 +5845,7 @@ fn render_upg_current(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         ]),
     };
     title(ctx, out, &t, Some(&snp(160, right)));
-    let a = when(r.rvi("started", 0), ctx.now);
+    let a = when_dated(r.rvi("started", 0), ctx.now);
     let b = span(ctx.now.wrapping_sub(r.rvi("started", 0)));
     card(
         out,
