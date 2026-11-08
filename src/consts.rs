@@ -134,7 +134,7 @@ pub const HIDEPINGPONG: bool = true;
 /// the bots tree and the one every upgrade comparison is made against.
 pub const HUB_VERSION: &str = match option_env!("IRCHUB_VERSION") {
     Some(v) => v,
-    None => "2.5.2",
+    None => "2.5.3",
 };
 
 /// Signed-release channel for the hub (irchub-releases).  Same Ed25519 key
