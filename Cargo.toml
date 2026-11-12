@@ -62,7 +62,7 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 
 # OS integration through safe wrappers (poll, daemon, mlock, termios,
 # RLIMIT_CORE, PR_SET_DUMPABLE).
-nix = { version = "0.31", features = ["user", "fs", "process", "term", "resource", "feature", "poll", "socket"] }
+nix = { version = "0.31", features = ["user", "fs", "process", "signal", "term", "resource", "feature", "poll", "socket"] }
 region = "4"
 # The console log ring: an anonymous mapping, mlock'd and MADV_DONTDUMP
 # through memmap2's safe advise/lock (unsafe_code is forbidden here).

@@ -42,11 +42,10 @@ fn pick(n: usize) -> usize {
     crypto::random_below(n as u32) as usize
 }
 
-fn peer(state: &HubState, fd: i32) -> Option<usize> {
-    state
-        .clients
-        .iter()
-        .position(|c| c.typ == ClientType::Hub && c.authenticated && c.fd == fd)
+fn peer(state: &HubState, fd: i32, serial: u64) -> Option<usize> {
+    state.clients.iter().position(|c| {
+        c.typ == ClientType::Hub && c.authenticated && c.fd == fd && c.conn_serial == serial
+    })
 }
 
 fn bot(state: &HubState, uuid: &str) -> Option<usize> {
@@ -56,8 +55,8 @@ fn bot(state: &HubState, uuid: &str) -> Option<usize> {
         .position(|c| c.typ == ClientType::Bot && c.authenticated && !c.superseded && c.id == uuid)
 }
 
-fn send_peer(state: &mut HubState, fd: i32, cmd: u8, payload: &str) -> bool {
-    match peer(state, fd) {
+fn send_peer(state: &mut HubState, fd: i32, serial: u64, cmd: u8, payload: &str) -> bool {
+    match peer(state, fd, serial) {
         Some(pi) => queue::send_urgent(&mut state.clients[pi], cmd, payload),
         None => false,
     }
@@ -502,8 +501,11 @@ fn finish(
 
 /// A relay hub's report back toward the origin.
 fn up(state: &mut HubState, ei: usize, cmd: u8, payload: &str) {
-    let fd = state.chan_elections[ei].from_fd;
-    send_peer(state, fd, cmd, payload);
+    let (fd, serial) = (
+        state.chan_elections[ei].from_fd,
+        state.chan_elections[ei].from_serial,
+    );
+    send_peer(state, fd, serial, cmd, payload);
 }
 
 fn done_up(
@@ -540,9 +542,20 @@ fn try_hub(state: &mut HubState, ei: usize) {
             break;
         }
         let hi = ready[pick(ready.len())];
-        let (fd, uuid, id) = (e.hubs[hi].fd, e.hubs[hi].uuid.clone(), e.id.clone());
+        let (fd, serial, uuid, id) = (
+            e.hubs[hi].fd,
+            e.hubs[hi].serial,
+            e.hubs[hi].uuid.clone(),
+            e.id.clone(),
+        );
         state.chan_elections[ei].hubs[hi].tried = true;
-        if !send_peer(state, fd, CMD_CHAN_ELECT_DO, &format!("{id}|{uuid}|elect")) {
+        if !send_peer(
+            state,
+            fd,
+            serial,
+            CMD_CHAN_ELECT_DO,
+            &format!("{id}|{uuid}|elect"),
+        ) {
             continue; // that hub's link went away: the next one
         }
         let e = &mut state.chan_elections[ei];
@@ -733,7 +746,7 @@ pub fn process_done(state: &mut HubState, ci: usize, payload: &str) {
 
 /// ELECT_FWD from a peer: eid|origin_hub|kind|channel|requester|nick|hostmask|ts
 pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
-    let fd = state.clients[ci].fd;
+    let (fd, serial) = (state.clients[ci].fd, state.clients[ci].conn_serial);
     let f = |i, cap| wire_field(payload, i, cap);
     let (Some(id), Some(_origin), Some(kind), Some(channel), Some(requester)) =
         (f(0, 64), f(1, 64), f(2, 8), f(3, MAX_CHAN), f(4, 64))
@@ -775,6 +788,7 @@ pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
         let e = &mut state.chan_elections[ei];
         e.active = true;
         e.from_fd = fd;
+        e.from_serial = serial;
         e.id = id;
         e.kind = kind;
         e.channel = channel;
@@ -817,7 +831,7 @@ pub fn process_elect_ack(state: &mut HubState, ci: usize, payload: &str) {
     let Some(ei) = find(state, &id) else {
         return;
     };
-    let fd = state.clients[ci].fd;
+    let (fd, serial) = (state.clients[ci].fd, state.clients[ci].conn_serial);
     let e = &mut state.chan_elections[ei];
     if e.hubs.len() >= MAX_MESH_HUBS || e.hubs.iter().any(|h| h.uuid == hub) {
         return; // full, or a second copy
@@ -826,6 +840,7 @@ pub fn process_elect_ack(state: &mut HubState, ci: usize, payload: &str) {
         uuid: roster_clean(&hub, 64),
         name: roster_clean(if name.is_empty() { &hub } else { &name }, 64),
         fd,
+        serial,
         asked: a,
         ready: r,
         tried: false,
@@ -842,15 +857,15 @@ pub fn process_elect_do(state: &mut HubState, ci: usize, payload: &str) {
     let Some(ei) = (!id.is_empty()).then(|| find(state, &id)).flatten() else {
         return;
     };
-    let fd = state.clients[ci].fd;
+    let (fd, serial) = (state.clients[ci].fd, state.clients[ci].conn_serial);
     let e = &state.chan_elections[ei];
-    if e.origin || fd != e.from_fd {
+    if e.origin || fd != e.from_fd || serial != e.from_serial {
         return;
     }
     if hub != state.hub_uuid {
         if let Some(h) = e.hubs.iter().find(|h| h.uuid == hub) {
-            let hfd = h.fd;
-            send_peer(state, hfd, CMD_CHAN_ELECT_DO, payload);
+            let (hfd, hserial) = (h.fd, h.serial);
+            send_peer(state, hfd, hserial, CMD_CHAN_ELECT_DO, payload);
         }
         return;
     }

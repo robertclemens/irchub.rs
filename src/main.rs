@@ -1299,6 +1299,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     // first let an immediate restart find the port still bound.
     let sig = if stop.load(Ordering::Relaxed) { 1 } else { 0 };
     hlog_info!("[HUB] Shutting down (signal {sig}).\n");
+    irchub::update::stage_kill_build(); // a stage's build does not outlive the hub
     state.listener = None;
     while !state.clients.is_empty() {
         let last = state.clients.len() - 1;

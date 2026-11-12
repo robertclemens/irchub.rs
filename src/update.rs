@@ -1159,15 +1159,26 @@ HLOCK="${HOME:-$D}/.irc-cron.lock"
 HELD=""
 
 take_lock() {
-  i=0
+  i=0; e=0
   while :; do
     if ( set -C; echo $$ >"$1" ) 2>/dev/null; then HELD="$HELD $1"; return 0; fi
     h=$(cat "$1" 2>/dev/null)
+    # Empty: its holder may be between create and write; look once more first.
+    if [ -z "$h" ] && [ "$e" = 0 ]; then e=1; sleep 1; continue; fi
+    e=0
     if [ -n "$h" ] && kill -0 "$h" 2>/dev/null; then
       i=$((i + 1)); [ "$i" -ge "$2" ] && return 1
       sleep 1
+    elif ( set -C; echo $$ >"$1.take" ) 2>/dev/null; then
+      # Only the holder of $1.take clears a stale $1, and only while it still
+      # names the dead holder it saw: two waiters can never both take over.
+      [ "$(cat "$1" 2>/dev/null)" = "$h" ] && rm -f "$1"
+      rm -f "$1.take"
     else
-      rm -f "$1"
+      t=$(cat "$1.take" 2>/dev/null)
+      [ -n "$t" ] && ! kill -0 "$t" 2>/dev/null && rm -f "$1.take"
+      i=$((i + 1)); [ "$i" -ge "$2" ] && return 1
+      sleep 1
     fi
   done
 }
@@ -1472,13 +1483,28 @@ fn cron_note(c: &mut CronState, rc: i32, now: u64) {
     c.status = match rc {
         0 => "yes",
         10 => "manual",
-        _ if rc == 11 || c.wanted != 1 => "no",
+        _ if rc == 11 || (rc == 3 && c.wanted != 1) => "no",
         3 => "failed:no crontab tool",
         4 => "failed:unsafe path",
         _ => "failed:cannot read crontab",
     }
     .to_string();
-    c.stat = now;
+    // Ours: look at the stamp in this same pass, so a host whose cron is dead
+    // stays "silent" instead of reading "yes" for a minute after every check.
+    c.stat = if c.ours { 0 } else { now };
+}
+
+/// The helper's work files are `.upgrade.cron.<its pid>.*`: a helper that was
+/// killed could not remove them, and they hold a copy of the crontab.
+fn cron_work_rm(pid: u32) {
+    let pre = format!(".upgrade.cron.{pid}.");
+    if let Ok(rd) = std::fs::read_dir(".") {
+        for e in rd.flatten() {
+            if e.file_name().to_str().is_some_and(|n| n.starts_with(&pre)) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 }
 
 /// What `cron_tick` last found: yes, silent, manual, no or failed:<why>.
@@ -1505,20 +1531,25 @@ pub fn cron_tick(exe: &str) -> bool {
     let now = cron_now();
     let before = c.status.clone();
     if let Some(child) = c.child.as_mut() {
+        let pid = child.id();
         match child.try_wait() {
             Ok(None) => {
-                if now.saturating_sub(c.started) > CRON_HELPER_TIMEOUT {
-                    let _ = c.child.as_mut().map(std::process::Child::kill);
+                if now.saturating_sub(c.started) > CRON_HELPER_TIMEOUT
+                    && let Some(ch) = c.child.as_mut()
+                {
+                    kill_group(ch);
                 }
                 return false;
             }
             Ok(Some(st)) => {
                 let rc = st.code().unwrap_or(1);
+                cron_work_rm(pid);
                 c.child = None;
                 let _ = std::fs::remove_file(CRON_HELPER);
                 cron_note(&mut c, rc, now);
             }
             Err(_) => {
+                cron_work_rm(pid);
                 c.child = None;
                 let _ = std::fs::remove_file(CRON_HELPER);
                 cron_note(&mut c, 1, now);
@@ -1556,10 +1587,14 @@ pub fn cron_tick(exe: &str) -> bool {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .process_group(0)
                 .spawn()
             {
                 c.child = Some(child);
                 c.started = now;
+            } else {
+                let _ = std::fs::remove_file(CRON_HELPER);
+                c.status = "failed:cannot start the helper".to_string();
             }
             // Set before it finishes: an order that arrives meanwhile clears this,
             // and must not be overwritten when this child ends.
@@ -1586,8 +1621,9 @@ pub fn cron_drop(exe: &str) -> i32 {
     if let Ok(mut c) = CRON.lock()
         && let Some(mut child) = c.child.take()
     {
-        let _ = child.kill();
+        kill_group(&mut child);
         let _ = child.wait();
+        cron_work_rm(child.id());
     }
     if !failback_write(
         CRON_HELPER,
@@ -1768,9 +1804,69 @@ struct StageState {
 
 static STAGE: std::sync::Mutex<Option<StageState>> = std::sync::Mutex::new(None);
 static STAGE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The process group of the build `stage_run` runs now (cargo or make and every
+/// compiler under it), 0 when none: a stop or the daemon's exit kills it whole.
+static STAGE_BUILD_PGID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Kill a child and everything it started: it leads a process group of its own.
+fn kill_group(child: &mut std::process::Child) {
+    let killed = i32::try_from(child.id()).is_ok_and(|p| {
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(p),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .is_ok()
+    });
+    if !killed {
+        let _ = child.kill();
+    }
+}
+
+/// The daemon is exiting, or the stage was called off: the running build goes
+/// now, not when the stage thread next looks (the thread dies with the process
+/// and would leave it running).
+pub fn stage_kill_build() {
+    let g = STAGE_BUILD_PGID.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if g > 0 {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(g),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+}
+
+const STAGE_ASIDE: &str = ".upgrade.stage.old.";
+
+/// The stage directory goes at once: renamed aside (so a new stage can start in
+/// a clean one straight away, and nothing still writing lands in it), then
+/// removed on a thread of its own so the event loop does not sit through a
+/// cargo `target/` tree.  If it cannot be renamed, removed here as before.
 fn stage_rm() {
-    let _ = std::fs::remove_dir_all(STAGE_DIR);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !std::path::Path::new(STAGE_DIR).exists() {
+        return;
+    }
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let aside = format!("{STAGE_ASIDE}{}.{n}", std::process::id());
+    if std::fs::rename(STAGE_DIR, &aside).is_ok() {
+        stage_rm_detached(aside);
+    } else {
+        let _ = std::fs::remove_dir_all(STAGE_DIR);
+    }
+}
+
+fn stage_rm_detached(dir: String) {
+    if std::thread::Builder::new()
+        .spawn({
+            let dir = dir.clone();
+            move || {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        })
+        .is_err()
+    {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// In the thread: one note, unless a newer stage has replaced this one.
@@ -1802,14 +1898,36 @@ fn stage_run(id: u64, cmd: &mut Command, limit: u64) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
+        .process_group(0)
         .spawn()
         .map_err(|e| e.to_string())?;
+    STAGE_BUILD_PGID.store(
+        i32::try_from(child.id()).unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let res = stage_wait(id, &mut child, &log, limit);
+    // Only ours: a newer stage may already have put its own build here.
+    let _ = STAGE_BUILD_PGID.compare_exchange(
+        i32::try_from(child.id()).unwrap_or(0),
+        0,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    res
+}
+
+fn stage_wait(
+    id: u64,
+    child: &mut std::process::Child,
+    log: &str,
+    limit: u64,
+) -> Result<(), String> {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(limit);
     loop {
         match child.try_wait() {
             Ok(Some(st)) if st.success() => return Ok(()),
             Ok(Some(_)) => {
-                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let text = std::fs::read_to_string(log).unwrap_or_default();
                 return Err(text
                     .lines()
                     .next()
@@ -1820,7 +1938,7 @@ fn stage_run(id: u64, cmd: &mut Command, limit: u64) -> Result<(), String> {
             Err(e) => return Err(e.to_string()),
         }
         if stage_cancelled(id) || std::time::Instant::now() > end {
-            let _ = child.kill();
+            kill_group(child);
             let _ = child.wait();
             return Err("ran past its limit".to_string());
         }
@@ -2076,9 +2194,20 @@ pub fn stage_start(id: &str, ver: &str, variant: &str) {
 
 pub fn stage_clear() {
     STAGE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    stage_kill_build();
     let had = STAGE.lock().ok().and_then(|mut g| g.take()).is_some();
     if had {
         stage_rm();
+    }
+}
+
+/// The last report could not be sent (no hub link, or the driver's peer link is
+/// down): say the current state again on the next tick.
+pub fn stage_unsaid() {
+    if let Ok(mut g) = STAGE.lock()
+        && let Some(s) = g.as_mut()
+    {
+        s.said = 0;
     }
 }
 
@@ -2125,6 +2254,16 @@ pub fn stage_tick() -> Option<(String, String)> {
 /// A stage belongs to one process: whatever a dead one left is rubbish.
 pub fn stage_boot_clean() {
     stage_rm();
+    // and what an earlier process had set aside but not finished removing
+    if let Ok(rd) = std::fs::read_dir(".") {
+        for e in rd.flatten() {
+            if let Some(n) = e.file_name().to_str()
+                && n.starts_with(STAGE_ASIDE)
+            {
+                stage_rm_detached(n.to_string());
+            }
+        }
+    }
 }
 
 /// The staged build for this run, ready to swap in.

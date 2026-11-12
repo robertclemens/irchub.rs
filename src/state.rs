@@ -291,6 +291,8 @@ pub struct PendingOpRequest {
     pub channel: String,
     /// FD to send the response back to (-1 if a local bot).
     pub origin_fd: i32,
+    /// ...and that link's conn_serial.
+    pub origin_serial: u64,
     pub timestamp: i64,
     pub active: bool,
 }
@@ -328,6 +330,8 @@ pub struct ChanElectHub {
     pub name: String,
     /// The peer its answer came from.
     pub fd: i32,
+    /// ...and that link's conn_serial.
+    pub serial: u64,
     pub asked: i64,
     pub ready: i64,
     pub tried: bool,
@@ -339,6 +343,8 @@ pub struct ChanElect {
     pub id: String,
     pub origin: bool,
     pub from_fd: i32,
+    /// from_fd's conn_serial.
+    pub from_serial: u64,
     pub admin_fd: i32,
     /// admin_fd's conn_serial.
     pub admin_serial: u64,
@@ -377,6 +383,8 @@ pub struct PendingChanRequest {
     pub channel: String,
     /// Peer fd the request came from, -1 if a local bot.
     pub origin_fd: i32,
+    /// ...and that link's conn_serial.
+    pub origin_serial: u64,
     pub timestamp: i64,
     pub active: bool,
 }
@@ -1915,6 +1923,22 @@ impl HubState {
             return None;
         }
         self.clients.iter().position(|c| c.fd == fd)
+    }
+
+    /// Index of the client on `fd` that is still the link with this
+    /// conn_serial, or None (the link dropped and the fd may be reused).
+    pub fn client_by_fd_serial(&self, fd: i32, serial: u64) -> Option<usize> {
+        self.client_by_fd(fd)
+            .filter(|&i| self.clients[i].conn_serial == serial)
+    }
+
+    /// The conn_serial of the link on `fd` now, or 0 (none: -1, or no such
+    /// link).  A reply table keeps it beside the fd, so an answer that comes
+    /// back after the link dropped and the fd was reused never reaches the
+    /// newcomer.
+    pub fn fd_conn_serial(&self, fd: i32) -> u64 {
+        self.client_by_fd(fd)
+            .map_or(0, |i| self.clients[i].conn_serial)
     }
 
     /// Index of the authenticated bot with this UUID, or None.

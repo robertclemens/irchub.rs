@@ -350,7 +350,8 @@ pub fn find(state: &HubState, id: &str) -> Option<usize> {
 
 /// Merge a parsed body.  True when the store changed.
 fn merge(state: &mut HubState, v: &UhistView, body: &str) -> bool {
-    if let Some(at) = find(state, &v.id) {
+    let at = find(state, &v.id);
+    if let Some(at) = at {
         let r = &state.uhist[at];
         if v.rev < r.rev || (v.rev == r.rev && body.as_bytes() <= r.body.as_bytes()) {
             return false;
@@ -363,9 +364,10 @@ fn merge(state: &mut HubState, v: &UhistView, body: &str) -> bool {
         .iter()
         .position(|r| order(r.started, &r.id, v.started, &v.id) != Ordering::Less)
         .unwrap_or(state.uhist.len());
-    // It would fall straight off the end: nothing changed.
+    // It would fall straight off the end: nothing new is stored, but an older
+    // revision removed above is a change the caller must save and flood.
     if pos >= k {
-        return false;
+        return at.is_some();
     }
     state.uhist.insert(
         pos,
@@ -851,6 +853,14 @@ mod tests {
         assert!(merge(&mut a, &v2, &s2));
         assert!(!merge(&mut a, &bodies[13].0, &bodies[13].1));
         assert_eq!(a.uhist[0].rev, 2);
+        // A higher rev of a record past a window that shrank before the
+        // store was trimmed removes it and says so (fable_52_pass F10).
+        a.uhist_keep_setting = 5;
+        let last = a.uhist[UHIST_DEFAULT_KEEP - 1].clone();
+        let v3 = sample(&last.id, last.started, last.rev + 1);
+        let s3 = format(&v3).unwrap();
+        assert!(merge(&mut a, &v3, &s3));
+        assert!(find(&a, &last.id).is_none());
     }
 
     #[test]

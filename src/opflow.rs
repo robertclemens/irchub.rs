@@ -59,12 +59,14 @@ fn add_pending_op_request(
     let Some(i) = state.pending_op_requests.iter().position(|p| !p.active) else {
         return false;
     };
+    let origin_serial = state.fd_conn_serial(origin_fd);
     let p = &mut state.pending_op_requests[i];
     p.request_id = trunc_string(request_id, 64);
     p.requester_uuid = trunc_string(requester_uuid, 64);
     p.target_uuid = trunc_string(target_uuid, 64);
     p.channel = trunc_string(channel, MAX_CHAN);
     p.origin_fd = origin_fd;
+    p.origin_serial = origin_serial;
     p.timestamp = now();
     p.active = true;
     true
@@ -493,9 +495,12 @@ pub fn process_forward_op_grant(state: &mut HubState, payload: &str) {
         crate::hlog_warning!("[HUB] No pending request found for id:{request_id}\n");
         return;
     };
-    let origin_fd = state.pending_op_requests[pi].origin_fd;
+    let (origin_fd, origin_serial) = {
+        let p = &state.pending_op_requests[pi];
+        (p.origin_fd, p.origin_serial)
+    };
     if state
-        .client_by_fd(origin_fd)
+        .client_by_fd_serial(origin_fd, origin_serial)
         .is_some_and(|i| state.clients[i].typ == ClientType::Bot)
     {
         crate::hlog_debug!(
@@ -523,8 +528,11 @@ pub fn process_forward_op_failed(state: &mut HubState, payload: &str) {
         crate::hlog_warning!("[HUB] No pending request found for id:{request_id}\n");
         return;
     };
-    let origin_fd = state.pending_op_requests[pi].origin_fd;
-    if let Some(i) = state.client_by_fd(origin_fd)
+    let (origin_fd, origin_serial) = {
+        let p = &state.pending_op_requests[pi];
+        (p.origin_fd, p.origin_serial)
+    };
+    if let Some(i) = state.client_by_fd_serial(origin_fd, origin_serial)
         && state.clients[i].typ == ClientType::Bot
     {
         let fail_msg = if reason.is_empty() {
@@ -558,6 +566,7 @@ pub(crate) fn add_pending_chan_request(
     origin_fd: i32,
 ) -> bool {
     let t = now();
+    let origin_serial = state.fd_conn_serial(origin_fd);
     for p in state.pending_chan_requests.iter_mut() {
         if p.active && t - p.timestamp > CHAN_REQUEST_TIMEOUT {
             p.active = false;
@@ -568,6 +577,7 @@ pub(crate) fn add_pending_chan_request(
             p.kind = trunc_string(kind, 8);
             p.channel = trunc_string(channel, MAX_CHAN);
             p.origin_fd = origin_fd;
+            p.origin_serial = origin_serial;
             p.timestamp = t;
             p.active = true;
             return true;
@@ -818,13 +828,14 @@ pub fn process_chan_reply(state: &mut HubState, ci: usize, payload: &str) {
     };
     // Bind the answer to what was actually asked: holding a request id must
     // not let a bot hand the requester a key for some other channel.
-    let (req_kind, req_chan, req_uuid, origin_fd) = {
+    let (req_kind, req_chan, req_uuid, origin_fd, origin_serial) = {
         let p = &state.pending_chan_requests[pi];
         (
             p.kind.clone(),
             p.channel.clone(),
             p.requester_uuid.clone(),
             p.origin_fd,
+            p.origin_serial,
         )
     };
     if req_kind != kind || !req_chan.eq_ignore_ascii_case(&channel) {
@@ -857,7 +868,7 @@ pub fn process_chan_reply(state: &mut HubState, ci: usize, payload: &str) {
                 req_uuid = state.who('b', &req_uuid)
             ),
         }
-    } else if let Some(i) = state.client_by_fd(origin_fd)
+    } else if let Some(i) = state.client_by_fd_serial(origin_fd, origin_serial)
         && state.clients[i].typ == ClientType::Hub
         && state.clients[i].authenticated
     {
@@ -939,9 +950,9 @@ pub fn process_forward_chan_reply(state: &mut HubState, ci: usize, payload: &str
     let Some(pi) = find_pending_chan_request(state, &request_id) else {
         return; // not ours, or already answered
     };
-    let (origin_fd, req_uuid) = {
+    let (origin_fd, origin_serial, req_uuid) = {
         let p = &state.pending_chan_requests[pi];
-        (p.origin_fd, p.requester_uuid.clone())
+        (p.origin_fd, p.origin_serial, p.requester_uuid.clone())
     };
 
     if origin_fd == -1 {
@@ -952,7 +963,7 @@ pub fn process_forward_chan_reply(state: &mut HubState, ci: usize, payload: &str
                 req_uuid = state.who('b', &req_uuid)
             );
         }
-    } else if let Some(i) = state.client_by_fd(origin_fd)
+    } else if let Some(i) = state.client_by_fd_serial(origin_fd, origin_serial)
         && state.clients[i].typ == ClientType::Hub
         && state.clients[i].authenticated
     {

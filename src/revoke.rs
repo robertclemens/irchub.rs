@@ -106,7 +106,24 @@ pub fn cron_prune(state: &mut HubState, kind: char) {
     state.cron_recs.retain(|r| r.kind != kind || r.ts >= gts);
 }
 
+/// A deleted node's single-node setting goes with it.
+fn cron_rec_drop(state: &mut HubState, kind: char, uuid: &str) {
+    if let Some(i) = state
+        .cron_recs
+        .iter()
+        .position(|r| r.kind == kind && r.uuid == uuid)
+    {
+        state.cron_recs.swap_remove(i);
+        state.config_dirty = true;
+    }
+}
+
 fn cron_rec_put(state: &mut HubState, kind: char, uuid: &str, on: i32, ts: i64) -> Option<bool> {
+    // A deleted bot is gone for good (rv| list): its setting is not kept, and a
+    // peer that still sends it cannot bring it back.
+    if kind == 'b' && is_revoked(state, uuid) {
+        return Some(false);
+    }
     if ts < cron_global(state, kind).1 {
         return Some(false); // replaced by a newer global setting
     }
@@ -310,6 +327,7 @@ pub fn merge(state: &mut HubState, inp: &Revoked) -> bool {
         }
         state.revoked.push(inp.clone());
         state.config_dirty = true;
+        cron_rec_drop(state, 'b', &inp.uuid);
         return true;
     };
     let r = &mut state.revoked[i];

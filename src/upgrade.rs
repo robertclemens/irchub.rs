@@ -1304,7 +1304,19 @@ pub fn note_ready(state: &mut HubState, payload: &str, from_peer: Option<&str>) 
 /// records the bot as a remote node.  Otherwise it belongs to a run this hub
 /// drives itself (or none), and is noted locally.
 pub fn bot_report(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
-    let id = payload.split('|').next().unwrap_or("");
+    let mut f = payload.split('|');
+    let id = f.next().unwrap_or("");
+    let uuid = f.next().unwrap_or("");
+    // A bot reports for itself only: READY, PROGRESS and RESULT all carry the
+    // sender's uuid in field 1, so anything else is refused before it is
+    // forwarded or noted.
+    if uuid != state.clients[ci].id {
+        crate::hlog_warning!(
+            "[UPGRADE] {} sent an upgrade report for another node: dropped\n",
+            state.who_client(ci)
+        );
+        return;
+    }
     if !state.follow_id.is_empty() && !id.is_empty() && state.follow_id == id {
         let origin = state.follow_origin.clone();
         if let Some(oi) = find_client_hub(state, &origin) {
@@ -1321,13 +1333,9 @@ pub fn bot_report(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         note_progress(state, payload);
         return;
     }
-    // A bot reports for itself, and once per link: a bot sends one RESULT after
-    // a restart, so one relay per link bounds what it can make the mesh carry.
-    let uuid = payload.split('|').nth(1).unwrap_or("");
-    if !state.clients[ci].result_relayed
-        && uuid == state.clients[ci].id
-        && result_relay(state, None, payload)
-    {
+    // Once per link: a bot sends one RESULT after a restart, so one relay per
+    // link bounds what it can make the mesh carry.
+    if !state.clients[ci].result_relayed && result_relay(state, None, payload) {
         state.clients[ci].result_relayed = true;
     }
     note_result(state, payload);
@@ -4109,19 +4117,30 @@ fn stage_tick(state: &mut HubState) {
             queue::send_urgent(&mut state.clients[oi], CMD_UPGRADE_PROGRESS, &payload);
             return;
         }
+        // Driver's link down: keep it owed.
+        update::stage_unsaid();
     }
     note_progress(state, &payload);
 }
 
 /// One step per maintenance tick.  A no-op unless a run is active.
 pub fn tick(state: &mut HubState, now_ts: i64) {
+    // Called once per poll-loop pass.  The housekeeping below is second-granular
+    // (a file probe, a walk of every bot, a roll-up settle), so it runs once a
+    // second; the plan and the run's own steps still look on every pass.
+    static LAST_SEC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let new_sec = LAST_SEC.swap(now_ts, std::sync::atomic::Ordering::Relaxed) != now_ts;
     // A hub with no peers to link to has nothing more to prove than being up.
-    if state.peers.is_empty() {
+    if new_sec && state.peers.is_empty() {
         update::failback_confirm();
     }
-    cron_tick(state);
+    if new_sec {
+        cron_tick(state);
+    }
     stage_tick(state);
-    rollup_tick(state, now_ts);
+    if new_sec {
+        rollup_tick(state, now_ts);
+    }
     plan_tick(state, now_ts);
     if !state.upgrade.active {
         return;
