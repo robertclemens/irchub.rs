@@ -1220,7 +1220,7 @@ cron_sweep() { # in out
 }
 cron_edit() { # add|remove tag line
   command -v crontab >/dev/null 2>&1 || return 3
-  take_lock "$HLOCK" 15 || return 1
+  take_lock "$HLOCK" 15 || return 5  # busy: the binary runs it again soon
   T=".upgrade.cron.$$"; rc=1; n=0
   while [ "$n" -lt 3 ]; do
     n=$((n + 1))
@@ -1367,14 +1367,6 @@ case "${1:-tick}" in
     cron_edit remove "$PRODTAG" || rc=$?
     if [ "$rc" = 0 ]; then rm -f .cron.seen; cron_status; rc=$?; fi
     rm -f "$SELF"; exit "$rc" ;;
-  cron-drop)
-    rc=0
-    cron_edit remove "$PRODTAG" || rc=$?
-    cron_edit remove "$FAILTAG" || rc=$?
-    if [ "$rc" = 0 ]; then
-      cron_status; [ $? = 10 ] && rc=10
-    fi
-    rm -f "$SELF" .cron.seen; exit "$rc" ;;
 esac
 exit 0
 "##;
@@ -1486,12 +1478,22 @@ fn cron_note(c: &mut CronState, rc: i32, now: u64) {
         _ if rc == 11 || (rc == 3 && c.wanted != 1) => "no",
         3 => "failed:no crontab tool",
         4 => "failed:unsafe path",
+        CRON_RC_BUSY => "busy",
         _ => "failed:cannot read crontab",
     }
     .to_string();
     // Ours: look at the stamp in this same pass, so a host whose cron is dead
     // stays "silent" instead of reading "yes" for a minute after every check.
     c.stat = if c.ours { 0 } else { now };
+    // Another node held the lock: soon, not in an hour, and never later than an
+    // order that arrived meanwhile has already asked for.
+    if rc == CRON_RC_BUSY {
+        let spread = u64::from(std::process::id())
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(now)
+            % CRON_BUSY_RETRY_SPAN;
+        c.next = c.next.min(now + CRON_BUSY_RETRY_MIN + spread);
+    }
 }
 
 /// The helper's work files are `.upgrade.cron.<its pid>.*`: a helper that was
@@ -1507,7 +1509,7 @@ fn cron_work_rm(pid: u32) {
     }
 }
 
-/// What `cron_tick` last found: yes, silent, manual, no or failed:<why>.
+/// What `cron_tick` last found: yes, silent, manual, no, busy or failed:<why>.
 pub fn cron_status() -> String {
     CRON.lock().map(|c| c.status.clone()).unwrap_or_default()
 }
@@ -1574,7 +1576,8 @@ pub fn cron_tick(exe: &str) -> bool {
             fail = Some("cannot write here".to_string());
         }
         if let Some(why) = fail {
-            c.status = format!("failed:{why}");
+            // C: snprintf into g_cron_status[CRON_STATUS_MAX + 1]
+            c.status = crate::cstr::trunc_string(&format!("failed:{why}"), CRON_STATUS_MAX + 1);
             c.next = now + CRON_CHECK_SECS;
         } else {
             let arg = match c.wanted {
@@ -1613,42 +1616,6 @@ pub fn cron_tick(exe: &str) -> bool {
         c.status = if quiet { "silent" } else { "yes" }.to_string();
     }
     before != c.status
-}
-
-/// The node is being deleted: both tagged lines go.  0 gone, 10 gone but a
-/// hand-written line still runs this binary, anything else could not.
-pub fn cron_drop(exe: &str) -> i32 {
-    if let Ok(mut c) = CRON.lock()
-        && let Some(mut child) = c.child.take()
-    {
-        kill_group(&mut child);
-        let _ = child.wait();
-        cron_work_rm(child.id());
-    }
-    if !failback_write(
-        CRON_HELPER,
-        exe,
-        "",
-        true,
-        HUB_CONFIG_FILE,
-        HUB_PID_FILE,
-        HUB_UPGRADE_SCRIPT,
-        "",
-        CRON_HELPER,
-    ) {
-        return 1;
-    }
-    let rc = Command::new(format!("./{CRON_HELPER}"))
-        .arg("cron-drop")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()
-        .and_then(|s| s.code())
-        .unwrap_or(1);
-    let _ = std::fs::remove_file(CRON_HELPER);
-    rc
 }
 
 /// A keepalive line can fire while an upgrade installs, when no daemon holds the

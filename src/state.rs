@@ -978,21 +978,16 @@ pub struct BotRoster {
     pub connected_at: i64,
     /// Bot -> its hub link, 0 = unknown.
     pub link_since: i64,
+    /// Phase 4: bot's link-order counter, 0 = unknown.
+    pub link_ord: u64,
     /// The bot's address as its hub sees it, "" = unknown.
     pub ip: String,
     /// Local clock: drives the TTL.
     pub reported_at: i64,
     /// The gossip round it came in (0 = none); C `gen`.
     pub round: i64,
-}
-
-/// Loop-prevention seen-set: highest lamport_seq observed per (origin, bot).
-#[derive(Clone, Debug, Default)]
-pub struct DeltaSeen {
-    pub origin_hub_uuid: String,
-    pub bot_uuid: String,
-    pub max_seq_seen: u64,
-    pub last_seen_at: i64,
+    /// Arrival order vs presence v2 records (`P2State::stamp_ctr`).
+    pub p2_stamp: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1132,11 @@ pub struct HubClient {
     pub drop_unlogged: i32,
     /// A newer session of this bot replaced it.
     pub superseded: bool,
+    /// Peer: it sent a CMD_PRESENCE2 record.
+    pub p2_seen: bool,
+    /// Peer: a frame from it opened (a dialled link is not up until the far
+    /// end speaks).
+    pub peer_heard: bool,
     /// This link's one relayed UPGRADE_RESULT has gone.
     pub result_relayed: bool,
     /// Start of the hour replace_count is for.
@@ -1249,6 +1249,8 @@ pub struct HubClient {
     pub plan_capable: bool,
     /// The bot's own start time, 0 = unreported.
     pub bot_started: i64,
+    /// Phase 4: bot's link-order counter, 0 = unreported.
+    pub bot_link_ord: u64,
     /// SHA-256 of the last full config queued to this bot (CMD_CONFIG_DATA),
     /// so a broadcast push that would repeat it is skipped.  Only set while
     /// that push is known to be on its way: cleared when a queued config is
@@ -1260,10 +1262,16 @@ pub struct HubClient {
     /// reconnecting bot may hold a stale copy, e.g. its own old key after a
     /// rekey).
     pub pushed: bool,
-    /// SHA-256 of the last bot tree queued to this bot (CMD_BOT_TREE): a
-    /// change push that would repeat it is skipped (the BOT_TREE_REFRESH one
-    /// never is).  Cleared when a queued tree is dropped on overflow.
-    pub tree_sent_hash: Option<[u8; 32]>,
+    /// Phase 5: whether this bot holds a known tree version, and which
+    /// (`tree_seq`).  A current bot gets the row delta from the last tree to
+    /// the new one; others get the whole tree.  Cleared when a queued tree or
+    /// delta is dropped on overflow, so the bot is resent the whole tree.
+    pub tree_sent_valid: bool,
+    pub tree_sent_seq: u64,
+    /// Last CMD_BOT_TREE_PULL served.
+    pub tree_pull_at: i64,
+    /// One came inside TREE_PULL_MIN_GAP: held.
+    pub tree_pull_due: bool,
 }
 
 impl HubClient {
@@ -1296,6 +1304,8 @@ impl HubClient {
             drop_logged: 0,
             drop_unlogged: 0,
             superseded: false,
+            p2_seen: false,
+            peer_heard: false,
             result_relayed: false,
             replace_window: 0,
             replace_count: 0,
@@ -1350,9 +1360,13 @@ impl HubClient {
             late_prepared: false,
             plan_capable: false,
             bot_started: 0,
+            bot_link_ord: 0,
             cfg_sent_hash: None,
             pushed: false,
-            tree_sent_hash: None,
+            tree_sent_valid: false,
+            tree_sent_seq: 0,
+            tree_pull_at: 0,
+            tree_pull_due: false,
         }
     }
 
@@ -1661,16 +1675,17 @@ pub struct HubState {
     /// value lags.
     pub next_lamport_seq: u64,
 
-    /// Loop prevention: deltas already observed per (origin_hub_uuid,
-    /// bot_uuid).  LRU-evicted past MAX_DELTA_SEEN.
-    pub delta_seen: Vec<DeltaSeen>,
-
     // ---- Bot presence (volatile; never serialized) ----
     pub roster: Vec<BotRoster>,
     /// This hub's own uptime base.
     pub hub_started: i64,
     pub last_presence_gossip: i64,
     pub last_tree_push: i64,
+    /// Phase 5: the last whole tree pushed, its FNV-1a 64 and version, for row
+    /// deltas (a current bot gets the diff from this to the new tree).
+    pub tree_last: String,
+    pub tree_last_fnv: u64,
+    pub tree_seq: u64,
     /// Roster changed: push to bots on the next tick.
     pub tree_dirty: bool,
     /// ...by one of our own bots (short gap).
@@ -1691,6 +1706,8 @@ pub struct HubState {
     pub presence_last_event: i64,
     /// Event gossips in a row inside the window.
     pub presence_burst: i32,
+    /// Presence v2 (None until `presence2::init`).
+    pub p2: Option<Box<crate::presence2::P2State>>,
     /// A link came up: gossip once more then.
     pub gossip_again_at: i64,
     /// Ask peers for a sync then (0 = none).
@@ -1829,11 +1846,13 @@ impl HubState {
             last_config_write: 0,
             mesh_state_dirty: false,
             next_lamport_seq: 0,
-            delta_seen: Vec::new(),
             roster: Vec::new(),
             hub_started: 0,
             last_presence_gossip: 0,
             last_tree_push: 0,
+            tree_last: String::new(),
+            tree_last_fnv: 0,
+            tree_seq: 0,
             tree_dirty: false,
             tree_dirty_local: false,
             last_tree_change_push: 0,
@@ -1844,6 +1863,7 @@ impl HubState {
             presence_hold_until: 0,
             presence_last_event: 0,
             presence_burst: 0,
+            p2: None,
             gossip_again_at: 0,
             resync_due_at: 0,
             console: None,

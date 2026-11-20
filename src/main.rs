@@ -19,7 +19,7 @@ use irchub::state::Lane;
 use irchub::state::{ClientType, HubClient, HubState, MaskRecord, UserRecord, name_valid};
 use irchub::{
     activity, auth, client, config, crypto, hlog_debug, hlog_error, hlog_info, hlog_warning,
-    logging, mesh, net, presence, queue, ratelimit, storage, tool, upgrade,
+    logging, mesh, net, presence, presence2, queue, ratelimit, storage, tool, upgrade,
 };
 
 const PEER_INFO: &[u8] = b"irchub-peer-session-v1";
@@ -311,6 +311,9 @@ fn peer_handshake(state: &mut HubState, ci: usize, pi: usize) {
     hlog_info!("[PEER] Handshake complete with {}\n", state.clients[ci].ip);
     let peer_uuid = state.peers[pi].uuid.clone();
     irchub::client::link_offer(state, ci, Some(&peer_uuid));
+    // presence2::link_up waits for the first frame back (peer_heard): a hub
+    // that is frozen still accepts the TCP connect, and must not look linked.
+    irchub::presence::roster_send_to_peer(state, ci); // our k|rollcall + bots, past the damping
     // If this process is the product of an upgrade a peer drove, close that
     // run out now that there is a peer to tell (no-op otherwise).
     upgrade::report_pending(state, ci);
@@ -583,7 +586,17 @@ fn maintenance(state: &mut HubState) {
                 i += 1;
                 continue;
             }
-            if t - c.last_seen > CLIENT_TIMEOUT {
+            // Phase 3: a v2 peer link lives on the 15 s digest, so it is dropped
+            // after P2_LINK_TIMEOUT (3 missed digests) rather than CLIENT_TIMEOUT.
+            let p2_keepalive = presence2::digest_keepalive(state, c);
+            // A dialled peer link that has not answered gets no longer either.
+            let unheard = c.typ == ClientType::Hub && c.authenticated && !c.peer_heard;
+            let idle_limit = if p2_keepalive || unheard {
+                presence2::P2_LINK_TIMEOUT
+            } else {
+                CLIENT_TIMEOUT
+            };
+            if t - c.last_seen > idle_limit {
                 hlog_warning!("[HUB] Client {} timed out.\n", c.ip);
                 auth::disconnect_client(state, i);
                 continue;
@@ -636,9 +649,11 @@ fn maintenance(state: &mut HubState) {
                 auth::disconnect_client(state, i);
                 continue;
             }
-            if c.authenticated && t - c.last_seen > PING_INTERVAL {
+            // Phase 3: no ping on a v2 peer link — its 15 s digest is the
+            // keepalive; other clients keep the 60 s ping.
+            if c.authenticated && !p2_keepalive && t - c.last_seen > PING_INTERVAL {
                 let ip = c.ip.clone();
-                if !client::send_ping(&mut state.clients[i]) {
+                if !client::send_ping(state, i) {
                     hlog_warning!("Ping failed to {ip}. Disconnecting.\n");
                     auth::disconnect_client(state, i);
                     continue;
@@ -1100,6 +1115,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     }
     irchub::uhist::boot(&mut state);
     irchub::upgrade::plan_boot(&mut state);
+    irchub::presence2::init(&mut state); // bumps the boot counter: after the config gave us our uuid
     drop(password);
     logging::set_levels(state.log_level, state.console_log_level);
     logging::set_max_size(state.log_max_size);

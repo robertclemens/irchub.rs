@@ -1292,8 +1292,8 @@ fn regen_keys(state: &mut HubState, ci: usize) -> bool {
         return false;
     };
 
-    let fname = chrono::Local::now()
-        .format("%Y%m%d%H%M_pub.b64")
+    let fname = jiff::ZonedDateTime::now()
+        .strftime("%Y%m%d%H%M_pub.b64")
         .to_string();
     let written = std::fs::write(&fname, &pub_b64).is_ok();
     let mut r = Reply::new();
@@ -4226,6 +4226,23 @@ fn upgrade_status_cmd(state: &mut HubState, ci: usize, payload: &str) -> bool {
 /// Client load and the maintenance countdowns of CMD_ADMIN_STATS
 /// (hub_maintenance), between the sync counters and the opcode rows.
 fn stats_load(state: &HubState, r: &mut Reply) {
+    // Presence v2 (presence2.rs), before the load record as in C.
+    if let Some(p) = state.p2.as_ref() {
+        r.rec("p2");
+        r.kvi("ready", i64::from(p.ready));
+        r.kvu("rx", p.c_rx);
+        r.kvu("bad", p.c_rx_bad);
+        r.kvu("tx", p.c_tx);
+        r.kvu("deltas", p.c_deltas);
+        r.kvu("snaps", p.c_snaps);
+        r.kvu("held", p.c_held);
+        r.kvu("pulls", p.c_pulls);
+        r.kvu("relays", p.c_relays);
+        r.kvu("miss", p.c_digest_miss);
+        r.kvu("heals", p.c_heals);
+        r.kvu("jumps", p.c_jumps);
+        r.kvu("drops", p.c_purges);
+    }
     let t = now();
     let (mut bots, mut peers, mut consoles, mut authing) = (0i64, 0i64, 0i64, 0i64);
     for c in &state.clients {

@@ -113,7 +113,9 @@ fn open_log(truncate: bool) -> Option<File> {
 use std::os::unix::fs::PermissionsExt;
 
 fn local_time_str() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    jiff::ZonedDateTime::now()
+        .strftime("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 /// Length of the valid UTF-8 sequence starting at `p`, or 0 when the bytes

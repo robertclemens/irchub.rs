@@ -25,7 +25,6 @@ pub const MAX_BUFFER: usize = 16384;
 pub const SALT_SIZE: usize = 16;
 pub const GCM_IV_LEN: usize = 12;
 pub const GCM_TAG_LEN: usize = 16;
-pub const HEADER_SIZE: usize = 4;
 pub const MAX_PENDING_OP_REQUESTS: usize = 500;
 /// PBKDF2-HMAC-SHA256 rounds for the .irchub.cnf and .irchub.pass keys
 /// (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; every
@@ -122,6 +121,10 @@ pub const PURGE_FLOOR_HOLD: i64 = 600;
 // OP_FORWARD_REQUEST deduplication — prevents packet storms
 pub const OP_FORWARD_TTL_SECONDS: i64 = 60;
 pub const MAX_SEEN_FORWARD_IDS: usize = 256;
+/// The longest key the ring is given: the plan keys ("pb:<driver>:<step>",
+/// "pc:<started>:<at>") are built in 96-byte buffers.  A key cut to fit would
+/// make two different steps look like one.
+pub const SEEN_FORWARD_ID_MAX: usize = 96;
 
 /// Keepalive traffic (CMD_PING and the PONG it draws) is pure noise in the
 /// hub log; true = never log it.  Mirrors HIDEPINGPONG in ircbot/bot.h.
@@ -202,7 +205,9 @@ pub const CMD_UPDATE_PUBKEY: u8 = 0x05;
 pub const CMD_PEER_SYNC: u8 = 0x06;
 pub const CMD_MESH_STATE: u8 = 0x07;
 pub const CMD_SYNC_REQUEST: u8 = 0x08;
-pub const CMD_INVITE_REQUEST: u8 = 0x09;
+// 0x09 was CMD_INVITE_REQUEST (a bot asking every bot to invite a nick, flooded
+// as invite| sync lines); removed in 2.5.3, the channel-request election does
+// invites.  Never reuse the value.
 
 pub const CMD_ADMIN_AUTH: u8 = 0x10;
 pub const CMD_ADMIN_LIST_FULL: u8 = 0x11;
@@ -446,6 +451,16 @@ pub const CMD_CRON_SET: u8 = 0x8B;
 // would leave the mesh unable to upgrade it.  Mirrors irchub/hub.h.
 pub const CMD_HUB_ROLLCALL: u8 = 0x8C;
 pub const CMD_HUB_ROLLCALL_ACK: u8 = 0x8D;
+/// Presence v2 (docs/plans/2026-11-14_presence_v2_plan.md, phase 1): one
+/// versioned record per hub.  Hub <-> Hub only, text payload, one frame each:
+/// `S|origin|epoch|seq|ttl|caps|links|bots` (ttl 0 = this peer only),
+/// `G|origin:epoch:seq,...` / `W|...` (digest; W asks for a G back),
+/// `R|origin` (pull: answer S ttl 0).  Unknown tags are ignored.  presence2.rs.
+pub const CMD_PRESENCE2: u8 = 0x8E;
+/// Phase 5 (presence v2 K): the bots tree is pushed as row deltas with the new
+/// tree's hash; a bot whose hash mismatches pulls the whole tree.
+pub const CMD_BOT_TREE_DELTA: u8 = 0x8F;
+pub const CMD_BOT_TREE_PULL: u8 = 0x90;
 /// Seconds the asking hub waits for the answers.
 pub const ROLLCALL_WAIT: i64 = 3;
 /// A relayed roll call older than this is dropped.
@@ -637,8 +652,6 @@ pub const CONSOLE_CORE_OUTQ_MAX: usize = 1024 * 1024;
 /// In-memory ring of recent log lines the log view and "log on" replay.
 pub const CONSOLE_LOG_RING: usize = 1024;
 pub const CONSOLE_LOG_LINE_MAX: usize = 512;
-/// Coalescing of pushed events: seconds between two tree events.
-pub const CONSOLE_TREE_MIN_GAP: i64 = 1;
 pub const CONSOLE_NAME_MAX: usize = 64;
 /// Largest control / session frame either side accepts.
 pub const CONSOLE_FRAME_MAX: usize = 4 * 1024 * 1024;
@@ -649,8 +662,11 @@ pub const CHAN_REQUEST_TIMEOUT: i64 = 45;
 // ---- Network upgrade run (CMD_UPGRADE_*, CMD_ADMIN_UPGRADE_NET) -----------
 // One run at a time per hub: the whole point is that exactly one plan drives
 // the mesh while the config is frozen.
-/// Every client, plus this hub.
-pub const MAX_UPGRADE_NODES: usize = MAX_CLIENTS + 1;
+/// A run spans the whole mesh, not one hub's clients: every registered bot
+/// (the config holds at most MAX_BOTS mesh-wide), every hub the mesh can know
+/// (MAX_MESH_HUBS remote plus MAX_PEERS direct), plus this hub.  Sized to
+/// MAX_CLIENTS + 1 it left 10 bots out of an 11-hub, 100-bot network.
+pub const MAX_UPGRADE_NODES: usize = MAX_BOTS + MAX_MESH_HUBS + MAX_PEERS + 1;
 /// Downstream routes a follower remembers for a run it is only relaying: one
 /// per node it forwarded an answer for.  See `state::UpgradeRoute`.
 pub const MAX_UPGRADE_ROUTES: usize = MAX_UPGRADE_NODES;
@@ -898,6 +914,8 @@ pub const UHIST_HEADER_FIELDS: usize = 20;
 pub const UHIST_NODE_MAX: usize = 1280;
 pub const UHIST_LINE_MAX: usize = 6144 + MAX_UPGRADE_NODES * UHIST_NODE_MAX;
 pub const UHIST_MIN_PREFIX: usize = 4;
+// One upgrade history record must fit a peer frame (hub.h _Static_assert).
+const _: () = assert!(UHIST_LINE_MAX + 16 <= MAX_SYNC_PAYLOAD);
 pub const HUB_CONFIG_FIXED_MAX: usize = 8192
     + MAX_UPGRADE_HISTORY * UHIST_LINE_MAX
     + ROLLUP_LINE_MAX
@@ -925,7 +943,12 @@ pub const MAX_BULK_PAYLOAD: usize = if MAX_CONFIG_PAYLOAD > MAX_SYNC_PAYLOAD {
 // follows from MAX_BOTS / MAX_PEERS, so raising either retracks the buffers
 // automatically.  None of this touches the config store.
 pub const BOT_PRESENCE_INTERVAL: i64 = 60;
+/// Whole-tree re-push to pre-delta bots (delta bots are checked by the
+/// keepalive tree hash instead).
 pub const BOT_TREE_REFRESH: i64 = 300;
+/// Bots from this version apply CMD_BOT_TREE_DELTA and check the tree hash a
+/// keepalive PING carries ("t|<fnv64hex>"); older ones get whole trees.
+pub const TREE_DELTA_MIN_BOT: &str = "2.5.3";
 /// Change pushes are coalesced: news from the mesh (peer gossip, links, TTL
 /// expiry) reaches bots at most once per BOT_TREE_COALESCE — it is already up
 /// to a gossip interval old — while a change to this hub's own bots goes out
@@ -933,10 +956,25 @@ pub const BOT_TREE_REFRESH: i64 = 300;
 /// edge); the flag is held until the push, so the latest tree always lands.
 pub const BOT_TREE_COALESCE: i64 = 30;
 pub const BOT_TREE_COALESCE_LOCAL: i64 = 2;
+/// A bot's CMD_BOT_TREE_PULLs are served at most once per this many seconds;
+/// one inside the gap is held and served when it ends (presence::tree_pull).
+pub const TREE_PULL_MIN_GAP: i64 = 2;
 pub const BOT_ROSTER_TTL: i64 = 240;
 pub const ROSTER_VERSION_MAX: usize = 15;
 /// Code base: "c" / "rs".
 pub const ROSTER_VARIANT_MAX: usize = 7;
+/// The longest CMD_BOT_PRESENCE payload read: version|server|started|variant|
+/// cron|link_ord at their caps (a 64-bit number is at most 20 digits), plus room
+/// for fields a newer bot adds.  Anything longer is cut, and then the
+/// link-order counter (last) is not trusted: it reads 0.
+pub const BOT_PRESENCE_MAX: usize = ROSTER_VERSION_MAX
+    + ROSTER_SERVER_MAX
+    + 20
+    + ROSTER_VARIANT_MAX
+    + CRON_STATUS_MAX
+    + 20
+    + 5
+    + 64;
 pub const ROSTER_SERVER_MAX: usize = 63;
 /// INET6_ADDRSTRLEN - 1: a bot's address in a roster row.
 pub const ROSTER_IP_MAX: usize = 45;
@@ -989,11 +1027,8 @@ const _: () = assert!(
     "per-peer queue budget must hold at least one bulk payload"
 );
 
-pub const MAX_DELTA_SEEN: usize = 8192;
 pub const BULK_SOFT_BUDGET_BPS: i64 = 32 * 1024;
 pub const DELTA_HARD_BUDGET_BPS: i64 = 64 * 1024;
-pub const BOT_DELTA_RATE_LIMIT: i64 = 10;
-pub const BOT_DELTA_RATE_WINDOW: i64 = 30;
 
 // ---- IP allow/deny list entries --------------------------------------------
 pub const MAX_IP_ACL_ENTRIES: usize = 64;
@@ -1019,6 +1054,12 @@ pub const UPGRADE_FAILBACK_EXPIRY: u64 = 1800;
 pub const CRON_HELPER_TIMEOUT: u64 = 60; // a crontab edit that takes longer is killed
 pub const CRON_CHECK_SECS: u64 = 3600; // how often a node looks at its line
 pub const CRON_SILENT_SECS: u64 = 900; // no stamp for this long: no cron daemon
+/// Every node of one account edits its one crontab under one lock: a helper that
+/// cannot get it exits `CRON_RC_BUSY` and is run again this soon, spread by pid so
+/// a queue of nodes does not meet again at the same second.
+pub const CRON_RC_BUSY: i32 = 5;
+pub const CRON_BUSY_RETRY_MIN: u64 = 10;
+pub const CRON_BUSY_RETRY_SPAN: u64 = 21; // 10..30 s
 /// A node says it is staging this often, and one silent this long has left the run.
 pub const UPGRADE_STAGE_BEAT: u64 = 20;
 pub const UPGRADE_STAGE_SILENCE: i64 = 90;

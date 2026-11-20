@@ -1051,7 +1051,9 @@ fn run() -> i32 {
         }
     }
 
-    let stamp = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
+    let stamp = jiff::ZonedDateTime::now()
+        .strftime("%Y%m%d%H%M%S")
+        .to_string();
     let pre = dir.map(|d| format!("{d}/")).unwrap_or_default();
     let priv_path = format!("{pre}{stamp}_{name}.private.b64");
     let pub_path = format!("{pre}{stamp}_{name}.public.b64");

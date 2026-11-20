@@ -11,7 +11,7 @@ use crate::consts::*;
 use crate::crypto;
 use crate::cstr::now;
 use crate::net::{self, SendOutcome};
-use crate::state::{ClientType, DeltaSeen, HubClient, HubState, Lane, QueuedMsg};
+use crate::state::{ClientType, HubClient, Lane, QueuedMsg};
 
 /// peer_enqueue(): put `m` on the client's lane, coalescing when its key
 /// matches one already queued.
@@ -100,8 +100,8 @@ pub fn enqueue(client: &mut HubClient, m: QueuedMsg) -> bool {
 /// A config push that never reaches its bot must not stand as "sent", or the
 /// next identical broadcast would be skipped and the bot left behind.
 fn cfg_push_lost(client: &mut HubClient, m: &QueuedMsg) {
-    if m.cmd == CMD_BOT_TREE {
-        client.tree_sent_hash = None; // same for a tree
+    if m.cmd == CMD_BOT_TREE || m.cmd == CMD_BOT_TREE_DELTA {
+        client.tree_sent_valid = false; // a tree or delta that never landed: resend whole
     }
     if m.cmd == CMD_CONFIG_DATA {
         client.cfg_sent_hash = None;
@@ -288,50 +288,6 @@ pub fn send_urgent(client: &mut HubClient, cmd: u8, payload: &str) -> bool {
     true
 }
 
-/// hub_delta_seen_check_and_update(): true if (origin, bot, seq) is new (and
-/// updates the set); false if seq <= the last seen.
-pub fn delta_seen_check_and_update(
-    state: &mut HubState,
-    origin_hub_uuid: &str,
-    bot_uuid: &str,
-    seq: u64,
-) -> bool {
-    if origin_hub_uuid.is_empty() || bot_uuid.is_empty() {
-        return true;
-    }
-    if let Some(e) = state
-        .delta_seen
-        .iter_mut()
-        .find(|e| e.origin_hub_uuid == origin_hub_uuid && e.bot_uuid == bot_uuid)
-    {
-        if seq <= e.max_seq_seen {
-            return false;
-        }
-        e.max_seq_seen = seq;
-        e.last_seen_at = now();
-        return true;
-    }
-
-    // Insert new.  If full, LRU-evict the oldest by moving the last entry
-    // into its slot (never shift the array).
-    if state.delta_seen.len() >= MAX_DELTA_SEEN {
-        let mut oldest = 0;
-        for i in 1..state.delta_seen.len() {
-            if state.delta_seen[i].last_seen_at < state.delta_seen[oldest].last_seen_at {
-                oldest = i;
-            }
-        }
-        state.delta_seen.swap_remove(oldest);
-    }
-    state.delta_seen.push(DeltaSeen {
-        origin_hub_uuid: origin_hub_uuid.to_string(),
-        bot_uuid: bot_uuid.to_string(),
-        max_seq_seen: seq,
-        last_seen_at: now(),
-    });
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,19 +352,6 @@ mod tests {
             QueuedMsg::new(CMD_PEER_SYNC, Lane::Bulk, &vec![0u8; MAX_BULK_PAYLOAD + 1]).is_none()
         );
         assert!(QueuedMsg::new(CMD_PEER_SYNC, Lane::Bulk, &vec![0u8; MAX_BULK_PAYLOAD]).is_some());
-    }
-
-    #[test]
-    fn delta_seen_rejects_replays_and_evicts_lru() {
-        let mut s = HubState::new();
-        assert!(delta_seen_check_and_update(&mut s, "hub-a", "bot-1", 5));
-        assert!(!delta_seen_check_and_update(&mut s, "hub-a", "bot-1", 5));
-        assert!(!delta_seen_check_and_update(&mut s, "hub-a", "bot-1", 4));
-        assert!(delta_seen_check_and_update(&mut s, "hub-a", "bot-1", 6));
-        // A missing origin or bot is not tracked at all.
-        assert!(delta_seen_check_and_update(&mut s, "", "bot-1", 1));
-        assert!(delta_seen_check_and_update(&mut s, "hub-a", "", 1));
-        assert_eq!(s.delta_seen.len(), 1);
     }
 
     #[test]

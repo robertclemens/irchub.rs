@@ -43,6 +43,7 @@ pub mod modes;
 pub mod net;
 pub mod opflow;
 pub mod presence;
+pub mod presence2;
 pub mod queue;
 pub mod ratelimit;
 pub mod reply;

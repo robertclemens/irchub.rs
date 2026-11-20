@@ -33,7 +33,8 @@ fn rc_id_ok(s: &str) -> bool {
 /// a link to (the same set upgrade::hubs_missing counts).  None when the
 /// gossip check has to decide instead: a configured peer that has never linked
 /// (no uuid, nobody can ask it), a known hub that has not said it answers a
-/// roll call (an older build), or more hubs than a roll call holds.
+/// roll call (an older build), a linked peer not yet in the mesh view, or more
+/// hubs than a roll call holds.  A hub presence dropped as unreachable is asked.
 fn known_hubs(state: &HubState) -> Option<Vec<(String, String, bool)>> {
     let mut want: Vec<(String, String, bool)> = Vec::new();
     let add = |uuid: &str, name: &str, want: &mut Vec<(String, String, bool)>| -> bool {
@@ -73,13 +74,17 @@ fn known_hubs(state: &HubState) -> Option<Vec<(String, String, bool)>> {
     if want.is_empty() {
         return None;
     }
-    let all_answer = want.iter().all(|w| {
-        state
-            .mesh_hubs
-            .iter()
-            .find(|m| m.uuid == w.0)
-            .is_some_and(|m| m.rollcall)
-    });
+    // Not in the mesh view: a peer linked right now that has not gossiped yet
+    // may be an older build, so the gossip decides.  Otherwise presence dropped
+    // it as unreachable (a stopped hub, 2 s before an upgrade start on a 10-hub
+    // mesh): it cannot answer whatever it runs, so ask anyway and let it count
+    // as "did not answer".
+    let all_answer = want
+        .iter()
+        .all(|w| match state.mesh_hubs.iter().find(|m| m.uuid == w.0) {
+            Some(m) => m.rollcall,
+            None => !state.peers.iter().any(|p| p.connected && p.uuid == w.0),
+        });
     all_answer.then_some(want)
 }
 

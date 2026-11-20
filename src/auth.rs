@@ -381,7 +381,7 @@ pub fn handle_bot_authentication(state: &mut HubState, ci: usize, data: &[u8]) -
         // of leaving it invisible to the mesh until the periodic refresh.
         presence::roster_mark_dirty(state, true);
         let hub = state.hub_uuid.clone();
-        presence::roster_evict_moved(state, &id, &hub, 0);
+        presence::roster_evict_moved(state, &id, &hub, 0, 0);
         presence::presence_event(state);
 
         crate::hlog_info!(
@@ -475,7 +475,15 @@ pub fn disconnect_client(state: &mut HubState, ci: usize) {
     }
     // fd -1: a socket handed to the SSH console, not a disconnect.
     if fd >= 0 {
-        crate::hlog_info!("[HUB] Disconnecting client {ip} (FD: {fd})\n");
+        // An authenticated bot or peer hub by name and uuid (a dropped peer read
+        // "client 127.0.0.1"); consoles and unauthenticated sockets have only
+        // their address.
+        if authed && matches!(typ, ClientType::Bot | ClientType::Hub) {
+            let who = state.who_client(ci);
+            crate::hlog_info!("[HUB] Disconnecting {who} at {ip} (FD: {fd})\n");
+        } else {
+            crate::hlog_info!("[HUB] Disconnecting client {ip} (FD: {fd})\n");
+        }
     }
 
     ratelimit::decrement_active_connections(state, &ip);

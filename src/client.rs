@@ -156,7 +156,8 @@ fn link_seq_recv(state: &mut HubState, ci: usize, what: &str) {
 /// send_pong(): the keepalive answer, through [`client_send`].  Drops the
 /// client when it cannot be queued.
 fn send_pong(state: &mut HubState, ci: usize) -> bool {
-    let ok = client_send(&mut state.clients[ci], CMD_PING, "");
+    let tp = crate::presence::tree_ping_payload(state, ci);
+    let ok = client_send(&mut state.clients[ci], CMD_PING, &tp);
     if !ok {
         auth::disconnect_client(state, ci);
         return false;
@@ -168,8 +169,10 @@ fn send_pong(state: &mut HubState, ci: usize) -> bool {
 /// handshake (a ping sent straight to the socket landed inside a part-sent
 /// sync frame and broke the link).  False = it could not be queued: the
 /// caller drops the connection.
-pub fn send_ping(client: &mut HubClient) -> bool {
-    client_send(client, CMD_PING, "")
+/// A bot's ping carries its tree hash (`presence::tree_ping_payload`).
+pub fn send_ping(state: &mut HubState, ci: usize) -> bool {
+    let tp = crate::presence::tree_ping_payload(state, ci);
+    client_send(&mut state.clients[ci], CMD_PING, &tp)
 }
 
 /// SHA-256 of a bot config, leaving out the pd| line: it is stamped with the
@@ -1184,36 +1187,6 @@ pub fn process_peer_bot_relay(state: &mut HubState, ci: usize, payload: &str) {
     crate::hlog_debug!("[HUB] BOT_RELAY_FWD {id} for {target} passed on to {sent} peer(s)\n");
 }
 
-/// CMD_INVITE_REQUEST: `nick|#channel` — broadcast to the other local bots
-/// and forward to the peers.
-fn process_invite_request(state: &mut HubState, ci: usize, payload: &str) {
-    let conv = sscanf(payload, &[Fmt::Set(63, b"|"), Fmt::Lit("|"), Fmt::Word(63)]);
-    let id = state.who_client(ci);
-    let fd = state.clients[ci].fd;
-    if conv.len() != 2 {
-        crate::hlog_warning!("[HUB] Invalid INVITE_REQUEST payload from {id}\n");
-        return;
-    }
-    let inv_nick = conv[0].s().to_string();
-    let inv_chan = conv[1].s().to_string();
-    crate::hlog_info!("[HUB] INVITE_REQUEST from {id}: invite {inv_nick} into {inv_chan}\n");
-
-    for bi in state.bot_clients() {
-        if state.clients[bi].fd == fd {
-            continue;
-        }
-        if !send_cmd_to_bot(&mut state.clients[bi], CMD_INVITE_REQUEST, payload) {
-            crate::hlog_warning!(
-                "[HUB] Failed to forward INVITE_REQUEST to {}\n",
-                state.who_client(bi)
-            );
-        }
-    }
-
-    let peer_inv = trunc_string(&format!("invite|{inv_nick}|{inv_chan}"), 192);
-    mesh::broadcast_sync_to_peers(state, &peer_inv, fd);
-}
-
 /// process_bot_command().
 fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
     match cmd {
@@ -1223,6 +1196,8 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
             }
         }
         CMD_BOT_PRESENCE => presence::process_bot_presence(state, ci, payload),
+        // Phase 5: the bot's tree diverged from a delta — send it the whole one.
+        CMD_BOT_TREE_PULL => presence::tree_pull(state, ci),
         CMD_ACTIVITY => crate::activity::process(state, ci, payload),
         CMD_ACTIVITY_QUERY => crate::activity::process_query(state, ci, payload),
         CMD_UPGRADE_READY => upgrade::bot_report(state, ci, CMD_UPGRADE_READY, payload),
@@ -1241,7 +1216,6 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
         CMD_CHAN_PROBE_ACK => crate::elect::process_probe_ack(state, ci, payload),
         CMD_CHAN_DONE => crate::elect::process_done(state, ci, payload),
         CMD_CHAN_EVENT => crate::modes::chan_event_receive(state, ci, payload),
-        CMD_INVITE_REQUEST => process_invite_request(state, ci, payload),
         CMD_BOT_RELAY => process_bot_relay(state, ci, payload),
         _ => {}
     }
@@ -1457,7 +1431,10 @@ fn handle_hubv3(state: &mut HubState, ci: usize, payload: &str, eph: &[u8; 32]) 
         peer_uuid = state.who('h', &peer_uuid)
     );
 
+    state.clients[ci].peer_heard = true; // its signed hello was the first frame
     link_offer(state, ci, Some(&peer_uuid));
+    crate::presence2::link_up(state, ci);
+    crate::presence::roster_send_to_peer(state, ci);
 
     // Initial full-state sync to the newly authenticated peer.
     let init_sync = mesh::generate_sync_packet(state);
@@ -1549,6 +1526,7 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         CMD_UPGRADE_HISTORY => crate::uhist::process(state, ci, payload),
         CMD_UPGRADE_PLAN => upgrade::plan_process(state, ci, payload),
         CMD_UPGRADE_FORGET => upgrade::peer_forget(state, ci, payload),
+        CMD_PRESENCE2 => crate::presence2::rx(state, ci, payload),
         CMD_HUB_ROLLCALL => crate::rollcall::peer_rollcall(state, ci, payload),
         CMD_HUB_ROLLCALL_ACK => crate::rollcall::peer_rollcall_ack(state, ci, payload),
         CMD_CHAN_FWD_REQUEST => opflow::process_forward_chan_request(state, ci, payload),
@@ -1738,6 +1716,12 @@ pub fn handle_client_data(state: &mut HubState, ci: usize) -> bool {
                 crate::hlog_warning!("[HUB] GCM decrypt failed from {ip}\n");
                 auth::disconnect_client(state, ci);
                 return false;
+            }
+            if state.clients[ci].typ == ClientType::Hub && !state.clients[ci].peer_heard {
+                // A dialled link: the far end answered, so it is alive and
+                // holds our session key.  Only now does the link count as up.
+                state.clients[ci].peer_heard = true;
+                crate::presence2::link_up(state, ci);
             }
 
             let cmd = plain[0];

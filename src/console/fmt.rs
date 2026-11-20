@@ -3031,7 +3031,6 @@ fn opname(op: u64) -> Option<&'static str> {
         0x06 => "CMD_PEER_SYNC",
         0x07 => "CMD_MESH_STATE",
         0x08 => "CMD_SYNC_REQUEST",
-        0x09 => "CMD_INVITE_REQUEST",
         0x10 => "CMD_ADMIN_AUTH",
         0x11 => "CMD_ADMIN_LIST_FULL",
         0x12 => "CMD_ADMIN_ADD",
@@ -3156,6 +3155,9 @@ fn opname(op: u64) -> Option<&'static str> {
         0x8B => "CMD_CRON_SET",
         0x8C => "CMD_HUB_ROLLCALL",
         0x8D => "CMD_HUB_ROLLCALL_ACK",
+        0x8E => "CMD_PRESENCE2",
+        0x8F => "CMD_BOT_TREE_DELTA",
+        0x90 => "CMD_BOT_TREE_PULL",
         _ => return None,
     })
 }
@@ -3228,6 +3230,7 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let cfg = rep.r.iter().rfind(|x| x.is("cfg"));
     let sy = rep.r.iter().rfind(|x| x.is("sync"));
     let ld = rep.r.iter().rfind(|x| x.is("load"));
+    let p2 = rep.r.iter().rfind(|x| x.is("p2"));
     let mut b = Sb::default();
     if let Some(cfg) = cfg {
         line(out, RL_HEAD, &[b" Config pushes to bots"]);
@@ -3242,6 +3245,26 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         count_kv(&mut b, "no-op", sy.rvu("noop"), 24);
         count_kv(&mut b, "records", sy.rvu("records"), 40);
         count_kv(&mut b, "applied", sy.rvu("applied"), 60);
+        b.emit(out, RL_NORMAL);
+    }
+    if let Some(p2) = p2 {
+        let head: &[u8] = if p2.rvi("ready", 0) != 0 {
+            b" Presence v2 (every hub on it)"
+        } else {
+            b" Presence v2 (older hub in the mesh)"
+        };
+        line(out, RL_HEAD, &[head]);
+        count_kv(&mut b, "  deltas", p2.rvu("deltas"), 0);
+        count_kv(&mut b, "snapshots", p2.rvu("snaps"), 24);
+        count_kv(&mut b, "held", p2.rvu("held"), 40);
+        count_kv(&mut b, "pulls", p2.rvu("pulls"), 60);
+        count_kv(&mut b, "relays", p2.rvu("relays"), 80);
+        b.emit(out, RL_NORMAL);
+        count_kv(&mut b, "  digest misses", p2.rvu("miss"), 0);
+        count_kv(&mut b, "heals", p2.rvu("heals"), 24);
+        count_kv(&mut b, "jumps", p2.rvu("jumps"), 40);
+        count_kv(&mut b, "bad", p2.rvu("bad"), 60);
+        count_kv(&mut b, "drops", p2.rvu("drops"), 80);
         b.emit(out, RL_NORMAL);
     }
     if let Some(ld) = ld {

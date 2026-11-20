@@ -38,7 +38,7 @@ pub fn forward_seen_check_and_add(state: &mut HubState, request_id: &str) -> boo
         return true;
     }
     let slot = state.seen_forward_head;
-    state.seen_forwards[slot].request_id = trunc_string(request_id, 64);
+    state.seen_forwards[slot].request_id = trunc_string(request_id, SEEN_FORWARD_ID_MAX);
     state.seen_forwards[slot].seen_at = now();
     state.seen_forward_head = (slot + 1) % MAX_SEEN_FORWARD_IDS;
     false

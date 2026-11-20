@@ -1141,28 +1141,6 @@ pub fn process_peer_sync(state: &mut HubState, payload: &str, origin_fd: i32, bc
             continue;
         }
 
-        // Peer-forwarded invite request: invite|nick|#channel
-        if let Some(body) = line.strip_prefix("invite|") {
-            let f = split_fields(body, 2);
-            if f.len() == 2 && !f[0].is_empty() && !f[1].is_empty() {
-                let (inv_nick, inv_chan) = (f[0], f[1].split_whitespace().next().unwrap_or(""));
-                if !inv_chan.is_empty() {
-                    crate::hlog_info!(
-                        "[MESH] Forwarded INVITE_REQUEST: invite {inv_nick} into {inv_chan}\n"
-                    );
-                    let inv_payload = format!("{inv_nick}|{inv_chan}");
-                    for ci in state.bot_clients() {
-                        client::send_cmd_to_bot(
-                            &mut state.clients[ci],
-                            CMD_INVITE_REQUEST,
-                            &inv_payload,
-                        );
-                    }
-                }
-            }
-            continue;
-        }
-
         // uf| / uc|: admin flags and oper channel bindings (access.rs), for
         // users this hub holds (their a| / o| lines come first in every sync).
         if let Some(body) = line

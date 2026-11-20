@@ -3852,7 +3852,7 @@ fn stage_watch(state: &mut HubState, t_now: i64) -> bool {
         }
         let who = state.who(
             if n.kind == UpgradeNodeKind::Bot {
-                '\0'
+                'b'
             } else {
                 'h'
             },
@@ -3920,7 +3920,7 @@ fn weigh_failures(state: &mut HubState) -> bool {
             "[UPGRADE] {} failed: {}\n",
             state.who(
                 if n.kind == UpgradeNodeKind::Bot {
-                    '\0'
+                    'b'
                 } else {
                     'h'
                 },
@@ -4072,7 +4072,12 @@ pub fn note_progress(state: &mut HubState, payload: &str) {
         }
         n.left = true;
         let r = n.reason.clone();
-        let who = state.who('\0', uuid);
+        let kind = if n.kind == UpgradeNodeKind::Bot {
+            'b'
+        } else {
+            'h'
+        };
+        let who = state.who(kind, uuid);
         crate::hlog_warning!("[UPGRADE] {who} left run {id}: {r}\n");
     }
 }

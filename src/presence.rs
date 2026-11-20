@@ -114,16 +114,30 @@ pub fn peer_is_linked(state: &HubState, p: &PeerConfig) -> bool {
 /// briefly reported by two hubs mid-migration shows up once per hub rather
 /// than flapping — the stale one expires on its own.
 /// A bot has one hub link at a time: entries for it under any other hub than
-/// `keep_hub` that linked before `since` describe where it was.  `since` 0 drops
-/// them all (the bot is linked here now).
-pub fn roster_evict_moved(state: &mut HubState, bot_uuid: &str, keep_hub: &str, since: i64) {
+/// `keep_hub` that are older than this sighting describe where it was.  `since`
+/// 0 (with link_ord 0) drops them all — an authoritative local link.  Phase 4:
+/// when both this sighting and the old entry carry a link-order counter the
+/// counter decides; otherwise it falls back to the hubs' `link_since` clocks.
+pub fn roster_evict_moved(
+    state: &mut HubState,
+    bot_uuid: &str,
+    keep_hub: &str,
+    since: i64,
+    link_ord: u64,
+) {
     let mut i = 0;
     while i < state.roster.len() {
         let e = &state.roster[i];
-        if e.bot_uuid == bot_uuid
-            && e.hub_uuid != keep_hub
-            && (since == 0 || (e.link_since > 0 && e.link_since < since))
-        {
+        let older = if e.bot_uuid != bot_uuid || e.hub_uuid == keep_hub {
+            false
+        } else if since == 0 && link_ord == 0 {
+            true
+        } else if link_ord > 0 && e.link_ord > 0 {
+            e.link_ord < link_ord
+        } else {
+            e.link_since > 0 && since > 0 && e.link_since < since
+        };
+        if older {
             crate::hlog_debug!(
                 "[PRESENCE] {} moved off {}\n",
                 state.who('b', &e.bot_uuid),
@@ -177,18 +191,23 @@ fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
     if crate::revoke::is_revoked(state, &incoming.bot_uuid) {
         return;
     }
-    // Linked here since before that report: it is where the bot was.
-    if incoming.link_since > 0
-        && state.bot_clients().into_iter().any(|ci| {
-            state.clients[ci].id == incoming.bot_uuid
-                && incoming.link_since <= state.clients[ci].connected_at
-        })
-    {
+    // The bot is linked here now and this report is older: it is where it was.
+    // Phase 4: the bot's link-order counter decides when both sightings carry
+    // it, else the hub clocks (its link time vs our local connect time).
+    if state.bot_clients().into_iter().any(|ci| {
+        let c = &state.clients[ci];
+        c.id == incoming.bot_uuid
+            && if incoming.link_ord > 0 && c.bot_link_ord > 0 {
+                incoming.link_ord <= c.bot_link_ord
+            } else {
+                incoming.link_since > 0 && incoming.link_since <= c.connected_at
+            }
+    }) {
         return;
     }
-    if incoming.link_since > 0 {
+    if incoming.link_since > 0 || incoming.link_ord > 0 {
         let (b, h) = (incoming.bot_uuid.clone(), incoming.hub_uuid.clone());
-        roster_evict_moved(state, &b, &h, incoming.link_since);
+        roster_evict_moved(state, &b, &h, incoming.link_since, incoming.link_ord);
     }
     if let Some(i) = state
         .roster
@@ -203,7 +222,16 @@ fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
             || e.variant != incoming.variant
             || e.server != incoming.server
             || e.connected_at != incoming.connected_at;
+        // Phase 4: a report with no counter (a p2 reconcile, which does not
+        // carry it this release) must not wipe one the legacy gossip learned.
+        let keep_ord = e.link_ord;
+        let hub = incoming.hub_uuid.clone();
         state.roster[i] = incoming;
+        if state.roster[i].link_ord == 0 && keep_ord > 0 {
+            state.roster[i].link_ord = keep_ord;
+        }
+        state.roster[i].p2_stamp = p2_next_stamp(state);
+        crate::presence2::roster_touched(state, &hub);
         if changed {
             state.tree_dirty = true;
         }
@@ -216,27 +244,135 @@ fn roster_upsert(state: &mut HubState, incoming: BotRoster) {
         );
         return;
     }
+    let mut incoming = incoming;
+    incoming.p2_stamp = p2_next_stamp(state);
+    let hub = incoming.hub_uuid.clone();
     state.roster.push(incoming);
+    crate::presence2::roster_touched(state, &hub);
     state.tree_dirty = true;
+}
+
+/// `bot_roster_t.p2_stamp` for an entry upserted now (0 without presence v2).
+fn p2_next_stamp(state: &mut HubState) -> u64 {
+    match state.p2.as_mut() {
+        Some(p) => {
+            p.stamp_ctr += 1;
+            p.stamp_ctr
+        }
+        None => 0,
+    }
+}
+
+/// Presence v2 (C hub_roster_p2_drop_hub): hub `hub_uuid` has been
+/// unreachable past the grace.  Its bots and its mesh-map entry go now instead
+/// of on the BOT_ROSTER_TTL.  Called once per outage, and again if a late
+/// relayed round brings entries of it back.
+pub fn p2_drop_hub(state: &mut HubState, hub_uuid: &str) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < state.roster.len() {
+        if state.roster[i].hub_uuid == hub_uuid {
+            state.roster.swap_remove(i);
+            n += 1;
+            continue;
+        }
+        i += 1;
+    }
+    if let Some(i) = state.mesh_hubs.iter().position(|h| h.uuid == hub_uuid) {
+        state.mesh_hubs.swap_remove(i);
+        n += 1;
+    }
+    if n > 0 {
+        state.tree_dirty = true;
+    }
+    n
+}
+
+/// Presence v2 (C hub_roster_p2_reconcile): a reachable hub's record says
+/// which bots it has.  An entry of that hub for a bot it no longer lists goes,
+/// unless it arrived after the record (`p2_stamp`); a listed bot nobody
+/// reported yet gets a bare entry (nick from the config, details "-") until
+/// the hub's own round fills it in.
+pub fn p2_reconcile(state: &mut HubState, rec: &crate::presence2::P2Rec) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < state.roster.len() {
+        let e = &state.roster[i];
+        if e.hub_uuid == rec.origin
+            && e.p2_stamp < rec.stamp
+            && !rec.bots.iter().any(|b| b.id == e.bot_uuid)
+        {
+            crate::hlog_debug!(
+                "[PRESENCE] {} left {} (record)\n",
+                state.who('b', &e.bot_uuid),
+                state.who('h', &e.hub_uuid)
+            );
+            state.roster.swap_remove(i);
+            state.tree_dirty = true;
+            n += 1;
+            continue;
+        }
+        i += 1;
+    }
+    let mh = mesh_hub_find(state, &rec.origin);
+    for b in &rec.bots {
+        // Skip it when it is there already, or linked to another hub more
+        // recently (it moved and this hub has not noticed yet).
+        if state
+            .roster
+            .iter()
+            .any(|e| e.bot_uuid == b.id && (e.hub_uuid == rec.origin || e.link_since >= b.since))
+        {
+            continue;
+        }
+        let now_ts = now();
+        let e = BotRoster {
+            hub_uuid: rec.origin.clone(),
+            hub_name: mh
+                .map(|i| state.mesh_hubs[i].name.clone())
+                .unwrap_or_default(),
+            bot_uuid: b.id.clone(),
+            nick: bot_nick_from_config(state, &b.id),
+            link_since: if b.since > 0 && b.since <= now_ts {
+                b.since
+            } else {
+                0
+            },
+            reported_at: now_ts,
+            round: mh.map_or(0, |i| state.mesh_hubs[i].round),
+            ..Default::default()
+        };
+        roster_upsert(state, e);
+        // Added (it was absent): still "older" than any round.
+        if let Some(j) = state
+            .roster
+            .iter()
+            .position(|e| e.hub_uuid == rec.origin && e.bot_uuid == b.id)
+        {
+            state.roster[j].p2_stamp = rec.stamp;
+            n += 1;
+        }
+    }
+    n
 }
 
 /// process_bot_presence(): this bot just told us what it is running.  Per
 /// connection and volatile.
 pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
-    // "<version>|<server>|<started>|<variant>[|<cron>]" — a short, fixed shape.  The
+    // "<version>|<server>|<started>|<variant>[|<cron>[|<linkord>]]"
+    // (BOT_PRESENCE_MAX) — a short, fixed shape.  The
     // variant (code base, c / rs) is the newest field; a bot that predates it
     // sends three and simply shows no code base.  Anything longer than the
     // field caps is truncated by roster_clean, never rejected, so a newer bot
     // advertising more never drops off the tree entirely.
-    let work = trunc_string(
-        payload,
-        ROSTER_VERSION_MAX + ROSTER_SERVER_MAX + ROSTER_VARIANT_MAX + CRON_STATUS_MAX + 64,
-    );
+    let work = trunc_string(payload, BOT_PRESENCE_MAX + 1);
+    let cut = work.len() < payload.len(); // the counter rode past the cut
     let mut version_src = work.as_str();
     let mut server = String::new();
     let mut variant = String::new();
     let mut cron = String::new();
     let mut started = 0i64;
+    let mut link_ord = 0u64; // phase 4: the bot's link-order counter
     if let Some(p1) = work.find('|') {
         version_src = &work[..p1];
         let rest = &work[p1 + 1..];
@@ -249,6 +385,10 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
                     let mut more = tail[p3 + 1..].split('|');
                     variant = roster_clean(more.next().unwrap_or(""), ROSTER_VARIANT_MAX + 1);
                     cron = roster_clean(more.next().unwrap_or(""), CRON_STATUS_MAX + 1);
+                    // The link-order counter rides last; a bad/missing value is 0.
+                    if !cut {
+                        link_ord = more.next().unwrap_or("").parse::<u64>().unwrap_or(0);
+                    }
                 }
                 &rest[..p2]
             }
@@ -296,11 +436,13 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
     let changed = c.bot_version != version
         || c.bot_server != server
         || c.bot_variant != variant
-        || c.bot_started != started;
+        || c.bot_started != started
+        || c.bot_link_ord != link_ord;
     c.bot_version = version.clone();
     c.bot_server = server.clone();
     c.bot_variant = variant.clone();
     c.bot_started = started;
+    c.bot_link_ord = link_ord;
     let cron_changed = c.bot_cron != cron;
     c.bot_cron = cron;
     if cron_changed {
@@ -514,9 +656,9 @@ fn roster_round(state: &HubState, round: i64, total: Option<usize>) -> Option<Ve
         let c = &state.clients[ci];
         let row = format!(
             // 7th field: when the bot linked to this hub; 8th: the bot's
-            // address as this hub sees it (a hub that predates either stops
-            // reading before it).
-            "b|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+            // address as this hub sees it; 9th: cron; 10th (phase 4): the bot's
+            // link-order counter (a hub that predates any stops reading before it).
+            "b|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
             c.id,
             if nick.is_empty() { "-" } else { &nick },
             if c.bot_version.is_empty() {
@@ -541,9 +683,10 @@ fn roster_round(state: &HubState, round: i64, total: Option<usize>) -> Option<Ve
                 "-"
             } else {
                 &c.bot_cron
-            }
+            },
+            c.bot_link_ord
         );
-        if row.len() >= TREE_ROW_MAX + CRON_STATUS_MAX + 16 {
+        if row.len() >= TREE_ROW_MAX + CRON_STATUS_MAX + 48 {
             continue; // an unrepresentable row
         }
         if frame.len() + row.len() >= ROSTER_FRAME_BUDGET && rows > 0 {
@@ -593,6 +736,39 @@ fn gossip_bot_roster(state: &mut HubState) {
     }
     state.last_presence_gossip = now_ts;
     state.presence_event_due = false;
+}
+
+/// A peer link just authenticated: one round of our own, to it alone and past
+/// the damping.  A hub that restarted knows nothing of us until our gossip
+/// reaches it — not our bots, and not that we answer a roll call (k|), so its
+/// upgrade gates would fall back to the gossip check for up to a full
+/// BOT_PRESENCE_INTERVAL.  A fresh generation, so it relays and replaces like
+/// any round; the other peers' damping clock is left alone.
+pub fn roster_send_to_peer(state: &mut HubState, ci: usize) {
+    let Some(c) = state.clients.get(ci) else {
+        return;
+    };
+    if c.typ != ClientType::Hub || !c.authenticated {
+        return;
+    }
+    let round = (now() * 1000).max(state.roster_gen + 1);
+    state.roster_gen = round;
+    let total = roster_round(state, round, None).map_or(0, |f| f.len());
+    if total > 0
+        && let Some(frames) = roster_round(state, round, Some(total))
+    {
+        for f in frames {
+            let Some(m) = QueuedMsg::new(CMD_BOT_ROSTER, Lane::Delta, f.as_bytes()) else {
+                continue;
+            };
+            if !queue::enqueue(&mut state.clients[ci], m) {
+                crate::hlog_warning!(
+                    "[PRESENCE] roster enqueue failed for peer {}\n",
+                    state.clients[ci].ip
+                );
+            }
+        }
+    }
 }
 
 /// The g| relay control of a roster frame: `(round, chunk, ttl, last)`.
@@ -893,7 +1069,7 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
         // Five fields from any hub; a sixth (the bot's code base), a seventh
         // (when it linked to that hub) and an eighth (its address) from one
         // that knows them.
-        let f = crate::cstr::split_fields(body, 9);
+        let f = crate::cstr::split_fields(body, 10);
         if f.len() < 5 || f[0].is_empty() {
             continue;
         }
@@ -946,6 +1122,9 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 Some(s) if s > 0 && s <= now_ts => s,
                 _ => 0,
             },
+            // Phase 4: the link-order counter rides last; a bad or missing
+            // value reads 0, which the move decision treats as "no counter".
+            link_ord: f.get(9).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
             // Display only, but still a peer's word: an IPv4/IPv6 literal or
             // nothing.
             ip: match f.get(7) {
@@ -965,6 +1144,7 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 Some((round, ..)) if mh.is_some() && hub_uuid == origin => round,
                 _ => 0,
             },
+            p2_stamp: 0,
         };
         roster_upsert(state, e);
     }
@@ -1037,12 +1217,20 @@ pub fn build_tree(state: &HubState) -> String {
         return String::new();
     }
 
+    // Each bot once (uuid-keyed row deltas need unique rows): a superseded
+    // session still open during a reconnect, or a moved bot a peer's roster
+    // still reports, would list it twice.  Our own live session comes first.
+    let mut listed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
     // Our own bots, from the live client list — never from a peer's report.
     for ci in state.bot_clients() {
         if max_len - out.len() <= TREE_ROW_MAX {
             break;
         }
         let c = &state.clients[ci];
+        if c.superseded || !listed.insert(c.id.as_str()) {
+            continue;
+        }
         let nick = bot_nick_from_config(state, &c.id);
         out.push_str(&format!(
             "B|1|{}|{}|{}|{}|0|{}|{}|{}\n",
@@ -1203,9 +1391,16 @@ pub fn build_tree(state: &HubState) -> String {
         ));
 
         if !puuid.is_empty() {
-            for e in state.roster.iter().filter(|e| e.hub_uuid == puuid) {
+            for e in state
+                .roster
+                .iter()
+                .filter(|e| e.hub_uuid == puuid && !crate::presence2::hub_gone(state, puuid))
+            {
                 if max_len - out.len() <= TREE_ROW_MAX {
                     break;
+                }
+                if !listed.insert(e.bot_uuid.as_str()) {
+                    continue;
                 }
                 out.push_str(&format!(
                     "B|{}|{}|{}|{}|{}|0|{}|{}|{}\n",
@@ -1271,13 +1466,155 @@ pub fn build_tree(state: &HubState) -> String {
     out
 }
 
-/// Push the assembled tree to every connected bot.  Coalesced per bot so a
-/// burst of roster changes collapses to one send per drain cycle.
-/// `force` false (a change) skips a bot that was already sent this exact
-/// tree; the BOT_TREE_REFRESH push is forced, which is what keeps a bot's
-/// tree from looking stale (BOT_TREE_STALE_AFTER) on a quiet mesh.
+/// Phase 5: FNV-1a 64 over the whole tree text — the hash in each row delta so
+/// a bot that applied one can tell its tree matches ours and pull if not.
+fn tree_fnv64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The uuid of a tree row, "" if malformed: field 3 of KIND|depth|name|uuid|...,
+/// but field 2 of an offline row D|nick|uuid|last_seen (its field 3 is a time
+/// offline bots share, which made deltas hit the wrong row).  The bots' row key
+/// (ircbot bot_row_uuid, ircbot.rs tree_row_uuid) must match.
+fn tree_row_uuid(line: &str) -> &str {
+    let idx = if line.starts_with('D') { 2 } else { 3 };
+    line.split('|').nth(idx).unwrap_or("")
+}
+
+/// Every row has a key and no key repeats: the rows a delta addresses by uuid
+/// are then exactly one each (C `tree_rows_keyed`).
+fn tree_rows_keyed<'a>(rows: &[&'a str]) -> Option<std::collections::HashSet<&'a str>> {
+    let mut set = std::collections::HashSet::with_capacity(rows.len());
+    for r in rows {
+        let u = tree_row_uuid(r);
+        if u.is_empty() || !set.insert(u) {
+            return None;
+        }
+    }
+    Some(set)
+}
+
+/// Build the row-delta from `oldt` to `newt`: `<fnvhex>\n`, a `-|uuid` for each
+/// row gone and a `+|anchor|row` for each row added, moved or changed (anchor =
+/// the uuid of the row it now follows, `^` at head: no uuid is `^`, while `-` is
+/// the key of a hub whose uuid is not known yet).  None if it would not be
+/// smaller than the whole tree, or either tree has a row without a key or two
+/// rows with one key (then the caller sends the whole tree).
+fn build_tree_delta(oldt: &str, newt: &str, fnv: u64) -> Option<String> {
+    let oldr: Vec<&str> = oldt.lines().filter(|l| !l.is_empty()).collect();
+    let newr: Vec<&str> = newt.lines().filter(|l| !l.is_empty()).collect();
+    tree_rows_keyed(&oldr)?;
+    let newk = tree_rows_keyed(&newr)?;
+    let mut out = format!("{fnv:016x}\n");
+    // The deletions, and `w` = the old rows that stay (in order).
+    let mut w: Vec<&str> = Vec::with_capacity(newr.len());
+    for ol in &oldr {
+        let u = tree_row_uuid(ol);
+        if newk.contains(u) {
+            w.push(ol);
+        } else {
+            out.push_str(&format!("-|{u}\n"));
+        }
+    }
+    // Replay the bot's apply on `w`: after step j, w[..=j] == newr[..=j].  A row
+    // is skipped only when it already sits at position j, so a row left behind
+    // by a moved neighbour is re-sent.
+    for (j, nl) in newr.iter().enumerate() {
+        if w.get(j) == Some(nl) {
+            continue;
+        }
+        let anchor = if j == 0 {
+            "^"
+        } else {
+            tree_row_uuid(newr[j - 1])
+        };
+        out.push_str(&format!("+|{anchor}|{nl}\n"));
+        // rows before j are final, so the old copy of this row sits at j or later
+        let u = tree_row_uuid(nl);
+        if let Some(i) = w.iter().skip(j).position(|r| tree_row_uuid(r) == u) {
+            w.remove(j + i);
+        }
+        w.insert(j.min(w.len()), nl);
+    }
+    if out.len() >= newt.len() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// A bot that applies CMD_BOT_TREE_DELTA and checks the keepalive tree hash
+/// (TREE_DELTA_MIN_BOT and up); as C `bot_takes_tree_deltas`.
+fn bot_takes_tree_deltas(c: &crate::state::HubClient) -> bool {
+    !c.bot_version.is_empty()
+        && crate::update::version_cmp(&c.bot_version, TREE_DELTA_MIN_BOT)
+            != std::cmp::Ordering::Less
+}
+
+/// The payload of a keepalive PING to client `ci`: "t|<fnv64hex>", the hash
+/// of the tree the bot holds once all we sent has landed, or "" (not a bot,
+/// an older bot, a tree frame still queued — pings jump the queue — or the
+/// bot not current).  As C `hub_tree_ping_payload`.
+pub fn tree_ping_payload(state: &HubState, ci: usize) -> String {
+    let c = &state.clients[ci];
+    if c.typ != ClientType::Bot || !c.authenticated || c.superseded {
+        return String::new();
+    }
+    if !bot_takes_tree_deltas(c) || state.tree_last.is_empty() {
+        return String::new();
+    }
+    let queued = c.out_lanes.iter().any(|l| {
+        l.msgs
+            .iter()
+            .any(|m| m.cmd == CMD_BOT_TREE || m.cmd == CMD_BOT_TREE_DELTA)
+    });
+    if !c.tree_sent_valid || c.tree_sent_seq != state.tree_seq || queued {
+        return String::new();
+    }
+    format!("t|{:016x}", state.tree_last_fnv)
+}
+
+/// A bot owed a whole tree (a dropped tree frame, or it just connected): it
+/// is pushed on the next tick, not left for the next change.
+fn tree_owed(state: &HubState) -> bool {
+    state
+        .clients
+        .iter()
+        .any(|c| c.typ == ClientType::Bot && c.authenticated && !c.superseded && !c.tree_sent_valid)
+}
+
+/// Send bot `ci` the whole current tree (its own frame, coalesced).
+fn send_whole_tree(state: &mut HubState, ci: usize, payload: &str, seq: u64) {
+    let Some(mut m) = QueuedMsg::new(CMD_BOT_TREE, Lane::Bulk, payload.as_bytes()) else {
+        return;
+    };
+    let coalesce = format!("{}|bot_tree|{}", state.hub_uuid, state.clients[ci].id);
+    let lseq = state.next_lamport_seq();
+    let hub_uuid = state.hub_uuid.clone();
+    m.set_coalesce(&hub_uuid, lseq, &coalesce);
+    let c = &mut state.clients[ci];
+    c.tree_sent_valid = true;
+    c.tree_sent_seq = seq;
+    if !queue::enqueue(c, m) {
+        c.tree_sent_valid = false;
+    }
+}
+
+/// Push the assembled tree to every connected bot.  Phase 5: a bot already
+/// holding the previous tree gets just the row delta to the new one; others
+/// (new, lagging, or on a forced BOT_TREE_REFRESH) get the whole tree.
 fn push_tree_to_bots(state: &mut HubState, force: bool) {
-    let bots = state.bot_clients();
+    // A superseded session is closing: no tree frames to it.
+    let bots: Vec<usize> = state
+        .bot_clients()
+        .into_iter()
+        .filter(|&ci| !state.clients[ci].superseded)
+        .collect();
     if bots.is_empty() {
         return;
     }
@@ -1285,27 +1622,76 @@ fn push_tree_to_bots(state: &mut HubState, force: bool) {
     if payload.is_empty() {
         return;
     }
-    let hash: [u8; 32] = {
-        use sha2::{Digest, Sha256};
-        Sha256::digest(payload.as_bytes()).into()
+    let fnv = tree_fnv64(&payload);
+    let changed = state.tree_last.len() != payload.len()
+        || fnv != state.tree_last_fnv
+        || state.tree_last != payload;
+    let old_seq = state.tree_seq;
+    let new_seq = if changed { old_seq + 1 } else { old_seq };
+
+    // `force` (the BOT_TREE_REFRESH tick) re-pushes the whole tree only to the
+    // older bots that need it; delta bots are checked by the keepalive hash.
+    let delta = if changed && !state.tree_last.is_empty() {
+        build_tree_delta(&state.tree_last, &payload, fnv)
+    } else {
+        None
     };
+
     for ci in bots {
-        if !force && state.clients[ci].tree_sent_hash == Some(hash) {
-            continue;
+        let deltas = bot_takes_tree_deltas(&state.clients[ci]);
+        let forced = force && !deltas;
+        let current =
+            state.clients[ci].tree_sent_valid && state.clients[ci].tree_sent_seq == old_seq;
+        if !forced && !changed && current {
+            continue; // already up to date
         }
-        let Some(mut m) = QueuedMsg::new(CMD_BOT_TREE, Lane::Bulk, payload.as_bytes()) else {
-            continue;
+        let m = if !forced && changed && current && deltas {
+            delta
+                .as_deref()
+                .and_then(|d| QueuedMsg::new(CMD_BOT_TREE_DELTA, Lane::Bulk, d.as_bytes()))
+        } else {
+            None
         };
-        let coalesce = format!("{}|bot_tree|{}", state.hub_uuid, state.clients[ci].id);
-        let seq = state.next_lamport_seq();
-        let hub_uuid = state.hub_uuid.clone();
-        m.set_coalesce(&hub_uuid, seq, &coalesce);
-        let c = &mut state.clients[ci];
-        c.tree_sent_hash = Some(hash);
-        if !queue::enqueue(c, m) {
-            c.tree_sent_hash = None;
+        match m {
+            Some(m) => {
+                let c = &mut state.clients[ci];
+                c.tree_sent_valid = true;
+                c.tree_sent_seq = new_seq;
+                if !queue::enqueue(c, m) {
+                    c.tree_sent_valid = false;
+                }
+            }
+            None => send_whole_tree(state, ci, &payload, new_seq),
         }
     }
+
+    if changed {
+        state.tree_last = payload;
+        state.tree_last_fnv = fnv;
+        state.tree_seq = new_seq;
+    }
+}
+
+/// A bot applied a delta whose hash did not match: send it the whole tree, at
+/// most once per TREE_PULL_MIN_GAP; one inside the gap is held and served by
+/// presence_tick when the gap ends (C `hub_tree_pull`).
+pub fn tree_pull(state: &mut HubState, ci: usize) {
+    let t = now();
+    let c = &mut state.clients[ci];
+    if c.tree_pull_at != 0 && t - c.tree_pull_at < TREE_PULL_MIN_GAP {
+        c.tree_pull_due = true;
+        return;
+    }
+    c.tree_pull_due = false;
+    c.tree_pull_at = t;
+    if state.tree_last.is_empty() {
+        state.clients[ci].tree_sent_valid = false;
+        state.tree_dirty = true;
+        return;
+    }
+    let payload = state.tree_last.clone();
+    let seq = state.tree_seq;
+    send_whole_tree(state, ci, &payload, seq);
 }
 
 /// hub_presence_tick(): drives both halves on the maintenance clock.  It
@@ -1334,6 +1720,7 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
     }
 
     roster_expire(state, now_ts);
+    crate::presence2::tick(state); // presence v2 records, reachability (phase 1)
 
     // A peer link that came up or went down is news for everyone's tree and
     // for every forwarder's split horizon (`mesh::sync_send_to_peers`):
@@ -1365,7 +1752,11 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
         crate::mesh::request_sync_from_peers(state);
     }
 
-    if now_ts - state.last_presence_gossip >= BOT_PRESENCE_INTERVAL {
+    // Presence v2 runs alongside today's rounds for one release (plan §8.4):
+    // v2 gossips who is where, these rounds keep carrying it too and the roster
+    // details (nick, version, capabilities) on their own cadence.
+    let round = BOT_PRESENCE_INTERVAL;
+    if now_ts - state.last_presence_gossip >= round {
         gossip_bot_roster(state);
     } else if state.presence_event_due && now_ts >= state.presence_hold_until {
         gossip_bot_roster(state);
@@ -1381,6 +1772,14 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
         state.presence_hold_until = now_ts + presence_hold(state.presence_burst);
     }
 
+    // Pulls held by the TREE_PULL_MIN_GAP throttle, once the gap is over.
+    for ci in 0..state.clients.len() {
+        let c = &state.clients[ci];
+        if c.tree_pull_due && now_ts - c.tree_pull_at >= TREE_PULL_MIN_GAP {
+            tree_pull(state, ci);
+        }
+    }
+
     // Push on change (only to bots whose tree it changes), with an
     // unconditional refresh.  Only the refresh restarts the refresh clock: a
     // change push may reach no bot at all.  Changes are coalesced (see
@@ -1393,6 +1792,12 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
         BOT_TREE_COALESCE
     };
     let due = state.tree_dirty && now_ts - state.last_tree_change_push >= gap;
+    // A bot owed a whole tree gets it now (a dropped frame used to wait for
+    // the next change or the refresh).
+    if !due && !refresh && tree_owed(state) {
+        push_tree_to_bots(state, false);
+        return;
+    }
     if due || refresh {
         state.tree_dirty = false;
         state.tree_dirty_local = false;
@@ -1692,7 +2097,7 @@ mod tests {
         // Unknown link times keep today's behaviour.
         roster_upsert(&mut s, row("third", "b", 0, 1));
         assert!(s.roster.iter().any(|e| e.hub_uuid == "third"));
-        roster_evict_moved(&mut s, "b", "me", 0);
+        roster_evict_moved(&mut s, "b", "me", 0, 0);
         assert!(
             s.roster.is_empty(),
             "linked here now: every other entry goes"
@@ -1804,5 +2209,98 @@ mod tests {
             format!("H|0|Me|me|1|0|{HUB_VERSION}|{HUB_UPDATE_VARIANT}|1700000000|-")
         );
         assert_eq!(lines[1], "D|offbot|bot-1|4242");
+    }
+
+    /// The bots' apply (ircbot hub_client_process_tree_delta): `-|uuid` drops
+    /// a row, `+|anchor|row` replaces one after its anchor, `^` = head.
+    fn apply_delta(raw: &str, delta: &str) -> (String, u64) {
+        let mut lines = delta.split('\n');
+        let want = u64::from_str_radix(lines.next().unwrap(), 16).unwrap();
+        let mut rows: Vec<String> = raw.lines().map(str::to_string).collect();
+        for op in lines.filter(|l| !l.is_empty()) {
+            if let Some(u) = op.strip_prefix("-|") {
+                rows.retain(|r| super::tree_row_uuid(r) != u);
+            } else if let Some((anchor, row)) =
+                op.strip_prefix("+|").and_then(|r| r.split_once('|'))
+            {
+                rows.retain(|r| super::tree_row_uuid(r) != super::tree_row_uuid(row));
+                let pos = if anchor == "^" {
+                    0
+                } else {
+                    rows.iter()
+                        .position(|r| super::tree_row_uuid(r) == anchor)
+                        .map_or(rows.len(), |i| i + 1)
+                };
+                rows.insert(pos, row.to_string());
+            }
+        }
+        (rows.iter().map(|r| format!("{r}\n")).collect(), want)
+    }
+
+    #[test]
+    fn tree_delta_replays_to_the_new_tree() {
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let (mut applied, mut whole) = (0, 0);
+        for _ in 0..2000 {
+            // old: up to 40 unique keys, one of them maybe the unknown-uuid `-`
+            let mut rows: Vec<String> = Vec::new();
+            for k in 0..(5 + rnd(35)) {
+                let u = if k == 0 && rnd(3) == 0 {
+                    "-".to_string()
+                } else {
+                    format!("u{k}")
+                };
+                rows.push(match rnd(3) {
+                    0 => format!("D|n|{u}|{}", rnd(4)),
+                    1 => format!("H|{}|nm|{u}|1", rnd(3)),
+                    _ => format!("B|{}|nm|{u}|0", rnd(3)),
+                });
+            }
+            let oldt: String = rows.iter().map(|r| format!("{r}\n")).collect();
+            for _ in 0..(1 + rnd(4)) {
+                match rnd(4) {
+                    0 if !rows.is_empty() => {
+                        let i = rnd(rows.len());
+                        rows.remove(i);
+                    }
+                    1 if !rows.is_empty() => {
+                        let r = rows.remove(rnd(rows.len()));
+                        let i = rnd(rows.len() + 1);
+                        rows.insert(i, r);
+                    }
+                    2 if !rows.is_empty() => {
+                        let i = rnd(rows.len());
+                        rows[i].push('x');
+                    }
+                    _ => {
+                        let i = rnd(rows.len() + 1);
+                        rows.insert(i, format!("B|1|nm|new{}|0|padding", rnd(1000)));
+                    }
+                }
+            }
+            let newt: String = rows.iter().map(|r| format!("{r}\n")).collect();
+            let fnv = super::tree_fnv64(&newt);
+            match super::build_tree_delta(&oldt, &newt, fnv) {
+                Some(d) => {
+                    assert_eq!(
+                        apply_delta(&oldt, &d),
+                        (newt.clone(), fnv),
+                        "{oldt}->{newt}: {d}"
+                    );
+                    applied += 1;
+                }
+                None => whole += 1,
+            }
+        }
+        assert!(applied > 1000, "applied {applied}, whole {whole}");
+        // Two rows with one key, or a row with none: the whole tree instead.
+        assert!(super::build_tree_delta("H|1|a|-|1\n", "H|1|a|-|1\nH|1|b|-|1\n", 0).is_none());
+        assert!(super::build_tree_delta("H|1|a|u|1\n", "H|1|a|u|1\nB|1|x\n", 0).is_none());
     }
 }

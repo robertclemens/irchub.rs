@@ -5113,6 +5113,8 @@ impl Ui {
                         self.anchor[self.view] = self.sb_floor(self.view, self.cols, self.rows - 3);
                     } else if self.view == V_UPG || self.view == V_STATS {
                         self.anchor[self.view] = -1;
+                    } else if self.view == V_NET {
+                        self.net_sel = 0;
                     }
                     self.dirty = true;
                 }
@@ -5123,6 +5125,10 @@ impl Ui {
                     self.anchor[self.view] = -1;
                     if self.view == V_LOG {
                         self.paused = false;
+                    }
+                    if self.view == V_NET && empty {
+                        let n = self.net_rows_count();
+                        self.net_sel = if n > 0 { n - 1 } else { 0 };
                     }
                 }
                 self.in_cur = self.input.len();
@@ -5170,8 +5176,23 @@ impl Ui {
                     self.in_set(&h);
                 }
             }
-            K::PgUp => self.scroll_view(-1),
-            K::PgDn => self.scroll_view(1),
+            K::PgUp | K::PgDn => {
+                if self.view == V_NET {
+                    // View 3 pages its pick: the list follows it, as with Up/Down.
+                    let n = self.net_rows_count();
+                    let shown = net_list_rows(self.rows - 3, n).0 - 1;
+                    let page = if shown > 2 { shown - 1 } else { 1 };
+                    self.net_sel += if k.t == K::PgUp { -page } else { page };
+                    if self.net_sel >= n {
+                        self.net_sel = n - 1;
+                    }
+                    if self.net_sel < 0 {
+                        self.net_sel = 0;
+                    }
+                } else {
+                    self.scroll_view(if k.t == K::PgUp { -1 } else { 1 });
+                }
+            }
             K::Tab => self.complete(),
             K::F => {
                 if k.cp == 2 {
@@ -5455,6 +5476,114 @@ impl RowB {
     }
 }
 
+/// Tree pane, folded to fit (no keys: view 3 lists everything). A tree that
+/// fits is drawn whole. Otherwise every other hub folds to one line with its
+/// bot count; our own hub (row 0) keeps as many of its bots as the rows left
+/// allow, then "… N more"; the not-connected rows fold to one line when they
+/// do not fit beside the hubs; our hub folds too when not even two rows are
+/// left for its bots; past that the last row says how much is cut. C
+/// `pane_plan`, the same walk.
+#[derive(Clone, Copy, PartialEq)]
+enum PLine {
+    Row(usize),
+    Fold(usize, i32),
+    More(usize, i32),
+    DSum(i32),
+    Trunc(i32),
+}
+
+/// The bots listed under hub row i: they follow it (pre-order).
+fn tree_hub_bots(tr: &[TRow], i: usize) -> i32 {
+    tr.iter().skip(i + 1).take_while(|t| t.typ == b'B').count() as i32
+}
+
+/// View 3's list height in nodes for a pane h rows tall and n nodes, and the
+/// detail rows: the details take 5 rows when they fit, the header one. C
+/// `net_list_rows`.
+fn net_list_rows(h: i32, n: i32) -> (i32, i32) {
+    let d = if n > 0 { 5 } else { 0 };
+    if h - d < 1 { (h, 0) } else { (h - d, d) }
+}
+
+fn pane_plan(tr: &[TRow], h: usize) -> Vec<PLine> {
+    let n = tr.len();
+    let mut out = Vec::new();
+    if h < 1 {
+        return out;
+    }
+    if n <= h {
+        return (0..n).map(PLine::Row).collect();
+    }
+    let local = tr[0].typ == b'H';
+    let (mut hubs, mut nd) = (0i32, 0i32);
+    for t in tr.iter().skip(if local { 1 } else { 0 }) {
+        if t.typ == b'H' {
+            hubs += 1;
+        } else if t.typ == b'D' {
+            nd += 1;
+        }
+    }
+    let hh = h as i32;
+    let local_bots = if local { tree_hub_bots(tr, 0) } else { 0 };
+    let lone = if local { 1 } else { 0 };
+    let fold_d = lone + hubs + nd > hh;
+    let fixed = lone
+        + hubs
+        + if nd > 0 {
+            if fold_d { 1 } else { nd }
+        } else {
+            0
+        };
+    let budget = hh - fixed;
+    let (mut show, mut more, mut fold_local) = (local_bots, 0, false);
+    if local_bots > budget {
+        if budget >= 2 {
+            show = budget - 1;
+            more = local_bots - show;
+        } else {
+            show = 0;
+            fold_local = true;
+        }
+    }
+    let mut d_done = false;
+    let mut i = 0;
+    while i < n {
+        let t = &tr[i];
+        if t.typ == b'H' {
+            let b = tree_hub_bots(tr, i);
+            let fold = !(local && i == 0) || fold_local;
+            out.push(if fold {
+                PLine::Fold(i, b)
+            } else {
+                PLine::Row(i)
+            });
+            if !fold {
+                for k in 0..show as usize {
+                    out.push(PLine::Row(i + 1 + k));
+                }
+                if more > 0 {
+                    out.push(PLine::More(i, more));
+                }
+            }
+            i += b as usize;
+        } else if t.typ == b'D' && fold_d {
+            if !d_done {
+                out.push(PLine::DSum(nd));
+            }
+            d_done = true;
+        } else {
+            out.push(PLine::Row(i));
+        }
+        i += 1;
+    }
+    if out.len() > h {
+        let cut = (out.len() - (h - 1)) as i32;
+        out.truncate(h - 1);
+        out.push(PLine::Trunc(cut));
+    }
+    out
+}
+
 #[derive(Clone, Default)]
 struct TRow {
     typ: u8,
@@ -5559,6 +5688,8 @@ impl Ui {
             "─" => "-",
             "┬" => "+",
             "▾" => "v",
+            "▸" => ">",
+            "…" => "...",
             "├" => "|",
             "└" => "`",
             "●" => "*",
@@ -5568,7 +5699,9 @@ impl Ui {
     }
 
     /// One pane line for tree row i.
-    fn tree_line(&self, r: &mut RowB, all: &[TRow], i: usize, width: i32) {
+    /// One tree-pane line. `folded` >= 0: a hub row standing for its bots (the
+    /// pane folded to fit): ▸, and the bot count where the version goes.
+    fn tree_line(&self, r: &mut RowB, all: &[TRow], i: usize, width: i32, folded: i32) {
         let t = &all[i];
         let start = r.w;
         let (wide_ver, wide_var, wide_up) = (width >= 30, width >= 26, width >= 34);
@@ -5576,14 +5709,26 @@ impl Ui {
             + 2
             + if wide_var { 3 } else { 0 }
             + if wide_up { 5 } else { 0 };
+        // no version column to hold a folded hub's count: it follows the name
+        let mut nm = t.name.clone();
+        if folded >= 0 && !wide_ver {
+            nm.extend_from_slice(format!(" ({folded})").as_bytes());
+        }
+        let nm = c_cut(&nm, 96).to_vec();
         let mut indent = if t.typ == b'D' { 0 } else { t.depth * 2 };
         if indent > width / 3 {
             indent = width / 3;
         }
+        // A deep row gives up indent before its name is cut: tnhub10 at depth 9
+        // of a chain read "tnhub1" in a 38-column pane.
+        let room = width - right - 2 - str_width(&nm);
+        if indent > room {
+            indent = room.max(0);
+        }
         r.pad(start + indent);
         if t.typ == b'H' {
             r.sgr("0;1");
-            r.text(self.g("▾").as_bytes(), 1);
+            r.text(self.g(if folded >= 0 { "▸" } else { "▾" }).as_bytes(), 1);
             r.text(b" ", 1);
         } else if t.typ == b'B' {
             let mut last = true;
@@ -5604,11 +5749,18 @@ impl Ui {
             r.text(b"  ", 2);
         }
         let name_w = (width - (r.w - start) - right).max(1);
-        r.text(&t.name, name_w);
+        let bots = if folded >= 0 {
+            format!("{} {}", folded, if folded == 1 { "bot" } else { "bots" })
+        } else {
+            String::new()
+        };
+        r.text(&nm, name_w);
         r.pad(start + width - right);
         if wide_ver {
             r.sgr("0;90");
-            let v: &[u8] = if t.typ == b'D' {
+            let v: &[u8] = if folded >= 0 {
+                bots.as_bytes()
+            } else if t.typ == b'D' {
                 b""
             } else {
                 dash_empty(&t.ver)
@@ -5632,6 +5784,31 @@ impl Ui {
             r.right(age.as_bytes(), 4);
             r.text(b" ", 1);
         }
+        r.sgr(SGR_RESET);
+        r.pad(start + width);
+    }
+
+    /// A pane line that is no tree row: "… N more", "N not connected", the
+    /// truncation note.
+    fn tree_note_line(
+        &self,
+        r: &mut RowB,
+        indent: i32,
+        glyph: Option<(&'static str, &str)>,
+        text: &[u8],
+        width: i32,
+    ) {
+        let start = r.w;
+        let indent = indent.min(width / 3);
+        r.pad(start + indent);
+        if let Some((g, sgr)) = glyph {
+            r.sgr(sgr);
+            r.text(self.g(g).as_bytes(), 1);
+            r.text(b" ", 1);
+        }
+        r.sgr("0;90");
+        let w = width - (r.w - start);
+        r.text(text, w.max(1));
         r.sgr(SGR_RESET);
         r.pad(start + width);
     }
@@ -5849,14 +6026,12 @@ impl Ui {
         if self.net_sel >= n {
             self.net_sel = if n > 0 { n - 1 } else { 0 };
         }
-        let mut detail = if n > 0 { 5 } else { 0 };
-        let mut list_h = h as i32 - detail;
-        if list_h < 1 {
-            list_h = h as i32;
-            detail = 0;
-        }
-        let top = if self.net_sel >= list_h {
-            self.net_sel - list_h + 1
+        let (list_h, detail) = net_list_rows(h as i32, n);
+        // Row 0 is the header, so the list shows list_h - 1 nodes: keep the pick
+        // among them (counting list_h hid it one row below the last line).
+        let shown = if list_h - 1 > 0 { list_h - 1 } else { 1 };
+        let top = if self.net_sel >= shown {
+            self.net_sel - shown + 1
         } else {
             0
         };
@@ -6070,8 +6245,8 @@ impl Ui {
         }
         {
             let mut act = String::new();
-            for v in 0..V_COUNT {
-                if self.act[v] && act.len() + 3 < 32 {
+            for (v, &on) in self.act.iter().enumerate().take(V_COUNT) {
+                if on && act.len() + 3 < 32 {
                     if !act.is_empty() {
                         act.push(',');
                     }
@@ -6227,12 +6402,41 @@ impl Ui {
             // tree pane
             if pane_w > 0 {
                 let tr = parse_tree(self.tree.as_deref().unwrap_or(b""));
+                let plan = pane_plan(&tr, h);
                 for (y, row) in body.iter_mut().enumerate() {
                     row.sgr(SGR_LINE);
                     row.text(self.g("│").as_bytes(), 1);
                     row.sgr(SGR_RESET);
-                    if y < tr.len() {
-                        self.tree_line(row, &tr, y, pane_w);
+                    if let Some(p) = plan.get(y) {
+                        match *p {
+                            PLine::Row(i) => self.tree_line(row, &tr, i, pane_w, -1),
+                            PLine::Fold(i, b) => self.tree_line(row, &tr, i, pane_w, b),
+                            PLine::More(i, m) => {
+                                let note = format!("{} {} more", self.g("…"), m);
+                                let ind = (tr[i].depth + 1) * 2;
+                                self.tree_note_line(
+                                    row,
+                                    ind,
+                                    Some(("└", SGR_RESET)),
+                                    note.as_bytes(),
+                                    pane_w,
+                                );
+                            }
+                            PLine::DSum(d) => {
+                                let note = format!("{d} not connected");
+                                self.tree_note_line(
+                                    row,
+                                    0,
+                                    Some(("○", "0;31")),
+                                    note.as_bytes(),
+                                    pane_w,
+                                );
+                            }
+                            PLine::Trunc(c) => {
+                                let note = format!("{} +{} more, Alt+3", self.g("…"), c);
+                                self.tree_note_line(row, 0, None, note.as_bytes(), pane_w);
+                            }
+                        }
                     } else {
                         let t = row.w + pane_w;
                         row.pad(t);
