@@ -508,6 +508,13 @@ pub const CHAN_ELECT_DO_WAIT: i64 = 5;
 pub const CHAN_ELECT_HUB_WAIT: i64 = 12;
 /// Seconds: hard end of any election.
 pub const CHAN_ELECT_TTL: i64 = 40;
+/// An origin whose mesh view is still settling holds its mesh ask (Hold):
+/// up to CHAN_ELECT_SETTLE s after start while configured peers are still
+/// dialing, or while a peer linked less than that ago has not yet named its
+/// version (sync_held).  At most CHAN_ELECT_HOLD_MAX s, once per election;
+/// HOLD_MAX + PROBE + MESH + DO + HUB_WAIT stays within CHAN_ELECT_TTL.
+pub const CHAN_ELECT_SETTLE: i64 = 10;
+pub const CHAN_ELECT_HOLD_MAX: i64 = 10;
 pub const MAX_CHAN_ELECTIONS: usize = 16;
 pub const CHAN_ELECT_REASON_MAX: usize = 48;
 

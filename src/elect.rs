@@ -567,12 +567,74 @@ fn try_hub(state: &mut HubState, ei: usize) {
     finish(state, ei, "nobody", "", "", "", "");
 }
 
+/// Hubs this one knows, itself included: what its ELECT_ACK reports.
+fn mesh_total(state: &HubState) -> usize {
+    1 + state
+        .mesh_hubs
+        .iter()
+        .filter(|m| m.uuid != state.hub_uuid)
+        .count()
+}
+
+/// True while this hub's picture of the mesh is still being built: it
+/// started moments ago and configured peers are not all linked yet, or a
+/// peer linked moments ago has not yet named its version (no sync
+/// exchanged).  An origin that asked the mesh then would take a few
+/// neighbours for all of it.  C `ce_mesh_settling`.
+fn mesh_settling(state: &HubState, t: i64) -> bool {
+    if state.hub_started > 0
+        && t - state.hub_started < CHAN_ELECT_SETTLE
+        && (crate::admin::linked_peer_count(state) as usize) < state.peers.len()
+    {
+        return true;
+    }
+    state.clients.iter().any(|c| {
+        c.typ == ClientType::Hub
+            && c.authenticated
+            && c.sync_held
+            && t - c.connected_at < CHAN_ELECT_SETTLE
+    })
+}
+
+/// A bot authenticated here that the election has not asked yet.
+fn new_local_bot(state: &HubState, ei: usize) -> bool {
+    let e = &state.chan_elections[ei];
+    state.clients.iter().any(|c| {
+        c.typ == ClientType::Bot
+            && c.authenticated
+            && c.id != e.requester
+            && !e.bots.iter().any(|b| b.uuid == c.id)
+    })
+}
+
 /// Nothing (more) to do locally: the origin asks the mesh, a relay says so.
 fn local_exhausted(state: &mut HubState, ei: usize) {
     if !state.chan_elections[ei].origin {
         done_up(state, ei, "", "", "fail", "no ready bot");
         state.chan_elections[ei].phase = ChanElectPhase::Acked;
         return;
+    }
+    // Held once, not re-sent: the one election waits for the mesh view and
+    // then runs; the requester is answered either way, nothing is repeated.
+    let t = now();
+    {
+        let e = &state.chan_elections[ei];
+        if !e.held
+            && e.phase != ChanElectPhase::MeshDo
+            && e.hubs.is_empty()
+            && mesh_settling(state, t)
+        {
+            let e = &mut state.chan_elections[ei];
+            e.held = true;
+            e.phase = ChanElectPhase::Hold;
+            e.phase_at = t;
+            crate::hlog_debug!(
+                "[CHANREQ] Election {}: mesh view still settling, held up to {} s\n",
+                e.id,
+                CHAN_ELECT_HOLD_MAX
+            );
+            return;
+        }
     }
     let e = &state.chan_elections[ei];
     if e.phase == ChanElectPhase::MeshDo || !e.hubs.is_empty() || linked_peer_count(state) == 0 {
@@ -818,13 +880,17 @@ pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
     );
 }
 
-/// ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|0.  The origin records
-/// it; a relay remembers which peer leads to that hub and passes it on.
+/// ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|silent|mesh.  mesh (2.5.3+,
+/// absent from older hubs) is how many hubs the answering hub knows, itself
+/// included.  The origin records it; a relay remembers which peer leads to
+/// that hub and passes it on unchanged.
 pub fn process_elect_ack(state: &mut HubState, ci: usize, payload: &str) {
     let f = |i, cap| wire_field(payload, i, cap).unwrap_or_default();
     let (id, hub, name) = (f(0, 64), f(1, 64), f(2, 64));
     let num = |s: String| crate::cstr::atoi(&s).max(0) as i64;
     let (a, r) = (num(f(3, 12)), num(f(4, 12)));
+    // bounded: a wild count can only cost CHAN_ELECT_MESH_WAIT
+    let known = (num(f(6, 12)) as usize).min(MAX_MESH_HUBS);
     if id.is_empty() || hub.is_empty() {
         return;
     }
@@ -833,7 +899,11 @@ pub fn process_elect_ack(state: &mut HubState, ci: usize, payload: &str) {
     };
     let (fd, serial) = (state.clients[ci].fd, state.clients[ci].conn_serial);
     let e = &mut state.chan_elections[ei];
-    if e.hubs.len() >= MAX_MESH_HUBS || e.hubs.iter().any(|h| h.uuid == hub) {
+    if e.hubs.len() >= MAX_MESH_HUBS {
+        return;
+    }
+    e.mesh_known = e.mesh_known.max(known);
+    if e.hubs.iter().any(|h| h.uuid == hub) {
         return; // full, or a second copy
     }
     e.hubs.push(ChanElectHub {
@@ -982,13 +1052,14 @@ pub fn tick(state: &mut HubState, t: i64) {
                 let e = &state.chan_elections[ei];
                 if !e.origin {
                     let ack = format!(
-                        "{}|{}|{}|{}|{}|{}",
+                        "{}|{}|{}|{}|{}|{}|{}",
                         e.id,
                         state.hub_uuid,
                         hub_display_name(state),
                         e.bots.len(),
                         count(e, b'y'),
-                        count(e, b'a')
+                        count(e, b'a'),
+                        mesh_total(state)
                     );
                     up(state, ei, CMD_CHAN_ELECT_ACK, &ack);
                     let e = &mut state.chan_elections[ei];
@@ -1014,15 +1085,22 @@ pub fn tick(state: &mut HubState, t: i64) {
                 }
             }
             ChanElectPhase::MeshWait => {
-                let expect = state
-                    .mesh_hubs
-                    .iter()
-                    .filter(|m| m.uuid != state.hub_uuid)
-                    .count();
+                // every other hub we know of, or that any answer says exists
+                let expect = (mesh_total(state) - 1).max(e.mesh_known.saturating_sub(1));
                 if e.hubs.len() < expect && t - e.phase_at < CHAN_ELECT_MESH_WAIT {
                     continue;
                 }
                 try_hub(state, ei);
+            }
+            ChanElectPhase::Hold => {
+                if mesh_settling(state, t) && t - e.phase_at < CHAN_ELECT_HOLD_MAX {
+                    continue;
+                }
+                if new_local_bot(state, ei) {
+                    probe_local(state, ei); // attached meanwhile
+                } else {
+                    local_exhausted(state, ei);
+                }
             }
             ChanElectPhase::MeshDo => {
                 if t - e.phase_at < CHAN_ELECT_HUB_WAIT {

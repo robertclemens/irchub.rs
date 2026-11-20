@@ -313,6 +313,9 @@ pub enum ChanElectPhase {
     MeshDo,
     /// Relay: answered the origin, routing DO/DONE now.
     Acked,
+    /// Origin: its mesh view is still settling (restart or relink); asks the
+    /// mesh once it has, CHAN_ELECT_HOLD_MAX at most.
+    Hold,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -358,6 +361,12 @@ pub struct ChanElect {
     pub created: i64,
     pub bots: Vec<ChanElectBot>,
     pub hubs: Vec<ChanElectHub>,
+    /// The most hubs any answer said it knows, itself included: a hub that
+    /// has just restarted or relinked may know only its neighbours yet, and
+    /// must not take their answers for the whole mesh's.
+    pub mesh_known: usize,
+    /// Hold was used (only once).
+    pub held: bool,
     /// Bot (LocalDo) or hub uuid (MeshDo) being tried.
     pub doing: String,
     /// A person's request from a bot (CMD_USER_CHAN_REQUEST): the answer
