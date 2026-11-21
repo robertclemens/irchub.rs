@@ -4115,6 +4115,11 @@ fn stage_tick(state: &mut HubState) {
     let Some((id, status)) = update::stage_tick() else {
         return;
     };
+    // A build staged after another failed says so: the operator should know
+    // this host could not take its first choice.  As C.
+    if status.starts_with("staged|") && status.contains("; the ") {
+        crate::hlog_info!("[UPGRADE] Stage of {}: {}\n", id, status);
+    }
     let payload = format!("{id}|{}|{status}", state.hub_uuid);
     if state.follow_id == id {
         let origin = state.follow_origin.clone();

@@ -880,8 +880,8 @@ pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
     );
 }
 
-/// ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|silent|mesh.  mesh (2.5.3+,
-/// absent from older hubs) is how many hubs the answering hub knows, itself
+/// ELECT_ACK: eid|hub_uuid|hub_name|asked|ready|silent|mesh.  mesh (2.5.3+:
+/// every hub the mesh admits sends it) is how many hubs the answering hub knows, itself
 /// included.  The origin records it; a relay remembers which peer leads to
 /// that hub and passes it on unchanged.
 pub fn process_elect_ack(state: &mut HubState, ci: usize, payload: &str) {

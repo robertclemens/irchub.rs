@@ -35,14 +35,48 @@ pub fn host_arch() -> String {
     std::env::consts::ARCH.to_string()
 }
 
+/// The host's C library, at run time (2.5.4, irchub
+/// docs/plans/2026-11-20_artifact_choice_plan.md §3): on Linux "gnu" when a
+/// glibc program loader is present — whatever libc this build itself uses, so
+/// a static (musl) build on Ubuntu can still take a gnu artifact — else
+/// "musl"; elsewhere the OS name in lower case (freebsd, netbsd, openbsd,
+/// darwin), which no Linux row ever matches.  C `hub_update_host_libc`.
 pub fn host_libc() -> String {
-    if cfg!(target_env = "musl") {
-        "musl".to_string()
-    } else if cfg!(target_os = "linux") {
-        "gnu".to_string()
-    } else {
-        "unknown".to_string()
+    if cfg!(target_os = "linux") {
+        const LOADERS: [&str; 5] = [
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/ld-linux-x86-64.so.2",
+            "/lib/ld-linux-aarch64.so.1",
+            "/lib/ld-linux-armhf.so.3",
+            "/lib/ld-linux.so.2",
+        ];
+        return if LOADERS.iter().any(|l| std::path::Path::new(l).exists()) {
+            "gnu".to_string()
+        } else {
+            "musl".to_string()
+        };
     }
+    nix::sys::utsname::uname()
+        .ok()
+        .map(|u| {
+            u.sysname()
+                .to_string_lossy()
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .map(|c| c.to_ascii_lowercase())
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The host's glibc version (the highest GLIBC_x.y its libc.so.6 defines,
+/// read from that file's version table — elf_needs.rs), or None; asked once.
+/// The same in a static and a glibc build, and in the C trees.  A pre-filter
+/// only: the new build's -selftest decides.  C `host_glibc`.
+fn host_glibc() -> Option<String> {
+    static GLIBC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    GLIBC.get_or_init(crate::elf_needs::glibc).clone()
 }
 
 /// The variant this binary was built from.  Same value the compiled release
@@ -527,12 +561,69 @@ struct ManifestRow {
     cpu: String,
     /// Column 11: archive + unpacked bytes, 0 = unknown.
     size: u64,
+    /// Column 12: a gnu row's minimum glibc, "-" = none.
+    libc_min: String,
+    /// Column 13: a gnu row's libraries + versions, "-" = none.
+    needs: String,
 }
 
 impl ManifestRow {
-    fn fits_host(&self) -> bool {
-        (self.arch == "any" || self.arch.eq_ignore_ascii_case(&host_arch()))
-            && (self.libc == "any" || self.libc.eq_ignore_ascii_case(&host_libc()))
+    /// Ok when this host can take the row, else why not.  A binary row with
+    /// libc "any" is a static Linux build: only Linux hosts (gnu / musl) take
+    /// it.  A gnu row whose libc_min is newer than this host's known glibc is
+    /// skipped without a download; unknown leaves it to -selftest.  C
+    /// `row_fits_host`.
+    fn fits_host(&self) -> Result<(), String> {
+        let libc = host_libc();
+        let nofit = || "no artifact for this host arch/libc".to_string();
+        if self.arch != "any" && !self.arch.eq_ignore_ascii_case(&host_arch()) {
+            return Err(nofit());
+        }
+        let linux_host = libc == "gnu" || libc == "musl";
+        let bin = self.kind.eq_ignore_ascii_case("bin");
+        if if self.libc == "any" {
+            bin && !linux_host
+        } else {
+            !self.libc.eq_ignore_ascii_case(&libc)
+        } {
+            return Err(nofit());
+        }
+        if bin
+            && self.libc.eq_ignore_ascii_case("gnu")
+            && !self.libc_min.is_empty()
+            && self.libc_min != "-"
+            && let Some(g) = host_glibc()
+            && version_cmp(&g, &self.libc_min) == std::cmp::Ordering::Less
+        {
+            return Err(format!(
+                "this host's glibc {g} is older than the gnu build's {}",
+                self.libc_min
+            ));
+        }
+        // Column 13: every library the gnu build needs, with the versions it
+        // requires, present here — read from the host's own files, nothing
+        // downloaded (plan §4a).
+        if bin && self.libc != "any" {
+            crate::elf_needs::check(&self.needs).map_err(|m| format!("the gnu build needs {m}"))?;
+        }
+        Ok(())
+    }
+
+    /// The host's own libc's build first (gnu: distro-patched shared
+    /// libraries), then the static Linux build, then source.  C `row_rank`.
+    fn rank(&self) -> u8 {
+        if !self.kind.eq_ignore_ascii_case("bin") {
+            2
+        } else if self.libc == "any" {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// What a candidate is called in logs: gnu, static or src.
+    fn label(&self) -> &'static str {
+        ["gnu", "static", "src"][usize::from(self.rank())]
     }
 }
 
@@ -611,6 +702,9 @@ fn preflight_exe(exe: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// A stage note's length, as C `stage_say` (`char clean[192]`).
+const STAGE_NOTE_MAX: usize = 191;
 
 fn clip(s: &str, cap: usize) -> &str {
     let mut end = s.len().min(cap);
@@ -721,7 +815,7 @@ fn parse_row(line: &str) -> Option<(String, ManifestRow)> {
     if f.len() < 5 {
         return None;
     }
-    let caps = [63, 63, 511, 127, 255, 7, 31, 15, 63, 255];
+    let caps = [63, 63, 511, 127, 255, 7, 31, 15, 63, 255, 20, 15, 511];
     if f.iter().zip(caps).any(|(s, c)| s.len() > c) {
         return None;
     }
@@ -737,19 +831,31 @@ fn parse_row(line: &str) -> Option<(String, ManifestRow)> {
             min_from: at(8, "*"),
             cpu: at(9, "-"),
             size: f.get(10).and_then(|v| v.parse().ok()).unwrap_or(0),
+            libc_min: at(11, "-"),
+            needs: at(12, "-"),
         },
     ))
 }
 
-/// Choose the artifact for `version`: a usable prebuilt binary for this host
-/// wins, otherwise a source tarball.
+/// Candidates manifest_candidates keeps per version (C MANIFEST_CANDIDATES_MAX).
+const MANIFEST_CANDIDATES_MAX: usize = 8;
+
+/// Every artifact for `version` this host can take, best first (rank: the
+/// host's own libc's build, the static build, source; manifest order within a
+/// rank), or why there is none.  The caller tries them in turn: the first
+/// whose download, hash and -selftest pass is installed (irchub plan §2).
 ///
 /// Build dependencies are NOT checked as the bot's updater does: the hub has
 /// no dependency prober, and a source build that cannot compile fails in the
-/// upgrade script, which restores the retained binary.
-fn manifest_select(manifest: &str, version: &str, variant: &str) -> Result<ManifestRow, String> {
+/// stage or the upgrade script, which restores the retained binary.  C
+/// `manifest_candidates`.
+fn manifest_candidates(
+    manifest: &str,
+    version: &str,
+    variant: &str,
+) -> Result<Vec<ManifestRow>, String> {
     let mut why = "requested version is not in the manifest".to_string();
-    let mut pick: Option<ManifestRow> = None;
+    let mut rows: Vec<ManifestRow> = Vec::new();
 
     for line in manifest
         .split('\n')
@@ -765,8 +871,8 @@ fn manifest_select(manifest: &str, version: &str, variant: &str) -> Result<Manif
             why = "untrusted artifact URL in manifest".to_string();
             continue;
         }
-        if !row.fits_host() {
-            why = "no artifact for this host arch/libc".to_string();
+        if let Err(e) = row.fits_host() {
+            why = e;
             continue;
         }
         if let Some(f) = cpu_missing(&row.cpu, &host_arch(), host_cpu_features()) {
@@ -782,13 +888,18 @@ fn manifest_select(manifest: &str, version: &str, variant: &str) -> Result<Manif
             );
             continue;
         }
-        let is_bin = row.kind.eq_ignore_ascii_case("bin");
-        pick = Some(row);
-        if is_bin {
-            break;
+        if rows.len() < MANIFEST_CANDIDATES_MAX {
+            rows.push(row);
         }
     }
-    pick.ok_or(why)
+    // Stable: manifest order within a rank.
+    rows.sort_by_key(ManifestRow::rank);
+    if rows.is_empty() { Err(why) } else { Ok(rows) }
+}
+
+/// The best candidate alone (the checks that only need to know one fits).
+fn manifest_select(manifest: &str, version: &str, variant: &str) -> Result<ManifestRow, String> {
+    manifest_candidates(manifest, version, variant).map(|mut v| v.remove(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,6 +1261,7 @@ const FAILBACK_BODY: &str = r##"umask 077
 PATH="${PATH:-}:/usr/bin:/bin"; export PATH
 cd "$D" 2>/dev/null || exit 1
 STATE=.upgrade.state; CONF=.upgrade.confirmed; SELF=${SELF:-.upgrade.failback}
+FAILF=.upgrade.failback
 LOCK=.upgrade.lock; TRIES=.upgrade.tries; PREV="$EXE.prev"
 FAILTAG="# $PRODUCT:failback:$D:"; PRODTAG="# $PRODUCT:production:$D:"
 # A hardened daemon is not dumpable, so its /proc/<pid>/exe cannot be read: the
@@ -1218,10 +1330,16 @@ cron_sweep() { # in out
     while read -r dd; do [ -d "$dd" ] || printf ':%s:\n' "$dd"; done >"$2.dead"
   if [ -s "$2.dead" ]; then grep -vF -f "$2.dead" "$1" >"$2"; else cp "$1" "$2"; fi
 }
-cron_edit() { # add|remove tag line
+cron_edit() { # add|remove|orphan tag line
   command -v crontab >/dev/null 2>&1 || return 3
   take_lock "$HLOCK" 15 || return 5  # busy: the binary runs it again soon
   T=".upgrade.cron.$$"; rc=1; n=0
+  # orphan: remove, but only while no upgrade script is here.  Looked at under
+  # the lock, so an upgrade that is starting keeps its line.
+  if [ "$1" = orphan ]; then
+    [ -e "$FAILF" ] && n=3 && rc=0
+    set -- remove "$2"
+  fi
   while [ "$n" -lt 3 ]; do
     n=$((n + 1))
     cron_read "$T.cur" || break
@@ -1244,6 +1362,21 @@ cron_edit() { # add|remove tag line
   rm -f "$T".*
   rm -f "$HLOCK"; HELD=$(printf '%s' "$HELD" | sed "s| $HLOCK||")
   return "$rc"
+}
+# An upgrade's line whose script is gone: a "done" that found the crontab lock
+# busy left it behind.  A helper that finds the lock busy here exits 5 (busy),
+# and the binary runs it again in 10-30 s.
+orphan_or_busy() {
+  [ -e "$FAILF" ] && return 0
+  command -v crontab >/dev/null 2>&1 || return 0
+  T=".upgrade.cron.$$"
+  cron_read "$T.fo" || { rm -f "$T".*; return 0; }
+  grep -qF "$FAILTAG" "$T.fo"; f=$?
+  rm -f "$T".*
+  [ "$f" = 0 ] || return 0
+  cron_edit orphan "$FAILTAG"
+  [ $? = 5 ] && { rm -f "$SELF"; exit 5; }
+  return 0
 }
 fail_line() {
   printf "* * * * * [ -x '%s/%s' ] && '%s/%s' tick >/dev/null 2>&1 %s\n" \
@@ -1350,8 +1483,9 @@ case "${1:-tick}" in
   # A loop names its upgrade: a loop that outlived it stops here, touching nothing.
   tick) [ -n "${2:-}" ] && [ "$2" != "$ID" ] && exit 1
     take_lock "$LOCK" 2 || exit 0; tick ;;
-  cron-status) cron_status; rc=$?; rm -f "$SELF"; exit "$rc" ;;
+  cron-status) orphan_or_busy; cron_status; rc=$?; rm -f "$SELF"; exit "$rc" ;;
   cron-on)
+    orphan_or_busy
     cron_status; rc=$?
     if [ "$rc" = 11 ]; then
       if safe_path; then
@@ -1363,6 +1497,7 @@ case "${1:-tick}" in
     fi
     rm -f "$SELF"; exit "$rc" ;;
   cron-off)
+    orphan_or_busy
     rc=0
     cron_edit remove "$PRODTAG" || rc=$?
     if [ "$rc" = 0 ]; then rm -f .cron.seen; cron_status; rc=$?; fi
@@ -2037,7 +2172,54 @@ fn stage_job(id: u64, ver: &str, variant: &str) -> Result<(), (&'static str, Str
             t,
         )
     })?;
-    let row = manifest_select(&manifest, ver, variant).map_err(|e| ("build", e))?;
+    let rows = manifest_candidates(&manifest, ver, variant).map_err(|e| ("build", e))?;
+    // Every candidate in turn (gnu, static, src — irchub plan §2) until one
+    // builds and passes its -selftest here.  C `stage_child`.
+    let mut last = ("build", String::new());
+    // What failed before the build that is staged: the "staged" note carries
+    // it ("static; the gnu build: <why>"), since the "trying" notes in between
+    // can be replaced before the daemon reads them.  C `fell` (191 bytes).
+    let mut fell = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        let _ = std::fs::remove_dir_all(format!("{STAGE_DIR}/build"));
+        let _ = std::fs::remove_file(format!("{STAGE_DIR}/archive.tar.gz"));
+        match stage_one(id, row) {
+            Ok(()) => {
+                let word = if row.kind.eq_ignore_ascii_case("bin") {
+                    "bin"
+                } else {
+                    "src"
+                };
+                let note = format!("{}{}", row.label(), fell);
+                stage_say(id, "staged", word, clip(&note, STAGE_NOTE_MAX));
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(format!("{STAGE_DIR}/build"));
+                let _ = std::fs::remove_file(format!("{STAGE_DIR}/archive.tar.gz"));
+                if let Some(next) = rows.get(i + 1) {
+                    let note = format!(
+                        "the {} build: {}; trying the {} build",
+                        row.label(),
+                        clip(&e.1, 300),
+                        next.label()
+                    );
+                    stage_say(id, "fetching", "", &note);
+                    if fell.len() < STAGE_NOTE_MAX {
+                        fell.push_str(&format!("; the {} build: {}", row.label(), clip(&e.1, 120)));
+                        fell.truncate(clip(&fell, STAGE_NOTE_MAX).len());
+                    }
+                }
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// One candidate, in the stage job: fetch, verify, unpack, build (source),
+/// -selftest, and keep it as STAGE_DIR/new.  C `stage_one`.
+fn stage_one(id: u64, row: &ManifestRow) -> Result<(), (&'static str, String)> {
     let is_bin = row.kind.eq_ignore_ascii_case("bin");
     let word = if is_bin { "bin" } else { "src" };
     let archive = format!("{STAGE_DIR}/archive.tar.gz");
@@ -2102,7 +2284,6 @@ fn stage_job(id: u64, ver: &str, variant: &str) -> Result<(), (&'static str, Str
         .map_err(|_| ("dir", "could not keep the staged build".to_string()))?;
     let _ = std::fs::remove_dir_all(&bdir);
     let _ = std::fs::remove_file(&archive);
-    stage_say(id, "staged", word, "");
     Ok(())
 }
 
@@ -2381,51 +2562,81 @@ pub fn commit(
     } else {
         stage_clear();
         let manifest = fetch_verified_manifest(&tree)?;
-        let row = manifest_select(&manifest, target_ver, want_variant)?;
-
-        let url_name = row
-            .url
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("irchub.tar.gz");
-        let archive =
-            sanitize_filename(url_name).ok_or("artifact filename in manifest is not acceptable")?;
-
-        // Every release artifact is named "<product>-…tar.gz" (see the releases
-        // repo README).  A base override that names the OTHER product's tree
-        // would otherwise hand this daemon the wrong binary and install it over
-        // itself — fail closed here, where nothing has been downloaded yet.
-        if !archive.starts_with("irchub-") {
-            return Err("manifest artifact is not a irchub release".to_string());
-        }
-
-        crate::hlog_info!("[UPGRADE] Fetching {} artifact {archive}\n", row.kind);
-        if !download(&row.url, &archive) {
-            return Err("artifact download failed".to_string());
-        }
-        if !crypto::sha256_file_hex(&archive).is_some_and(|h| h.eq_ignore_ascii_case(&row.hash)) {
-            let _ = std::fs::remove_file(&archive);
-            return Err("artifact SHA-256 mismatch".to_string());
-        }
-        // Run the new build's own -selftest BEFORE anything is renamed: a build
-        // that cannot run here is refused with nothing touched.  A target older
-        // than MESH_MIN_VERSION would be refused by every peer and bot.
+        let rows = manifest_candidates(&manifest, target_ver, want_variant)?;
+        // A target older than MESH_MIN_VERSION would be refused by every peer and bot.
         if version_cmp(target_ver, MESH_MIN_VERSION) == std::cmp::Ordering::Less {
-            let _ = std::fs::remove_file(&archive);
             return Err(format!(
                 "target predates {MESH_MIN_VERSION}, the oldest the mesh links with"
             ));
         }
-        if row.kind.eq_ignore_ascii_case("bin") {
-            crate::hlog_info!("[UPGRADE] Running the new build's selftest\n");
-            if let Err(e) = staged_selftest(&archive) {
-                let _ = std::fs::remove_file(&archive);
-                return Err(format!("new build failed its selftest: {e}"));
+        // Every candidate in turn, best first (gnu, static, src: irchub plan
+        // §2): the first whose download, hash and -selftest pass is the one.
+        // A source build is checked by the script.  C hub_update_perform.
+        let mut last = String::new();
+        let mut chosen: Option<(String, String)> = None;
+        for (i, row) in rows.iter().enumerate() {
+            let url_name = row
+                .url
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("irchub.tar.gz");
+            let archive = sanitize_filename(url_name)
+                .ok_or("artifact filename in manifest is not acceptable")?;
+            // Every release artifact is named "<product>-…tar.gz" (see the
+            // releases repo README).  A base override that names the OTHER
+            // product's tree would otherwise hand this daemon the wrong binary
+            // and install it over itself — fail closed here, where nothing has
+            // been downloaded yet.
+            if !archive.starts_with("irchub-") {
+                return Err("manifest artifact is not a irchub release".to_string());
+            }
+            crate::hlog_info!(
+                "[UPGRADE] Fetching the {} artifact {archive}\n",
+                row.label()
+            );
+            let no = if !download(&row.url, &archive) {
+                Some("artifact download failed".to_string())
+            } else if !crypto::sha256_file_hex(&archive)
+                .is_some_and(|h| h.eq_ignore_ascii_case(&row.hash))
+            {
+                Some("artifact SHA-256 mismatch".to_string())
+            } else if row.kind.eq_ignore_ascii_case("bin") {
+                // Run the new build's own -selftest BEFORE anything is
+                // renamed: a build that cannot run here is refused with
+                // nothing touched.
+                crate::hlog_info!("[UPGRADE] Running the new build's selftest\n");
+                match staged_selftest(&archive) {
+                    Err(e) => Some(format!("new build failed its selftest: {e}")),
+                    Ok(()) => {
+                        crate::hlog_info!(
+                            "[UPGRADE] Staged {target_ver} ({}) passed its selftest\n",
+                            row.label()
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            match no {
+                None => {
+                    chosen = Some((row.kind.clone(), archive));
+                    break;
+                }
+                Some(e) => {
+                    let _ = std::fs::remove_file(&archive);
+                    last = format!("the {} build: {e}", row.label());
+                    if let Some(next) = rows.get(i + 1) {
+                        crate::hlog_warning!(
+                            "[UPGRADE] {last}; trying the {} build\n",
+                            next.label()
+                        );
+                    }
+                }
             }
         }
-
-        (row.kind.clone(), archive)
+        chosen.ok_or(last)?
     };
 
     // End the previous upgrade's failback before laying down anything of this

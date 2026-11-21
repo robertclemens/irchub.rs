@@ -3158,6 +3158,10 @@ fn opname(op: u64) -> Option<&'static str> {
         0x8E => "CMD_PRESENCE2",
         0x8F => "CMD_BOT_TREE_DELTA",
         0x90 => "CMD_BOT_TREE_PULL",
+        0x91 => "CMD_CONFIG_DELTA",
+        0x92 => "CMD_CFG_RESYNC",
+        0x93 => "CMD_ADMIN_BOT_RESYNC",
+        0x94 => "CMD_SYNC_DIGEST",
         _ => return None,
     })
 }
@@ -3166,6 +3170,19 @@ fn count_kv(b: &mut Sb, label: &str, n: u64, colx: i32) {
     let c = count(n);
     b.pad(colx);
     b.a(&cat(&[s(label), b"  ", &c]));
+}
+
+/// "delta share  N%" and "saved  <bytes>" for a cfg / tree stats record: the
+/// share of pushes sent as deltas, and the full bytes they stood in for less
+/// what they took.  C `delta_kv`.
+fn delta_kv(b: &mut Sb, r: &Crec) {
+    let (full, delta) = (r.rvu("full"), r.rvu("delta"));
+    let (of, db) = (r.rvu("delta_of"), r.rvu("delta_bytes"));
+    let share = (delta * 100).checked_div(full + delta).unwrap_or(0);
+    b.pad(24);
+    b.a(format!("delta share  {share}%").as_bytes());
+    b.pad(48);
+    b.a(&cat(&[b"saved  ", &bytes(of.saturating_sub(db))]));
 }
 
 /// The maintenance countdowns of a stats reply ("timer" records).
@@ -3231,12 +3248,35 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let sy = rep.r.iter().rfind(|x| x.is("sync"));
     let ld = rep.r.iter().rfind(|x| x.is("load"));
     let p2 = rep.r.iter().rfind(|x| x.is("p2"));
+    let tr = rep.r.iter().rfind(|x| x.is("tree"));
     let mut b = Sb::default();
     if let Some(cfg) = cfg {
+        // A 2.5.3 hub answers sent= (all full) and no delta or pull.
         line(out, RL_HEAD, &[b" Config pushes to bots"]);
-        count_kv(&mut b, "  sent", cfg.rvu("sent"), 0);
-        count_kv(&mut b, "skipped (unchanged)", cfg.rvu("same"), 24);
-        count_kv(&mut b, "lost", cfg.rvu("lost"), 56);
+        let full = if cfg.rv("full").is_some() {
+            cfg.rvu("full")
+        } else {
+            cfg.rvu("sent")
+        };
+        count_kv(&mut b, "  full", full, 0);
+        count_kv(&mut b, "delta", cfg.rvu("delta"), 24);
+        count_kv(&mut b, "skipped (unchanged)", cfg.rvu("same"), 40);
+        count_kv(&mut b, "lost", cfg.rvu("lost"), 72);
+        b.emit(out, RL_NORMAL);
+        if cfg.rv("delta").is_some() {
+            count_kv(&mut b, "  pulls", cfg.rvu("pull"), 0);
+            delta_kv(&mut b, cfg);
+            b.emit(out, RL_NORMAL);
+        }
+    }
+    if let Some(tr) = tr {
+        line(out, RL_HEAD, &[b" Bot tree pushes"]);
+        count_kv(&mut b, "  full", tr.rvu("full"), 0);
+        count_kv(&mut b, "delta", tr.rvu("delta"), 24);
+        count_kv(&mut b, "pulls", tr.rvu("pull"), 40);
+        b.emit(out, RL_NORMAL);
+        b.a(b" ");
+        delta_kv(&mut b, tr);
         b.emit(out, RL_NORMAL);
     }
     if let Some(sy) = sy {
@@ -3246,12 +3286,23 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         count_kv(&mut b, "records", sy.rvu("records"), 40);
         count_kv(&mut b, "applied", sy.rvu("applied"), 60);
         b.emit(out, RL_NORMAL);
+        if sy.rv("digests").is_some() {
+            // 2.5.4 hash-first rounds: sent, received, nothing to repair,
+            // kinds exchanged, whole-state fallbacks.
+            count_kv(&mut b, "  digests", sy.rvu("digests"), 0);
+            count_kv(&mut b, "received", sy.rvu("digests_in"), 24);
+            count_kv(&mut b, "matched", sy.rvu("matched"), 40);
+            count_kv(&mut b, "repaired", sy.rvu("repaired"), 60);
+            count_kv(&mut b, "fallbacks", sy.rvu("fallbacks"), 80);
+            b.emit(out, RL_NORMAL);
+        }
     }
     if let Some(p2) = p2 {
+        // Not ready: a linked hub's first record is not in yet (every hub runs v2).
         let head: &[u8] = if p2.rvi("ready", 0) != 0 {
-            b" Presence v2 (every hub on it)"
+            b" Presence v2"
         } else {
-            b" Presence v2 (older hub in the mesh)"
+            b" Presence v2 (waiting for a hub's record)"
         };
         line(out, RL_HEAD, &[head]);
         count_kv(&mut b, "  deltas", p2.rvu("deltas"), 0);
@@ -6579,6 +6630,31 @@ fn render_bot_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             out,
             b"it reconnects by itself; use bot del to remove it for good",
         );
+    } else if code == b"bot.resync" {
+        let (here, hubs) = (r.rvi("here", 0), r.rvi("hubs", 0));
+        let pl = |n: i64| if n == 1 { "" } else { "s" };
+        let e = if uuid == b"all" {
+            ok(ctx, b"Full config queued", Some(b"every bot"), out);
+            format!(
+                "{here} bot{} on this hub now; {hubs} other hub{} asked to do the same",
+                pl(here),
+                pl(hubs)
+            )
+        } else {
+            let subj = cat(&[r.rv("nick").unwrap_or(b"?"), b"  ", uuid]);
+            ok(ctx, b"Full config queued", Some(&snp(256, subj)), out);
+            if here != 0 {
+                "it is connected to this hub: sent now".to_string()
+            } else if hubs != 0 {
+                format!(
+                    "it is not on this hub: {hubs} other hub{} asked to send it",
+                    pl(hubs)
+                )
+            } else {
+                "it is not on this hub, and no other hub is linked to ask".to_string()
+            }
+        };
+        effect(ctx, out, &snp(192, e.into_bytes()));
     } else if code == b"bot.rekey_howto" {
         let nick = r.rvs("nick").unwrap_or(uuid);
         let on = r.rvb("online");

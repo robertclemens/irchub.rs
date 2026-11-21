@@ -3699,9 +3699,11 @@ fn user_target_flag(state: &HubState, payload: &str) -> Option<char> {
 /// admin may run.  C `admin_flag_needed`.
 fn admin_flag_needed(state: &HubState, me: Option<usize>, cmd: u8, payload: &str) -> Option<char> {
     match cmd {
-        CMD_ADMIN_CREATE_BOT | CMD_ADMIN_DEL | CMD_ADMIN_DISCONNECT_BOT | CMD_ADMIN_REKEY_BOT => {
-            Some('b')
-        }
+        CMD_ADMIN_CREATE_BOT
+        | CMD_ADMIN_DEL
+        | CMD_ADMIN_DISCONNECT_BOT
+        | CMD_ADMIN_REKEY_BOT
+        | CMD_ADMIN_BOT_RESYNC => Some('b'),
         CMD_ADMIN_NET_SET if payload.starts_with("hubcron|") => Some('h'),
         CMD_ADMIN_NET_SET => mf_payload_mutates(cmd, payload).then_some('b'),
         CMD_ADMIN_ADD_PEER
@@ -3985,6 +3987,7 @@ pub fn console_admin_op(cmd: u8) -> bool {
             | CMD_ADMIN_DEL
             | CMD_ADMIN_DISCONNECT_BOT
             | CMD_ADMIN_REKEY_BOT
+            | CMD_ADMIN_BOT_RESYNC
             | CMD_ADMIN_LIST_PEERS
             | CMD_ADMIN_ADD_PEER
             | CMD_ADMIN_DEL_PEER
@@ -4365,8 +4368,8 @@ pub(crate) fn upgrade_start(
             };
             return true;
         }
-        // No roll call possible (an older hub, a peer that never linked): the
-        // gossip decides, as before.
+        // No roll call possible (a peer that never linked, a full table): the
+        // gossip decides.
         let gone = upgrade::hubs_missing(state);
         if !gone.is_empty() {
             let why = format!(
@@ -4585,6 +4588,85 @@ pub fn handle_admin_command(
             {
                 r.kv("fp", &crypto::key_fingerprint_b64(&p.value));
             }
+            send_reply(state, ci, &mut r)
+        }
+
+        CMD_ADMIN_BOT_RESYNC => {
+            // bot resync <nick|uuid|all>: a full config push, here and on
+            // every hub.
+            if payload.is_empty() {
+                return admin_err(
+                    state,
+                    ci,
+                    "bot.usage",
+                    "say which bot",
+                    Some("bot resync <nick|uuid|all>"),
+                );
+            }
+            let all = payload.eq_ignore_ascii_case("all");
+            let mut target = "*".to_string();
+            let mut nick = String::new();
+            if !all {
+                let mut hit = bot_by_uuid(state, payload).filter(|&i| state.bots[i].is_active);
+                let mut matches = usize::from(hit.is_some());
+                if hit.is_none() {
+                    for (i, b) in state.bots.iter().enumerate() {
+                        if b.is_active
+                            && b.entry("n")
+                                .is_some_and(|n| n.value.eq_ignore_ascii_case(payload))
+                        {
+                            if hit.is_none() {
+                                hit = Some(i);
+                            }
+                            matches += 1;
+                        }
+                    }
+                }
+                let Some(h) = hit else {
+                    return admin_err(
+                        state,
+                        ci,
+                        "bot.not_found",
+                        "no registered bot has that nick or uuid",
+                        Some("bot list"),
+                    );
+                };
+                if matches > 1 {
+                    return admin_err(
+                        state,
+                        ci,
+                        "bot.ambiguous",
+                        "more than one bot has that nick",
+                        Some("bot resync <uuid>"),
+                    );
+                }
+                target = state.bots[h].uuid.clone();
+                nick = presence::bot_nick_from_config(state, &target);
+            }
+            let admin_fd = state.clients[ci].fd;
+            let here = client::cfg_resync_local(state, &target);
+            let id = opflow::generate_request_id();
+            opflow::forward_seen_check_and_add(state, &id);
+            let fwd = format!("{id}|{}|{target}", crate::cstr::now());
+            // A bot connected here needs no other hub; all, or one elsewhere, floods.
+            let told = if all || here == 0 {
+                client::cfg_resync_flood(state, None, &fwd)
+            } else {
+                0
+            };
+            crate::hlog_info!(
+                "[ADMIN] Resync {}: full config queued to {here} bot(s) here, {told} hub(s) asked\n",
+                if all { "all bots" } else { target.as_str() }
+            );
+            let Some(ci) = refind(state, admin_fd) else {
+                return false;
+            };
+            let mut r = Reply::new();
+            r.ok("bot.resync");
+            r.kv("uuid", if all { "all" } else { &target });
+            opt(&mut r, "nick", &nick);
+            r.kvi("here", here);
+            r.kvi("hubs", told);
             send_reply(state, ci, &mut r)
         }
 

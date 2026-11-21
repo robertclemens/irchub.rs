@@ -156,7 +156,7 @@ fn link_seq_recv(state: &mut HubState, ci: usize, what: &str) {
 /// send_pong(): the keepalive answer, through [`client_send`].  Drops the
 /// client when it cannot be queued.
 fn send_pong(state: &mut HubState, ci: usize) -> bool {
-    let tp = crate::presence::tree_ping_payload(state, ci);
+    let tp = crate::presence::bot_ping_payload(state, ci);
     let ok = client_send(&mut state.clients[ci], CMD_PING, &tp);
     if !ok {
         auth::disconnect_client(state, ci);
@@ -169,9 +169,9 @@ fn send_pong(state: &mut HubState, ci: usize) -> bool {
 /// handshake (a ping sent straight to the socket landed inside a part-sent
 /// sync frame and broke the link).  False = it could not be queued: the
 /// caller drops the connection.
-/// A bot's ping carries its tree hash (`presence::tree_ping_payload`).
+/// A bot's ping carries its tree and config hashes (`presence::bot_ping_payload`).
 pub fn send_ping(state: &mut HubState, ci: usize) -> bool {
-    let tp = crate::presence::tree_ping_payload(state, ci);
+    let tp = crate::presence::bot_ping_payload(state, ci);
     client_send(&mut state.clients[ci], CMD_PING, &tp)
 }
 
@@ -199,15 +199,30 @@ fn bot_config_hash(payload: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// send_config_to_bot(): queue this bot's full config on its BULK lane.
+/// A bot that applies CMD_CONFIG_DELTA and checks the keepalive config hash
+/// (CFG_DELTA_MIN_BOT and up); as C `bot_takes_cfg_deltas`.
+pub fn bot_takes_cfg_deltas(c: &crate::state::HubClient) -> bool {
+    !c.bot_version.is_empty()
+        && crate::update::version_cmp(&c.bot_version, CFG_DELTA_MIN_BOT) != std::cmp::Ordering::Less
+}
+
+fn hex32(h: &[u8; 32]) -> String {
+    h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// send_config_to_bot(): queue this bot its config on its BULK lane — a
+/// delta of the text it holds (S, `cfg_base`) when it takes them, else the
+/// full text.
 ///
 /// Coalesced on a per-bot key so a burst of
-/// `broadcast_full_config_to_all_bots` calls collapses to one send per bot
-/// per drain cycle.  `MAX_CONFIG_PAYLOAD` is a hard upper bound (see
-/// `consts`), so the generator never truncates.  `force` false (a broadcast)
-/// skips the push when the bot was already sent this exact config and that
-/// push was not lost; true always sends (the bot's first config, a PULL, a
-/// re-shape).
+/// `broadcast_full_config_to_all_bots` calls collapses to one frame per bot
+/// per drain cycle; full or delta, the newer replaces the queued one whole.
+/// `MAX_CONFIG_PAYLOAD` is a hard upper bound (see `consts`), so the
+/// generator never truncates.  `force` false (a broadcast) skips the push
+/// when the bot was already sent this exact config and that push was not
+/// lost; true always sends, and sends it full (the bot's first config, a
+/// PULL, `bot resync`).  Plan §4.3a: the one queued frame always has base S;
+/// S moves only when a frame is written (`queue::cfg_frame_written`).
 pub fn send_config_to_bot(state: &mut HubState, ci: usize, force: bool) {
     let id = state.clients[ci].id.clone();
     let payload = Zeroizing::new(storage::generate_bot_payload(state, &id));
@@ -223,27 +238,127 @@ pub fn send_config_to_bot(state: &mut HubState, ci: usize, force: bool) {
         crate::stats::cfg_same();
         return;
     }
+
+    // A delta against S when the bot takes them and S is known.
+    let delta = {
+        let c = &state.clients[ci];
+        match &c.cfg_base {
+            Some(base) if !force && bot_takes_cfg_deltas(c) => {
+                use sha2::{Digest, Sha256};
+                let nh: [u8; 32] = Sha256::digest(payload.as_bytes()).into();
+                let cap = payload.len() * crate::cfg_delta::CFG_DELTA_MAX_PCT / 100
+                    + crate::cfg_delta::CFGD_HEADER_LEN;
+                crate::cfg_delta::diff(
+                    base,
+                    payload.as_bytes(),
+                    &hex32(&c.cfg_base_hash),
+                    &hex32(&nh),
+                    cap,
+                )
+            }
+            _ => None,
+        }
+    };
+
     crate::hlog_debug!(
-        "[HUB-SYNC] Queueing config to {id} ({} bytes)\n",
+        "[HUB-SYNC] Queueing config to {id} ({} bytes{})\n",
         payload.len(),
+        if delta.is_some() { ", as a delta" } else { "" },
         id = state.who_client(ci)
     );
 
     let coalesce = format!("{}|cfg_data|{id}", state.hub_uuid);
-    let Some(mut m) = QueuedMsg::new(CMD_CONFIG_DATA, Lane::Bulk, payload.as_bytes()) else {
+    let m = match &delta {
+        Some(d) => QueuedMsg::new(CMD_CONFIG_DELTA, Lane::Bulk, d),
+        None => QueuedMsg::new(CMD_CONFIG_DATA, Lane::Bulk, payload.as_bytes()),
+    };
+    let Some(mut m) = m else {
+        // Nothing queued: owe it rather than leave it.
+        state.clients[ci].cfg_sent_hash = None;
+        state.clients[ci].cfg_owed = true;
+        queue::cfg_owed_set();
         return;
     };
+    m.cfg_frame = true;
     let seq = state.next_lamport_seq();
     let hub_uuid = state.hub_uuid.clone();
     m.set_coalesce(&hub_uuid, seq, &coalesce);
     let c = &mut state.clients[ci];
     c.cfg_sent_hash = None;
+    // The queued frame's result: replaces any earlier queued one's.
+    c.cfg_next = Some(Zeroizing::new(payload.as_bytes().to_vec()));
+    c.cfg_queued = true;
+    c.cfg_owed = false;
     if !queue::enqueue(c, m) {
+        c.cfg_next = None;
+        c.cfg_queued = false;
         crate::stats::cfg_lost();
         return;
     }
-    crate::stats::cfg_sent();
+    match &delta {
+        Some(d) => crate::stats::cfg_delta(d.len(), payload.len()),
+        None => crate::stats::cfg_full(payload.len()),
+    }
     c.cfg_sent_hash = Some(hash);
+}
+
+/// `bot resync`: a forced full config push to this hub's bot `target` (a
+/// uuid), or to every one of its bots for "*".  The count queued.  C
+/// `cfg_resync_local`.
+pub fn cfg_resync_local(state: &mut HubState, target: &str) -> i64 {
+    let mut n = 0;
+    for ci in state.bot_clients() {
+        let c = &state.clients[ci];
+        if c.superseded || c.retiring || (target != "*" && c.id != target) {
+            continue;
+        }
+        send_config_to_bot(state, ci, true);
+        n += 1;
+    }
+    n
+}
+
+/// CMD_CFG_RESYNC `"<id>|<ts>|<uuid or *>"` to every linked hub but `skip`.
+/// C `cfg_resync_flood`.
+pub fn cfg_resync_flood(state: &mut HubState, skip: Option<usize>, payload: &str) -> i64 {
+    let mut told = 0;
+    for pi in state.peer_clients() {
+        if Some(pi) != skip && queue::send_urgent(&mut state.clients[pi], CMD_CFG_RESYNC, payload) {
+            told += 1;
+        }
+    }
+    told
+}
+
+/// CMD_CFG_RESYNC from a peer: resync our matching bots, pass it on.  C
+/// `process_peer_cfg_resync`.
+fn peer_cfg_resync(state: &mut HubState, ci: usize, payload: &str) {
+    let f: Vec<&str> = payload.split('|').collect();
+    let ok = f.len() >= 3
+        && !f[0].is_empty()
+        && f[0].len() < 64
+        && f[1].len() < 24
+        && f[2].len() < 64
+        && upgrade::plan_field_ok(f[0])
+        && (f[2] == "*" || crate::cstr::is_uuid(f[2]));
+    if !ok {
+        let ip = state.clients[ci].ip.clone();
+        crate::hlog_warning!("[HUB] Malformed CFG_RESYNC from peer {ip}\n");
+        return;
+    }
+    let ts = crate::cstr::atoll(f[1]);
+    let age = if ts > 0 { crate::cstr::now() - ts } else { 0 };
+    if ts <= 0 || !(-CFG_RESYNC_TTL..=CFG_RESYNC_TTL).contains(&age) {
+        return;
+    }
+    if crate::opflow::forward_seen_check_and_add(state, f[0]) {
+        return;
+    }
+    let n = cfg_resync_local(state, f[2]);
+    if n > 0 {
+        crate::hlog_info!("[HUB] Resync from another hub: full config queued to {n} bot(s)\n");
+    }
+    cfg_resync_flood(state, Some(ci), payload);
 }
 
 /// hub_broadcast_config_to_bots(): log the changed line, then re-send every
@@ -268,15 +383,29 @@ pub fn broadcast_full_config_to_all_bots(state: &mut HubState) {
 /// hub_flush_bot_config(): send the owed full config push to every local
 /// bot (maintenance loop).
 pub fn flush_bot_config(state: &mut HubState, now_ts: i64) {
-    if !state.bot_config_pending || now_ts - state.last_bot_config_push < BOT_CONFIG_PUSH_COALESCE {
+    if now_ts - state.last_bot_config_push < BOT_CONFIG_PUSH_COALESCE {
         return;
     }
-    send_owed_bot_config(state, now_ts);
+    if state.bot_config_pending {
+        send_owed_bot_config(state, now_ts); // every bot, owed ones included
+        return;
+    }
+    if !queue::cfg_owed_take() {
+        return;
+    }
+    // Only bots whose last config frame was lost (queue::cfg_push_lost).
+    state.last_bot_config_push = now_ts;
+    for ci in state.bot_clients() {
+        if state.clients[ci].cfg_owed {
+            send_config_to_bot(state, ci, false);
+        }
+    }
 }
 
 /// send_owed_bot_config(): the push itself, past any coalescing window.
 fn send_owed_bot_config(state: &mut HubState, now_ts: i64) {
     state.bot_config_pending = false;
+    queue::cfg_owed_take();
     state.last_bot_config_push = now_ts;
     let bots = state.bot_clients();
     let n = bots.len();
@@ -1205,7 +1334,11 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
         CMD_UPGRADE_PROGRESS => upgrade::bot_report(state, ci, CMD_UPGRADE_PROGRESS, payload),
         CMD_CONFIG_PUSH => process_bot_config_push(state, ci, payload),
         CMD_CONFIG_PULL => {
+            // A delta did not apply, or the keepalive's c| did not match what
+            // the bot holds: a full push.  A burst collapses into the one
+            // queued frame.
             crate::hlog_debug!("[HUB] Config PULL request from {}\n", state.who_client(ci));
+            crate::stats::cfg_pull();
             send_config_to_bot(state, ci, true);
         }
         CMD_BOT_DELTA => process_bot_delta(state, ci, payload),
@@ -1526,6 +1659,8 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         CMD_UPGRADE_HISTORY => crate::uhist::process(state, ci, payload),
         CMD_UPGRADE_PLAN => upgrade::plan_process(state, ci, payload),
         CMD_UPGRADE_FORGET => upgrade::peer_forget(state, ci, payload),
+        CMD_CFG_RESYNC => peer_cfg_resync(state, ci, payload),
+        CMD_SYNC_DIGEST => mesh::process_sync_digest(state, ci, payload),
         CMD_PRESENCE2 => crate::presence2::rx(state, ci, payload),
         CMD_HUB_ROLLCALL => crate::rollcall::peer_rollcall(state, ci, payload),
         CMD_HUB_ROLLCALL_ACK => crate::rollcall::peer_rollcall_ack(state, ci, payload),

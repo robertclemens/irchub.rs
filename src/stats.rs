@@ -10,12 +10,28 @@ struct Stats {
     rx_bytes: [AtomicU64; 256],
     tx_frames: [AtomicU64; 256],
     tx_bytes: [AtomicU64; 256],
-    /// Full configs queued to a bot.
-    cfg_sent: AtomicU64,
+    /// Full configs queued to a bot (CMD_CONFIG_DATA), and their bytes.
+    cfg_full: AtomicU64,
+    cfg_full_bytes: AtomicU64,
+    /// Config deltas queued (CMD_CONFIG_DELTA), their bytes, and the
+    /// full-text bytes they stood in for.
+    cfg_delta: AtomicU64,
+    cfg_delta_bytes: AtomicU64,
+    cfg_delta_of: AtomicU64,
     /// Skipped: that bot already has this exact one.
     cfg_same: AtomicU64,
     /// Queued config dropped on lane overflow.
     cfg_lost: AtomicU64,
+    /// CMD_CONFIG_PULLs served (a bot's hash check).
+    cfg_pull: AtomicU64,
+    /// Whole bot trees queued (CMD_BOT_TREE), deltas (CMD_BOT_TREE_DELTA),
+    /// the same byte counts, and CMD_BOT_TREE_PULLs served.
+    tree_full: AtomicU64,
+    tree_full_bytes: AtomicU64,
+    tree_delta: AtomicU64,
+    tree_delta_bytes: AtomicU64,
+    tree_delta_of: AtomicU64,
+    tree_pull: AtomicU64,
     /// PEER_SYNC / PEER_BCAST frames processed.
     sync_frames: AtomicU64,
     /// ... of which changed nothing.
@@ -24,6 +40,13 @@ struct Stats {
     sync_records: AtomicU64,
     /// ... of which were new and applied.
     sync_applied: AtomicU64,
+    /// CMD_SYNC_DIGEST rounds sent / received / matched, kinds exchanged,
+    /// and whole-state fallbacks (stuck or malformed) — 2.5.4.
+    sd_tx: AtomicU64,
+    sd_rx: AtomicU64,
+    sd_match: AtomicU64,
+    sd_kinds: AtomicU64,
+    sd_full: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -31,13 +54,29 @@ static STATS: Stats = Stats {
     rx_bytes: [const { AtomicU64::new(0) }; 256],
     tx_frames: [const { AtomicU64::new(0) }; 256],
     tx_bytes: [const { AtomicU64::new(0) }; 256],
-    cfg_sent: AtomicU64::new(0),
+    cfg_full: AtomicU64::new(0),
+    cfg_full_bytes: AtomicU64::new(0),
+    cfg_delta: AtomicU64::new(0),
+    cfg_delta_bytes: AtomicU64::new(0),
+    cfg_delta_of: AtomicU64::new(0),
     cfg_same: AtomicU64::new(0),
     cfg_lost: AtomicU64::new(0),
+    cfg_pull: AtomicU64::new(0),
+    tree_full: AtomicU64::new(0),
+    tree_full_bytes: AtomicU64::new(0),
+    tree_delta: AtomicU64::new(0),
+    tree_delta_bytes: AtomicU64::new(0),
+    tree_delta_of: AtomicU64::new(0),
+    tree_pull: AtomicU64::new(0),
     sync_frames: AtomicU64::new(0),
     sync_noop: AtomicU64::new(0),
     sync_records: AtomicU64::new(0),
     sync_applied: AtomicU64::new(0),
+    sd_tx: AtomicU64::new(0),
+    sd_rx: AtomicU64::new(0),
+    sd_match: AtomicU64::new(0),
+    sd_kinds: AtomicU64::new(0),
+    sd_full: AtomicU64::new(0),
 };
 
 /// An authenticated frame this hub decrypted (`wire_len` includes the
@@ -53,8 +92,38 @@ pub fn tx(cmd: u8, wire_len: usize) {
     STATS.tx_bytes[cmd as usize].fetch_add(wire_len as u64, Relaxed);
 }
 
-pub fn cfg_sent() {
-    STATS.cfg_sent.fetch_add(1, Relaxed);
+/// A full config of `bytes` queued.
+pub fn cfg_full(bytes: usize) {
+    STATS.cfg_full.fetch_add(1, Relaxed);
+    STATS.cfg_full_bytes.fetch_add(bytes as u64, Relaxed);
+}
+
+/// A config delta of `bytes` queued, standing in for `of` full bytes.
+pub fn cfg_delta(bytes: usize, of: usize) {
+    STATS.cfg_delta.fetch_add(1, Relaxed);
+    STATS.cfg_delta_bytes.fetch_add(bytes as u64, Relaxed);
+    STATS.cfg_delta_of.fetch_add(of as u64, Relaxed);
+}
+
+pub fn cfg_pull() {
+    STATS.cfg_pull.fetch_add(1, Relaxed);
+}
+
+/// A whole tree of `bytes` queued.
+pub fn tree_full(bytes: usize) {
+    STATS.tree_full.fetch_add(1, Relaxed);
+    STATS.tree_full_bytes.fetch_add(bytes as u64, Relaxed);
+}
+
+/// A tree row delta of `bytes` queued, standing in for `of` whole-tree bytes.
+pub fn tree_delta(bytes: usize, of: usize) {
+    STATS.tree_delta.fetch_add(1, Relaxed);
+    STATS.tree_delta_bytes.fetch_add(bytes as u64, Relaxed);
+    STATS.tree_delta_of.fetch_add(of as u64, Relaxed);
+}
+
+pub fn tree_pull() {
+    STATS.tree_pull.fetch_add(1, Relaxed);
 }
 
 pub fn cfg_same() {
@@ -63,6 +132,26 @@ pub fn cfg_same() {
 
 pub fn cfg_lost() {
     STATS.cfg_lost.fetch_add(1, Relaxed);
+}
+
+pub fn sd_tx() {
+    STATS.sd_tx.fetch_add(1, Relaxed);
+}
+
+pub fn sd_rx() {
+    STATS.sd_rx.fetch_add(1, Relaxed);
+}
+
+pub fn sd_match() {
+    STATS.sd_match.fetch_add(1, Relaxed);
+}
+
+pub fn sd_kinds(n: usize) {
+    STATS.sd_kinds.fetch_add(n as u64, Relaxed);
+}
+
+pub fn sd_full() {
+    STATS.sd_full.fetch_add(1, Relaxed);
 }
 
 pub fn sync_frame() {
@@ -96,14 +185,31 @@ pub fn report(
     r.ok("stats");
     r.kvi("up", uptime);
     r.rec("cfg");
-    r.kvu("sent", g(&s.cfg_sent));
+    r.kvu("full", g(&s.cfg_full));
+    r.kvu("full_bytes", g(&s.cfg_full_bytes));
+    r.kvu("delta", g(&s.cfg_delta));
+    r.kvu("delta_bytes", g(&s.cfg_delta_bytes));
+    r.kvu("delta_of", g(&s.cfg_delta_of));
     r.kvu("same", g(&s.cfg_same));
     r.kvu("lost", g(&s.cfg_lost));
+    r.kvu("pull", g(&s.cfg_pull));
+    r.rec("tree");
+    r.kvu("full", g(&s.tree_full));
+    r.kvu("full_bytes", g(&s.tree_full_bytes));
+    r.kvu("delta", g(&s.tree_delta));
+    r.kvu("delta_bytes", g(&s.tree_delta_bytes));
+    r.kvu("delta_of", g(&s.tree_delta_of));
+    r.kvu("pull", g(&s.tree_pull));
     r.rec("sync");
     r.kvu("frames", g(&s.sync_frames));
     r.kvu("noop", g(&s.sync_noop));
     r.kvu("records", g(&s.sync_records));
     r.kvu("applied", g(&s.sync_applied));
+    r.kvu("digests", g(&s.sd_tx));
+    r.kvu("digests_in", g(&s.sd_rx));
+    r.kvu("matched", g(&s.sd_match));
+    r.kvu("repaired", g(&s.sd_kinds));
+    r.kvu("fallbacks", g(&s.sd_full));
     load(r);
     for op in 0..256 {
         let (rf, tf) = (g(&s.rx_frames[op]), g(&s.tx_frames[op]));

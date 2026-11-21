@@ -790,6 +790,7 @@ const CMDS: &[CmdDef] = &[
     cmd!("bot", Some("del"), CMD_ADMIN_DEL, B::Arg, 1, 0, Cf::Yn, Pre::BotDel, "", "bot del <uuid|nick>", "delete a bot everywhere for good (asks y/N; wipes its config and stops it)", None),
     cmd!("bot", Some("kick"), CMD_ADMIN_DISCONNECT_BOT, B::Arg, 1, 0, Cf::Yn, Pre::BotKick, "", "bot kick <uuid|nick>", "drop its connection to this hub (asks y/N; it reconnects)", None),
     cmd!("bot", Some("rekey"), CMD_ADMIN_REKEY_BOT, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot rekey <uuid>", "how to rekey a bot (only the bot can)", None),
+    cmd!("bot", Some("resync"), CMD_ADMIN_BOT_RESYNC, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot resync <uuid|nick|all>", "send a bot (or every bot) its whole config again, from whichever hub it is on", None),
     cmd!("bot", Some("tree"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|tree", "bot tree", "every hub and bot as a tree", None),
     cmd!("bot", Some("set"), CMD_ADMIN_NET_SET, B::NetSet, 0, 3, Cf::None, Pre::None, "", "bot set [flood <cmd|msg|ctcp> <N:S|off|default> | ignoretime <min|default> | sendq <B:I|default> | cron <global|nick|uuid> <on|off>]", "show the bot settings, or change one (every bot gets it; cron: every bot, or one until the next global)", None),
     cmd!("hub", Some("show"), CMD_ADMIN_GET_PUBKEY, B::HubShow, 0, 1, Cf::None, Pre::None, "", "hub show [#|uuid|name]", "this hub (identity, key, listener, counts), or one linked hub in detail", None),
@@ -870,6 +871,7 @@ const GROUPS: [(&str, &str); 10] = [
 const CMD_FLAGS: &[(&str, &str, &str)] = &[
     ("bot", "add", "b"),
     ("bot", "del", "b"), ("bot", "kick", "b"), ("bot", "rekey", "b"),
+    ("bot", "resync", "b"),
     ("bot", "set", "b"),
     ("hub", "add", "h"), ("hub", "del", "h"), ("hub", "set", "h"),
     ("hub", "sync", "h"), ("hub", "rekey", "h"), ("hub", "purge", "h"),
@@ -996,6 +998,11 @@ const CMD_HELP: &[CmdHelp] = &[
      concat!("bot kick alpha\nbot kick ", ex_uuid!())),
     ("bot", Some("rekey"), Some("uuid\tthe bot's uuid; prints how to rekey it on its host"),
      concat!("bot rekey ", ex_uuid!())),
+    ("bot", Some("resync"), Some("uuid|nick|all\tthe bot's uuid or its nick (Tab completes both), or all.  \
+                                  Bots are normally sent only what changed and check what they hold against the hub at each \
+                                  keepalive, pulling the whole config on any mismatch; this sends it whole now, from the hub \
+                                  each bot is connected to"),
+     "bot resync alpha\nbot resync all"),
     ("bot", Some("tree"), None, "bot tree"),
     ("bot", Some("set"),
      Some("(none)\tshows every bot setting: its value, where it comes from, its default\n\
@@ -1233,6 +1240,7 @@ const ARG_COMP: &[ArgComp] = &[
     ("bot", Some("del"), Some(0), Ck::BotNick),
     ("bot", Some("kick"), Some(0), Ck::BotOn),
     ("bot", Some("rekey"), Some(0), Ck::Bot),
+    ("bot", Some("resync"), Some(0), Ck::BotNick),
     (
         "bot",
         Some("set"),

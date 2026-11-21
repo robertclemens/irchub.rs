@@ -363,6 +363,183 @@ pub fn peer_version_level(state: &HubState, ci: usize) -> u8 {
     }
 }
 
+// ---- Hash-first anti-entropy (CMD_SYNC_DIGEST, 2.5.4) ----------------------
+// irchub docs/plans/2026-11-20_sync_digest_plan.md; spec proto/syncdigest/
+// model.py.  G1: a digest applies nothing — only the ordinary CMD_PEER_SYNC
+// records it makes us send do.  G2: anything malformed sends more, never
+// less.  As the C hub's block of the same name.
+
+/// The peer's version as `peer_version_level` reads it ("" unknown).  C
+/// `peer_version_str`.
+fn peer_version_str(state: &HubState, ci: usize) -> String {
+    let cu = crate::upgrade::peer_uuid_of(state, ci);
+    if cu.is_empty() {
+        return String::new();
+    }
+    if let Some(p) = state
+        .peers
+        .iter()
+        .find(|p| p.uuid == cu && !p.remote_version.is_empty())
+    {
+        return p.remote_version.clone();
+    }
+    state
+        .mesh_hubs
+        .iter()
+        .find(|h| h.uuid == cu)
+        .map(|h| h.version.clone())
+        .unwrap_or_default()
+}
+
+fn peer_takes_sync_digest(state: &HubState, ci: usize) -> bool {
+    let v = peer_version_str(state, ci);
+    !v.is_empty() && crate::update::version_cmp(&v, SYNC_DIGEST_MIN_HUB) != std::cmp::Ordering::Less
+}
+
+fn sd_send(state: &mut HubState, ci: usize, text: &[u8]) {
+    if let Some(m) = QueuedMsg::new(CMD_SYNC_DIGEST, Lane::Bulk, text)
+        && queue::enqueue(&mut state.clients[ci], m)
+    {
+        return;
+    }
+    let ip = state.clients[ci].ip.clone();
+    crate::hlog_warning!("[MESH] Could not queue a sync digest to {ip}\n");
+}
+
+/// Our records of `kinds` (all for `all`) to peer `ci` as one CMD_PEER_SYNC.
+fn sd_push(state: &mut HubState, ci: usize, packet: &str, kinds: &[Vec<u8>], all: bool) {
+    let sel = crate::sync_digest::select(packet.as_bytes(), kinds, all);
+    if sel.is_empty() || sel.len() > MAX_SYNC_PAYLOAD - 1 {
+        return;
+    }
+    let text = String::from_utf8_lossy(&sel).into_owned();
+    let lane = if text.len() > 1024 {
+        Lane::Bulk
+    } else {
+        Lane::Delta
+    };
+    peer_enqueue_sync(state, ci, CMD_PEER_SYNC, lane, &text, None);
+}
+
+/// One periodic anti-entropy round: to each peer the digest of `full`, or
+/// the full state to a peer older than SYNC_DIGEST_MIN_HUB and on every
+/// SYNC_DIGEST_FULL_EVERY-th round (S2).  C `hub_anti_entropy_round`.
+pub fn anti_entropy_round(state: &mut HubState, full: &str) {
+    let dg = crate::sync_digest::digest(full.as_bytes());
+    let lane = if full.len() > 1024 {
+        Lane::Bulk
+    } else {
+        Lane::Delta
+    };
+    for ci in state.peer_clients() {
+        let digest = dg.is_some() && peer_takes_sync_digest(state, ci) && {
+            let c = &mut state.clients[ci];
+            c.sd_rounds = c.sd_rounds.wrapping_add(1);
+            !c.sd_rounds.is_multiple_of(SYNC_DIGEST_FULL_EVERY)
+        };
+        match (&dg, digest) {
+            (Some(d), true) => {
+                sd_send(state, ci, d);
+                crate::stats::sd_tx();
+            }
+            _ => {
+                let op = sync_bcast_opcode(state, ci);
+                peer_enqueue_sync(state, ci, op, lane, full, None);
+            }
+        }
+    }
+}
+
+/// G3: the kinds that differed this round on peer `ci`'s link, counted
+/// across consecutive rounds (a kind that matched drops out).  True when one
+/// has differed SYNC_DIGEST_STUCK times running.  C `sd_note_stuck`.
+fn sd_note_stuck(state: &mut HubState, ci: usize, bad: &[Vec<u8>]) -> bool {
+    let prev = std::mem::take(&mut state.clients[ci].sd_stuck);
+    let mut keep = Vec::new();
+    let mut which: Option<Vec<u8>> = None;
+    for k in bad.iter().take(crate::sync_digest::SDG_KINDS_MAX) {
+        let n = prev
+            .iter()
+            .find(|(pk, _)| pk == k)
+            .map_or(1, |(_, n)| n + 1);
+        keep.push((k.clone(), n));
+        if n >= SYNC_DIGEST_STUCK && which.is_none() {
+            which = Some(k.clone());
+        }
+    }
+    let Some(which) = which else {
+        state.clients[ci].sd_stuck = keep;
+        return false;
+    };
+    let t = crate::cstr::now();
+    if t - state.clients[ci].sd_warned >= SYNC_DIGEST_WARN_EVERY {
+        state.clients[ci].sd_warned = t;
+        crate::hlog_warning!(
+            "[MESH] Sync with {}: records of kind {} still differ after {} repaired rounds; \
+             sending the whole state both ways\n",
+            state.who_client(ci),
+            String::from_utf8_lossy(&which),
+            SYNC_DIGEST_STUCK
+        );
+    }
+    true
+}
+
+/// CMD_SYNC_DIGEST from a peer: a digest to compare, or a pull to answer.
+/// C `process_sync_digest`.
+pub fn process_sync_digest(state: &mut HubState, ci: usize, payload: &str) {
+    let full = zeroize::Zeroizing::new(generate_sync_packet(state));
+    let p = payload.as_bytes();
+    if p.starts_with(b"r|") {
+        match crate::sync_digest::parse_pull(p) {
+            Some((kinds, all)) => sd_push(state, ci, &full, &kinds, all),
+            None => {
+                crate::hlog_warning!("[MESH] Malformed sync pull from {}\n", state.who_client(ci))
+            }
+        }
+        return;
+    }
+    crate::stats::sd_rx();
+    let bad = crate::sync_digest::parse(p).and_then(|theirs| {
+        let mine = crate::sync_digest::parse(&crate::sync_digest::digest(full.as_bytes())?)?;
+        crate::sync_digest::mismatch(&mine, &theirs)
+    });
+    match bad {
+        Some(b) if b.is_empty() => {
+            crate::stats::sd_match();
+            state.clients[ci].sd_stuck.clear();
+        }
+        Some(b) if !sd_note_stuck(state, ci, &b) => {
+            // Push ours of every kind that differs, pull theirs: either may be behind.
+            crate::stats::sd_kinds(b.len());
+            sd_push(state, ci, &full, &b, false);
+            let mut pull = b"r|".to_vec();
+            for (i, k) in b.iter().enumerate() {
+                if i > 0 {
+                    pull.push(b',');
+                }
+                pull.extend_from_slice(k);
+            }
+            pull.push(b'\n');
+            sd_send(state, ci, &pull);
+        }
+        stuck => {
+            // Malformed, unreadable, or stuck: the whole state both ways (G2/G3).
+            if stuck.is_none() {
+                crate::hlog_warning!(
+                    "[MESH] Unreadable sync digest from {}; sending the whole state\n",
+                    state.who_client(ci)
+                );
+            } else {
+                state.clients[ci].sd_stuck.clear();
+            }
+            crate::stats::sd_full();
+            sd_push(state, ci, &full, &[], true);
+            sd_send(state, ci, b"r|*\n");
+        }
+    }
+}
+
 /// One sync payload onto peer `ci`'s queue (every sync to a peer goes
 /// through it).  Held, not sent, while the peer's version is not known:
 /// `peer_sync_release` sends the full state once it is.  C

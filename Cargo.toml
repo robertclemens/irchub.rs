@@ -1,6 +1,6 @@
 [package]
 name = "irchub"
-version = "2.5.3"
+version = "2.5.4"
 edition = "2024"
 rust-version = "1.89"
 description = "Encrypted hub mesh for ircbot (safe-Rust port of irchub.c)"
@@ -29,20 +29,20 @@ test-hooks = []
 # Cryptography (RustCrypto + dalek), matched to ircbot.rs so the two trees
 # agree bit for bit on the wire: AES-256-GCM, PBKDF2/HKDF-SHA256, Ed25519
 # signatures and X25519 key agreement.
-aes-gcm = "0.11"
-ed25519-dalek = "3.0"
-x25519-dalek = { version = "3.0", features = ["static_secrets"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["zeroize"] }
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize"] }
 hkdf = "0.13"
-pbkdf2 = "0.13"
-sha2 = "0.11"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+sha2 = { version = "0.11", default-features = false }
 getrandom = "0.4"
-zeroize = "1.9"
-base64 = "0.23"
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 # keygen only: passphrase-protected keys (docs/console.md §9) -- scrypt for
 # the irckey-v2 IRC key, bcrypt_pbkdf + AES-256-CTR for the OpenSSH key.
 # All pure Rust.  src/bin/keygen.rs is byte-identical to ircbot.rs's.
 scrypt = { version = "0.12", default-features = false }
-bcrypt-pbkdf = "0.11"
+bcrypt-pbkdf = { version = "0.11", default-features = false, features = ["alloc"] }
 aes = "0.9"
 ctr = "0.10"
 
@@ -56,14 +56,14 @@ socket2 = "0.6"
 # x86_64/aarch64 only and asserts on its required CPU features, so the
 # provider is installed lazily and a failure disables the updater rather than
 # taking the daemon down (see update::tls_ready).
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 rustls-graviola = "0.4"
-ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 
 # OS integration through safe wrappers (poll, daemon, mlock, termios,
 # RLIMIT_CORE, PR_SET_DUMPABLE).
-nix = { version = "0.32", features = ["user", "fs", "process", "signal", "term", "resource", "feature", "poll", "socket"] }
-region = "4"
+nix = { version = "0.32", features = ["user", "fs", "signal", "term", "resource", "poll", "socket"] }
+region = { version = "4", default-features = false }
 # The console log ring: an anonymous mapping, mlock'd and MADV_DONTDUMP
 # through memmap2's safe advise/lock (unsafe_code is forbidden here).
 memmap2 = "0.9"
@@ -76,7 +76,7 @@ memmap2 = "0.9"
 # single-threaded tokio runtime on the console thread.
 russh = { version = "0.65.0", default-features = false, features = ["ring"] }
 tokio = { version = "1", default-features = false, features = ["rt", "net", "sync", "time", "macros", "io-util"] }
-signal-hook = "0.4"
+signal-hook = { version = "0.4", default-features = false }
 jiff = { version = "1", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 
 [lints.rust]

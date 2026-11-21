@@ -912,8 +912,6 @@ pub struct MeshHub {
     pub chunks_seen: u64,
     /// Local clock: drives the TTL.
     pub reported_at: i64,
-    /// Its gossip carries k|rollcall: it answers one.
-    pub rollcall: bool,
 }
 
 /// What a roll call is for (see CMD_HUB_ROLLCALL).
@@ -1042,6 +1040,10 @@ pub struct QueuedMsg {
     pub lamport_seq: u64,
     pub origin_hub_uuid: String,
     pub payload: Zeroizing<Vec<u8>>,
+    /// A config push to a bot (CMD_CONFIG_DATA / CMD_CONFIG_DELTA from
+    /// send_config_to_bot): written, it moves the bot's cfg_base; a PURGE
+    /// line, also CMD_CONFIG_DATA, does not.
+    pub cfg_frame: bool,
 }
 
 impl QueuedMsg {
@@ -1057,6 +1059,7 @@ impl QueuedMsg {
             lamport_seq: 0,
             origin_hub_uuid: String::new(),
             payload: Zeroizing::new(payload.to_vec()),
+            cfg_frame: false,
         })
     }
 
@@ -1266,6 +1269,27 @@ pub struct HubClient {
     /// dropped on overflow and whenever the bot sends a config push of its
     /// own.
     pub cfg_sent_hash: Option<[u8; 32]>,
+    /// Config deltas (2.5.4, plan §4.3a).  `cfg_base` is S, the exact text
+    /// this bot holds once every config frame already written to its socket
+    /// is applied (None = unknown: the next push is full), with its SHA-256
+    /// in `cfg_base_hash`, what the keepalive's c| vouches for.  `cfg_next`
+    /// is the text the one queued config frame (`cfg_queued`) leaves the bot
+    /// holding: at most one is queued (per-bot coalesce key), it always has
+    /// base S, and a newer push replaces it with delta(S -> newer), never a
+    /// delta on top of it.  When the frame is written, S := cfg_next.  A
+    /// frame lost on overflow leaves S as it was and sets `cfg_owed`, which
+    /// the next flush honours.  Zeroized on replace and drop.
+    pub cfg_base: Option<Zeroizing<Vec<u8>>>,
+    pub cfg_base_hash: [u8; 32],
+    pub cfg_next: Option<Zeroizing<Vec<u8>>>,
+    pub cfg_queued: bool,
+    pub cfg_owed: bool,
+    /// Hash-first anti-entropy (CMD_SYNC_DIGEST) on a peer link: rounds sent
+    /// (every SYNC_DIGEST_FULL_EVERY-th is full), the kinds that differed in
+    /// consecutive rounds with their counts, and the last stuck warning.
+    pub sd_rounds: u32,
+    pub sd_stuck: Vec<(Vec<u8>, u32)>,
+    pub sd_warned: i64,
     /// This connection has pushed its config once: the first push is
     /// answered with a full config even when it changed nothing (a
     /// reconnecting bot may hold a stale copy, e.g. its own old key after a
@@ -1371,6 +1395,14 @@ impl HubClient {
             bot_started: 0,
             bot_link_ord: 0,
             cfg_sent_hash: None,
+            cfg_base: None,
+            cfg_base_hash: [0; 32],
+            cfg_next: None,
+            cfg_queued: false,
+            cfg_owed: false,
+            sd_rounds: 0,
+            sd_stuck: Vec::new(),
+            sd_warned: 0,
             pushed: false,
             tree_sent_valid: false,
             tree_sent_seq: 0,
@@ -1689,7 +1721,6 @@ pub struct HubState {
     /// This hub's own uptime base.
     pub hub_started: i64,
     pub last_presence_gossip: i64,
-    pub last_tree_push: i64,
     /// Phase 5: the last whole tree pushed, its FNV-1a 64 and version, for row
     /// deltas (a current bot gets the diff from this to the new tree).
     pub tree_last: String,
@@ -1858,7 +1889,6 @@ impl HubState {
             roster: Vec::new(),
             hub_started: 0,
             last_presence_gossip: 0,
-            last_tree_push: 0,
             tree_last: String::new(),
             tree_last_fnv: 0,
             tree_seq: 0,

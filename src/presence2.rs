@@ -1180,13 +1180,13 @@ pub fn hub_gone(state: &HubState, uuid: &str) -> bool {
 }
 
 /// Phase 3: a link whose keepalive is the 15 s digest rather than pings — a
-/// connected configured peer that has sent us a v2 record, so both ends run v2
-/// and exchange `H` every `P2_DIGEST_MS`.  Its liveness is the digest; it is
-/// pinged no more and dropped after `P2_LINK_TIMEOUT` unheard.  A bot, an older
-/// peer that has not spoken v2, and an unconfigured inbound hub are not such
-/// links and keep today's ping and `CLIENT_TIMEOUT`.  C `hub_p2_digest_keepalive`.
+/// connected configured peer: every hub the mesh admits (MESH_MIN_VERSION
+/// 2.5.3) runs v2 and sends `H` every `P2_DIGEST_MS` from link-up.  Its
+/// liveness is the digest; it is pinged no more and dropped after
+/// `P2_LINK_TIMEOUT` unheard.  A bot and an unconfigured inbound hub are not
+/// such links and keep the ping and `CLIENT_TIMEOUT`.  C `hub_p2_digest_keepalive`.
 pub fn digest_keepalive(state: &HubState, c: &crate::state::HubClient) -> bool {
-    if c.typ != ClientType::Hub || !c.authenticated || !c.p2_seen {
+    if c.typ != ClientType::Hub || !c.authenticated {
         return false;
     }
     state.peers.iter().any(|pc| pc.connected && pc.fd == c.fd)

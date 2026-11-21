@@ -38,9 +38,11 @@ pub const PBKDF2_ITERATIONS: u32 = 600_000;
 pub const BOT_PROTO_USER_FLAGS: i32 = 3;
 /// The oldest bot or hub this hub links with (2.5.1 plan D1 / D4): a bot's
 /// CMD_BOT_PRESENCE or a direct peer's roster header below it drops the link
-/// with a "upgrade it by hand" line.  2.5.2 raised it to 2.5.1: every node
-/// reads only PBKDF2 600k files, reports K|, and has dropped .pass.prev.
-pub const MESH_MIN_VERSION: &str = "2.5.1";
+/// with a "upgrade it by hand" line.  2.5.2 raised it to 2.5.1 (every node
+/// reads only PBKDF2 600k files, reports K|, and has dropped .pass.prev);
+/// 2.5.4 to 2.5.3: every node speaks the sequenced link framing, presence v2
+/// and the hub roll call, and every bot takes tree deltas.
+pub const MESH_MIN_VERSION: &str = "2.5.3";
 pub const KEY_FP_LEN: usize = 19; // "ab12:cd34:ef56:7890"
 pub const HUB_PID_FILE: &str = ".irchub.pid";
 pub const HUB_PASS_FILE: &str = ".irchub.pass";
@@ -137,7 +139,7 @@ pub const HIDEPINGPONG: bool = true;
 /// the bots tree and the one every upgrade comparison is made against.
 pub const HUB_VERSION: &str = match option_env!("IRCHUB_VERSION") {
     Some(v) => v,
-    None => "2.5.3",
+    None => "2.5.4",
 };
 
 /// Signed-release channel for the hub (irchub-releases).  Same Ed25519 key
@@ -412,10 +414,9 @@ pub const CMD_ADMIN_PEER_REFS: u8 = 0x82;
 /// HUB_LINK_AAD_LEN bytes of AAD: "LNK1" || direction || 64-bit counter (big
 /// endian, from 0, not sent).  The counter makes a replayed or reordered frame
 /// fail its tag, the direction byte a reflected one (H hub->bot, B bot->hub;
-/// between hubs L from the lower uuid, G from the greater).  A 2.5.1 node
-/// ignores the offer and the link keeps the old framing; one that says it is
-/// HUB_LINK_SEQ_VERSION or newer without having offered is dropped (a stripped
-/// offer).  2.5.3 drops the old framing.
+/// between hubs L from the lower uuid, G from the greater).  A node that names
+/// its version without having offered is dropped (a stripped offer): every
+/// node the mesh admits (MESH_MIN_VERSION) offers.
 pub const CMD_LINK_SEQ: u8 = 0x83;
 /// channel kick (2.5.3): console -> hub "nick|#chan|reason"; one elected bot
 /// kicks (CMD_CHAN_PROBE kind "kick", the reason riding the hostmask slot).
@@ -461,6 +462,31 @@ pub const CMD_PRESENCE2: u8 = 0x8E;
 /// tree's hash; a bot whose hash mismatches pulls the whole tree.
 pub const CMD_BOT_TREE_DELTA: u8 = 0x8F;
 pub const CMD_BOT_TREE_PULL: u8 = 0x90;
+/// 2.5.4: a bot's config as a line edit of the text it holds (cfg_delta.rs):
+/// `"<base sha256>|<new sha256>\n"` + =n / -n / +line ops.  The bot rebuilds
+/// the full text, checks both hashes and runs its full-config apply on it;
+/// any doubt is a CMD_CONFIG_PULL, answered with a full CMD_CONFIG_DATA.
+pub const CMD_CONFIG_DELTA: u8 = 0x91;
+/// `bot resync <nick|uuid|all>`: every hub queues a full config push to the
+/// named bot (or all of its bots), whatever they hold.  Hub <-> hub flood
+/// `"<id>|<ts>|<bot uuid or *>"`, deduplicated by id (op_forward_seen) and
+/// dropped past CFG_RESYNC_TTL; the admin request carries the bot alone.
+pub const CMD_CFG_RESYNC: u8 = 0x92;
+pub const CMD_ADMIN_BOT_RESYNC: u8 = 0x93;
+pub const CFG_RESYNC_TTL: i64 = 60;
+/// 2.5.4 hash-first anti-entropy (irchub docs/plans/2026-11-20_sync_digest_plan.md).
+/// Hub <-> hub, point-to-point: `"v|1\n"` + one `"s|<kind>|<records>|<sha256hex>\n"`
+/// per record kind (sync_digest.rs) in place of the periodic full state, or
+/// `"r|<kind>[,<kind>...]\n"` / `"r|*\n"` to pull a peer's records of those
+/// kinds.  Only to a peer at SYNC_DIGEST_MIN_HUB or later; every
+/// SYNC_DIGEST_FULL_EVERY-th round is full anyway (2.5.4 only), and a kind
+/// still differing after SYNC_DIGEST_STUCK repaired rounds sends the whole
+/// state both ways.  As hub.h.
+pub const CMD_SYNC_DIGEST: u8 = 0x94;
+pub const SYNC_DIGEST_MIN_HUB: &str = "2.5.4";
+pub const SYNC_DIGEST_FULL_EVERY: u32 = 6;
+pub const SYNC_DIGEST_STUCK: u32 = 3;
+pub const SYNC_DIGEST_WARN_EVERY: i64 = 3600;
 /// Seconds the asking hub waits for the answers.
 pub const ROLLCALL_WAIT: i64 = 3;
 /// A relayed roll call older than this is dropped.
@@ -472,7 +498,6 @@ pub const MAX_ROLLCALLS: usize = 16;
 /// 16 random bytes in hex + NUL.
 pub const ROLLCALL_ID_LEN: usize = 33;
 pub const HUB_LINK_AAD_LEN: usize = 13;
-pub const HUB_LINK_SEQ_VERSION: &str = "2.5.2";
 /// Review 7: ephemeral keys of the HUBv3 hellos accepted in the last
 /// HELLO_SEEN_SECS (the hello's freshness window); a repeat is a replay.
 pub const HELLO_SEEN_MAX: usize = 128;
@@ -950,12 +975,12 @@ pub const MAX_BULK_PAYLOAD: usize = if MAX_CONFIG_PAYLOAD > MAX_SYNC_PAYLOAD {
 // follows from MAX_BOTS / MAX_PEERS, so raising either retracks the buffers
 // automatically.  None of this touches the config store.
 pub const BOT_PRESENCE_INTERVAL: i64 = 60;
-/// Whole-tree re-push to pre-delta bots (delta bots are checked by the
-/// keepalive tree hash instead).
-pub const BOT_TREE_REFRESH: i64 = 300;
-/// Bots from this version apply CMD_BOT_TREE_DELTA and check the tree hash a
-/// keepalive PING carries ("t|<fnv64hex>"); older ones get whole trees.
-pub const TREE_DELTA_MIN_BOT: &str = "2.5.3";
+// Every bot (MESH_MIN_VERSION 2.5.3) applies CMD_BOT_TREE_DELTA and checks
+// the tree hash a keepalive PING carries ("t|<fnv64hex>").
+/// Bots from this version take CMD_CONFIG_DELTA and check the config hash a
+/// keepalive carries ("c|<sha256hex>", a second line after any t|); older
+/// ones get full pushes and t| alone.
+pub const CFG_DELTA_MIN_BOT: &str = "2.5.4";
 /// Change pushes are coalesced: news from the mesh (peer gossip, links, TTL
 /// expiry) reaches bots at most once per BOT_TREE_COALESCE — it is already up
 /// to a gossip interval old — while a change to this hub's own bots goes out

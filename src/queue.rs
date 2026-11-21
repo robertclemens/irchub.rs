@@ -12,6 +12,22 @@ use crate::crypto;
 use crate::cstr::now;
 use crate::net::{self, SendOutcome};
 use crate::state::{ClientType, HubClient, Lane, QueuedMsg};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+/// Some bot's config frame was lost since the last flush (`cfg_owed`); the
+/// C hub's g_cfg_owed.  Atomic only because the queue sees a client, not the
+/// hub state.
+static CFG_OWED: AtomicBool = AtomicBool::new(false);
+
+/// Mark that some bot is owed its config (flush_bot_config honours it).
+pub fn cfg_owed_set() {
+    CFG_OWED.store(true, Relaxed);
+}
+
+/// Take and clear the "some bot is owed its config" flag.
+pub fn cfg_owed_take() -> bool {
+    CFG_OWED.swap(false, Relaxed)
+}
 
 /// peer_enqueue(): put `m` on the client's lane, coalescing when its key
 /// matches one already queued.
@@ -42,6 +58,10 @@ pub fn enqueue(client: &mut HubClient, m: QueuedMsg) -> bool {
         let new_bytes = m.len();
         cur.payload = m.payload;
         cur.lamport_seq = m.lamport_seq;
+        // The newer frame wins whole: a queued full config may be replaced
+        // by a delta or the other way round (same per-bot key).
+        cur.cmd = m.cmd;
+        cur.cfg_frame = m.cfg_frame;
         // The origin hub may differ if a peer's update overwrote a
         // local-origin one; the new origin "wins" because the newer seq
         // belongs to it.
@@ -98,15 +118,41 @@ pub fn enqueue(client: &mut HubClient, m: QueuedMsg) -> bool {
 }
 
 /// A config push that never reaches its bot must not stand as "sent", or the
-/// next identical broadcast would be skipped and the bot left behind.
+/// next identical broadcast would be skipped and the bot left behind.  Nor
+/// may it wait for the next change: the bot still holds S, which the
+/// keepalive's c| vouches for, so nothing else would notice (proto/cfgdelta
+/// model, seed 82) — it is owed, and the next flush sends it.
 fn cfg_push_lost(client: &mut HubClient, m: &QueuedMsg) {
     if m.cmd == CMD_BOT_TREE || m.cmd == CMD_BOT_TREE_DELTA {
         client.tree_sent_valid = false; // a tree or delta that never landed: resend whole
     }
-    if m.cmd == CMD_CONFIG_DATA {
-        client.cfg_sent_hash = None;
-        crate::stats::cfg_lost();
+    if m.cmd != CMD_CONFIG_DATA && m.cmd != CMD_CONFIG_DELTA {
+        return;
     }
+    client.cfg_sent_hash = None;
+    crate::stats::cfg_lost();
+    if !m.cfg_frame {
+        return;
+    }
+    client.cfg_next = None;
+    client.cfg_queued = false;
+    client.cfg_owed = true;
+    cfg_owed_set();
+}
+
+/// cfg_frame_written(): the queued config frame went to the socket, so the
+/// bot will hold its text.
+fn cfg_frame_written(client: &mut HubClient) {
+    if !client.cfg_queued {
+        return;
+    }
+    let Some(next) = client.cfg_next.take() else {
+        return;
+    };
+    use sha2::{Digest, Sha256};
+    client.cfg_base_hash = Sha256::digest(next.as_slice()).into();
+    client.cfg_base = Some(next);
+    client.cfg_queued = false;
 }
 
 /// Review 6: the AAD of frame number `ctr` sent with direction byte `dir` on a
@@ -261,6 +307,9 @@ pub fn drain_writable(client: &mut HubClient) {
                 continue; // drop and move on
             }
             crate::stats::tx(m.cmd, wire_len);
+            if m.cfg_frame {
+                cfg_frame_written(client);
+            }
             drop(m);
             client.writing_offset = 0;
 

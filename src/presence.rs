@@ -418,12 +418,9 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
         state.clients[ci].refused = true;
         return;
     }
-    // Review 6: a bot this new sends CMD_LINK_SEQ "offer" as its first frame,
+    // Review 6: every bot sends CMD_LINK_SEQ "offer" as its first frame,
     // before any presence; none means it was stripped on the way.
-    if !version.is_empty()
-        && !state.clients[ci].link_offered
-        && crate::update::version_cmp(&version, HUB_LINK_SEQ_VERSION) != std::cmp::Ordering::Less
-    {
+    if !version.is_empty() && !state.clients[ci].link_offered {
         let id = state.who_client(ci);
         crate::hlog_warning!(
             "[HUB] {id} runs {version} but never offered the sequenced link framing (a frame stripped on the way?): dropped\n"
@@ -586,7 +583,8 @@ fn roster_frame_begin(state: &HubState, round: i64, chunk: u32, last: bool) -> S
     if !cron.is_empty() {
         f.push_str(&format!("c|{cron}\n"));
     }
-    // This hub answers CMD_HUB_ROLLCALL: the upgrade gates may ask it.
+    // This hub answers CMD_HUB_ROLLCALL.  Every hub the mesh admits does
+    // (MESH_MIN_VERSION 2.5.3); a 2.5.3 hub still asks only hubs that say so.
     f.push_str("k|rollcall\n");
     if chunk != 0 {
         return f;
@@ -842,7 +840,6 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
         if o_started > 0 && h.started > 0 && o_started != h.started {
             h.round = -1;
             h.chunks_seen = 0;
-            h.rollcall = false; // a build that lost it says so by leaving out k|
         }
         if round < h.round {
             return; // a late copy of an older round
@@ -945,12 +942,10 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 state.clients[from].refused = true;
                 return;
             }
-            // Review 6: a direct peer this new offered CMD_LINK_SEQ on connect.
+            // Review 6: every direct peer offers CMD_LINK_SEQ on connect.
             if !hub_ver.is_empty()
                 && from < state.clients.len()
                 && !state.clients[from].link_offered
-                && crate::update::version_cmp(&hub_ver, HUB_LINK_SEQ_VERSION)
-                    != std::cmp::Ordering::Less
                 && hub_uuid == upgrade::peer_uuid_of(state, from)
             {
                 let ip = state.clients[from].ip.clone();
@@ -977,14 +972,8 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
             upgrade::note_presence(state, &hub_uuid, &hub_ver, "");
             continue;
         }
-        if let Some(v) = line.strip_prefix("k|") {
-            // What the hub whose h| header opened it can do (see CMD_HUB_ROLLCALL).
-            if v == "rollcall"
-                && let Some(m) = state.mesh_hubs.iter_mut().find(|m| m.uuid == hub_uuid)
-            {
-                m.rollcall = true;
-            }
-            continue;
+        if line.starts_with("k|") {
+            continue; // capabilities: every hub answers a roll call
         }
         if let Some(v) = line.strip_prefix("c|") {
             // The production crontab line of the hub whose h| header opened it.
@@ -1548,35 +1537,47 @@ fn build_tree_delta(oldt: &str, newt: &str, fnv: u64) -> Option<String> {
     }
 }
 
-/// A bot that applies CMD_BOT_TREE_DELTA and checks the keepalive tree hash
-/// (TREE_DELTA_MIN_BOT and up); as C `bot_takes_tree_deltas`.
-fn bot_takes_tree_deltas(c: &crate::state::HubClient) -> bool {
-    !c.bot_version.is_empty()
-        && crate::update::version_cmp(&c.bot_version, TREE_DELTA_MIN_BOT)
-            != std::cmp::Ordering::Less
-}
-
 /// The payload of a keepalive PING to client `ci`: "t|<fnv64hex>", the hash
-/// of the tree the bot holds once all we sent has landed, or "" (not a bot,
-/// an older bot, a tree frame still queued — pings jump the queue — or the
-/// bot not current).  As C `hub_tree_ping_payload`.
-pub fn tree_ping_payload(state: &HubState, ci: usize) -> String {
+/// of the tree the bot holds once all we sent has landed; and, to a 2.5.4+
+/// bot, a second line "c|<sha256hex>", the hash of S, the config text it
+/// holds once every config frame already written has applied (plan §4.3a
+/// I5), so a bot holding anything else pulls a full config.  Each part is
+/// left out when there is nothing to vouch for: not a bot, a frame of that
+/// kind still queued (pings jump the queue), or the bot not current; "" when
+/// both are.  2.5.3 bots read t| alone and ignore anything
+/// more, so they never get c|.  As C `hub_bot_ping_payload`.
+pub fn bot_ping_payload(state: &HubState, ci: usize) -> String {
     let c = &state.clients[ci];
     if c.typ != ClientType::Bot || !c.authenticated || c.superseded {
         return String::new();
     }
-    if !bot_takes_tree_deltas(c) || state.tree_last.is_empty() {
-        return String::new();
-    }
+    let mut out = String::new();
     let queued = c.out_lanes.iter().any(|l| {
         l.msgs
             .iter()
             .any(|m| m.cmd == CMD_BOT_TREE || m.cmd == CMD_BOT_TREE_DELTA)
     });
-    if !c.tree_sent_valid || c.tree_sent_seq != state.tree_seq || queued {
-        return String::new();
+    if !state.tree_last.is_empty()
+        && c.tree_sent_valid
+        && c.tree_sent_seq == state.tree_seq
+        && !queued
+    {
+        out = format!("t|{:016x}", state.tree_last_fnv);
     }
-    format!("t|{:016x}", state.tree_last_fnv)
+    if crate::client::bot_takes_cfg_deltas(c)
+        && c.cfg_base.is_some()
+        && !c.cfg_queued
+        && !c.cfg_owed
+    {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("c|");
+        for b in c.cfg_base_hash {
+            out.push_str(&format!("{b:02x}"));
+        }
+    }
+    out
 }
 
 /// A bot owed a whole tree (a dropped tree frame, or it just connected): it
@@ -1602,13 +1603,16 @@ fn send_whole_tree(state: &mut HubState, ci: usize, payload: &str, seq: u64) {
     c.tree_sent_seq = seq;
     if !queue::enqueue(c, m) {
         c.tree_sent_valid = false;
+        return;
     }
+    crate::stats::tree_full(payload.len());
 }
 
 /// Push the assembled tree to every connected bot.  Phase 5: a bot already
 /// holding the previous tree gets just the row delta to the new one; others
-/// (new, lagging, or on a forced BOT_TREE_REFRESH) get the whole tree.
-fn push_tree_to_bots(state: &mut HubState, force: bool) {
+/// (new or lagging) get the whole tree.  On a quiet mesh the keepalive tree
+/// hash (`bot_ping_payload`) keeps a bot's tree from looking stale.
+fn push_tree_to_bots(state: &mut HubState) {
     // A superseded session is closing: no tree frames to it.
     let bots: Vec<usize> = state
         .bot_clients()
@@ -1629,8 +1633,8 @@ fn push_tree_to_bots(state: &mut HubState, force: bool) {
     let old_seq = state.tree_seq;
     let new_seq = if changed { old_seq + 1 } else { old_seq };
 
-    // `force` (the BOT_TREE_REFRESH tick) re-pushes the whole tree only to the
-    // older bots that need it; delta bots are checked by the keepalive hash.
+    // One delta, shared by every bot holding the previous tree; the keepalive
+    // hash checks that it landed.
     let delta = if changed && !state.tree_last.is_empty() {
         build_tree_delta(&state.tree_last, &payload, fnv)
     } else {
@@ -1638,14 +1642,12 @@ fn push_tree_to_bots(state: &mut HubState, force: bool) {
     };
 
     for ci in bots {
-        let deltas = bot_takes_tree_deltas(&state.clients[ci]);
-        let forced = force && !deltas;
         let current =
             state.clients[ci].tree_sent_valid && state.clients[ci].tree_sent_seq == old_seq;
-        if !forced && !changed && current {
+        if !changed && current {
             continue; // already up to date
         }
-        let m = if !forced && changed && current && deltas {
+        let m = if changed && current {
             delta
                 .as_deref()
                 .and_then(|d| QueuedMsg::new(CMD_BOT_TREE_DELTA, Lane::Bulk, d.as_bytes()))
@@ -1654,11 +1656,14 @@ fn push_tree_to_bots(state: &mut HubState, force: bool) {
         };
         match m {
             Some(m) => {
+                let dlen = m.len();
                 let c = &mut state.clients[ci];
                 c.tree_sent_valid = true;
                 c.tree_sent_seq = new_seq;
                 if !queue::enqueue(c, m) {
                     c.tree_sent_valid = false;
+                } else {
+                    crate::stats::tree_delta(dlen, payload.len());
                 }
             }
             None => send_whole_tree(state, ci, &payload, new_seq),
@@ -1684,6 +1689,7 @@ pub fn tree_pull(state: &mut HubState, ci: usize) {
     }
     c.tree_pull_due = false;
     c.tree_pull_at = t;
+    crate::stats::tree_pull();
     if state.tree_last.is_empty() {
         state.clients[ci].tree_sent_valid = false;
         state.tree_dirty = true;
@@ -1697,8 +1703,9 @@ pub fn tree_pull(state: &mut HubState, ci: usize) {
 /// hub_presence_tick(): drives both halves on the maintenance clock.  It
 /// gossips this hub's own connected bots to the peers every
 /// BOT_PRESENCE_INTERVAL and pushes a refreshed tree down to the bots when
-/// the roster changed (or every BOT_TREE_REFRESH regardless, so a bot that
-/// missed a frame — or connected between changes — still converges).
+/// the roster changed (a bot that missed a frame converges through the
+/// keepalive tree hash, one that connected between changes through
+/// `tree_owed`).
 /// How long event gossip holds after `burst` event gossips in a row: 1, 2, 4, 8,
 /// 16, then PRESENCE_HOLD_MAX seconds.
 pub fn presence_hold(burst: i32) -> i64 {
@@ -1780,12 +1787,9 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
         }
     }
 
-    // Push on change (only to bots whose tree it changes), with an
-    // unconditional refresh.  Only the refresh restarts the refresh clock: a
-    // change push may reach no bot at all.  Changes are coalesced (see
-    // BOT_TREE_COALESCE): under churn every peer's gossip round re-rendered
-    // the tree for every bot, O(hubs x bots) 10 KB frames a minute.
-    let refresh = now_ts - state.last_tree_push >= BOT_TREE_REFRESH;
+    // Push on change (only to bots whose tree it changes).  Changes are
+    // coalesced (see BOT_TREE_COALESCE): under churn every peer's gossip round
+    // re-rendered the tree for every bot, O(hubs x bots) 10 KB frames a minute.
     let gap = if state.tree_dirty_local {
         BOT_TREE_COALESCE_LOCAL
     } else {
@@ -1793,19 +1797,16 @@ pub fn presence_tick(state: &mut HubState, now_ts: i64) {
     };
     let due = state.tree_dirty && now_ts - state.last_tree_change_push >= gap;
     // A bot owed a whole tree gets it now (a dropped frame used to wait for
-    // the next change or the refresh).
-    if !due && !refresh && tree_owed(state) {
-        push_tree_to_bots(state, false);
+    // the next change).
+    if !due && tree_owed(state) {
+        push_tree_to_bots(state);
         return;
     }
-    if due || refresh {
+    if due {
         state.tree_dirty = false;
         state.tree_dirty_local = false;
         state.last_tree_change_push = now_ts;
-        if refresh {
-            state.last_tree_push = now_ts;
-        }
-        push_tree_to_bots(state, refresh);
+        push_tree_to_bots(state);
     }
 }
 
@@ -1867,7 +1868,6 @@ mod tests {
         s.hub_uuid = "me".into();
         let now_ts = now();
         s.hub_started = now_ts;
-        s.last_tree_push = now_ts; // no forced refresh due
         s.last_presence_gossip = now_ts;
         // Mesh news inside the gap waits; the flag is held, not dropped.
         s.last_tree_change_push = now_ts - 5;
@@ -2033,7 +2033,6 @@ mod tests {
         let t = now();
         s.hub_started = t;
         s.last_presence_gossip = t; // no periodic round due
-        s.last_tree_push = t;
         presence_event(&mut s);
         presence_tick(&mut s, t);
         assert!(!s.presence_event_due, "the first event goes at once");

@@ -508,7 +508,7 @@ fn maintenance(state: &mut HubState) {
         state.timers.last_anti_entropy = t;
         if !state.peers.is_empty() {
             let full_sync = mesh::generate_sync_packet(state);
-            mesh::broadcast_sync_to_peers(state, &full_sync, -1);
+            mesh::anti_entropy_round(state, &full_sync);
             irchub::uhist::digest_all(state);
         }
     }
