@@ -162,7 +162,8 @@ pub struct P2State {
     pub c_digest_miss: u64,
 }
 
-fn now_ms() -> i64 {
+/// The clock the timers here keep (hub stats turns them into seconds left).
+pub(crate) fn now_ms() -> i64 {
     static START: OnceLock<Instant> = OnceLock::new();
     // Offset so the first reading is never 0 (C's monotonic clock is not).
     START.get_or_init(Instant::now).elapsed().as_millis() as i64 + 1_000_000

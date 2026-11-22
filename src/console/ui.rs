@@ -780,7 +780,7 @@ macro_rules! cmd {
 use Confirm as Cf;
 #[rustfmt::skip]
 const CMDS: &[CmdDef] = &[
-    cmd!("help", None, 0, B::Local, 0, 2, Cf::None, Pre::None, "", "help [group [command]]", "the command groups, one group's commands, or one command in full (? does the same)", None),
+    cmd!("help", None, 0, B::Local, 0, 4, Cf::None, Pre::None, "", "help [group [command [topic ...]]]", "the command groups, one group's commands, one command in full, or one of its topics (? does the same)", None),
     cmd!("quit", None, 0, B::Local, 0, 0, Cf::None, Pre::None, "", "quit", "close this console", None),
     cmd!("bot", Some("list"), CMD_ADMIN_LIST_FULL, B::None, 0, 0, Cf::None, Pre::None, "", "bot list", "every registered bot: state, hub, version, last seen", None),
     cmd!("bot", Some("show"), CMD_ADMIN_LIST_FULL, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot show <uuid|nick>", "one bot in detail", None),
@@ -973,9 +973,11 @@ type CmdHelp = (
 const CMD_HELP: &[CmdHelp] = &[
     ("help", None,
      Some("group\tone of: bot hub log acl option user channel ban upgrade display\n\
-           command\tone of that group's commands: its arguments and an example\n\
-           ?\ttyped in place of help it does the same"),
-     "help\nhelp bot\nhelp bot add\n? upgrade start"),
+           command\tone of that group's commands: its arguments, its topics and examples\n\
+           topic\ta setting or keyword the command takes (help <group> <command> lists them), \
+           then any topic under that one (help hub set ssh preauth)\n\
+           ?\ttyped in place of help it does the same; Tab completes every level"),
+     "help\nhelp bot\nhelp bot set\nhelp bot set cron\nhelp hub set ssh preauth\n? upgrade start"),
     ("quit", None, None, "quit"),
     ("bot", Some("list"), None, "bot list"),
     ("bot", Some("show"), Some("uuid|nick\tthe bot's uuid or its current nick (Tab completes both)"),
@@ -1012,8 +1014,13 @@ const CMD_HELP: &[CmdHelp] = &[
            ignoretime\tminutes (1-1440), or default\n\
            sendq\tB:I = B lines (1-100) at once, then one every I ms (0-10000, 0 = no delay), or \
            default\n\
-           (scope)\tevery bot on every hub gets the same values; there is no per-bot setting"),
-     "bot set\nbot set flood cmd 10:30\nbot set flood msg off\nbot set ignoretime 20\nbot set sendq 5:250\nbot set sendq default"),
+           cron\tglobal, or a bot's nick or uuid, then on or off: the keepalive crontab line on \
+           each bot's host (global = every bot; one bot keeps its own until the next global).  \
+           help bot set cron has the whole of it\n\
+           (scope)\tflood, ignoretime and sendq: every bot on every hub gets the same values; only \
+           cron can be set per bot"),
+     "bot set\nbot set flood cmd 10:30\nbot set flood msg off\nbot set ignoretime 20\nbot set sendq 5:250\nbot set sendq default\n\
+      bot set cron global on\nbot set cron alpha off"),
     ("hub", Some("show"), Some("#|uuid|name\talone: this hub; else a linked hub by the number hub list \
                                 shows, its uuid, or its name"),
      "hub show\nhub show 1\nhub show east"),
@@ -1044,10 +1051,14 @@ const CMD_HELP: &[CmdHelp] = &[
            pubkey: the key its private key derives (a new key is hub rekey) · \
            autopurge: days to keep tombstones, 0 = off\n\
            #|uuid|name key\ta linked hub (its number in hub list, its uuid, or its name), then \
-           key and its new 88-character public key: hub show or ./irchub -id on that hub"),
+           key and its new 88-character public key: hub show or ./irchub -id on that hub\n\
+           cron\tglobal, or a hub's list number, uuid or name (this hub's too), then on or off: the \
+           keepalive crontab line on each hub's host (global = every hub; one hub keeps its own until \
+           the next global).  help hub set cron has the whole of it"),
      concat!("hub set\nhub set name west\nhub set port 6697\nhub set autopurge 30\nhub set ssh\n\
       hub set ssh preauth 16\nhub set ssh authfail 3:3600\nhub set conn perip 8\n\
-      hub set conn churn 30:10:30\nhub set east key ", ex_key!())),
+      hub set conn churn 30:10:30\nhub set east key ", ex_key!(), "\n\
+      hub set cron global on\nhub set cron east off")),
     ("hub", Some("sync"), None, "hub sync"),
     ("hub", Some("stats"), None, "hub stats"),
     ("hub", Some("rekey"), Some("(confirm)\tyou type this hub's name to go ahead; every other hub and bot \
@@ -1231,7 +1242,11 @@ enum Ck {
     Bot,
     BotOn,
     BotNick,
+    /// BotNick, and these words first
+    BotNickOr(&'static str),
     HubName,
+    /// HubName with this hub too
+    HubSelf,
     ChSet,
     NetSet,
     HubSet,
@@ -1247,15 +1262,16 @@ const ARG_COMP: &[ArgComp] = &[
     ("bot", Some("del"), Some(0), Ck::BotNick),
     ("bot", Some("kick"), Some(0), Ck::BotOn),
     ("bot", Some("rekey"), Some(0), Ck::Bot),
-    ("bot", Some("resync"), Some(0), Ck::BotNick),
+    ("bot", Some("resync"), Some(0), Ck::BotNickOr("all")),
     (
         "bot",
         Some("set"),
         Some(0),
-        Ck::Words("flood ignoretime sendq"),
+        Ck::Words("flood ignoretime sendq cron"),
     ),
     ("bot", Some("set"), None, Ck::NetSet),
     ("hub", Some("show"), Some(0), Ck::HubName),
+    ("hub", Some("del"), Some(0), Ck::HubName),
     ("hub", Some("set"), None, Ck::HubSet),
     ("hub", Some("purge"), Some(0), Ck::Words("now")),
     ("log", Some("set"), Some(0), Ck::Words("file console size")),
@@ -1327,6 +1343,10 @@ fn netset_words(p1: &[u8], p2: &[u8]) -> &'static str {
         "off default"
     } else if eq_ic(p1, "ignoretime") || eq_ic(p1, "sendq") {
         "default"
+    } else if eq_ic(p1, "cron") {
+        "global" // and the bots' nicks and uuids
+    } else if eq_ic(p2, "cron") {
+        "on off"
     } else {
         ""
     }
@@ -1335,7 +1355,11 @@ fn netset_words(p1: &[u8], p2: &[u8]) -> &'static str {
 /// hub set <setting> | ssh <name> <value> | conn <name> <value> | <hub> key <key>
 fn hubset_words(pos: usize, p1: &[u8], p2: &[u8]) -> &'static str {
     if pos == 0 {
-        "name bindip port pubkey autopurge ssh conn"
+        "name bindip port pubkey autopurge ssh conn cron"
+    } else if pos == 1 && eq_ic(p1, "cron") {
+        "global" // and the hubs' names and uuids
+    } else if pos == 2 && eq_ic(p2, "cron") {
+        "on off"
     } else if pos == 1 && eq_ic(p1, "ssh") {
         "preauth preauthip sessions grace authtries idle authfail connect block cmdrate"
     } else if pos == 1 && eq_ic(p1, "conn") {
@@ -2508,6 +2532,247 @@ fn flag_cmds(f: u8) -> String {
     out
 }
 
+/// (path, brief, usage, text, examples): generated from irchub hub_console_ui.c TOPICS
+#[rustfmt::skip]
+const TOPICS: &[(&str, &str, &str, &str, &str); 44] = &[
+    ("bot set flood", "how many commands, messages or CTCPs a bot takes before it acts", "bot set flood <cmd|msg|ctcp> <N:S|off|default>", "N:S = more than N in S seconds trips it (N 1-1000, S 1-3600); off = no limit; default = back to the built-in.\ncmd counts per user: extras are dropped, 3x the rate ignores the user.  msg and ctcp count per host: the host is ignored for ignoretime.  Every bot on every hub gets the same values.", "bot set flood cmd 10:30\nbot set flood msg off\nbot set flood ctcp default"),
+    ("bot set ignoretime", "how long a flooding host or user stays ignored", "bot set ignoretime <min|default>", "Minutes, 1-1440; default = back to the built-in 10 min.  Every bot gets the same value.", "bot set ignoretime 20\nbot set ignoretime default"),
+    ("bot set sendq", "how fast a bot talks to its IRC server", "bot set sendq <B:I|default>", "B lines (1-100) at once, then one every I ms (0-10000, 0 = no delay); default = back to the built-in 10:100.  Every bot gets the same value.", "bot set sendq 5:250\nbot set sendq default"),
+    ("bot set cron", "the keepalive crontab line on each bot's host (default off)", "bot set cron <global|nick|uuid> <on|off>", "The keepalive crontab line on each bot's host: every 5 minutes it starts the bot if it is not running (the line ends # ircbot:production:<dir>:).\non adds the line, off removes only that tagged line; no other crontab line is ever changed.  A hand-written line that runs the same binary path is left alone and shows as manual.  The bot needs .ircbot.pass in its directory to start unattended.\nA bot looks at its line once an hour, and at once when its setting changes.  The CRON column of bot list shows what it found: yes, silent (cron has not run the line for 15 min), manual, no, busy (another node held the crontab lock; it tries again in 10-30 s) or failed (bot show has why).\nglobal = every bot; a nick or uuid = that bot only, until the next global (Tab completes both).", "bot set cron global on\nbot set cron alpha off\nbot set cron global off"),
+    ("bot resync all", "every bot, from whichever hub each is on", "bot resync all", "Sends every bot its whole config again instead of only what changed.", "bot resync all"),
+    ("hub set name", "this hub's name", "hub set name <name>", "A-Z a-z 0-9 . _ -, 1-63 characters.", "hub set name west"),
+    ("hub set bindip", "the address this hub listens on", "hub set bindip <ip>", "Takes effect at the next restart; hub set shows the pending value until then.", "hub set bindip 0.0.0.0"),
+    ("hub set port", "the port this hub listens on", "hub set port <1-65535>", "Takes effect at the next restart; bots and hubs that dial this hub need the new port.", "hub set port 6697"),
+    ("hub set pubkey", "store this hub's public key again", "hub set pubkey <key>", "The 88-character key its private key derives; refused if it does not match.  A new key is hub rekey.", "hub set pubkey O7Eu2jwpjbXeJVl/VNkk8uF+eKJq2JU+2CGO5oLwu76QIeLzAJ0VLJEb8fJexoOpAnFBZnZ6+9jlvQ+wEk7Lig=="),
+    ("hub set autopurge", "purge tombstones older than <days>, daily", "hub set autopurge <days>", "0 = off.  Checked daily on every hub; hub purge clears them by hand.", "hub set autopurge 30\nhub set autopurge 0"),
+    ("hub set ssh", "this hub's SSH console limits", "hub set ssh [<name> <value|default>]", "Alone it shows every limit, its value and its built-in.  A change applies to the next connection.  N:S is N per S seconds.", "hub set ssh\nhub set ssh preauth 16\nhub set ssh authfail 3:3600"),
+    ("hub set conn", "this hub's connection limits (bots, hubs and SSH)", "hub set conn [<name> <value|default>]", "Alone it shows every limit, its value and its built-in.  A change applies to the next connection.  N:S is N per S seconds; B is seconds blocked.", "hub set conn\nhub set conn perip 8\nhub set conn churn 30:10:30"),
+    ("hub set key", "replace a linked hub's public key", "hub set <#|uuid|name> key <key>", "The hub by its number in hub list, its uuid or its name (Tab completes names and uuids), then its new 88-character public key: hub show or ./irchub -id on that hub.", "hub set east key O7Eu2jwpjbXeJVl/VNkk8uF+eKJq2JU+2CGO5oLwu76QIeLzAJ0VLJEb8fJexoOpAnFBZnZ6+9jlvQ+wEk7Lig=="),
+    ("hub set cron", "the keepalive crontab line on each hub's host (default off)", "hub set cron <global|#|uuid|name> <on|off>", "The keepalive crontab line on each hub's host: every 5 minutes it starts the hub if it is not running (the line ends # irchub:production:<dir>:).\non adds the line, off removes only that tagged line; no other crontab line is ever changed.  A hand-written line that runs the same binary path is left alone and shows as manual.  The hub needs .irchub.pass in its directory to start unattended.\nA hub looks at its line once an hour, and at once when its setting changes.  The CRON column of hub list shows what it found: yes, silent (cron has not run the line for 15 min), manual, no, busy (another node held the crontab lock; it tries again in 10-30 s) or failed (hub show has why).\nglobal = every hub; a hub list number, uuid or name (this hub's too) = that hub only, until the next global (Tab completes names and uuids).", "hub set cron global on\nhub set cron east off\nhub set cron global off"),
+    ("hub purge now", "every tombstone, whatever its age", "hub purge now", "Asks y/N.  Deleted bots stay on bot revoked.", "hub purge now"),
+    ("log set file", "the log file's level", "log set file <level>", "none error warning info debug, or 0-4: that level and worse are written.", "log set file info"),
+    ("log set console", "the console log ring's level", "log set console <level>", "none error warning info debug, or 0-4: what the log view and log on can show.", "log set console debug"),
+    ("log set size", "the log file's size limit", "log set size <MB|<n>k|<n>b>", "<MB>, <n>k or <n>b, at most 1024 MB.", "log set size 50\nlog set size 512k"),
+    ("log filter clear", "drop the log view filter", "log filter clear", "The log view shows every line again.", "log filter clear"),
+    ("acl add allow", "the allow list", "acl add allow <ip[/n]> [console]", "Once the allow list has an entry, only the addresses on it may connect (console entries: only SSH logins).", "acl add allow 203.0.113.0/24"),
+    ("acl add deny", "the deny list", "acl add deny <ip[/n]> [console]", "A listed address is refused, and an open inbound connection from it is closed.", "acl add deny 198.51.100.9"),
+    ("acl add console", "the entry applies to SSH logins only", "acl add allow|deny <ip[/n]> console", "Bots and other hubs are not affected; without it the entry applies to everything.", "acl add allow 203.0.113.7 console"),
+    ("acl del allow", "remove an allow list entry", "acl del allow <ip[/n]> [console]", "The entry exactly as acl list shows it (asks y/N).", "acl del allow 203.0.113.0/24"),
+    ("acl del deny", "remove a deny list entry", "acl del deny <ip[/n]> [console]", "The entry exactly as acl list shows it (asks y/N).", "acl del deny 198.51.100.9"),
+    ("acl del console", "an entry that was added with console", "acl del allow|deny <ip[/n]> console", "Give it for an entry that was added with it.", "acl del allow 203.0.113.7 console"),
+    ("user list admin", "admins only", "user list admin", "Every admin with key, last seen and masks.", "user list admin"),
+    ("user list oper", "opers only", "user list oper", "Every oper with key, last seen and masks.", "user list oper"),
+    ("user add admin", "an admin, with flags", "user add admin <name> <key> <mask> <flags>", "flags: +a for a full admin (every command), or the letters of what they may change: b bots, c channels, h hub, o opers, u upgrades (+chu).  Every admin may log in and view everything.", "user add admin dana O7Eu2jwpjbXeJVl/VNkk8uF+eKJq2JU+2CGO5oLwu76QIeLzAJ0VLJEb8fJexoOpAnFBZnZ6+9jlvQ+wEk7Lig== dana!*@* +chu"),
+    ("user add oper", "an oper, with channels", "user add oper <name> <key> <mask> <channels>", "channels: * for every channel, or the channels, comma-separated (#ircbot,#dev); on each they may op, invite, unban, key.", "user add oper alice O7Eu2jwpjbXeJVl/VNkk8uF+eKJq2JU+2CGO5oLwu76QIeLzAJ0VLJEb8fJexoOpAnFBZnZ6+9jlvQ+wEk7Lig== alice!*@*.example.net #ircbot"),
+    ("user set key", "replace a user's key", "user set <name> key <key>", "Anyone's (your own needs no flag); their new 88-character public key.  Asks y/N.", "user set alice key O7Eu2jwpjbXeJVl/VNkk8uF+eKJq2JU+2CGO5oLwu76QIeLzAJ0VLJEb8fJexoOpAnFBZnZ6+9jlvQ+wEk7Lig=="),
+    ("user set flags", "an admin's flags", "user set <name> flags <+x-y|letters|+a>", "+c-u adds and removes, chu or +a replaces them all.  Needs +a.", "user set dana flags +b-u\nuser set dana flags +a"),
+    ("user chan add", "give an oper a channel", "user chan add <name> <#chan|*>", "* = every channel; * and channels exclude each other (add * drops the channels, add #c drops *).", "user chan add alice #ops\nuser chan add alice *"),
+    ("user chan del", "take a channel away from an oper", "user chan del <name> <#chan|*>", "del * takes everything away.", "user chan del alice #dev\nuser chan del alice *"),
+    ("user mask add", "add a usermask", "user mask add <name> <mask>", "nick!user@host (* and ? match).", "user mask add alice alice!*@203.0.113.*"),
+    ("user mask del", "remove a usermask", "user mask del <name> <mask>", "The mask exactly as user show lists it (asks y/N).", "user mask del alice alice!*@*.example.net"),
+    ("channel set default", "the network default every channel inherits", "channel set default [+opt|-opt|<name> <value|default>|flood <type> <N:S|off|default>]", "A channel without its own value for a setting follows this one; default on a setting here goes back to the built-in.", "channel set default\nchannel set default -dynamicbans\nchannel set default bantime 60"),
+    ("channel set flood", "the channel floods: chan ctcp join nick deop kick ban", "channel set <#chan|default> flood <type> <N:S|off|default>", "N:S = more than N in S seconds from one host trips it; off = no limit here; default = inherit.  Only unauthorised members are acted on, and only by an opped bot.", "channel set #ops flood join 10:60\nchannel set #ops flood chan off"),
+    ("channel ban perm", "the ban never expires (the default)", "channel ban <#chan|*> <mask> perm [sticky] [reason]", "Without a duration a ban is perm.", "channel ban #ops *!*@203.0.113.7 perm"),
+    ("channel ban sticky", "put the ban back at once if an op removes it", "channel ban <#chan|*> <mask> [<min>|perm] sticky [reason]", "The bots set it again as soon as they see it lifted.", "channel ban #ops *!*@203.0.113.7 60 sticky"),
+    ("ban add perm", "the ban never expires (the default)", "ban add <#chan|*> <mask> perm [sticky] [reason]", "Without a duration a ban is perm.", "ban add #ops *!*@203.0.113.7 perm"),
+    ("ban add sticky", "put the ban back at once if an op removes it", "ban add <#chan|*> <mask> [<min>|perm] sticky [reason]", "The bots set it again as soon as they see it lifted.", "ban add * *!*@*.badhost.example 1440 sticky open proxy"),
+    ("upgrade start bot=", "the bot version to move to (required)", "upgrade start bot=<ver>", "As upgrade releases lists it.", "upgrade start bot=2.4.5"),
+    ("upgrade start hub=", "also move the hubs to this version", "upgrade start bot=<ver> hub=<ver>", "- or left out = leave the hubs where they are.", "upgrade start bot=2.4.5 hub=2.4.4"),
+    ("upgrade start nodes=", "only these nodes", "upgrade start bot=<ver> nodes=<a,b=c>", "Names or uuids, comma-separated; name=c or name=rs also switches that node's build (default: the whole network).", "upgrade start bot=2.4.5 nodes=alpha,beta=rs"),
+];
+
+// ==========================================================================
+// Help topics: help <group> <command> <topic> [<topic>] (hub_console_ui.c)
+// Every keyword a command takes where it picks what changes (a setting, a
+// form, an option word) has a page of its own, listed by the page above it;
+// Tab offers the same words.  The setting families come from the tables
+// behind the settings views (fmt::setting_info, fmt::limit_info).
+// ==========================================================================
+const TOPIC_SET_MAX: usize = 40;
+
+struct Topic {
+    path: String,
+    brief: String,
+    usage: String,
+    text: String,
+    examples: String,
+}
+
+fn topic_name(path: &str) -> &str {
+    path.rsplit(' ').next().unwrap_or(path)
+}
+
+/// The topics right under `parent` ("bot set", "hub set ssh"), in help order.
+fn topic_children(parent: &[u8]) -> Vec<Topic> {
+    let mut v: Vec<Topic> = Vec::new();
+    let mut add = |path: String, brief: &str, usage: String, text: String, examples: String| {
+        if v.len() < TOPIC_SET_MAX {
+            v.push(Topic {
+                path,
+                brief: brief.to_string(),
+                usage,
+                text,
+                examples,
+            });
+        }
+    };
+    let pl = parent.len();
+    for t in TOPICS {
+        let p = t.0.as_bytes();
+        if p.len() > pl
+            && p[..pl].eq_ignore_ascii_case(parent)
+            && p[pl] == b' '
+            && !p[pl + 1..].contains(&b' ')
+        {
+            add(
+                t.0.to_string(),
+                t.1,
+                t.2.to_string(),
+                t.3.to_string(),
+                t.4.to_string(),
+            );
+        }
+    }
+    let bot_flood = eq_ic(parent, "bot set flood");
+    if bot_flood || eq_ic(parent, "channel set flood") {
+        let mut i = 0;
+        while let Some((n, def, what)) = fmt::setting_info(i, bot_flood) {
+            i += 1;
+            let Some(ty) = n.strip_prefix("flood ") else {
+                continue;
+            };
+            if bot_flood {
+                add(
+                    format!("bot set flood {ty}"),
+                    what,
+                    format!("bot set flood {ty} <N:S|off|default>"),
+                    format!(
+                        "Built-in: {def}.\nN:S = more than N in S seconds trips it (N \
+                         1-1000, S 1-3600); off = no limit; default = back to the built-in.  \
+                         Every bot gets the same value."
+                    ),
+                    format!("bot set flood {ty} {def}\nbot set flood {ty} default"),
+                );
+            } else {
+                add(
+                    format!("channel set flood {ty}"),
+                    what,
+                    format!("channel set <#chan|default> flood {ty} <N:S|off|default>"),
+                    format!(
+                        "Built-in: {def}.\nN:S = more than N in S seconds from one host \
+                         trips it; off = no limit here; default = inherit (a channel from \
+                         default, default from the built-in).  Only unauthorised members are \
+                         acted on, and only by an opped bot."
+                    ),
+                    format!(
+                        "channel set #ops flood {ty} {def}\nchannel set #ops flood {ty} default"
+                    ),
+                );
+            }
+        }
+    } else if eq_ic(parent, "channel set") {
+        let mut i = 0;
+        while let Some((n, def, what)) = fmt::setting_info(i, false) {
+            i += 1;
+            if n.starts_with("flood ") {
+                continue;
+            }
+            if fmt::setting_is_flag(n.as_bytes()) {
+                add(
+                    format!("channel set {n}"),
+                    what,
+                    format!("channel set <#chan|default> +{n} | -{n}"),
+                    format!(
+                        "Built-in: {def}.\n+{n} turns it on, -{n} off; several options \
+                         can go in one line.  On default it is what every channel without \
+                         its own value follows."
+                    ),
+                    format!("channel set #ops +{n}\nchannel set default -{n}"),
+                );
+            } else {
+                let w = def.split(' ').next().unwrap_or(def);
+                add(
+                    format!("channel set {n}"),
+                    what,
+                    format!("channel set <#chan|default> {n} <value|default>"),
+                    format!(
+                        "Built-in: {def}.\ndefault drops the channel's own value, so it \
+                         inherits again."
+                    ),
+                    format!("channel set #ops {n} {w}\nchannel set #ops {n} default"),
+                );
+            }
+        }
+    } else if eq_ic(parent, "hub set ssh") || eq_ic(parent, "hub set conn") {
+        let grp = &parent[8..];
+        let mut i = 0;
+        while let Some((g, n, what)) = fmt::limit_info(i) {
+            i += 1;
+            if !eq_ic(grp, g) {
+                continue;
+            }
+            add(
+                format!("hub set {g} {n}"),
+                what,
+                format!("hub set {g} {n} <value|default>"),
+                format!(
+                    "hub set {g} shows its value here and its built-in; default goes \
+                     back to the built-in.  This hub only; a change applies to the next \
+                     connection."
+                ),
+                format!("hub set {g} {n} default"),
+            );
+        }
+    }
+    v
+}
+
+/// The topic `word` under `parent` (a leading + or - is the channel option's
+/// sign, not its name).
+fn topic_find(parent: &[u8], word: &[u8]) -> Option<Topic> {
+    let word = match word.first() {
+        Some(b'+' | b'-') => &word[1..],
+        _ => word,
+    };
+    topic_children(parent)
+        .into_iter()
+        .find(|t| topic_name(&t.path).as_bytes().eq_ignore_ascii_case(word))
+}
+
+/// The topics under `parent`: a table of name and brief, or (compact, where a
+/// settings table above already explains them) one line of names.
+fn help_topic_list(f: &mut Flines, parent: &[u8], compact: bool) {
+    let set = topic_children(parent);
+    if set.is_empty() {
+        return;
+    }
+    fmt::flines_add(f, RL_NORMAL, b"");
+    let l = fmtb(&[b" Topics  help ", parent, b" <topic> for one"]);
+    fmt::flines_add(f, RL_HEAD, c_cut(&l, 1024));
+    if compact {
+        let mut l = b"  ".to_vec();
+        for t in &set {
+            l.push(b' ');
+            l.extend_from_slice(topic_name(&t.path).as_bytes());
+        }
+        fmt::flines_add(f, RL_NORMAL, c_cut(&l, 1024));
+    } else {
+        let nw = set
+            .iter()
+            .map(|t| str_width(topic_name(&t.path).as_bytes()))
+            .max()
+            .unwrap_or(0)
+            .min(16);
+        for t in &set {
+            let nm = topic_name(&t.path).as_bytes();
+            let w = str_width(nm);
+            let pad = vec![b' '; if w < nw { (nw - w) as usize } else { 0 }];
+            let l = fmtb(&[b"   ", nm, &pad, b"  ", t.brief.as_bytes()]);
+            fmt::flines_add(f, RL_NORMAL, c_cut(&l, 1024));
+        }
+    }
+}
+
 fn help_command(c: &Ctx, f: &mut Flines, d: &CmdDef) {
     let words = c_cut(&cmd_words(d), 32).to_vec();
     let (mut args, mut ex) = (None, None);
@@ -2627,6 +2892,15 @@ fn help_command(c: &Ctx, f: &mut Flines, d: &CmdDef) {
             fmt::flines_add(f, RL_NORMAL, c_cut(l.as_bytes(), 1024));
             i += 1;
         }
+    }
+    // the topics under it: help <group> <command> <topic>
+    if let Some(sub) = d.sub {
+        let parent = fmtb(&[d.cmd.as_bytes(), b" ", sub.as_bytes()]);
+        help_topic_list(
+            f,
+            c_cut(&parent, 48),
+            net_set || (d.cmd == "channel" && sub == "set"),
+        );
     }
     // user add / user set: what each admin flag allows (from CMD_FLAGS)
     if d.cmd == "user" && matches!(d.sub, Some("add" | "set")) {
@@ -3222,6 +3496,74 @@ fn opt_meaning(f: u8) -> &'static str {
 impl Ui {
     /// help: the groups; help <group>: its commands; help <group> <command>:
     /// one command in full (§2.2).
+    /// help <group> <command> <topic> [<topic>]: one topic in full, then the
+    /// topics under it.  `d` is the command it belongs to (the flag it needs).
+    fn help_topic(&mut self, d: &CmdDef, t: &Topic, parent: &[u8]) {
+        let sl = self.session_log_phrase(128);
+        let mut f = Flines::new();
+        {
+            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+            let deeper = parent.iter().filter(|&&b| b == b' ').count() >= 2;
+            let right = fmtb(&[
+                b"help ",
+                parent,
+                if deeper {
+                    b" for the topic" as &[u8]
+                } else {
+                    b" for the command"
+                },
+            ]);
+            fmt::title(&c, &mut f, t.path.as_bytes(), Some(c_cut(&right, 96)));
+            fmt::flines_add(
+                &mut f,
+                RL_NORMAL,
+                c_cut(&fmtb(&[b"   ", t.usage.as_bytes()]), 1024),
+            );
+            fmt::flines_add(
+                &mut f,
+                RL_DIM,
+                c_cut(&fmtb(&[b"   ", t.brief.as_bytes()]), 1024),
+            );
+            match cmd_flag(d) {
+                Some("a/o") => {
+                    fmt::flines_add(&mut f, RL_DIM, b"   needs +a for an admin, +o for an oper")
+                }
+                Some(fl) => {
+                    let l = format!("   changing needs +{fl} ({})", flag_word(fl.as_bytes()[0]));
+                    fmt::flines_add(&mut f, RL_DIM, c_cut(l.as_bytes(), 1024));
+                }
+                None => {}
+            }
+            if !t.text.is_empty() {
+                fmt::flines_add(&mut f, RL_NORMAL, b"");
+                for l in t.text.split('\n') {
+                    fmt::flines_add(
+                        &mut f,
+                        RL_NORMAL,
+                        c_cut(&fmtb(&[b"   ", l.as_bytes()]), 1024),
+                    );
+                }
+            }
+            help_topic_list(&mut f, t.path.as_bytes(), false);
+            if !t.examples.is_empty() {
+                fmt::flines_add(&mut f, RL_NORMAL, b"");
+                fmt::flines_add(
+                    &mut f,
+                    RL_HEAD,
+                    if t.examples.contains('\n') {
+                        b" Examples"
+                    } else {
+                        b" Example"
+                    },
+                );
+                for l in t.examples.split('\n') {
+                    fmt::flines_add(&mut f, RL_CMD, c_cut(&fmtb(&[b"   ", l.as_bytes()]), 1024));
+                }
+            }
+        }
+        self.emit_flines(f);
+    }
+
     fn show_help(&mut self, topic: Option<&[u8]>, one: Option<&CmdDef>) {
         let sl = self.session_log_phrase(128);
         let mut f = Flines::new();
@@ -3313,9 +3655,9 @@ impl Ui {
                     }
                 }
                 let l = fmtb(&[
-                    b"   help [group [command]] ",
+                    b"   help [group [command [topic]]] ",
                     dot,
-                    b" ? [group [command]] ",
+                    b" ? does the same ",
                     dot,
                     b" quit",
                 ]);
@@ -3451,7 +3793,34 @@ impl Ui {
                         return;
                     }
                 }
-                self.show_help(a1, one);
+                // help <group> <command> <topic> [<topic>]
+                if let Some(d) = one
+                    && let Some(sub) = d.sub
+                    && ws.n() > argi + 2
+                {
+                    let mut parent = fmtb(&[d.cmd.as_bytes(), b" ", sub.as_bytes()]);
+                    let mut found: Option<Topic> = None;
+                    for k in argi + 2..ws.n() {
+                        let w = ws.get(k);
+                        let Some(t) = topic_find(&parent, w) else {
+                            let m = fmtb(&[&parent, b" has no topic ", &w[..uprec(w, 40)]]);
+                            let h = fmtb(&[b"help ", &parent]);
+                            self.refuse(seq, "cmd.unknown", c_cut(&m, 224), Some(c_cut(&h, 176)));
+                            return;
+                        };
+                        if k + 1 < ws.n() {
+                            parent = t.path.as_bytes().to_vec();
+                        }
+                        found = Some(t);
+                    }
+                    if let Some(t) = found {
+                        // the parent of the page shown: the path without its last word
+                        let pp = t.path.rsplit_once(' ').map_or("", |x| x.0).to_string();
+                        self.help_topic(d, &t, pp.as_bytes());
+                    }
+                } else {
+                    self.show_help(a1, one);
+                }
             }
             ("quit", _) => {
                 if !self.raw {
@@ -4756,6 +5125,42 @@ impl Ui {
             }
             return out;
         }
+        // help <group> <command> <topic> [<topic>]
+        if eq_ic(&w[0], "help") && (word_idx == 3 || word_idx == 4) {
+            let up = match p1.first() {
+                Some(b'+' | b'-') => &p1[1..],
+                _ => p1,
+            };
+            let parent = if word_idx == 3 {
+                fmtb(&[&w[1], b" ", &w[2]])
+            } else {
+                fmtb(&[&w[1], b" ", &w[2], b" ", up])
+            };
+            let parent = c_cut(&parent, 200).to_vec();
+            // +bit / -bit: a channel option keeps the sign it was typed with
+            let sign = matches!(prefix.first(), Some(b'+' | b'-')) && eq_ic(&parent, "channel set");
+            for t in topic_children(&parent) {
+                if pooln >= 128 {
+                    break;
+                }
+                let nm = topic_name(&t.path).as_bytes();
+                if sign && !fmt::setting_is_flag(nm) {
+                    continue;
+                }
+                let cand = if sign {
+                    fmtb(&[&prefix[..1], nm])
+                } else {
+                    nm.to_vec()
+                };
+                if add(&mut out, c_cut(&cand, 72)) {
+                    pooln += 1;
+                }
+            }
+            return out;
+        }
+        if eq_ic(&w[0], "help") && word_idx > 4 {
+            return out;
+        }
         let subs = cmd_has_subs(&w[0]);
         if word_idx == 1 && subs {
             for d in CMDS {
@@ -4798,7 +5203,7 @@ impl Ui {
         else {
             return out;
         };
-        match ac.3 {
+        let kind = match ac.3 {
             Ck::Group => {
                 for g in GROUPS {
                     add(&mut out, g.0.as_bytes());
@@ -4823,10 +5228,32 @@ impl Ui {
                         p = &p[1..];
                     }
                 }
-                return out;
+                // bot set cron <nick|uuid>, hub set cron <name|uuid>, hub set <hub> key:
+                // the nodes too
+                if pos == 1 && eq_ic(p1, "cron") && ac.3 == Ck::NetSet {
+                    Ck::BotNick
+                } else if pos == 1 && eq_ic(p1, "cron") && ac.3 == Ck::HubSet {
+                    Ck::HubSelf
+                } else if pos == 0 && ac.3 == Ck::HubSet {
+                    Ck::HubName
+                } else {
+                    return out;
+                }
             }
-            _ => {}
-        }
+            Ck::BotNickOr(words) => {
+                // a bot, or one of these words (bot resync all)
+                for wd in words.split(' ').filter(|x| !x.is_empty()) {
+                    if pooln >= 128 {
+                        break;
+                    }
+                    if add(&mut out, c_cut(wd.as_bytes(), 72)) {
+                        pooln += 1;
+                    }
+                }
+                Ck::BotNick
+            }
+            k => k,
+        };
         // uuids (and for show / kick / del / hub show, names) from the tree rows:
         // H|depth|name|uuid|..., B|depth|nick|uuid|..., D|nick|uuid|... (offline)
         let tree = self.tree.as_deref().unwrap_or(b"");
@@ -4845,19 +5272,22 @@ impl Ui {
             let nf = f.len();
             let ty = f.first().map_or(0, |x| x[0]);
             let mut cand: [Option<&[u8]>; 2] = [None, None];
-            match ac.3 {
+            match kind {
                 Ck::HubName if ty == b'H' && nf >= 4 && f[1] != b"0" => {
+                    cand = [Some(f[2]), Some(f[3])];
+                }
+                Ck::HubSelf if ty == b'H' && nf >= 4 => {
                     cand = [Some(f[2]), Some(f[3])];
                 }
                 Ck::Bot | Ck::BotOn | Ck::BotNick if ty == b'B' && nf >= 4 => {
                     cand[0] = Some(f[3]);
-                    if ac.3 != Ck::Bot {
+                    if kind != Ck::Bot {
                         cand[1] = Some(f[2]);
                     }
                 }
                 Ck::Bot | Ck::BotNick if ty == b'D' && nf >= 3 => {
                     cand[0] = Some(f[2]);
-                    if ac.3 == Ck::BotNick {
+                    if kind == Ck::BotNick {
                         cand[1] = Some(f[1]);
                     }
                 }

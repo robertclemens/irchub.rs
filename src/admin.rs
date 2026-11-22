@@ -4282,6 +4282,48 @@ fn stats_load(state: &HubState, r: &mut Reply) {
         -1
     };
     stats_timer(r, "purge", 86400, purge, t);
+    stats_timer(
+        r,
+        "roster",
+        BOT_PRESENCE_INTERVAL,
+        state.last_presence_gossip,
+        t,
+    );
+    if let Some(p) = state.p2.as_ref() {
+        // Presence v2 keeps its own monotonic milliseconds.
+        let mono = crate::presence2::now_ms();
+        let due = |next: i64| t + (next - mono + 999).div_euclid(1000);
+        stats_timer_due(
+            r,
+            "p2digest",
+            crate::presence2::P2_DIGEST_MS / 1000,
+            due(p.next_digest_ms),
+            t,
+        );
+        stats_timer_due(
+            r,
+            "p2record",
+            crate::presence2::P2_FULL_EVERY_MS / 1000,
+            due(p.next_full_ms),
+            t,
+        );
+    }
+    stats_timer(r, "bansweep", BAN_SWEEP_INTERVAL, state.bans_swept_at, t);
+    stats_timer_due(
+        r,
+        "cron",
+        CRON_CHECK_SECS as i64,
+        crate::update::cron_next() as i64,
+        t,
+    );
+}
+
+/// The same for a job that keeps the time of its next run (`due`, 0 = now).
+fn stats_timer_due(r: &mut Reply, name: &str, every: i64, due: i64, t: i64) {
+    r.rec("timer");
+    r.kv("name", name);
+    r.kvi("every", every);
+    r.kvi("in", (due - t).clamp(0, every));
 }
 
 /// One "timer" record: seconds until the next run of a job that runs every

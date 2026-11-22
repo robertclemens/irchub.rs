@@ -2616,6 +2616,15 @@ fn render_hub_settings(ctx: &Ctx, h: &Crec, out: &mut Flines) {
         t.row(ctx, RL_NORMAL, None, r);
     }
     t.render(ctx, out);
+    line(
+        out,
+        RL_DIM,
+        &[b"  cron: each hub's keepalive crontab line (hub list CRON column); help hub set"],
+    );
+    hint(
+        out,
+        b"hub set ssh | hub set conn \xc2\xb7 hub set <#|uuid|name> key <key> \xc2\xb7 hub set cron <global|#|uuid|name> <on|off>",
+    );
 }
 
 /// hub set ssh / hub set conn: this hub's connection limits.  ok|hub.show
@@ -3188,13 +3197,18 @@ fn delta_kv(b: &mut Sb, r: &Crec) {
 
 /// The maintenance countdowns of a stats reply ("timer" records).
 fn render_timers(ctx: &Ctx, rep: &Creply, ld: Option<&Crec>, out: &mut Flines) {
-    const NAMES: [(&str, &str); 6] = [
+    const NAMES: [(&str, &str); 11] = [
         ("gossip", "mesh gossip"),
         ("entropy", "anti-entropy sync"),
         ("scan", "client scan"),
         ("ipclean", "ip limit cleanup"),
         ("peers", "hub reconnect"),
         ("purge", "tombstone purge"),
+        ("roster", "bot roster gossip"),
+        ("p2digest", "presence v2 digest"),
+        ("p2record", "presence v2 record"),
+        ("bansweep", "ban expiry sweep"),
+        ("cron", "crontab line check"),
     ];
     const COLS: [Col; 3] = [
         col("JOB", b'L', 1),
@@ -4722,6 +4736,16 @@ fn is_flag_setting(name: &[u8]) -> bool {
     FLAG_SETTINGS.iter().any(|f| f.as_bytes() == name)
 }
 
+/// A channel setting that is on/off (+name / -name), not valued.
+pub fn setting_is_flag(name: &[u8]) -> bool {
+    is_flag_setting(name)
+}
+
+/// The i-th hub connection limit: (group ssh|conn, name, meaning).
+pub fn limit_info(i: usize) -> Option<(&'static str, &'static str, &'static str)> {
+    LIMIT_ROWS.get(i).copied()
+}
+
 /// What each setting does and its built-in value, as people read them: help
 /// channel set / help network set, the settings tables, channel show.  Names
 /// as those show them; the bot floods (net) are flood cmd|msg|ctcp, the words
@@ -4887,6 +4911,12 @@ const SET_INFO: &[(&str, &str, &str, bool)] = &[
         "sendq",
         "10:100",
         "a bot's IRC output: B lines at once, then one every I ms",
+        true,
+    ),
+    (
+        "cron",
+        "off",
+        "keepalive crontab line on each bot's host: global, or one bot",
         true,
     ),
 ];
@@ -5162,9 +5192,14 @@ fn render_settings_table(ctx: &Ctx, rep: &Creply, out: &mut Flines, network: boo
             RL_DIM,
             &[b"  sendq paces what a bot says: B lines at once, then one every I ms (I 0 = no delay)"],
         );
+        line(
+            out,
+            RL_DIM,
+            &[b"  cron: each bot's keepalive crontab line (bot list CRON column); help bot set"],
+        );
         hint(
             out,
-            b"bot set flood <cmd|msg|ctcp> <N:S|off|default> \xc2\xb7 bot set ignoretime <min|default> \xc2\xb7 bot set sendq <B:I|default>",
+            b"bot set flood <cmd|msg|ctcp> <N:S|off|default> \xc2\xb7 bot set ignoretime <min|default> \xc2\xb7 bot set sendq <B:I|default> \xc2\xb7 bot set cron <global|nick|uuid> <on|off>",
         );
     } else {
         let eff = r.rv("effective");

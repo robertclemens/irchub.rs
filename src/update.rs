@@ -1649,6 +1649,11 @@ pub fn cron_status() -> String {
     CRON.lock().map(|c| c.status.clone()).unwrap_or_default()
 }
 
+/// When the next look at the line is due (0 = at once): hub stats.
+pub fn cron_next() -> u64 {
+    CRON.lock().map(|c| c.next).unwrap_or(0)
+}
+
 /// A hub's order.
 pub fn cron_set(on: bool) {
     if let Ok(mut c) = CRON.lock() {
