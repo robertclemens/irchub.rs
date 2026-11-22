@@ -821,6 +821,7 @@ const CMDS: &[CmdDef] = &[
     cmd!("user", Some("mask"), 0, B::UserMask, 3, 0, Cf::None, Pre::None, "", "user mask add|del <name> <mask>", "add or remove a usermask (del asks y/N)", None),
     cmd!("channel", Some("list"), CMD_ADMIN_LIST_CHANNELS, B::None, 0, 0, Cf::None, Pre::None, "", "channel list", "every managed channel with its settings", None),
     cmd!("channel", Some("show"), CMD_ADMIN_LIST_CHANNELS, B::Arg, 1, 0, Cf::None, Pre::None, "", "channel show <#chan>", "one channel in detail", None),
+    cmd!("channel", Some("who"), CMD_CHAN_WHO, B::Arg, 1, 0, Cf::None, Pre::None, "", "channel who <#chan>", "topic, modes and members, as one bot in the channel sees them now", None),
     cmd!("channel", Some("add"), CMD_ADMIN_ADD_CHANNEL, B::ChanAdd, 1, 1, Cf::None, Pre::None, "", "channel add <#chan> [key]", "add (or re-add) a channel", None),
     cmd!("channel", Some("del"), CMD_ADMIN_DEL_CHANNEL, B::Arg, 1, 0, Cf::Yn, Pre::None, "", "channel del <#chan>", "remove it from every bot (asks y/N)", None),
     cmd!("channel", Some("mode"), CMD_ADMIN_CHAN_MODE, B::ChanModes, 1, 3, Cf::None, Pre::None, "", "channel mode <#chan> [<+modes> [key] [limit] | -]", "show the channel's modes, or store them and apply them once", Some("modes: i m n p s t k l \u{b7} - = the network default")),
@@ -1087,7 +1088,7 @@ const CMD_HELP: &[CmdHelp] = &[
      "option set h\noption set -"),
     ("user", Some("list"), Some("admin|oper\tonly that role (default both)"),
      "user list\nuser list oper"),
-    ("user", Some("show"), Some("name|*\ta user's name, or * for every user"), "user show robert\nuser show *"),
+    ("user", Some("show"), Some("name|*\ta user's name, or * for every user"), "user show admin\nuser show *"),
     ("user", Some("add"),
      Some(concat!(
          "admin|oper\tthe role\n",
@@ -1099,7 +1100,7 @@ const CMD_HELP: &[CmdHelp] = &[
          "admin may log in and view everything\n",
          "channels\tan oper: * for every channel, or the channels, comma-separated (#ircbot,#dev); ",
          "on each they may op, invite, unban, key")),
-     concat!("user add admin robert ", ex_key!(), " robert!*@* +a\n",
+     concat!("user add admin admin2 ", ex_key!(), " admin2!*@* +a\n",
              "user add admin dana ", ex_key!(), " dana!*@* +chu\n",
              "user add oper alice ", ex_key!(), " alice!*@*.example.net *\n",
              "user add oper alice ", ex_key!(), " alice!*@*.example.net #ircbot")),
@@ -1127,6 +1128,12 @@ const CMD_HELP: &[CmdHelp] = &[
      "user mask add alice alice!*@203.0.113.*\nuser mask del alice alice!*@*.example.net"),
     ("channel", Some("list"), None, "channel list"),
     ("channel", Some("show"), Some("#chan\tthe channel's name"), "channel show #ops"),
+    (
+        "channel",
+        Some("who"),
+        Some("#chan\tthe channel; one bot in it (no ops needed) is picked to answer"),
+        "channel who #ops",
+    ),
     ("channel", Some("add"), Some("#chan\tthe channel's name\nkey\tits channel key, if it has one"),
      "channel add #ops\nchannel add #ops s3cret"),
     ("channel", Some("del"), Some("#chan\tthe channel; every bot parts it (asks y/N)"), "channel del #ops"),
@@ -6915,13 +6922,13 @@ mod tests {
 
     #[test]
     fn line_mode_markers_and_confirmations() {
-        let mut ui = Ui::new(true, 80, 24, "robert", "127.0.0.1", "hub1");
+        let mut ui = Ui::new(true, 80, 24, "admin", "127.0.0.1", "hub1");
         ui.start(1);
         let hello = String::from_utf8_lossy(&ui.take_term()).into_owned();
         assert_eq!(
             hello,
             format!(
-                "irchub console {HUB_VERSION} ({HUB_UPDATE_VARIANT}) · hub1 · admin robert from 127.0.0.1\r\n> "
+                "irchub console {HUB_VERSION} ({HUB_UPDATE_VARIANT}) · hub1 · admin admin from 127.0.0.1\r\n> "
             )
         );
         assert!(run(&mut ui, "foo\r").contains("[err #1] unknown command \"foo\"\r\n> "));

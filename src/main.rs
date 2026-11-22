@@ -806,10 +806,10 @@ fn run_setup(state: &mut HubState) -> i32 {
     println!("[+] Public key: {pub_b64}\n");
     println!("    ┌─────────────────────────────────────────────────┐");
     println!("    │ Save this public key + this hub's UUID.         │");
-    println!("    │   - Bots adding this hub will need both         │");
-    println!("    │     (ircbot -setup prompts for UUID + pubkey).  │");
-    println!("    │   - Peer hubs adding this hub will need the     │");
-    println!("    │     UUID + ip:port + pubkey (console: peer add).│");
+    println!("    │   - Bots adding this hub need its ip:port and   │");
+    println!("    │     public key (ircbot -setup asks for both).   │");
+    println!("    │   - Other hubs adding this hub need the         │");
+    println!("    │     UUID + ip:port + pubkey (console: hub add). │");
     println!("    │ The hub's PRIVATE key never leaves this machine │");
     println!("    │ (stored encrypted inside .irchub.cnf).          │");
     println!("    └─────────────────────────────────────────────────┘");
@@ -837,7 +837,7 @@ fn run_setup(state: &mut HubState) -> i32 {
 
     let mut admin_name = String::new();
     while admin_name.is_empty() {
-        let n = tool::prompt_line("Admin friendly name (no spaces, e.g. robert): ", 64);
+        let n = tool::prompt_line("Admin friendly name (no spaces, e.g. admin): ", 64);
         if n.is_empty() {
             break;
         }

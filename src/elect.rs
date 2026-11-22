@@ -23,8 +23,17 @@ fn find(state: &HubState, id: &str) -> Option<usize> {
         .position(|e| e.active && e.id == id)
 }
 
+/// End an election: the slot is free and a `who` answer's buffer goes.
+fn release(state: &mut HubState, ei: usize) {
+    let e = &mut state.chan_elections[ei];
+    crypto::wipe(&mut e.who_buf); // it holds the key
+    e.who_buf = Vec::new();
+    e.active = false;
+}
+
 fn alloc(state: &mut HubState) -> Option<usize> {
     let i = state.chan_elections.iter().position(|e| !e.active)?;
+    release(state, i);
     let t = now();
     state.chan_elections[i] = ChanElect {
         from_fd: -1,
@@ -209,7 +218,306 @@ fn kind_word(kind: &str) -> &'static str {
         "mode" => "mode",
         "kick" => "kick",
         "ban" => "ban",
+        "who" => "who",
         _ => "key",
+    }
+}
+
+// ---- `channel who` (kind "who", CMD_CHAN_WHO) -----------------------------
+
+/// Text from a bot for the console: control bytes go ('|' stays; the reply
+/// escapes it).  Under `cap` bytes, as C's buffer of that size.
+fn wtext_clean(src: &[u8], cap: usize) -> Vec<u8> {
+    let mut o = Vec::new();
+    for &ch in src {
+        if o.len() + 1 >= cap {
+            break;
+        }
+        if ch < 0x20 || ch == 0x7f {
+            continue;
+        }
+        o.push(ch);
+    }
+    o
+}
+
+/// The value after "<tag>|" of the first body line that starts with it.
+fn who_line(body: &[u8], tag: u8) -> Option<&[u8]> {
+    body.split(|&b| b == b'\n')
+        .find(|l| l.len() >= 2 && l[0] == tag && l[1] == b'|')
+        .map(|l| &l[2..])
+}
+
+/// Field i ('|'-separated) of a line value, cleaned; last = the rest.
+fn who_field(val: &[u8], i: usize, last: bool, cap: usize) -> Vec<u8> {
+    let mut s = 0usize;
+    for _ in 0..i {
+        match val[s..].iter().position(|&b| b == b'|') {
+            Some(p) => s += p + 1,
+            None => return Vec::new(),
+        }
+    }
+    let e = if last {
+        val.len()
+    } else {
+        val[s..]
+            .iter()
+            .position(|&b| b == b'|')
+            .map_or(val.len(), |p| s + p)
+    };
+    wtext_clean(&val[s..e], cap)
+}
+
+/// Leading decimal digits; 0 when none or past 1e15 (hub_chanwho.c who_num).
+fn who_num(s: &[u8]) -> i64 {
+    let mut v: i64 = 0;
+    for &c in s.iter().take_while(|c| c.is_ascii_digit()) {
+        if v > 1_000_000_000_000_000 {
+            return 0;
+        }
+        v = v * 10 + i64::from(c - b'0');
+    }
+    v
+}
+
+fn lossy(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+/// irssi order: ops, halfops, voices, the rest; A-Z ignoring ASCII case
+/// within each; then by bytes (hub_logic.c who_nick_cmp).
+fn who_nick_cmp(x: &(u8, Vec<u8>), y: &(u8, Vec<u8>)) -> std::cmp::Ordering {
+    x.0.cmp(&y.0)
+        .then_with(|| {
+            let a = x.1.iter().map(u8::to_ascii_lowercase);
+            let b = y.1.iter().map(u8::to_ascii_lowercase);
+            a.cmp(b)
+        })
+        .then_with(|| x.1.cmp(&y.1))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn who_answer(
+    state: &mut HubState,
+    ai: usize,
+    e: &ChanElect,
+    ok: bool,
+    by_uuid: &str,
+    by_nick: &str,
+    hub_name: &str,
+    detail: &str,
+    asked: i64,
+    hubs: i64,
+) {
+    if !ok {
+        let mut why = reasons(e, 160);
+        if why.is_empty() && !detail.is_empty() {
+            why = trunc_string(detail, 160);
+        }
+        if why.is_empty() && asked > 0 {
+            why = "none is in the channel".to_string();
+        }
+        let msg = trunc_string(
+            &format!(
+                "no bot could list {}: {asked} bot{} asked on {hubs} hub{}{}{why}",
+                e.channel,
+                if asked == 1 { "" } else { "s" },
+                if hubs == 1 { "" } else { "s" },
+                if why.is_empty() { "" } else { "; " }
+            ),
+            256,
+        );
+        admin_err(
+            state,
+            ai,
+            "channel.nobody",
+            &msg,
+            Some("a bot must be in the channel (it needs no ops)"),
+        );
+        return;
+    }
+    if e.who_buf.is_empty() || !e.who_done || e.who_bad {
+        let msg = format!(
+            "{} answered for {} but its list did not arrive whole",
+            crate::cstr::trunc(if by_nick.is_empty() { "a bot" } else { by_nick }, 32),
+            crate::cstr::trunc(&e.channel, 65)
+        );
+        admin_err(
+            state,
+            ai,
+            "channel.who_incomplete",
+            &msg,
+            Some("channel who again"),
+        );
+        return;
+    }
+    let body = e.who_buf.as_slice();
+    let mut r = Reply::new();
+    r.ok("channel.who");
+    r.kv("chan", &e.channel);
+    r.kv("by", if by_nick.is_empty() { by_uuid } else { by_nick });
+    r.kv("by_uuid", by_uuid);
+    r.kv("hub_name", hub_name);
+    r.kvi("asked", asked);
+    r.kvi("hubs", hubs);
+    let (mut f1, mut f2) = (Vec::new(), Vec::new());
+    if let Some(v) = who_line(body, b't') {
+        f1 = who_field(v, 0, false, 24);
+        f2 = who_field(v, 1, false, 24);
+    }
+    let by = who_line(body, b'B').map_or(Vec::new(), |v| wtext_clean(v, MAX_MASK_LEN));
+    let topic = who_line(body, b'T').map_or(Vec::new(), |v| wtext_clean(v, CHAN_WHO_TOPIC_MAX));
+    r.kvb("topic_known", f1 == b"1");
+    r.kv("topic", &lossy(&topic));
+    r.kv("topic_by", &lossy(&by));
+    r.kvi("topic_at", who_num(&f2));
+    let (mut f1, mut f2, mut modes) = (Vec::new(), Vec::new(), Vec::new());
+    if let Some(v) = who_line(body, b'M') {
+        f1 = who_field(v, 0, false, 24);
+        f2 = who_field(v, 1, false, 24);
+        modes = who_field(v, 2, true, 64);
+    }
+    let mut key = who_line(body, b'K').map_or(Vec::new(), |v| wtext_clean(v, 64));
+    r.kvb("modes_known", f1 == b"1");
+    r.kv("modes", &lossy(&modes));
+    r.kvi("limit", who_num(&f2));
+    r.kv("key", &lossy(&key));
+    crypto::wipe(&mut key);
+    let capped = who_line(body, b'C').is_some_and(|v| who_field(v, 1, false, 24) == b"1");
+    // the members: N|@a %b +c d ... (any number of N lines)
+    let mut list: Vec<(u8, Vec<u8>)> = Vec::new();
+    for l in body.split(|&b| b == b'\n') {
+        if l.len() < 2 || l[0] != b'N' || l[1] != b'|' {
+            continue;
+        }
+        for t in l[2..].split(|&b| b == b' ') {
+            if t.is_empty() {
+                continue;
+            }
+            let (rank, t) = match t[0] {
+                b'@' => (0u8, &t[1..]),
+                b'%' => (1, &t[1..]),
+                b'+' => (2, &t[1..]),
+                _ => (3, t),
+            };
+            let nick = wtext_clean(t, MAX_NICK);
+            if !nick.is_empty() {
+                list.push((rank, nick));
+            }
+        }
+    }
+    list.sort_by(who_nick_cmp);
+    let mut cnt = [0i64; 4];
+    for (rank, _) in &list {
+        cnt[usize::from(*rank)] += 1;
+    }
+    r.kvi("total", list.len() as i64);
+    r.kvb("capped", capped);
+    r.kvi("ops", cnt[0]);
+    r.kvi("halfops", cnt[1]);
+    r.kvi("voices", cnt[2]);
+    r.kvi("normal", cnt[3]);
+    const PFX: [&str; 4] = ["@", "%", "+", ""];
+    for (rank, nick) in &list {
+        r.rec("nick");
+        r.kv("p", PFX[usize::from(*rank)]);
+        r.kv("n", &lossy(nick));
+    }
+    send_reply(state, ai, &mut r);
+}
+
+/// CHAN_WHO eid|seq|more|<chunk>: from the bot we picked, or from the peer
+/// on the election's path.  A relay passes it up unchanged; the origin joins
+/// the chunks (seq 0 starts afresh: a retry with the next bot).
+pub fn process_who(state: &mut HubState, ci: usize, payload: &str) {
+    let (Some(id), Some(seqs), Some(more)) = (
+        wire_field(payload, 0, 64),
+        wire_field(payload, 1, 12),
+        wire_field(payload, 2, 4),
+    ) else {
+        return;
+    };
+    let mut body = payload;
+    for _ in 0..3 {
+        match body.find('|') {
+            Some(p) => body = &body[p + 1..],
+            None => return,
+        }
+    }
+    let Some(ei) = (!id.is_empty()).then(|| find(state, &id)).flatten() else {
+        return;
+    };
+    let c = &state.clients[ci];
+    let e = &state.chan_elections[ei];
+    if e.kind != "who" {
+        return;
+    }
+    match c.typ {
+        ClientType::Bot => {
+            if e.phase != ChanElectPhase::LocalDo || e.doing != c.id {
+                return;
+            }
+        }
+        ClientType::Hub => {
+            if !e.origin {
+                if c.fd == e.from_fd && c.conn_serial == e.from_serial {
+                    return;
+                }
+            } else if !(e.phase == ChanElectPhase::MeshDo
+                && e.hubs
+                    .iter()
+                    .any(|h| h.uuid == e.doing && h.fd == c.fd && h.serial == c.conn_serial))
+            {
+                return;
+            }
+        }
+        _ => return,
+    }
+    if !e.origin {
+        up(state, ei, CMD_CHAN_WHO, payload);
+        return;
+    }
+    // hub_chanwho.c chanwho_add: digits only, at most ~1e6
+    let mut seq: i64 = 0;
+    if seqs.is_empty() {
+        return;
+    }
+    for c in seqs.bytes() {
+        if !c.is_ascii_digit() || seq > 100_000 {
+            return;
+        }
+        seq = seq * 10 + i64::from(c - b'0');
+    }
+    let e = &mut state.chan_elections[ei];
+    if seq == 0 {
+        crypto::wipe(&mut e.who_buf);
+        e.who_buf.clear();
+        e.who_seq = 0;
+        e.who_done = false;
+        e.who_bad = false;
+    }
+    if e.who_bad {
+        return;
+    }
+    if seq != e.who_seq || e.who_done {
+        e.who_bad = true;
+        return;
+    }
+    if body.len() > CHAN_WHO_MAX - e.who_buf.len() {
+        e.who_bad = true;
+        let (chan, eid) = (e.channel.clone(), e.id.clone());
+        crate::hlog_warning!(
+            "[CHANREQ] channel who {chan} (id:{eid}): the answer is over {CHAN_WHO_MAX} bytes, dropped\n"
+        );
+        return;
+    }
+    if e.who_buf.capacity() < CHAN_WHO_MAX + 1 {
+        e.who_buf.reserve_exact(CHAN_WHO_MAX + 1 - e.who_buf.len());
+    }
+    e.who_buf.extend_from_slice(body.as_bytes());
+    e.who_seq += 1;
+    if more == "0" {
+        e.who_done = true;
     }
 }
 
@@ -235,7 +543,9 @@ fn finish(
     let absent = status == "absent";
     let prot = status == "protected";
     let ban = e.kind == "ban";
-    let who = if !e.nick.is_empty() {
+    let who = if e.kind == "who" {
+        "members"
+    } else if !e.nick.is_empty() {
         &e.nick
     } else if ban && !e.hostmask.is_empty() {
         &e.hostmask
@@ -328,7 +638,11 @@ fn finish(
     } else {
         None
     };
-    if let (Some(ai), true) = (admin, ban) {
+    if let (Some(ai), true) = (admin, e.kind == "who") {
+        who_answer(
+            state, ai, &e, ok, by_uuid, by_nick, hub_name, detail, asked, hubs,
+        );
+    } else if let (Some(ai), true) = (admin, ban) {
         // ban add / channel ban: the ban is stored whatever happened; the
         // answer says whether one bot set it now (placed) or why not (the
         // bots' sweep keeps trying)
@@ -496,7 +810,7 @@ fn finish(
             }
         }
     }
-    state.chan_elections[ei].active = false;
+    release(state, ei);
 }
 
 /// A relay hub's report back toward the origin.
@@ -821,7 +1135,8 @@ pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
             || kind == "op"
             || kind == "mode"
             || kind == "kick"
-            || kind == "ban")
+            || kind == "ban"
+            || kind == "who")
         || !(channel.starts_with('#') || channel.starts_with('&'))
     {
         crate::hlog_warning!("[CHANREQ] Malformed CHAN_ELECT_FWD from peer fd={fd}\n");
@@ -1032,7 +1347,7 @@ pub fn tick(state: &mut HubState, t: i64) {
             if e.origin {
                 finish(state, ei, "timeout", "", "", "", "timed out");
             }
-            state.chan_elections[ei].active = false;
+            release(state, ei);
             continue;
         }
         match e.phase {

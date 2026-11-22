@@ -380,6 +380,13 @@ pub struct ChanElect {
     pub ban_sticky: bool,
     pub ban_existed: bool,
     pub ban_reason: String,
+    /// kind "who", origin only: the CHAN_WHO chunks joined (CHAN_WHO_MAX,
+    /// wiped by elect::release); who_seq the next chunk expected, who_bad a
+    /// chunk out of order or over the cap (the answer fails).
+    pub who_buf: Vec<u8>,
+    pub who_seq: i64,
+    pub who_done: bool,
+    pub who_bad: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2093,7 +2100,7 @@ impl HubState {
     }
 
     /// Log label for a node or user (hub_who): "bot bunny_ (<uuid>)",
-    /// "hub hubtbl (<uuid>)", "admin robert (<uuid>)"; an unknown name reads
+    /// "hub hubtbl (<uuid>)", "admin admin (<uuid>)"; an unknown name reads
     /// "?".  kind: 'b' bot, 'h' hub, 'u' admin/oper, '\0' = whichever knows
     /// the uuid.
     pub fn who(&self, kind: char, uuid: &str) -> String {

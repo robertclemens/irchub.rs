@@ -2482,7 +2482,7 @@ pub(crate) fn mf_field_count(s: &str) -> usize {
     1 + s.bytes().filter(|&c| c == b'|').count()
 }
 
-/// The name a console session logs in as ("ADMIN:robert" -> "robert").
+/// The name a console session logs in as ("ADMIN:admin" -> "admin").
 fn mf_admin_name(state: &HubState, ci: usize) -> String {
     let id = &state.clients[ci].id;
     id.strip_prefix("ADMIN:").unwrap_or(id).to_string()
@@ -3988,6 +3988,7 @@ pub fn console_admin_op(cmd: u8) -> bool {
             | CMD_ADMIN_DISCONNECT_BOT
             | CMD_ADMIN_REKEY_BOT
             | CMD_ADMIN_BOT_RESYNC
+            | CMD_CHAN_WHO
             | CMD_ADMIN_LIST_PEERS
             | CMD_ADMIN_ADD_PEER
             | CMD_ADMIN_DEL_PEER
@@ -4824,6 +4825,51 @@ pub fn handle_admin_command(
                 &channel,
                 "ADMIN",
                 &nick,
+                "",
+                Some((admin_fd, state.clients[ci].conn_serial)),
+            )
+            .is_some()
+            {
+                return true;
+            }
+            admin_err(
+                state,
+                ci,
+                "channel.busy",
+                "too many channel requests in flight",
+                Some("try again in a few seconds"),
+            )
+        }
+
+        CMD_CHAN_WHO => {
+            // #chan: one bot in the channel reports its topic, modes and
+            // members (election kind "who"; no ops needed).  Read-only: no
+            // flag.
+            let channel = wire_field(payload, 0, MAX_CHAN).unwrap_or_default();
+            if payload.is_empty() || !chan_name_valid(&channel) {
+                return admin_err(
+                    state,
+                    ci,
+                    "channel.usage",
+                    "say which channel",
+                    Some("channel who <#chan>"),
+                );
+            }
+            let live = chan_entry(state, &channel).is_some_and(|i| {
+                mesh::parse_global_channel_value(&state.global_entries[i].value)
+                    .is_some_and(|(_, _, _, op)| op != "del")
+            });
+            if !live {
+                let m = format!("{} is not a managed channel", trunc_string(&channel, 65));
+                return admin_err(state, ci, "channel.not_found", &m, Some("channel list"));
+            }
+            let admin_fd = state.clients[ci].fd;
+            if crate::elect::start(
+                state,
+                "who",
+                &channel,
+                "ADMIN",
+                "",
                 "",
                 Some((admin_fd, state.clients[ci].conn_serial)),
             )

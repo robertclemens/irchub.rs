@@ -1120,8 +1120,9 @@ fn run() -> i32 {
     println!("  public key:  {pub_b64}");
     print_fp(&pub_key);
     println!("\nNext:");
-    println!("  - Give the PUBLIC key to an admin: hub console 'admin add' / 'oper add'");
-    println!("    / 'userkey', or IRC '+admin|+oper <name> <pubkey> <mask>'.");
+    println!("  - Give the PUBLIC key to an admin, who adds you on the hub console:");
+    println!("    'user add admin|oper <name> <pubkey> <mask> <flags|channels>'");
+    println!("    (or on IRC: '+admin|+oper <name> <pubkey> <mask> <flags|channels>').");
     println!("  - Point your IRC client script (ircbot/utils) at {priv_path}");
     if n == 0 {
         println!("  - Add a passphrase later with: keygen --passwd {priv_path}");

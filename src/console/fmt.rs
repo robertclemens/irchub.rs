@@ -3162,6 +3162,7 @@ fn opname(op: u64) -> Option<&'static str> {
         0x92 => "CMD_CFG_RESYNC",
         0x93 => "CMD_ADMIN_BOT_RESYNC",
         0x94 => "CMD_SYNC_DIGEST",
+        0x95 => "CMD_CHAN_WHO",
         _ => return None,
     })
 }
@@ -4345,24 +4346,55 @@ fn render_channel_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             },
             RL_NORMAL,
         );
-        let v = snp(
-            160,
-            cat(&[
-                res.rv("want").unwrap_or(b""),
-                b"   (",
-                modes_source_phrase(res.rv("want_src")),
-                b")",
-            ]),
-        );
-        card(out, L, "modes", &v, RL_NORMAL);
-        let v = match c.rvs("modes") {
-            Some(m) => snp(
-                160,
-                cat(&[b"+", m, b"   (i and k as last reported by a bot)"]),
-            ),
-            None => b"not reported".to_vec(),
-        };
-        card(out, L, "live modes", &v, RL_NORMAL);
+        match setting_on(rep, "enforcemodes") {
+            None => {
+                // a hub without the settings records: the stored modes as before
+                let v = snp(
+                    160,
+                    cat(&[
+                        res.rv("want").unwrap_or(b""),
+                        b"   (",
+                        modes_source_phrase(res.rv("want_src")),
+                        b")",
+                    ]),
+                );
+                card(out, L, "modes", &v, RL_NORMAL);
+                let v = match c.rvs("modes") {
+                    Some(m) => snp(
+                        160,
+                        cat(&[b"+", m, b"   (i and k as last reported by a bot)"]),
+                    ),
+                    None => b"not reported".to_vec(),
+                };
+                card(out, L, "live modes", &v, RL_NORMAL);
+            }
+            Some(true) => {
+                // 2.5.4: the stored modes are shown only when the bots hold
+                // the channel to them; otherwise the live ones are channel who's
+                let v = snp(
+                    160,
+                    cat(&[
+                        res.rv("want").unwrap_or(b""),
+                        b"   enforced (",
+                        modes_source_phrase(res.rv("want_src")),
+                        b")",
+                    ]),
+                );
+                card(out, L, "modes", &v, RL_NORMAL);
+            }
+            Some(false) => {
+                let v = snp(
+                    160,
+                    cat(&[
+                        b"not enforced ",
+                        glyph(ctx, G_DOT),
+                        b" live: channel who ",
+                        c.rv("name").unwrap_or(b"<#chan>"),
+                    ]),
+                );
+                card(out, L, "modes", &v, RL_NORMAL);
+            }
+        }
         if !settings_card(ctx, rep, out, L) {
             let ov = overrides_phrase(res.rv("overrides"), 512);
             card(
@@ -4397,6 +4429,121 @@ fn render_channel_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             "channel mode <#chan> \u{b7} channel set <#chan> \u{b7} ban list <#chan>".as_bytes(),
         );
     }
+}
+
+/// channel who: the topic, the modes, then the members as irssi's /names
+/// lays them out -- "[@nick ]" cells, as many to a row as the width takes.
+fn render_channel_who(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    let chan = r.rv("chan").unwrap_or(b"?");
+    let t = snp(96, cat(&[b"Channel ", chan]));
+    let right = snp(
+        160,
+        cat(&[
+            b"via ",
+            r.rv("by").unwrap_or(b"?"),
+            b" on ",
+            r.rv("hub_name").unwrap_or(b"?"),
+        ]),
+    );
+    title(ctx, out, &t, Some(&right));
+    const L: i32 = 6;
+    if !r.rvb("topic_known") {
+        card(out, L, "topic", b"not known yet", RL_DIM);
+    } else if r.rvs("topic").is_none() {
+        card(out, L, "topic", b"(none)", RL_NORMAL);
+    } else {
+        card(out, L, "topic", r.rv("topic").unwrap_or(b""), RL_NORMAL);
+        if r.rvs("topic_by").is_some() || r.rvi("topic_at", 0) > 0 {
+            let w = when_ago(ctx, r.rvi("topic_at", 0), 96);
+            let v = snp(
+                1024,
+                cat(&[
+                    r.rvs("topic_by").unwrap_or(b"?"),
+                    b" ",
+                    glyph(ctx, G_DOT),
+                    b" ",
+                    &w,
+                ]),
+            );
+            card(out, L, "set by", &v, RL_NORMAL);
+        }
+    }
+    if !r.rvb("modes_known") {
+        card(out, L, "modes", b"not known yet", RL_DIM);
+    } else {
+        let mut v = r.rvs("modes").unwrap_or(b"(none)").to_vec();
+        if let Some(k) = r.rvs("key") {
+            v = cat(&[&v, b"   key ", k]);
+        }
+        let lim = r.rvi("limit", 0);
+        if lim > 0 {
+            v = cat(&[&v, b"   limit ", &num(lim)]);
+        }
+        card(out, L, "modes", &snp(1024, v), RL_NORMAL);
+    }
+    line(out, RL_HEAD, &[b"  [Users ", chan, b"]"]);
+    let nicks: Vec<&Crec> = rep
+        .r
+        .iter()
+        .filter(|m| m.is("nick") && m.rv("n").is_some())
+        .collect();
+    let nw = nicks
+        .iter()
+        .map(|m| str_width(m.rv("n").unwrap_or(b"")))
+        .fold(1, i32::max);
+    let cell = nw + 3; // "[" prefix nick "]"
+    let cols = ((ctx.width - 2 + 1) / (cell + 1)).max(1) as usize;
+    let mut b = Sb::default();
+    for (k, m) in nicks.iter().enumerate() {
+        b.a(if k % cols == 0 { b"  " } else { b" " });
+        let n = m.rv("n").unwrap_or(b"");
+        b.a(b"[");
+        b.a(m.rvs("p").unwrap_or(b" "));
+        b.a(n);
+        b.rep(b" ", nw - str_width(n));
+        b.a(b"]");
+        if (k + 1) % cols == 0 {
+            b.emit(out, RL_NORMAL);
+        }
+    }
+    if !nicks.len().is_multiple_of(cols) {
+        b.emit(out, RL_NORMAL);
+    }
+    if nicks.is_empty() {
+        line(out, RL_DIM, &[b"  (nobody)"]);
+    }
+    let total = r.rvi("total", 0);
+    line(
+        out,
+        RL_NORMAL,
+        &[
+            b"  Total of ",
+            &num(total),
+            b" nick",
+            if total == 1 { b"" } else { b"s" },
+            b" [",
+            &num(r.rvi("ops", 0)),
+            b" ops, ",
+            &num(r.rvi("halfops", 0)),
+            b" halfops, ",
+            &num(r.rvi("voices", 0)),
+            b" voices, ",
+            &num(r.rvi("normal", 0)),
+            b" normal]",
+        ],
+    );
+    if r.rvb("capped") {
+        warn(
+            ctx,
+            out,
+            b"the bot's member list is full; some members are not shown",
+        );
+    }
+    hint(
+        out,
+        "channel show <#chan> \u{b7} channel mode <#chan>".as_bytes(),
+    );
 }
 
 fn render_channel_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
@@ -5302,6 +5449,15 @@ fn render_ban_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
 /// (options on, options off, values, message floods, op floods), the
 /// channel's own marked '*',
 /// then whether it is all default.  False: no setting records (an older hub).
+/// An on/off setting's effective value from the reply's setting records;
+/// None when the reply has none (an older hub).
+fn setting_on(rep: &Creply, name: &str) -> Option<bool> {
+    rep.r
+        .iter()
+        .find(|c| c.is("setting") && c.rv("name") == Some(name.as_bytes()))
+        .map(|c| setting_value(name.as_bytes(), c.rv("kind"), c.rv("value"), 48) == b"on")
+}
+
 fn settings_card(ctx: &Ctx, rep: &Creply, out: &mut Flines, l: i32) -> bool {
     let mut ln: [Vec<u8>; 5] = Default::default();
     let (mut own, mut rows) = (0, 0);
@@ -6731,7 +6887,7 @@ fn render_peer_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         res_kv(out, "uuid", r.rvs("uuid").unwrap_or(glyph(ctx, G_DASH)));
         res_kv(out, "key", r.rvs("fp").unwrap_or(b"?"));
         let subj = cat(&[
-            b"this hub dials it now; hub list shows the link once ",
+            b"the link comes up on the next dial (within 2 min) once ",
             peer_name(r),
             b" has added this hub too",
         ]);
@@ -7010,6 +7166,8 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
         render_channel_list(ctx, rep, out);
     } else if c == b"channel.show" {
         render_channel_show(ctx, rep, out);
+    } else if c == b"channel.who" {
+        render_channel_who(ctx, rep, out);
     } else if c == b"channel.settings" {
         render_settings_table(ctx, rep, out, false);
     } else if c == b"channel.mode" {

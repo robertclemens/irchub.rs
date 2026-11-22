@@ -359,6 +359,21 @@ pub const CMD_CHAN_ELECT_FWD: u8 = 0x71;
 pub const CMD_CHAN_ELECT_ACK: u8 = 0x72;
 pub const CMD_CHAN_ELECT_DO: u8 = 0x73;
 pub const CMD_CHAN_ELECT_DONE: u8 = 0x74;
+// 2.5.4 `channel who` (docs/plans/2026-11-21_channel_who_plan.md): election
+// kind "who" -- any bot in the channel whose WHO list is complete answers,
+// ops not needed.  The picked bot sends its view as CHAN_WHO chunks ahead of
+// DONE; relay hubs pass them up the election path like ELECT_DONE; the origin
+// joins them (CHAN_WHO_MAX, freed with the election) and answers the console
+// channel.who.  Admin -> hub uses the same opcode, payload "#chan".
+//   CHAN_WHO  bot->hub, hub->hub  eid|seq|more|<body chunk>
+// Body (split anywhere; ircbot/bot.h has the lines): t| B| T| M| K| C| N|.
+// A 2.5.3 bot answers the probe "unknown request" and a 2.5.3 hub drops the
+// ELECT_FWD, so old nodes take no part.  Mirrors hub.h, ircbot/bot.h.
+pub const CMD_CHAN_WHO: u8 = 0x95;
+/// Joined body: 500 nicks + topic + key.
+pub const CHAN_WHO_MAX: usize = 32768;
+/// The bots keep a topic to this.
+pub const CHAN_WHO_TOPIC_MAX: usize = 512;
 /// Admin: invite a user (nick|#chan).
 pub const CMD_ADMIN_INVITE_USER: u8 = 0x75;
 
