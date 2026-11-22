@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="868" height="475" viewBox="0 0 868 475" font-family="DejaVu Sans Mono, Menlo, Consolas, monospace" font-size="14">
+<rect width="100%" height="100%" rx="6" fill="#1e1e1e"/>
+<circle cx="16" cy="12" r="5" fill="#ff5f56"/><circle cx="32" cy="12" r="5" fill="#ffbd2e"/><circle cx="48" cy="12" r="5" fill="#27c93f"/>
+<text y="36" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">hub2/irchub -id</tspan></text>
+<text y="53" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Hub name:        hub2</tspan></text>
+<text y="70" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Hub UUID:        85e7077b-3e0e-4927-a175-5eb09bfb5464</tspan></text>
+<text y="87" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Hub public key:  TJLL1GGtNvJyGUXiMeCiMg6DklIjTCZ54E33yG46eH85L2S+OVKGflacFmfXg4+OJl4zXJ/jZdJy/ZLeJnG</tspan></text>
+<text y="104" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">jeA==</tspan></text>
+<text y="121" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Key fingerprint: 6178:216d:b354:9bef</tspan></text>
+<text y="138" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">SSH host key:    ssh-ed25519 SHA256:wERQLLqBTYs9RGhNrBszkp2unf/9qCEMHsuVrTnFUEA</tspan></text>
+<text y="155" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Listening:       127.0.0.1:8002</tspan></text>
+<text y="172" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Other hubs:      hub add 127.0.0.1 8002 85e7077b-3e0e-4927-a175-5eb09bfb5464 hub2 TJLL1GGtNvJyGUXiMe</tspan></text>
+<text y="189" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">CiMg6DklIjTCZ54E33yG46eH85L2S+OVKGflacFmfXg4+OJl4zXJ/jZdJy/ZLeJnGjeA==</tspan></text>
+<text y="206" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Bots:            +hub 127.0.0.1:8002 TJLL1GGtNvJyGUXiMeCiMg6DklIjTCZ54E33yG46eH85L2S+OVKGflacFmfXg4+</tspan></text>
+<text y="223" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">OJl4zXJ/jZdJy/ZLeJnGjeA==</tspan></text>
+<text y="240" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ hub1/irchub -id</tspan></text>
+<text y="257" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Hub name:        hub1</tspan></text>
+<text y="274" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Hub UUID:        478e6452-fa97-406c-9e78-5ce638e2795d</tspan></text>
+<text y="291" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Hub public key:  AsEfPYAylagpYvlz8CTZb13LS7HRGkDueMf4PCQx/HnMDcQmBSbI3ANxJZ938iCZenxR3oMpgdmv25lQ4yM</tspan></text>
+<text y="308" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">wZA==</tspan></text>
+<text y="325" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Key fingerprint: ca67:f28f:b3ea:2b14</tspan></text>
+<text y="342" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">SSH host key:    ssh-ed25519 SHA256:hj6UZbJG9HMfkn4cl13P5pKCSjyhBMCP/Bibcg8U2Vc</tspan></text>
+<text y="359" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Listening:       127.0.0.1:8001</tspan></text>
+<text y="376" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Other hubs:      hub add 127.0.0.1 8001 478e6452-fa97-406c-9e78-5ce638e2795d hub1 AsEfPYAylagpYvlz8C</tspan></text>
+<text y="393" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">TZb13LS7HRGkDueMf4PCQx/HnMDcQmBSbI3ANxJZ938iCZenxR3oMpgdmv25lQ4yMwZA==</tspan></text>
+<text y="410" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Bots:            +hub 127.0.0.1:8001 AsEfPYAylagpYvlz8CTZb13LS7HRGkDueMf4PCQx/HnMDcQmBSbI3ANxJZ938iC</tspan></text>
+<text y="427" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">ZenxR3oMpgdmv25lQ4yMwZA==</tspan></text>
+<text y="444" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$</tspan></text>
+</svg>

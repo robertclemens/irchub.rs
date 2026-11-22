@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="868" height="832" viewBox="0 0 868 832" font-family="DejaVu Sans Mono, Menlo, Consolas, monospace" font-size="14">
+<rect width="100%" height="100%" rx="6" fill="#1e1e1e"/>
+<circle cx="16" cy="12" r="5" fill="#ff5f56"/><circle cx="32" cy="12" r="5" fill="#ffbd2e"/><circle cx="48" cy="12" r="5" fill="#27c93f"/>
+<text y="36" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">mkdir bot1 &amp;&amp; cp ircbot/ircbot bot1/ &amp;&amp; cd bot1</tspan></text>
+<text y="53" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ ./ircbot -setup</tspan></text>
+<text y="70" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Removed group/other write from /home/user/bot1 (now 0755)</tspan></text>
+<text y="87" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">--- IRC Bot Initial Setup ---</tspan></text>
+<text y="104" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">No config file found. Let's create one.</tspan></text>
+<text y="138" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">==========================================</tspan></text>
+<text y="155" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">         Starting Configuration Wizard</tspan></text>
+<text y="172" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">==========================================</tspan></text>
+<text y="206" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">--- Setup Config Master Password ---</tspan></text>
+<text y="223" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Enter new config password:</tspan></text>
+<text y="240" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  …</tspan></text>
+<text y="274" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">✓ Hub configuration saved (2 hubs).</tspan></text>
+<text y="308" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  Admins, usermasks and channels for this bot are added on the</tspan></text>
+<text y="325" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  hub console ('user add', 'user mask', 'channel add'), not here.</tspan></text>
+<text y="342" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  This wizard assumes the hub network runs with opt 'h' (hub-only</tspan></text>
+<text y="359" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  mutations), which is the default — it cannot verify that until</tspan></text>
+<text y="376" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  the first sync. If your hub does not set opt 'h', you can also</tspan></text>
+<text y="393" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  add them later from IRC with '+admin' and 'join'.</tspan></text>
+<text y="427" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">==========================================</tspan></text>
+<text y="444" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">     Configuration Summary (Review)</tspan></text>
+<text y="461" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">==========================================</tspan></text>
+<text y="478" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Bot Nick: bot1</tspan></text>
+<text y="495" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">IRC Server: 127.0.0.1:16667</tspan></text>
+<text y="512" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Mode: HUB-MANAGED (2 hubs)</tspan></text>
+<text y="529" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Admins/channels: managed on the hub</tspan></text>
+<text y="546" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Does this look correct? (Y/n): y</tspan></text>
+<text y="580" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">--- Finalizing Configuration ---</tspan></text>
+<text y="614" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Configuration saved to .ircbot.cnf.</tspan></text>
+<text y="631" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">You can now start the bot:</tspan></text>
+<text y="648" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  Run './ircbot -p' to create a machine-bound password file, then './ircbot'</tspan></text>
+<text y="665" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  Or run './ircbot' directly and enter the password when prompted.</tspan></text>
+<text y="682" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ ./ircbot -p</tspan></text>
+<text y="699" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Config Password:</tspan></text>
+<text y="716" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Confirm Config Password:</tspan></text>
+<text y="733" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Saved: .ircbot.pass (0600, machine-bound)</tspan></text>
+<text y="750" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ ./ircbot</tspan></text>
+<text y="767" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">ircbot.c by trojanman 2.5.4</tspan></text>
+<text y="784" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ cd ..</tspan></text>
+<text y="801" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$</tspan></text>
+</svg>

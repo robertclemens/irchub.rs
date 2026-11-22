@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="868" height="577" viewBox="0 0 868 577" font-family="DejaVu Sans Mono, Menlo, Consolas, monospace" font-size="14">
+<rect width="100%" height="100%" rx="6" fill="#1e1e1e"/>
+<circle cx="16" cy="12" r="5" fill="#ff5f56"/><circle cx="32" cy="12" r="5" fill="#ffbd2e"/><circle cx="48" cy="12" r="5" fill="#27c93f"/>
+<text y="36" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">mkdir admin &amp;&amp; cp irchub/bin/keygen admin/ &amp;&amp; cd admin</tspan></text>
+<text y="53" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ ./keygen admin</tspan></text>
+<text y="70" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Passphrase for the private keys (empty for none):</tspan></text>
+<text y="87" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Same passphrase again:</tspan></text>
+<text y="104" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Generated Curve25519 keypair (keygen v2) for 'admin':</tspan></text>
+<text y="121" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  private: 20261122105812_admin.private.b64  (0600, passphrase-protected)</tspan></text>
+<text y="138" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  public:  20261122105812_admin.public.b64</tspan></text>
+<text y="155" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  ssh key: 20261122105812_admin_ed25519  (0600, passphrase-protected)</tspan></text>
+<text y="172" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  ssh pub: 20261122105812_admin_ed25519.pub</tspan></text>
+<text y="189" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  public key:  c/ouMVnZATMYQwxd0ovOxk6vMLccwE9Azpkrr5s8mKKAlaAH7uK5MvBZjoW1Mek/wyClx2kZ3yE+OcKONDhbL</tspan></text>
+<text y="206" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">g==</tspan></text>
+<text y="223" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  fingerprint: 3c6e:bae8:f5e3:a7ea</tspan></text>
+<text y="257" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Next:</tspan></text>
+<text y="274" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  - Give the PUBLIC key to an admin, who adds you on the hub console:</tspan></text>
+<text y="291" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">    'user add admin|oper &lt;name&gt; &lt;pubkey&gt; &lt;mask&gt; &lt;flags|channels&gt;'</tspan></text>
+<text y="308" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">    (or on IRC: '+admin|+oper &lt;name&gt; &lt;pubkey&gt; &lt;mask&gt; &lt;flags|channels&gt;').</tspan></text>
+<text y="325" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  - Point your IRC client script (ircbot/utils) at 20261122105812_admin.private.b64</tspan></text>
+<text y="359" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">SSH console (any hub where 'admin' is an admin) — add to ~/.ssh/config:</tspan></text>
+<text y="376" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  Host irchub-&lt;hub&gt;</tspan></text>
+<text y="393" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">      HostName &lt;hub host&gt;</tspan></text>
+<text y="410" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">      Port &lt;hubport&gt;</tspan></text>
+<text y="427" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">      User admin</tspan></text>
+<text y="444" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">      IdentityFile /home/user/admin/20261122105812_admin_ed25519</tspan></text>
+<text y="461" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">      IdentitiesOnly yes</tspan></text>
+<text y="478" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">then: ssh irchub-&lt;hub&gt;</tspan></text>
+<text y="495" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Unlock it for an hour at a time with: ssh-add -t 1h /home/user/admin/20261122105812_admin_ed25519</tspan></text>
+<text y="512" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">PuTTY: load /home/user/admin/20261122105812_admin_ed25519 in PuTTYgen and save it as a .ppk.</tspan></text>
+<text y="529" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ cd ..</tspan></text>
+<text y="546" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$</tspan></text>
+</svg>

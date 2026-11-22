@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="868" height="832" viewBox="0 0 868 832" font-family="DejaVu Sans Mono, Menlo, Consolas, monospace" font-size="14">
+<rect width="100%" height="100%" rx="6" fill="#1e1e1e"/>
+<circle cx="16" cy="12" r="5" fill="#ff5f56"/><circle cx="32" cy="12" r="5" fill="#ffbd2e"/><circle cx="48" cy="12" r="5" fill="#27c93f"/>
+<text y="36" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">mkdir hub2 &amp;&amp; cp irchub/bin/irchub hub2/ &amp;&amp; cd hub2</tspan></text>
+<text y="53" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ ./irchub -setup</tspan></text>
+<text y="70" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Removed group/other write from /home/user/hub2 (now 0755)</tspan></text>
+<text y="87" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">--- Setup ---</tspan></text>
+<text y="104" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Port: 8002</tspan></text>
+<text y="121" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Bind IP (default 0.0.0.0): 127.0.0.1</tspan></text>
+<text y="138" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Friendly Name (A-Z a-z 0-9 . _ -, max 63): hub2</tspan></text>
+<text y="155" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Generated UUID: 85e7077b-3e0e-4927-a175-5eb09bfb5464</tspan></text>
+<text y="172" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Config Password:</tspan></text>
+<text y="189" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Confirm Config Password:</tspan></text>
+<text y="223" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">[*] Generating per-hub Curve25519 keypair (Ed25519 + X25519)...</tspan></text>
+<text y="240" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  …</tspan></text>
+<text y="257" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">    Admins check it on first connect (keygen --ssh-fingerprint</tspan></text>
+<text y="274" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">    hub_public.b64 prints the same line).</tspan></text>
+<text y="291" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">[+] ./irchub -id prints this hub's uuid and keys again at any time.</tspan></text>
+<text y="325" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">--- First Admin Setup ---</tspan></text>
+<text y="342" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">This creates the first named admin, who can log into the hub's SSH</tspan></text>
+<text y="359" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">console and command bots over IRC. Admins sign in with a Curve25519 key,</tspan></text>
+<text y="376" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">not a password: on the admin's own machine run</tspan></text>
+<text y="393" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">    ./keygen &lt;name&gt;      (irchub/bin/keygen or ircbot/utils/keygen)</tspan></text>
+<text y="410" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">keep the &lt;ts&gt;_&lt;name&gt;.private.b64 there (chmod 600), and give this</tspan></text>
+<text y="427" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">wizard the &lt;ts&gt;_&lt;name&gt;.public.b64.</tspan></text>
+<text y="461" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Admin friendly name (no spaces, e.g. admin): admin</tspan></text>
+<text y="478" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Public key for 'admin' (paste the 88 chars, or a path to the .public.b64): ../admin/20261122105812_a</tspan></text>
+<text y="495" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">dmin.public.b64</tspan></text>
+<text y="512" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">  Key fingerprint: 3c6e:bae8:f5e3:a7ea — use this key? (Y/n): y</tspan></text>
+<text y="546" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Enter usermasks for this admin (e.g. nick!*@*.example.com).</tspan></text>
+<text y="563" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Press Enter with no mask when done (at least one required).</tspan></text>
+<text y="597" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Usermask 1 (required): admin!*@*</tspan></text>
+<text y="614" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Usermask 2 (or Enter to finish):</tspan></text>
+<text y="631" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">[+] Admin 'admin' created with 1 usermask(s), UUID 8df918d4-2e3b-41d2-9883-28b11607d531</tspan></text>
+<text y="648" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">    Their SSH key:     &lt;ts&gt;_admin_ed25519 (keygen writes it with the IRC key)</tspan></text>
+<text y="665" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">    then log in with:  ssh -i &lt;ts&gt;_admin_ed25519 -p &lt;hub port&gt; admin@&lt;hub&gt;</tspan></text>
+<text y="682" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Done.</tspan></text>
+<text y="699" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ ./irchub -p</tspan></text>
+<text y="716" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Config Password:</tspan></text>
+<text y="733" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Confirm Config Password:</tspan></text>
+<text y="750" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">Saved: .irchub.pass (0600, machine-bound)</tspan></text>
+<text y="767" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ ./irchub</tspan></text>
+<text y="784" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$ cd ..</tspan></text>
+<text y="801" xml:space="preserve"><tspan x="14.0" fill="#d4d4d4">$</tspan></text>
+</svg>
