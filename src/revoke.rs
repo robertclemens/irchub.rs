@@ -40,6 +40,10 @@ const GSET: &[Gsetting] = &[
         name: "hubcron",
         max: 1,
     },
+    Gsetting {
+        name: "sgrant",
+        max: 1,
+    },
 ];
 const _: () = assert!(GSET.len() <= HUB_GSETTINGS_MAX);
 
@@ -53,6 +57,7 @@ fn gs_get(state: &HubState, name: &str) -> (i32, i64) {
         "upgradehistory" => (state.uhist_keep_setting, state.uhist_keep_ts),
         "botcron" => (state.bot_cron_setting, state.bot_cron_ts),
         "hubcron" => (state.hub_cron_setting, state.hub_cron_ts),
+        "sgrant" => (state.sgrant_setting, state.sgrant_ts),
         _ => (0, 0),
     }
 }
@@ -70,6 +75,9 @@ fn gs_put(state: &mut HubState, name: &str, v: i32, ts: i64) {
     } else if name == "hubcron" {
         state.hub_cron_setting = v;
         state.hub_cron_ts = ts;
+    } else if name == "sgrant" {
+        state.sgrant_setting = v;
+        state.sgrant_ts = ts;
     }
 }
 

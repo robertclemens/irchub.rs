@@ -32,6 +32,11 @@ struct Stats {
     tree_delta_bytes: AtomicU64,
     tree_delta_of: AtomicU64,
     tree_pull: AtomicU64,
+    /// CMD_SERVER_REPORTs taken in (server pool), entries this hub flagged
+    /// wrong network, CMD_POOL_VIEW frames queued to bots — 2.5.4.
+    pool_reports: AtomicU64,
+    pool_flagged: AtomicU64,
+    pool_views: AtomicU64,
     /// PEER_SYNC / PEER_BCAST frames processed.
     sync_frames: AtomicU64,
     /// ... of which changed nothing.
@@ -68,6 +73,9 @@ static STATS: Stats = Stats {
     tree_delta_bytes: AtomicU64::new(0),
     tree_delta_of: AtomicU64::new(0),
     tree_pull: AtomicU64::new(0),
+    pool_reports: AtomicU64::new(0),
+    pool_flagged: AtomicU64::new(0),
+    pool_views: AtomicU64::new(0),
     sync_frames: AtomicU64::new(0),
     sync_noop: AtomicU64::new(0),
     sync_records: AtomicU64::new(0),
@@ -126,6 +134,28 @@ pub fn tree_pull() {
     STATS.tree_pull.fetch_add(1, Relaxed);
 }
 
+pub fn pool_report() {
+    STATS.pool_reports.fetch_add(1, Relaxed);
+}
+
+pub fn pool_flagged() {
+    STATS.pool_flagged.fetch_add(1, Relaxed);
+}
+
+pub fn pool_view() {
+    STATS.pool_views.fetch_add(1, Relaxed);
+}
+
+/// The server pool's state for the stats `pool` record: live entries,
+/// usable ones, flagged ones, bots waiting.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoolCounts {
+    pub servers: usize,
+    pub usable: usize,
+    pub wrongnet: usize,
+    pub idle: usize,
+}
+
 pub fn cfg_same() {
     STATS.cfg_same.fetch_add(1, Relaxed);
 }
@@ -178,6 +208,7 @@ pub fn sync_done(updates: u64) {
 pub fn report(
     uptime: i64,
     r: &mut crate::reply::Reply,
+    pool: PoolCounts,
     load: impl FnOnce(&mut crate::reply::Reply),
 ) {
     let g = |a: &AtomicU64| a.load(Relaxed);
@@ -200,6 +231,15 @@ pub fn report(
     r.kvu("delta_bytes", g(&s.tree_delta_bytes));
     r.kvu("delta_of", g(&s.tree_delta_of));
     r.kvu("pull", g(&s.tree_pull));
+    // server pool: live entries, usable ones, flagged ones, bots waiting
+    r.rec("pool");
+    r.kvi("servers", pool.servers as i64);
+    r.kvi("usable", pool.usable as i64);
+    r.kvi("wrongnet", pool.wrongnet as i64);
+    r.kvi("idle", pool.idle as i64);
+    r.kvu("reports", g(&s.pool_reports));
+    r.kvu("flagged", g(&s.pool_flagged));
+    r.kvu("views", g(&s.pool_views));
     r.rec("sync");
     r.kvu("frames", g(&s.sync_frames));
     r.kvu("noop", g(&s.sync_noop));

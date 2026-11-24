@@ -540,6 +540,55 @@ pub fn process_sync_digest(state: &mut HubState, ci: usize, payload: &str) {
     }
 }
 
+/// Whether a connected bot running `version` takes N|/S| in its config
+/// (POOL_MIN_BOT).  C `hub_bot_version_takes_pool`.
+pub fn bot_version_takes_pool(version: &str) -> bool {
+    !version.is_empty()
+        && crate::update::version_cmp(version, POOL_MIN_BOT) != std::cmp::Ordering::Less
+}
+
+/// Whether peer `ci` takes server pool N|/S| sync lines (POOL_MIN_HUB).  An
+/// older hub reads an unknown sync key as "uuid|key|..." and stores a
+/// phantom bot named "N" or "S", so those lines never reach it.  C
+/// `peer_takes_pool`.
+pub fn peer_takes_pool(state: &HubState, ci: usize) -> bool {
+    let v = peer_version_str(state, ci);
+    !v.is_empty() && crate::update::version_cmp(&v, POOL_MIN_HUB) != std::cmp::Ordering::Less
+}
+
+/// N|, S|, the hs|sgrant marker and a bot's pm| (b|<uuid>|pm|...): new in
+/// POOL_MIN_HUB.  `l` is the rest of the payload from a line's start.
+fn line_is_pool(l: &[u8]) -> bool {
+    (l.len() >= 2 && (l[0] == b'N' || l[0] == b'S') && l[1] == b'|')
+        || l.starts_with(b"hs|sgrant|")
+        || (l.len() > 2 + 36 + 4
+            && l[0] == b'b'
+            && l[1] == b'|'
+            && &l[2 + 36..2 + 36 + 4] == b"|pm|")
+}
+
+/// `payload` without its N|/S| lines; None when it has none (send it as it
+/// is).  C `strip_pool_lines`.
+fn strip_pool_lines(payload: &str) -> Option<String> {
+    let b = payload.as_bytes();
+    let mut starts = Vec::new();
+    let mut at = 0;
+    for line in payload.split_inclusive('\n') {
+        starts.push(at);
+        at += line.len();
+    }
+    if !starts.iter().any(|&i| line_is_pool(&b[i..])) {
+        return None;
+    }
+    let mut out = String::with_capacity(payload.len());
+    for (line, &i) in payload.split_inclusive('\n').zip(&starts) {
+        if !line_is_pool(&b[i..]) {
+            out.push_str(line);
+        }
+    }
+    Some(out)
+}
+
 /// One sync payload onto peer `ci`'s queue (every sync to a peer goes
 /// through it).  Held, not sent, while the peer's version is not known:
 /// `peer_sync_release` sends the full state once it is.  C
@@ -559,6 +608,12 @@ pub fn peer_enqueue_sync(
         }
         return;
     }
+    let stripped = if peer_takes_pool(state, ci) {
+        None
+    } else {
+        strip_pool_lines(payload)
+    };
+    let payload = stripped.as_deref().unwrap_or(payload);
     if payload.is_empty() {
         return;
     }
@@ -888,14 +943,16 @@ fn is_global_key(key: &str) -> bool {
         "c" | "m" | "o" | "a" | "p"
         // 2.4.5: channel settings, network defaults, bans
         | "C" | "D" | "B"
+        // 2.5.4: server pool network / server entry
+        | "N" | "S"
     )
 }
 
 /// Store a global entry directly, without re-formatting: the value that
 /// arrived over the wire is already combined.
 fn store_global_entry_raw(state: &mut HubState, key: &str, value: &str, ts: i64) -> bool {
-    // C|, D|, B|: one validator, one LWW, one set of ceilings.
-    if matches!(key, "C" | "D" | "B") {
+    // C|, D|, B|, N|, S|: one validator, one LWW, one set of ceilings.
+    if matches!(key, "C" | "D" | "B" | "N" | "S") {
         return storage::put_record(state, key, value, ts);
     }
 
@@ -1251,7 +1308,7 @@ fn sync_bot_entry(state: &mut HubState, ptr: &str, cnt: &mut SyncCounters) {
     if stored {
         cnt.updates += 1;
         // seen/t are hub-side metadata; bots don't consume them.
-        if key != "seen" && key != "t" {
+        if key != "seen" && key != "t" && key != "pm" {
             cnt.bot_push_updates += 1;
         }
         let line = format!("b|{uuid}|{key}|{val}|{ts}\n");
@@ -1659,6 +1716,20 @@ pub fn execute_purge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_pool_lines_for_old_peers() {
+        let u = "11111111-2222-3333-4444-555555555555";
+        let p = format!(
+            "c|#a||add|1\nS|x|2\nN|main|3\nhs|sgrant|1|4\nhs|autopurge|0|4\nb|{u}|pm|9|5\nb|{u}|n|nick|5\n"
+        );
+        let o = strip_pool_lines(&p).unwrap();
+        assert_eq!(
+            o,
+            format!("c|#a||add|1\nhs|autopurge|0|4\nb|{u}|n|nick|5\n")
+        );
+        assert!(strip_pool_lines("c|#a||add|1\n").is_none());
+    }
 
     /// A hub with authenticated peer links s (fd 10), x (fd 11), y (fd 12).
     fn three_peers() -> (HubState, Vec<std::net::TcpListener>) {

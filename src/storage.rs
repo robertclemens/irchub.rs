@@ -56,6 +56,16 @@ fn key_is_modes(key: &str) -> bool {
     matches!(key, "C" | "D" | "B")
 }
 
+/// The server pool's records (N| network, S| server entry), 2.5.4.
+pub fn key_is_pool(key: &str) -> bool {
+    matches!(key, "N" | "S")
+}
+
+/// Every record kind written through [`put_record`].
+fn key_is_record(key: &str) -> bool {
+    key_is_modes(key) || key_is_pool(key)
+}
+
 /// Length of a value's identity prefix: the channel (c|, C|), channel|mask
 /// (B|), else the first field.
 fn ident_len(key: &str, v: &str) -> usize {
@@ -112,6 +122,10 @@ pub struct GlobalIdx {
     n_c: usize,
     n_d: usize,
     n_b: usize,
+    /// pool: networks, entries, live entries
+    n_n: usize,
+    n_s: usize,
+    n_s_live: usize,
 }
 
 /// The identity (in the sense of [`global_identity_eq`]) as a hash key.
@@ -163,9 +177,17 @@ pub fn global_note_new(state: &mut HubState, i: usize) {
     let e = &state.global_entries[i];
     let k = gkey(&e.key, &e.value);
     let (ek, live_ban) = (e.key.clone(), e.key == "B" && global_value_active(&e.value));
+    let live_s = e.key == "S" && global_value_active(&e.value);
     let idx = &mut state.global_idx;
     idx.map.entry(k).or_insert(i); // a duplicate keeps the first
     match ek.as_str() {
+        "N" => idx.n_n += 1,
+        "S" => {
+            idx.n_s += 1;
+            if live_s {
+                idx.n_s_live += 1;
+            }
+        }
         "C" => idx.n_c += 1,
         "D" => idx.n_d += 1,
         "B" => idx.n_b += 1,
@@ -187,10 +209,17 @@ pub fn global_reindex(state: &mut HubState) {
 
 /// hub_global_room(): room for one more entry of `key`'s class: the old
 /// c/m/o rows share MAX_BOT_ENTRIES, C| has MAX_CHANNELS, D| one, B|
-/// MAX_BANS_TOTAL.
+/// MAX_BANS_TOTAL, N| MAX_NETWORKS, S| MAX_POOL_SERVERS + MAX_POOL_TOMBS
+/// (live ones are capped separately in [`put_record`]).
 pub fn global_room(state: &HubState, key: &str) -> bool {
     let ix = &state.global_idx;
-    let (n, cap) = if key_is_modes(key) {
+    let (n, cap) = if key_is_pool(key) {
+        if key == "N" {
+            (ix.n_n, MAX_NETWORKS)
+        } else {
+            (ix.n_s, MAX_POOL_SERVERS + MAX_POOL_TOMBS)
+        }
+    } else if key_is_modes(key) {
         match key {
             "C" => (ix.n_c, MAX_CHANNELS),
             "D" => (ix.n_d, 1),
@@ -258,9 +287,9 @@ pub fn update_global_entry(
     op: &str,
     ts: i64,
 ) -> bool {
-    // C|, D| and B| carry their own op and field set: they go through
-    // put_record, never through this c/m/o composer.
-    if key_is_modes(key) {
+    // C|, D|, B|, N| and S| carry their own op and field set: they go
+    // through put_record, never through this c/m/o composer.
+    if key_is_record(key) {
         crate::hlog_warning!("[STORAGE] Global {key}: not a c/m/o record (use put_record)\n");
         return false;
     }
@@ -337,7 +366,7 @@ pub fn update_global_entry(
 }
 
 /// nick!user@host, three non-empty parts, printable ASCII, no '*' or '?'.
-fn hostmask_literal(h: &str) -> bool {
+pub(crate) fn hostmask_literal(h: &str) -> bool {
     let Some(bang) = h.find('!') else {
         return false;
     };
@@ -484,9 +513,10 @@ fn update_entry_inner(
         return false;
     }
 
-    // C|, D|, B| are global records with their own writers and checks; a
-    // per-bot delta or sync line under those keys is never one of them.
-    if key_is_modes(key) {
+    // C|, D|, B|, N|, S| are global records with their own writers and
+    // checks; a per-bot delta or sync line under those keys is never one of
+    // them.
+    if key_is_record(key) {
         crate::hlog_warning!("[STORAGE] REJECTED key '{key}' on the per-bot path\n");
         return false;
     }
@@ -505,23 +535,16 @@ fn update_entry_inner(
         return false;
     }
 
-    if get_or_create_bot(state, uuid).is_none() {
-        return false;
-    }
-
     // Change 3b — zero-trust per-bot ingest bound (the single enforcement
     // point for the delta path, config push, peer sync and config load).
     // Global keys were already intercepted above.  A bot's per-bot state is
     // exactly {t, n, h, pub, seen, d}; reject any other key so a hostile bot
     // or peer cannot create arbitrarily-named entries and unbound the sync
-    // payload.  This is what makes BOT_SYNC_FIELDS a hard bound (see
+    // payload.  pm (2.5.4) is the first migration offer's time, for the opt
+    // 'h' window.  This is what makes BOT_SYNC_FIELDS a hard bound (see
     // `consts`).  Value length is capped per key so a per-bot line can never
     // approach value[1024].
-    //
-    // The bound is on entries, not on the registration above: a refused key
-    // still leaves an (empty) bot record, exactly as in the C hub, so the two
-    // trees converge on the same config from the same input.
-    if !matches!(key, "t" | "n" | "h" | "pub" | "seen" | "d" | "hl") {
+    if !matches!(key, "t" | "n" | "h" | "pub" | "seen" | "d" | "hl" | "pm") {
         crate::hlog_warning!(
             "[STORAGE] REJECTED per-bot key '{key}' for {uuid} (not in whitelist)\n",
             uuid = state.who('b', uuid)
@@ -534,7 +557,7 @@ fn update_entry_inner(
             "n" => MAX_NICK - 1,
             "pub" => COMBINED_KEY_B64,
             "hl" => HL_VALUE_MAX,
-            _ => 31, // seen/d/t: short numerics
+            _ => 31, // seen/d/t/pm: short numerics
         };
         let vlen = value.len();
         if vlen > cap {
@@ -553,6 +576,22 @@ fn update_entry_inner(
         }
     }
 
+    // A reported hostmask is a literal nick!user@host, never a pattern: the ban
+    // protection matches bans against it, so a '*' here would shield everyone.
+    if key == "h" && !value.is_empty() && !hostmask_literal(value) {
+        crate::hlog_warning!(
+            "[STORAGE] REJECTED per-bot 'h' for {uuid}: not a literal nick!user@host\n",
+            uuid = state.who('b', uuid)
+        );
+        return false;
+    }
+
+    // Only now, with the key and value known good, may the bot record exist:
+    // creating it first let any unknown key (a newer hub's N|/S| sync line
+    // read as "uuid|key|...") leave a phantom bot named after the tag.
+    if get_or_create_bot(state, uuid).is_none() {
+        return false;
+    }
     let bi = state
         .bots
         .iter()
@@ -568,16 +607,6 @@ fn update_entry_inner(
         return false;
     }
 
-    // A reported hostmask is a literal nick!user@host, never a pattern: the ban
-    // protection matches bans against it, so a '*' here would shield everyone.
-    if key == "h" && !value.is_empty() && !hostmask_literal(value) {
-        crate::hlog_warning!(
-            "[STORAGE] REJECTED per-bot 'h' for {uuid}: not a literal nick!user@host\n",
-            uuid = state.who('b', uuid)
-        );
-        return false;
-    }
-
     let op = safe_op(op);
     let combined = combined_value(key, value, extra, &op, false);
 
@@ -588,7 +617,10 @@ fn update_entry_inner(
     // deleted bot's nick, or a config reload that read 'n' after 'd|1',
     // re-registered the bot.  A deleted bot cannot check in (auth needs
     // is_active), so nothing legitimate depended on it.
-    let is_singleton = matches!(key, "n" | "a" | "p" | "h" | "d" | "pub" | "seen" | "hl");
+    let is_singleton = matches!(
+        key,
+        "n" | "a" | "p" | "h" | "d" | "pub" | "seen" | "hl" | "pm"
+    );
 
     let found = state.bots[bi].entries.iter().position(|e| {
         if is_singleton {
@@ -677,16 +709,41 @@ pub fn delete(state: &mut HubState, uuid: &str) -> Option<i64> {
 /// hub_generate_bot_payload(): global + bot-specific config for one bot.
 /// Global items carry no "b|uuid|" prefix, preserving protocol
 /// compatibility.
-pub fn generate_bot_payload(state: &HubState, uuid: &str) -> String {
+///
+/// pool: the bot takes N|/S| (POOL_MIN_BOT); it then always gets an N| line
+/// for POOL_DEFAULT_NET, the stored one or the default, which is how it knows
+/// this hub keeps the pool.
+pub fn generate_bot_payload(state: &HubState, uuid: &str, pool: bool) -> String {
     let mut out = String::with_capacity(4096);
 
     // 1. Global entries (channels; skip h/n/a/m/o — now in typed arrays — and
     //    the retired bot password p).
+    let mut have_default_net = false;
     for e in &state.global_entries {
         if matches!(e.key.as_str(), "h" | "n" | "a" | "m" | "o" | "p") {
             continue;
         }
+        if key_is_pool(&e.key) {
+            if !pool {
+                continue; // an older bot would keep them as unknown lines
+            }
+            if e.key == "N"
+                && e.value.starts_with(crate::pool_rec::POOL_DEFAULT_NET)
+                && e.value
+                    .as_bytes()
+                    .get(crate::pool_rec::POOL_DEFAULT_NET.len())
+                    == Some(&b'|')
+            {
+                have_default_net = true;
+            }
+        }
         out.push_str(&format!("{}|{}|{}\n", e.key, e.value, e.timestamp));
+    }
+    // No N| stored yet: the default (name not learned, split_wait 0), stamp 0
+    // so any real record beats it.
+    if pool && !have_default_net {
+        let d = crate::pool_rec::POOL_DEFAULT_NET;
+        out.push_str(&format!("N|{d}|{d}|||0|add|0\n"));
     }
     // K|: what the bots saw on IRC, after the c| lines it hangs off.
     learned_append(state, &mut out);
@@ -709,7 +766,7 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str) -> String {
     }
 
     // 1b. Admin flags and oper channel bindings, after the users they name.
-    crate::access::append(state, &mut out, None);
+    crate::access::append_bot(state, &mut out, pool);
 
     // 1b. purge_days setting, so bots can validate purge policies.
     out.push_str(&format!(
@@ -727,11 +784,15 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str) -> String {
         out.push_str(&format!("O|{}|{}\n", state.opt_flags, state.opt_flags_ts));
     }
 
-    // 2. This bot's own entries.  Skip h, n (hub-only metadata) and the
+    // 2. This bot's own entries.  Skip h, n, pm (hub-only metadata) and the
     //    global keys c, m, o, a, p.
     if let Some(b) = state.bots.iter().find(|b| b.uuid == uuid) {
         for e in &b.entries {
-            if matches!(e.key.as_str(), "h" | "n" | "c" | "m" | "o" | "a" | "p") {
+            // pm: the hub's migration mark, never the bot's
+            if matches!(
+                e.key.as_str(),
+                "h" | "n" | "c" | "m" | "o" | "a" | "p" | "pm"
+            ) {
                 continue;
             }
             out.push_str(&format!("{}|{}|{}\n", e.key, e.value, e.timestamp));
@@ -870,6 +931,14 @@ fn rec_op_ok(s: &str) -> bool {
 /// hub_record_valid(): syntax check of one stored C/D/B value (all fields,
 /// caps, charsets, op).  The single validator behind every ingest path.
 pub fn record_valid(key: &str, value: &str) -> bool {
+    // Server pool records: shape, caps, charsets and (S|) the derived uuid
+    // live in pool_rec, shared with the bot.
+    if key == "N" {
+        return crate::pool_rec::net_parse(value).is_some();
+    }
+    if key == "S" {
+        return crate::pool_rec::srv_parse(value).is_some();
+    }
     const BUF: usize = 1100;
     match key {
         "C" => rec_split(value, 4, BUF).is_some_and(|f| {
@@ -981,7 +1050,12 @@ fn evict_oldest_tombstone(state: &mut HubState, key: &str) -> bool {
     } else {
         TOMB_MIN_AGE_OFF
     };
-    let newest_ok = crate::cstr::now() - keep;
+    let mut newest_ok = crate::cstr::now() - keep;
+    // S| tombstones have their own MAX_POOL_TOMBS share and are never purged
+    // by age, so the oldest goes whatever its age.
+    if key == "S" {
+        newest_ok = i64::MAX;
+    }
     let mut best: Option<usize> = None;
     for (i, e) in state.global_entries.iter().enumerate() {
         if e.key != key || entry_active(e) || e.timestamp > newest_ok {
@@ -1017,7 +1091,7 @@ fn ban_ceiling(chan: &str) -> usize {
 /// MAX_GLOBAL_BANS, MAX_BANS_TOTAL), keeps the stored spelling of the
 /// channel/mask.  False = rejected or not newer.
 pub fn put_record(state: &mut HubState, key: &str, value: &str, ts: i64) -> bool {
-    if !key_is_modes(key) || ts <= 0 || crate::state::ts_ahead(ts) {
+    if !key_is_record(key) || ts <= 0 || crate::state::ts_ahead(ts) {
         return false;
     }
     if !record_valid(key, value) {
@@ -1049,12 +1123,32 @@ pub fn put_record(state: &mut HubState, key: &str, value: &str, ts: i64) -> bool
                 return false;
             }
         }
+        let is_s = key == "S";
+        if is_s
+            && in_active
+            && !entry_active(&state.global_entries[i])
+            && state.global_idx.n_s_live >= MAX_POOL_SERVERS
+        {
+            crate::hlog_warning!(
+                "[STORAGE] S| {} REJECTED (pool full: {MAX_POOL_SERVERS} live servers)\n",
+                state.global_entries[i].value
+            );
+            return false;
+        }
         let was_active = entry_active(&state.global_entries[i]);
         let e = &mut state.global_entries[i];
         e.value = norm;
         e.timestamp = ts;
         if key == "B" && was_active != in_active {
             gban_adjust(state, i, in_active);
+        }
+        if is_s && was_active != in_active {
+            let n = &mut state.global_idx.n_s_live;
+            *n = if in_active {
+                *n + 1
+            } else {
+                n.saturating_sub(1)
+            };
         }
         return true;
     }
@@ -1075,6 +1169,12 @@ pub fn put_record(state: &mut HubState, key: &str, value: &str, ts: i64) -> bool
             return false;
         }
     }
+    if key == "S" && in_active && state.global_idx.n_s_live >= MAX_POOL_SERVERS {
+        crate::hlog_warning!(
+            "[STORAGE] S| record REJECTED (pool full: {MAX_POOL_SERVERS} live servers)\n"
+        );
+        return false;
+    }
     if !global_room(state, key) && !(evict_oldest_tombstone(state, key) && global_room(state, key))
     {
         crate::hlog_warning!("[STORAGE] {key}| record REJECTED (max entries reached)\n");
@@ -1088,6 +1188,123 @@ pub fn put_record(state: &mut HubState, key: &str, value: &str, ts: i64) -> bool
     });
     global_note_new(state, state.global_entries.len() - 1);
     true
+}
+
+/// hub_pool_eligible_count(): usable S| entries of network `net_id`: live,
+/// state ok.
+pub fn pool_eligible_count(state: &HubState, net_id: &str) -> usize {
+    state
+        .global_entries
+        .iter()
+        .filter(|e| e.key == "S")
+        .filter_map(|e| crate::pool_rec::srv_parse(&e.value))
+        .filter(|s| !s.deleted && s.state == crate::pool_rec::PoolState::Ok && s.net_id == net_id)
+        .count()
+}
+
+/// hub_pool_bot_write(): a bot-pushed `S|<value>|<ts>` line's data (plan §4,
+/// §5.2, §5.6): opt h refused; ts 0 (migration) only when no record exists,
+/// stamped now; an existing entry keeps its admin fields (a bot sets add/del
+/// only); the last usable entry is never deleted by a bot.  On success the
+/// stored value and its stamp.
+pub fn pool_bot_write(
+    state: &mut HubState,
+    who: &str,
+    data: &str,
+    hub_only: bool,
+    migrate_ok: bool,
+) -> Option<(String, i64)> {
+    use crate::pool_rec::{PoolState, srv_format, srv_parse};
+    let bar = data.rfind('|')?;
+    if bar >= crate::pool_rec::POOL_S_LINE_MAX {
+        return None;
+    }
+    let value = &data[..bar];
+    let ts_text = &data[bar + 1..];
+    // strtoll(..., &end, 10) with *end == '\0': the digits must be all of it
+    // ("" reads as 0, as in C).
+    let (ts0, used) = crate::cstr::strtoll(ts_text);
+    let parsed = srv_parse(value);
+    let (mut ts, inp) = match parsed {
+        Some(p) if used == ts_text.len() && ts0 >= 0 => (ts0, p),
+        _ => {
+            crate::hlog_warning!("[POOL] Ignored malformed S| record from {who}\n");
+            return None;
+        }
+    };
+    // Opt 'h': the pool is the console's, except a bot's one-time migration
+    // of its 2.5.3 s| lines (stamp 0, inside its POOL_MIGRATE_WINDOW; the
+    // caller decides migrate_ok).  Stamp 0 never beats anything held, so a
+    // migration only adds servers nobody knew of.  Removed with the
+    // migration in 2.5.5.
+    if hub_only && (ts != 0 || !migrate_ok) {
+        crate::hlog_warning!(
+            "[POOL] opt 'h' active: REJECTED bot-pushed S| record from {who} ({})\n",
+            if ts == 0 {
+                "its migration window is over"
+            } else {
+                "the pool is managed on the hub console"
+            }
+        );
+        return None;
+    }
+    let i = global_find(state, "S", value);
+    let cur = i.and_then(|i| srv_parse(&state.global_entries[i].value));
+    let migrated = ts == 0;
+    if ts == 0 {
+        // A migrated local server: never over anything held, a tombstone
+        // above all (plan D15).
+        if i.is_some() || inp.deleted {
+            return None;
+        }
+        ts = crate::cstr::now();
+    }
+    let next = match &cur {
+        Some(c) => {
+            // weight, max, state, seen stay the admin's
+            let mut n = c.clone();
+            n.deleted = inp.deleted;
+            n
+        }
+        None => {
+            if inp.deleted {
+                return None;
+            }
+            let mut n = inp;
+            n.state = PoolState::Ok; // a bot cannot flag or disable an entry
+            n.seen.clear();
+            n
+        }
+    };
+    if let Some(c) = &cur
+        && next.deleted
+        && !c.deleted
+        && c.state == PoolState::Ok
+        && pool_eligible_count(state, &c.net_id) <= 1
+    {
+        crate::hlog_warning!(
+            "[POOL] REJECTED {who} deleting {}: the last usable server of network {}\n",
+            c.host,
+            c.net_id
+        );
+        return None;
+    }
+    let out = srv_format(&next)?;
+    if !put_record(state, "S", &out, ts) {
+        return None;
+    }
+    crate::hlog_info!(
+        "[POOL] {who} {} server {} ({}){}\n",
+        if next.deleted { "removed" } else { "added" },
+        next.host,
+        next.uuid,
+        if migrated {
+            ", migrated from its s| list"
+        } else {
+            ""
+        }
+    );
+    Some((out, ts))
 }
 
 /// hub_chan_live(): the stored spelling of `chan` when it has a live c|
@@ -1393,11 +1610,10 @@ mod tests {
     fn per_bot_whitelist_and_caps() {
         let mut s = st();
         assert!(update_entry(&mut s, "bot-1", "n", "nick", "", "", 100));
-        // Not in {t,n,h,pub,seen,d}: the entry is refused.  The bot record
-        // itself is still created, as in the C hub — the bound is on entries.
+        // Not in {t,n,h,pub,seen,d,hl,pm}: the entry is refused, and (2.5.4,
+        // as in the C hub) no bot record is created for it either.
         assert!(!update_entry(&mut s, "bot-2", "zz", "x", "", "", 100));
-        let b2 = s.bots.iter().find(|b| b.uuid == "bot-2").unwrap();
-        assert!(b2.entries.is_empty());
+        assert!(!s.bots.iter().any(|b| b.uuid == "bot-2"));
         // Over the per-key value cap.
         assert!(!update_entry(
             &mut s,
@@ -1531,7 +1747,7 @@ mod tests {
 
         // Before flags: the admin is a full admin (access::migrate).
         crate::access::migrate(&mut s);
-        let v2 = generate_bot_payload(&s, "me");
+        let v2 = generate_bot_payload(&s, "me", false);
         assert!(v2.contains("c|#chan|key|0|add|100\n"));
         assert!(v2.contains(&format!(
             "a|11111111-2222-3333-4444-555555555555|rob|{k}|add|10|20|\n"
@@ -1553,9 +1769,67 @@ mod tests {
     fn bot_payload_never_trusts_the_bot_itself() {
         let mut s = st();
         update_entry(&mut s, "me", "h", "mybot!u@h", "", "", 100);
-        let p = generate_bot_payload(&s, "me");
+        let p = generate_bot_payload(&s, "me", false);
         assert!(!p.contains("b|mybot!u@h|me"));
         assert!(p.ends_with("T|0\n"));
+    }
+
+    /// Server pool (2.5.4): N|/S| only for a pool bot, with the default N|
+    /// when none is stored; pm| never; an unknown per-bot key makes no bot.
+    #[test]
+    fn pool_payload_and_per_bot_whitelist() {
+        let mut s = st();
+        let uuid = "11111111-2222-3333-4444-555555555555";
+        // An unknown key (a newer hub's sync line read per bot) creates nothing.
+        assert!(!update_entry(&mut s, "S", "zz", "1", "", "", 100));
+        assert!(!update_entry(&mut s, uuid, "zz", "1", "", "", 100));
+        assert!(s.bots.is_empty());
+        assert!(update_entry(&mut s, uuid, "pm", "1000", "", "", 100));
+        let old = generate_bot_payload(&s, uuid, false);
+        assert!(!old.contains("N|") && !old.contains("pm|"));
+        let p = generate_bot_payload(&s, uuid, true);
+        assert!(
+            p.starts_with("N|main|main|||0|add|0\n") || p.contains("\nN|main|main|||0|add|0\n")
+        );
+        assert!(!p.contains("pm|"));
+        let su = crate::pool_rec::srv_uuid("main", "irc.x.net", 6667).unwrap();
+        let v = format!("{su}|main|irc.x.net|6667|1|0|ok||add");
+        assert!(put_record(&mut s, "S", &v, 200));
+        assert!(generate_bot_payload(&s, uuid, true).contains(&format!("S|{v}|200\n")));
+        assert!(!generate_bot_payload(&s, uuid, false).contains("S|"));
+    }
+
+    /// hub_pool_bot_write: stamp 0 never over a held record, opt h refuses
+    /// all but an open migration, a bot keeps the admin fields, and the last
+    /// usable server is never deleted by a bot.
+    #[test]
+    fn pool_bot_write_rules() {
+        let mut s = st();
+        let su = crate::pool_rec::srv_uuid("main", "irc.x.net", 6667).unwrap();
+        let add = format!("{su}|main|irc.x.net|6667|5|3|ok||add");
+        let del = format!("{su}|main|irc.x.net|6667|5|3|ok||del");
+        assert!(pool_bot_write(&mut s, "b", &format!("{add}|5"), true, false).is_none());
+        assert!(pool_bot_write(&mut s, "b", &format!("{add}|0"), true, false).is_none());
+        let (v, ts) = pool_bot_write(&mut s, "b", &format!("{add}|0"), true, true).unwrap();
+        assert!(ts > 0 && v == add);
+        // a second migration add loses to what is held
+        assert!(pool_bot_write(&mut s, "b", &format!("{add}|0"), false, true).is_none());
+        // the last usable entry: a bot cannot delete it
+        assert!(pool_bot_write(&mut s, "b", &format!("{del}|{}", ts + 1), false, false).is_none());
+        // with a second one it can, and the admin's weight/max stay
+        let su2 = crate::pool_rec::srv_uuid("main", "irc.y.net", 6667).unwrap();
+        let add2 = format!("{su2}|main|irc.y.net|6667|1|0|ok||add");
+        assert!(pool_bot_write(&mut s, "b", &format!("{add2}|{}", ts), false, false).is_some());
+        let mine = format!("{su}|main|irc.x.net|6667|1|0|ok||del");
+        let (v, _) =
+            pool_bot_write(&mut s, "b", &format!("{mine}|{}", ts + 1), false, false).unwrap();
+        assert_eq!(v, del);
+        // a bot cannot flag an entry it adds
+        let su3 = crate::pool_rec::srv_uuid("main", "irc.z.net", 6667).unwrap();
+        let flag = format!("{su3}|main|irc.z.net|6667|1|0|wrongnet|X|add");
+        let (v, _) = pool_bot_write(&mut s, "b", &format!("{flag}|{}", ts), false, false).unwrap();
+        assert!(v.contains("|ok||add"));
+        assert_eq!(pool_eligible_count(&s, "main"), 2);
     }
 
     #[test]

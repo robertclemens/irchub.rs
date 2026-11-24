@@ -225,7 +225,8 @@ fn hex32(h: &[u8; 32]) -> String {
 /// S moves only when a frame is written (`queue::cfg_frame_written`).
 pub fn send_config_to_bot(state: &mut HubState, ci: usize, force: bool) {
     let id = state.clients[ci].id.clone();
-    let payload = Zeroizing::new(storage::generate_bot_payload(state, &id));
+    let pool = crate::mesh::bot_version_takes_pool(&state.clients[ci].bot_version);
+    let payload = Zeroizing::new(storage::generate_bot_payload(state, &id, pool));
     if payload.is_empty() {
         crate::hlog_warning!(
             "[HUB] No config to send to {id}\n",
@@ -579,6 +580,46 @@ fn push_sync(state: &mut HubState, s: &mut String, fd: i32, line: &str) {
     s.push_str(line);
 }
 
+/// A bot's migration of its 2.5.3 s| list (stamp-0 S| lines, sent once on
+/// its first pool-aware link): the first such line stamps pm|<now> on the
+/// bot, mesh-wide; under opt 'h' its lines are taken for POOL_MIGRATE_WINDOW
+/// after that, never later (2.5.5 ends this opt 'h' exception).  False also
+/// for a bot with no record.  C `pool_migrate_gate`.
+fn pool_migrate_gate(state: &mut HubState, ci: usize, buf: &mut String, updates: &mut u32) -> bool {
+    let id = state.clients[ci].id.clone();
+    let fd = state.clients[ci].fd;
+    let Some(b) = state.bots.iter().find(|b| b.uuid == id) else {
+        return false;
+    };
+    let pm = b.entry("pm").map(|e| e.value.clone());
+    let now_ts = crate::cstr::now();
+    let Some(pm) = pm else {
+        let v = now_ts.to_string();
+        let ts = crate::state::lww_next_ts(0);
+        if !crate::storage::update_entry(state, &id, "pm", &v, "", "", ts) {
+            return false;
+        }
+        *updates += 1;
+        push_sync(state, buf, fd, &format!("b|{id}|pm|{v}|{ts}\n"));
+        crate::hlog_info!(
+            "[POOL] {} is migrating its s| list to the pool\n",
+            state.who_client(ci)
+        );
+        return true;
+    };
+    #[cfg(feature = "test-hooks")]
+    // A sandbox cannot wait 5 minutes to see a second offer refused.
+    let window = std::env::var("IRCHUB_TEST_POOL_MIGRATE_WINDOW")
+        .ok()
+        .map(|v| i64::from(crate::cstr::atoi(&v)))
+        .filter(|v| *v > 0)
+        .unwrap_or(POOL_MIGRATE_WINDOW);
+    #[cfg(not(feature = "test-hooks"))]
+    let window = POOL_MIGRATE_WINDOW;
+    let (first, used) = crate::cstr::strtoll(&pm);
+    used == pm.len() && first <= now_ts && now_ts - first <= window
+}
+
 /// The v| protocol a config push carries (0 when unreadable), -1 when it has
 /// no v| line.
 fn push_proto(payload: &str) -> i64 {
@@ -812,6 +853,31 @@ fn process_bot_config_push(state: &mut HubState, ci: usize, payload: &str) {
                     updates += 1;
                     push_sync(state, &mut sync_buffer, fd, &format!("B|{bval}|{bts}\n"));
                 }
+            }
+            'S' => {
+                // Server pool entry (plan §4): storage::pool_bot_write holds
+                // the rules.  A stamp-0 line is the bot's migration of its s|
+                // list: pool_migrate_gate marks the first one (pm|) and says
+                // whether opt 'h' still takes it.
+                let migrate_ok = data.rfind('|').is_some_and(|b| &data[b + 1..] == "0")
+                    && pool_migrate_gate(state, ci, &mut sync_buffer, &mut updates);
+                let who = state.who_client(ci);
+                if let Some((sval, sts)) = crate::storage::pool_bot_write(
+                    state,
+                    &who,
+                    data,
+                    hub_only_mutations,
+                    migrate_ok,
+                ) {
+                    updates += 1;
+                    push_sync(state, &mut sync_buffer, fd, &format!("S|{sval}|{sts}\n"));
+                }
+            }
+            'N' => {
+                crate::hlog_warning!(
+                    "[HUB] Ignored bot-pushed 'N' record from {id} (console only)\n",
+                    id = state.who_client(ci)
+                );
             }
             'C' | 'D' => {
                 // Channel settings and network defaults are written by the
@@ -1325,6 +1391,13 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
             }
         }
         CMD_BOT_PRESENCE => presence::process_bot_presence(state, ci, payload),
+        CMD_SERVER_REPORT => crate::pool::server_report(state, ci, payload),
+        CMD_BOT_IRC_LINK => {
+            if crate::pool::irc_link(state, ci, payload) {
+                presence::roster_mark_dirty(state, true);
+                presence::presence_event(state);
+            }
+        }
         // Phase 5: the bot's tree diverged from a delta — send it the whole one.
         CMD_BOT_TREE_PULL => presence::tree_pull(state, ci),
         CMD_ACTIVITY => crate::activity::process(state, ci, payload),
@@ -1645,6 +1718,7 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         }
         CMD_PEER_SYNC => mesh::process_peer_sync(state, payload, fd, false),
         CMD_PEER_BCAST => mesh::process_peer_sync(state, payload, fd, true),
+        CMD_SERVER_REPORT => crate::pool::peer_report(state, ci, payload),
         CMD_MESH_STATE => mesh::process_mesh_state(state, ci, payload),
         CMD_BOT_ROSTER => {
             presence::process_bot_roster(state, ci, payload);

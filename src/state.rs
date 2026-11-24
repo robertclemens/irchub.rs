@@ -374,6 +374,9 @@ pub struct ChanElect {
     pub reply_fd: i32,
     pub reply_serial: u64,
     pub reply_rid: String,
+    /// The requesting bot's OWN op / invite / key / unban (CMD_CHAN_REQUEST
+    /// with a rid, 2.5.4): answered ok / none / denied, never fail.
+    pub reply_own: bool,
     /// kind "ban" (ban add / channel ban): the record just stored, for the
     /// ban.added answer the console gets when the election ends.
     pub ban_expires: i64,
@@ -1002,6 +1005,10 @@ pub struct BotRoster {
     pub round: i64,
     /// Arrival order vs presence v2 records (`P2State::stamp_ctr`).
     pub p2_stamp: u64,
+    /// pool: the entry its IRC link uses (i|)
+    pub irc_entry: String,
+    /// pool: connecting / up / down / idle
+    pub irc_link: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1264,13 @@ pub struct HubClient {
     /// never reports simply shows blank fields in the tree.  Never persisted.
     pub bot_version: String,
     pub bot_server: String,
+    /// Server pool (CMD_BOT_IRC_LINK, volatile): the pool entry the bot's IRC
+    /// link uses and its state ("connecting"/"up"/"down"/"idle", "" =
+    /// unknown).
+    pub bot_irc_entry: String,
+    pub bot_irc_link: String,
+    /// Had the current CMD_POOL_VIEW.
+    pub pool_view_sent: bool,
     /// "c" / "rs", empty = unreported.
     pub bot_variant: String,
     pub bot_cron: String,
@@ -1394,6 +1408,9 @@ impl HubClient {
             bw_bytes_in_window: 0,
             bot_version: String::new(),
             bot_server: String::new(),
+            bot_irc_entry: String::new(),
+            bot_irc_link: String::new(),
+            pool_view_sent: false,
             bot_variant: String::new(),
             bot_cron: String::new(),
             cron_sent: 0,
@@ -1597,6 +1614,14 @@ pub struct HubState {
     pub hub_cron_setting: i32,
     pub bot_cron_ts: i64,
     pub hub_cron_ts: i64,
+    /// hs|sgrant: 1 once every +b admin was given +s (server pool plan D11).
+    pub sgrant_setting: i32,
+    pub sgrant_ts: i64,
+    /// Server pool (pool.rs, volatile): the wrong-network strike lists per
+    /// entry, and the last CMD_POOL_VIEW sent (when, and its SHA-256).
+    pub pool_strikes: Vec<crate::pool::PoolStrikes>,
+    pub pool_view_last_sent: i64,
+    pub pool_view_hash: [u8; 32],
     pub cron_recs: Vec<CronRec>,
     /// The plan as every hub knows it: this hub's own copy of what its driver
     /// last published, and when it last heard the driver.
@@ -1628,6 +1653,13 @@ pub struct HubState {
     pub follow_prepared: i64,
     /// The run whose restart made this process.
     pub upgrade_installed_id: String,
+    /// That run's RESULT (status, detail), sent on every peer link that comes
+    /// up until `upgrade_report_until` (UPGRADE_RESULT_RESEND s after the
+    /// restart: the first link alone may be gone or still settling); the
+    /// driver drops the copies.
+    pub upgrade_report_status: String,
+    pub upgrade_report_detail: String,
+    pub upgrade_report_until: i64,
     /// Nodes below this hub in the followed run's fan-out tree (its own
     /// peers' subtrees).  Rebuilt for every run; see [`UpgradeRoute`].
     pub follow_routes: Vec<UpgradeRoute>,
@@ -1843,6 +1875,9 @@ impl HubState {
             follow_self_ready: false,
             follow_prepared: 0,
             upgrade_installed_id: String::new(),
+            upgrade_report_status: String::new(),
+            upgrade_report_detail: String::new(),
+            upgrade_report_until: 0,
             follow_routes: Vec::new(),
             rollup: PendingRollup::default(),
             rollup_tries: Vec::new(),
@@ -1867,6 +1902,11 @@ impl HubState {
             hub_cron_setting: 0,
             bot_cron_ts: 0,
             hub_cron_ts: 0,
+            sgrant_setting: 0,
+            sgrant_ts: 0,
+            pool_strikes: vec![crate::pool::PoolStrikes::default(); MAX_POOL_SERVERS],
+            pool_view_last_sent: 0,
+            pool_view_hash: [0; 32],
             cron_recs: Vec::new(),
             splan: Default::default(),
             splan_seen: 0,

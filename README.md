@@ -76,6 +76,7 @@ ssh -i <ts>_admin_ed25519 -o IdentitiesOnly=yes -p 8001 admin@hub1.example.net
 hub add <ip> <port> <uuid> <name> <pubkey>     # link a hub (from its -id); do it on both hubs,
                                                # the link comes up on the next dial (up to 2 min)
 bot add <nick> <uuid> <pubkey>                 # register a bot (from its ircbot -id)
+server add irc.example.net:6697                # the IRC servers every bot dials from
 channel add #demo                              # every bot joins
 user add admin|oper <name> <pubkey> <mask> …   # more admins and opers
 
@@ -88,9 +89,9 @@ user add admin|oper <name> <pubkey> <mask> …   # more admins and opers
 2. **Hub.** `./irchub -setup` in the hub's directory. It makes the hub's own keypair (the private key lives only inside the encrypted config), registers the first admin and exits. `./irchub` starts it.
 3. **Console.** `ssh -i <ts>_<name>_ed25519 -p <port> <name>@<hub>`. On first login, compare the host key with `./irchub -id` or `keygen --ssh-fingerprint hub_public.b64`. Only admins log in. `TERM=dumb` gives a plain line mode for scripts.
 4. **More hubs.** Set each one up the same way, then `hub add` each hub on the other.
-5. **Bots.** On the bot's machine, `ircbot -setup` (hub-managed) asks for each hub's address and public key, and prints the bot's UUID and key. Then run `bot add` in the console. The bot gets everything else from the hub. Hub-managed is the recommended way to run bots.
+5. **Bots.** On the bot's machine, `ircbot -setup` (hub-managed) asks for each hub's address and public key, and prints the bot's UUID and key. Then run `bot add` in the console. The bot gets everything else from the hub, its IRC servers included (`server add`; the bots spread over them and check the network's `NETWORK=` name). Hub-managed is the recommended way to run bots.
 
-Admin flags: `+a` is a full admin. Otherwise pick letters: `b` bots, `c` channels, `h` hub, `o` opers, `u` upgrades. Opers are bound to `*` or a channel list. `option set h` limits all user, mask, key and channel changes to the hub console.
+Admin flags: `+a` is a full admin. Otherwise pick letters: `b` bots, `c` channels, `h` hub, `o` opers, `s` servers, `u` upgrades. Opers are bound to `*` or a channel list. `option set h` limits all user, mask, key and channel changes to the hub console.
 
 ## Commanding bots from IRC
 

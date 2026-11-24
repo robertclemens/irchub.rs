@@ -472,6 +472,7 @@ fn maintenance(state: &mut HubState) {
     // Bot presence: gossip our own bots to the peers, expire entries nobody
     // refreshed, and push the tree to bots when it changed.  All volatile.
     presence::presence_tick(state, t);
+    irchub::pool::view_tick(state, t); // server pool load to the bots
 
     // Rolling network upgrade: one step per tick (no-op unless running).
     upgrade::tick(state, t);
@@ -1115,6 +1116,7 @@ fn run(mut state: HubState, password: Zeroizing<String>, stop: &Arc<AtomicBool>)
     }
     irchub::uhist::boot(&mut state);
     irchub::upgrade::plan_boot(&mut state);
+    irchub::access::sgrant_once(&mut state); // 2.5.4: +b admins get +s, once per mesh
     irchub::presence2::init(&mut state); // bumps the boot counter: after the config gave us our uuid
     drop(password);
     logging::set_levels(state.log_level, state.console_log_level);

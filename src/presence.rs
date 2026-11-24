@@ -430,6 +430,15 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
     }
 
     let c = &mut state.clients[ci];
+    // The bot's first config may have gone out before its version was known:
+    // once it shows it takes the pool (or stops), it is owed one with
+    // (without) the N|/S| lines — a delta, since it already holds a base.
+    if crate::mesh::bot_version_takes_pool(&c.bot_version)
+        != crate::mesh::bot_version_takes_pool(&version)
+    {
+        c.cfg_owed = true;
+        queue::cfg_owed_set();
+    }
     let changed = c.bot_version != version
         || c.bot_server != server
         || c.bot_variant != variant
@@ -684,8 +693,29 @@ fn roster_round(state: &HubState, round: i64, total: Option<usize>) -> Option<Ve
             },
             c.bot_link_ord
         );
-        if row.len() >= TREE_ROW_MAX + CRON_STATUS_MAX + 48 {
+        // + the i| line
+        const ROW_CAP: usize = TREE_ROW_MAX + CRON_STATUS_MAX + 48 + 128;
+        if row.len() >= ROW_CAP {
             continue; // an unrepresentable row
+        }
+        let mut row = row;
+        // Server pool: the IRC link's entry and state, on the row's heels so
+        // a chunk never splits the two (an older hub skips the i| tag).
+        if !c.bot_irc_link.is_empty() {
+            let il = format!(
+                "i|{}|{}|{}|{}|\n",
+                c.id,
+                crate::pool_rec::POOL_DEFAULT_NET,
+                if c.bot_irc_entry.is_empty() {
+                    "-"
+                } else {
+                    &c.bot_irc_entry
+                },
+                c.bot_irc_link
+            );
+            if il.len() < ROW_CAP - row.len() {
+                row.push_str(&il);
+            }
         }
         if frame.len() + row.len() >= ROSTER_FRAME_BUDGET && rows > 0 {
             // Full: flush and start the next chunk.
@@ -975,6 +1005,34 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
         if line.starts_with("k|") {
             continue; // capabilities: every hub answers a roll call
         }
+        if let Some(body) = line.strip_prefix("i|") {
+            // Server pool: a bot's IRC link, right after its b| row (upserted
+            // above).
+            if hub_uuid.is_empty() || hub_uuid == "-" {
+                continue;
+            }
+            use crate::admin::wire_field;
+            use crate::pool_rec::POOL_UUID_LEN;
+            let (Some(bu), Some(ent), Some(lk)) = (
+                wire_field(body, 0, 64),
+                wire_field(body, 2, POOL_UUID_LEN + 2),
+                wire_field(body, 3, POOL_LINK_WORD_MAX + 2),
+            ) else {
+                continue;
+            };
+            if !crate::pool::link_word_ok(&lk) || (ent != "-" && ent.len() != POOL_UUID_LEN) {
+                continue;
+            }
+            if let Some(e) = state
+                .roster
+                .iter_mut()
+                .find(|e| e.bot_uuid == bu && e.hub_uuid == hub_uuid)
+            {
+                e.irc_entry = roster_clean(if ent == "-" { "" } else { &ent }, POOL_UUID_LEN + 1);
+                e.irc_link = trunc_string(&lk, 12);
+            }
+            continue;
+        }
         if let Some(v) = line.strip_prefix("c|") {
             // The production crontab line of the hub whose h| header opened it.
             let hc = roster_clean(v, CRON_STATUS_MAX + 1);
@@ -1134,6 +1192,9 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
                 _ => 0,
             },
             p2_stamp: 0,
+            // The i| line after the row fills these (pool, 2.5.4).
+            irc_entry: String::new(),
+            irc_link: String::new(),
         };
         roster_upsert(state, e);
     }

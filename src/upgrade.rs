@@ -98,6 +98,7 @@ pub fn admin_cmd_mutates_config(cmd: u8) -> bool {
             | CMD_ADMIN_CHAN_SET
             | CMD_ADMIN_BAN
             | CMD_ADMIN_NET_SET
+            | CMD_ADMIN_POOL
     )
 }
 
@@ -1403,15 +1404,26 @@ pub fn note_result(state: &mut HubState, payload: &str) {
     // own ABORT — is logged and dropped: a finished node must never be turned
     // back into a failure by noise (run 83aac614's eb04).
     if state.upgrade.nodes[ni].state != UpgradeNodeState::Committed {
-        crate::hlog_info!(
+        // A node already finished: most often a restarted hub's RESULT sent
+        // again on another link (UPGRADE_RESULT_RESEND) — a copy, not news.
+        let ns = state.upgrade.nodes[ni].state;
+        let line = format!(
             "[UPGRADE] {} reports {} ({}) while {} — ignored{}{}\n",
             state.who('\0', uuid),
             status,
             f[3],
-            state.upgrade.nodes[ni].state.name(),
+            ns.name(),
             if detail.is_empty() { "" } else { ": " },
             detail
         );
+        if matches!(
+            ns,
+            UpgradeNodeState::Done | UpgradeNodeState::Failed | UpgradeNodeState::Unable
+        ) {
+            crate::hlog_debug!("{}", line);
+        } else {
+            crate::hlog_info!("{}", line);
+        }
         return;
     }
     let who = state.who('\0', uuid);
@@ -5030,6 +5042,18 @@ pub fn report_pending(state: &mut HubState, ci: usize) {
         queue::send_urgent(&mut state.clients[ci], CMD_UPGRADE_FORGET, &fwd);
     }
     let Some((id, want, want_variant)) = update::take_pending() else {
+        // Already reported: the same RESULT on this link too, for a while.
+        if !state.upgrade_installed_id.is_empty()
+            && !state.upgrade_report_status.is_empty()
+            && now() < state.upgrade_report_until
+        {
+            let (id, status, detail) = (
+                state.upgrade_installed_id.clone(),
+                state.upgrade_report_status.clone(),
+                state.upgrade_report_detail.clone(),
+            );
+            answer_result(state, ci, &id, &status, &detail);
+        }
         return;
     };
     state.upgrade_installed_id = id.clone();
@@ -5051,6 +5075,9 @@ pub fn report_pending(state: &mut HubState, ci: usize) {
     } else {
         update::failback_note().unwrap_or_else(|| format!("wanted {wanted}"))
     };
+    state.upgrade_report_status = status.to_string();
+    state.upgrade_report_detail = detail.clone();
+    state.upgrade_report_until = now() + UPGRADE_RESULT_RESEND;
     answer_result(state, ci, &id, status, &detail);
 }
 

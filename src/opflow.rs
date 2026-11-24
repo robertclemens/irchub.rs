@@ -551,8 +551,19 @@ pub fn process_forward_op_failed(state: &mut HubState, payload: &str) {
 // Channel-access requests (unban / invite / key)
 // ---------------------------------------------------------------------------
 
+/// A bot's own request: unban / invite / key, and (2.5.4, with a rid) op.
 pub(crate) fn chan_kind_valid(kind: &str) -> bool {
-    matches!(kind, "unban" | "invite" | "key")
+    matches!(kind, "unban" | "invite" | "key" | "op")
+}
+
+/// The answer to a bot's own request (rid set): CMD_USER_CHAN_RESULT
+/// rid|ok|detail, rid|none|detail or rid|denied|detail.
+fn chan_own_answer(state: &mut HubState, ci: usize, rid: &str, status: &str, detail: &str) {
+    if rid.is_empty() {
+        return;
+    }
+    let res = trunc_string(&format!("{rid}|{status}|{detail}"), 256);
+    crate::client::send_cmd_to_bot(&mut state.clients[ci], CMD_USER_CHAN_RESULT, &res);
 }
 
 /// add_pending_chan_request(): reuse a slot whose reply never came rather
@@ -722,22 +733,54 @@ pub(crate) fn chan_request_dispatch(
 /// bot's own records, so a bot can neither request an unban for a mask that
 /// is not its own nor have a third party invited.
 pub fn process_chan_request(state: &mut HubState, ci: usize, payload: &str) {
-    let conv = sscanf(payload, &[Fmt::Set(7, b"|"), Fmt::Lit("|"), Fmt::Word(64)]);
+    // Payload from a bot: `kind|channel`, or (2.5.4) `kind|channel|rid`, the
+    // rid asking for an answer.  Everything that could be forged is resolved
+    // here from the authenticated bot's own records.
     let id = state.clients[ci].id.clone();
-    if conv.len() != 2 || !chan_kind_valid(conv[0].s()) {
+    let nf = crate::admin::mf_field_count(payload);
+    let f = |i: usize, cap: usize| crate::admin::wire_field(payload, i, cap);
+    let parsed = match (nf, f(0, 8), f(1, MAX_CHAN)) {
+        (2 | 3, Some(k), Some(c)) if chan_kind_valid(&k) => {
+            let rid = if nf == 3 {
+                f(2, USER_CHAN_RID_MAX + 1)
+            } else {
+                Some(String::new())
+            };
+            rid.map(|r| (k, c, r))
+        }
+        _ => None,
+    };
+    let Some((kind, channel, rid)) = parsed else {
         crate::hlog_warning!(
             "[HUB] Invalid CHAN_REQUEST payload from {id}\n",
             id = state.who_client(ci)
         );
         return;
+    };
+    if !rid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        crate::hlog_warning!(
+            "[HUB] CHAN_REQUEST from {id}: bad request id\n",
+            id = state.who_client(ci)
+        );
+        return;
     }
-    let kind = conv[0].s().to_string();
-    let channel = conv[1].s().to_string();
-    if !channel.starts_with('#') && !channel.starts_with('&') {
+    // op is the 2.5.4 election form only: a bot sends it with a rid
+    if kind == "op" && rid.is_empty() {
+        crate::hlog_warning!(
+            "[HUB] CHAN_REQUEST op from {id} without a request id\n",
+            id = state.who_client(ci)
+        );
+        return;
+    }
+    if (!channel.starts_with('#') && !channel.starts_with('&'))
+        || channel.contains(' ')
+        || channel.contains(',')
+    {
         crate::hlog_warning!(
             "[HUB] CHAN_REQUEST from {id} for non-channel '{channel}'\n",
             id = state.who_client(ci)
         );
+        chan_own_answer(state, ci, &rid, "denied", "not a channel");
         return;
     }
 
@@ -755,13 +798,15 @@ pub fn process_chan_request(state: &mut HubState, ci: usize, payload: &str) {
             "[HUB] No hostmask for {id} — cannot service unban for {channel}\n",
             id = state.who_client(ci)
         );
+        chan_own_answer(state, ci, &rid, "none", "no hostmask on file");
         return;
     }
-    if kind == "invite" && nick.is_empty() {
+    if (kind == "invite" || kind == "op") && nick.is_empty() {
         crate::hlog_warning!(
-            "[HUB] No nick for {id} — cannot service invite for {channel}\n",
+            "[HUB] No nick for {id} — cannot service {kind} for {channel}\n",
             id = state.who_client(ci)
         );
+        chan_own_answer(state, ci, &rid, "none", "no nick on file");
         return;
     }
 
@@ -770,8 +815,24 @@ pub fn process_chan_request(state: &mut HubState, ci: usize, payload: &str) {
         id = state.who_client(ci)
     );
     // One bot answers it (CMD_CHAN_PROBE).
-    if crate::elect::start(state, &kind, &channel, &id, &nick, &hostmask, None).is_none() {
+    let Some(ei) = crate::elect::start(state, &kind, &channel, &id, &nick, &hostmask, None) else {
         crate::hlog_warning!("[CHANREQ] Election table full — dropping {kind} for {channel}\n");
+        chan_own_answer(
+            state,
+            ci,
+            &rid,
+            "none",
+            "too many channel requests in flight",
+        );
+        return;
+    };
+    if !rid.is_empty() {
+        let (fd, serial) = (state.clients[ci].fd, state.clients[ci].conn_serial);
+        let e = &mut state.chan_elections[ei];
+        e.reply_fd = fd;
+        e.reply_serial = serial;
+        e.reply_own = true;
+        e.reply_rid = rid;
     }
 }
 
@@ -1087,7 +1148,9 @@ mod tests {
         assert!(chan_kind_valid("unban"));
         assert!(chan_kind_valid("invite"));
         assert!(chan_kind_valid("key"));
-        assert!(!chan_kind_valid("op"));
+        // 2.5.4: a bot's own op goes through the election (with a rid)
+        assert!(chan_kind_valid("op"));
+        assert!(!chan_kind_valid("kick"));
         assert!(!chan_kind_valid(""));
     }
 

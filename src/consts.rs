@@ -304,7 +304,7 @@ pub const CMD_ADMIN_SET_USERKEY: u8 = 0x55;
 /// volatile runtime facts: parking them in the LWW config would persist them
 /// to disk, replicate them with tombstones, drag them through the purge
 /// policy and leave a dead hub's bots reading "online, uptime 40d" forever.
-/// They also do not belong in the per-bot ingest whitelist {t,n,h,pub,seen,d}
+/// They also do not belong in the per-bot ingest whitelist {t,n,h,pub,seen,d,hl,pm}
 /// -- that bound is what makes the payload ceilings below provable.
 ///
 /// So presence rides its own gossip: every hub reports the bots currently
@@ -372,6 +372,29 @@ pub const CMD_CHAN_ELECT_DONE: u8 = 0x74;
 pub const CMD_CHAN_WHO: u8 = 0x95;
 /// Joined body: 500 nicks + topic + key.
 pub const CHAN_WHO_MAX: usize = 32768;
+// Server pool (2.5.4, irchub docs/plans/2026-10-29_server_pool_plan.md §4).
+// Bot -> hub, sent only to a hub that gave the link an N| (so never to 2.5.3):
+//   <entry_uuid>|<kind>|<network>|<server>   kind ok / wrongnet / unverified
+// pool.rs: ok names an unlearned network; wrongnet/unverified from
+// POOL_STRIKES_NEEDED distinct bots (or the only bot) flags the entry.  Hub ->
+// hub (2.5.4 peers only) a new strike is forwarded and passed on:
+//   <bot_uuid>|<entry_uuid>|<kind>|<network>|<server>
+pub const CMD_SERVER_REPORT: u8 = 0x86;
+// Bot -> hub, volatile, gated like CMD_SERVER_REPORT:
+//   <net_id>|<entry_uuid>|<link>|<vs>   link connecting/up/down/idle; vs is
+//   the servers the bot sees friends on (split detection, 2.5.5: empty now).
+// Gossiped hub <-> hub as a roster i| line after the bot's b| row (2.5.3 hubs
+// skip unknown roster tags).
+pub const CMD_BOT_IRC_LINK: u8 = 0x96;
+// Hub -> bot (pool bots only), volatile: the load on each pool entry, one
+//   E|<entry_uuid>|<up>|<connecting>\n
+// per live entry.  up counts the bots on the entry's real servers (two names
+// for one server share it).  Built from this hub's bots and the roster, sent
+// on change at most every POOL_VIEW_GAP s, whole each time.  As hub.h.
+pub const CMD_POOL_VIEW: u8 = 0x85;
+pub const POOL_VIEW_GAP: i64 = 2;
+pub const POOL_VIEW_LINE_MAX: usize = 36 + 32; // POOL_UUID_LEN + 32
+pub const POOL_LINK_WORD_MAX: usize = 11;
 /// The bots keep a topic to this.
 pub const CHAN_WHO_TOPIC_MAX: usize = 512;
 /// Admin: invite a user (nick|#chan).
@@ -488,6 +511,10 @@ pub const CMD_CONFIG_DELTA: u8 = 0x91;
 /// dropped past CFG_RESYNC_TTL; the admin request carries the bot alone.
 pub const CMD_CFG_RESYNC: u8 = 0x92;
 pub const CMD_ADMIN_BOT_RESYNC: u8 = 0x93;
+/// Console -> hub (2.5.4): the server pool.  list | add|<hp>|<k=v,...> |
+/// set|<what>|<k=v,...> | del|<what>|<0|1 force> | clear|<what> | net |
+/// netset|<k=v,...>.  The changing forms need +s.
+pub const CMD_ADMIN_POOL: u8 = 0x97;
 pub const CFG_RESYNC_TTL: i64 = 60;
 /// 2.5.4 hash-first anti-entropy (irchub docs/plans/2026-11-20_sync_digest_plan.md).
 /// Hub <-> hub, point-to-point: `"v|1\n"` + one `"s|<kind>|<records>|<sha256hex>\n"`
@@ -773,6 +800,8 @@ pub const UPGRADE_DRIVER_SILENCE: i64 = 900;
 /// An `upgrade abort` is re-sent to every peer link that comes up for this
 /// long, so a planner restarting onto a step when it was typed still gets it.
 pub const UPGRADE_CANCEL_HOLD: i64 = 600;
+/// s after a restart that its RESULT goes to every new peer link
+pub const UPGRADE_RESULT_RESEND: i64 = 60;
 /// Stop waiting for READY acks.
 pub const UPGRADE_PREPARE_TIMEOUT: i64 = 45;
 /// PREPARE also stays open this long after the node table last grew: a hub
@@ -830,8 +859,41 @@ pub const K_LINE_MAX: usize = 2 + MAX_CHAN + MAX_KEY + 32;
 pub const K_MODES_MASK: i32 = 64 | 128;
 /// `bu|<#chan|*>|<mask>|<last_used>`: a ban's last use, cnf only (activity).
 pub const BU_LINE_MAX: usize = MAX_CHAN + BAN_MASK_MAX + 32;
-/// `global_entries`: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B.
-pub const MAX_GLOBAL_ENTRIES: usize = MAX_BOT_ENTRIES + MAX_CHANNELS + 1 + MAX_BANS_TOTAL;
+/// Server pool (irchub docs/plans/2026-10-29_server_pool_plan.md, 2.5.4): N|
+/// one per network, S| one per server entry, both in `global_entries` under
+/// the same LWW store (`storage::put_record`, validated by pool_rec).  Live
+/// S| entries are capped at MAX_POOL_SERVERS and their tombstones, which are
+/// never autopurged (they stop a re-migration reviving a deleted server), at
+/// MAX_POOL_TOMBS; past that the oldest tombstone goes.  Mirrored in
+/// ircbot/bot.h.
+/// v1 uses POOL_DEFAULT_NET only.
+pub const MAX_NETWORKS: usize = 4;
+pub const MAX_POOL_SERVERS: usize = 64;
+pub const MAX_POOL_TOMBS: usize = 64;
+/// pool_rec::POOL_N_LINE_MAX / POOL_S_LINE_MAX spelled out: consts.rs is
+/// built standalone by the testnet tools (pool.rs tests check they agree).
+pub const POOL_N_LINE_MAX_CFG: usize = 2 + 16 + 32 + 64 + 8 * (64 + 1) + 4 + 3 + 20 + 16;
+pub const POOL_S_LINE_MAX_CFG: usize = 2 + 36 + 16 + 253 + 5 + 3 + 4 + 8 + 64 + 3 + 20 + 16;
+pub const POOL_RECORDS_MAX: usize =
+    MAX_NETWORKS * POOL_N_LINE_MAX_CFG + (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX_CFG;
+/// The oldest hub a peer must run to be sent N|/S| sync lines, and the oldest
+/// bot sent them in its config.  A 2.5.3 hub reads an unknown sync key as a
+/// per-bot line and creates a phantom bot "S"/"N".
+pub const POOL_MIN_HUB: &str = "2.5.4";
+pub const POOL_MIN_BOT: &str = "2.5.4";
+/// s after a bot's first migration offer (its 2.5.3 s| lines, stamp 0) that
+/// more of it is taken under opt 'h': one offer spans a few CMD_CONFIG_PUSH
+/// frames.  After it, never again (per-bot pm|, mesh-wide).  2.5.5 drops the
+/// opt 'h' exception.
+pub const POOL_MIGRATE_WINDOW: i64 = 300;
+/// `global_entries`: the old c/m/o rows (MAX_BOT_ENTRIES), then C, D, B, N, S.
+pub const MAX_GLOBAL_ENTRIES: usize = MAX_BOT_ENTRIES
+    + MAX_CHANNELS
+    + 1
+    + MAX_BANS_TOTAL
+    + MAX_NETWORKS
+    + MAX_POOL_SERVERS
+    + MAX_POOL_TOMBS;
 /// Live bans one bot may hold per channel.
 pub const BOT_BANS_PER_CHAN: usize = 10;
 /// Tombstone age kept when purge is off (seconds).
@@ -858,8 +920,9 @@ pub const MAX_HUB_USER_MASKS: usize = 200;
 /// Admin flags and oper channel bindings (user_flags plan §3.1).  The
 /// letters in their canonical order: a full, b bots, c channels, h hub,
 /// o opers, u upgrades.  Mirrored in ircbot/bot.h.
-pub const USER_FLAG_LETTERS: &str = "abchou";
-pub const USER_FLAGS_MAX: usize = 6;
+/// s: server pool (2.5.4).
+pub const USER_FLAG_LETTERS: &str = "abchosu";
+pub const USER_FLAGS_MAX: usize = 7;
 /// One uf| per user record.
 pub const MAX_HUB_USER_FLAGS: usize = MAX_HUB_USER_RECORDS;
 /// uc| records, live and tombstones.
@@ -874,11 +937,12 @@ pub const USER_ACCESS_MIGRATE_TS: i64 = 1;
 // sent (payloads carry only real records at real sizes).
 //
 // They are true hard bounds because ingest is bounded: per-bot state is
-// restricted to the whitelist {t,n,h,pub,seen,d,hl} with per-key value caps in
+// restricted to the whitelist {t,n,h,pub,seen,d,hl,pm} with per-key value caps in
 // storage::update_entry, so a bot has at most BOT_SYNC_FIELDS entries whose
 // lines never approach value[1024].  Keep this shared contract identical with
 // ircbot/bot.h (MAX_CONFIG_PAYLOAD).
-pub const BOT_SYNC_FIELDS: usize = 8;
+/// {t,n,h,pub,seen,d,hl,pm} = 8, +slack; hl has its own HL_LINE_MAX.
+pub const BOT_SYNC_FIELDS: usize = 9;
 pub const GLOBAL_LINE_MAX: usize = 1088;
 pub const BOT_FIELD_LINE: usize = 320;
 pub const USER_LINE_MAX: usize = 384;
@@ -907,7 +971,7 @@ pub const HUB_GSETTINGS_MAX: usize = 8;
 /// Ed25519 key)[0..8].  Mirrors ircbot's bot.h.
 pub const HL_ADDR_MAX: usize = 80;
 pub const HL_FP_LEN: usize = 16;
-/// ircbot MAX_SERVERS.
+/// ircbot MAX_HUBS.
 pub const HL_ENTRIES_MAX: usize = 10;
 pub const HL_VALUE_MAX: usize = HL_ENTRIES_MAX * (HL_ADDR_MAX + 1 + HL_FP_LEN + 1);
 /// b|<uuid>|hl|<value>|<ts>
@@ -926,6 +990,7 @@ pub const MAX_CONFIG_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + BOT_SYNC_FIELDS * BOT_FIELD_LINE
     + MAX_BOTS * BLINE_MAX
     + MODES_RECORDS_MAX
+    + POOL_RECORDS_MAX
     + PAYLOAD_SLACK;
 
 /// Hub<->hub full-state sync (`mesh::generate_sync_packet`): globals + users +
@@ -938,6 +1003,7 @@ pub const MAX_SYNC_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + MAX_BOTS * HL_LINE_MAX
     + MAX_PEERS * PEER_LINE_MAX
     + MODES_RECORDS_MAX
+    + POOL_RECORDS_MAX
     + REVOKE_RECORDS_MAX
     + PAYLOAD_SLACK;
 
@@ -972,6 +1038,7 @@ pub const HUB_CONFIG_FIXED_MAX: usize = 8192
     + MAX_HUB_USER_MASKS * MASK_LINE_MAX
     + USER_ACCESS_RECORDS_MAX
     + MODES_RECORDS_MAX
+    + POOL_RECORDS_MAX
     + REVOKE_RECORDS_MAX
     + MAX_BANS_TOTAL * BU_LINE_MAX
     + 2 * MAX_IP_ACL_ENTRIES * IP_ACL_LINE_MAX

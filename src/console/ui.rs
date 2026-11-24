@@ -740,6 +740,7 @@ enum B {
     NetSet,
     UserChan,
     ChanKick,
+    Pool,
 }
 
 struct CmdDef {
@@ -830,6 +831,13 @@ const CMDS: &[CmdDef] = &[
     cmd!("channel", Some("invite"), CMD_ADMIN_INVITE_USER, B::ChanOp, 2, 0, Cf::None, Pre::None, "", "channel invite <#chan> <nick>", "have one opped bot invite a user", None),
     cmd!("channel", Some("kick"), CMD_ADMIN_KICK_USER, B::ChanKick, 2, 0, Cf::None, Pre::None, "", "channel kick <#chan> <nick> [reason]", "have one opped bot kick a user (never a bot or authorised user)", None),
     cmd!("channel", Some("ban"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "channel ban <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "the same as ban add: list a ban, and one opped bot sets it now", None),
+    cmd!("server", Some("list"), CMD_ADMIN_POOL, B::Pool, 0, 0, Cf::None, Pre::None, "", "server list", "the IRC servers every hub-managed bot dials from, and the bots on each", None),
+    cmd!("server", Some("add"), CMD_ADMIN_POOL, B::Pool, 1, 2, Cf::None, Pre::None, "", "server add <host[:port]> [weight=<1-100>] [max=<0-100>]", "add a server to the pool (or bring back a removed one)", None),
+    cmd!("server", Some("set"), CMD_ADMIN_POOL, B::Pool, 2, 3, Cf::None, Pre::None, "", "server set <host[:port]|uuid> weight=<1-100> max=<0-100> enabled=on|off", "change one server's weight, cap or whether bots use it", None),
+    cmd!("server", Some("del"), CMD_ADMIN_POOL, B::Pool, 1, 1, Cf::Yn, Pre::None, "", "server del <host[:port]|uuid> [force]", "remove a server (asks y/N; the last usable one only with force)", None),
+    cmd!("server", Some("clear"), CMD_ADMIN_POOL, B::Pool, 1, 0, Cf::None, Pre::None, "", "server clear <host[:port]|uuid>", "undo a wrong-network flag", None),
+    cmd!("network", Some("show"), CMD_ADMIN_POOL, B::Pool, 0, 0, Cf::None, Pre::None, "", "network show", "the IRC network the bots check for, and how many servers are usable", None),
+    cmd!("network", Some("set"), CMD_ADMIN_POOL, B::Pool, 1, 1, Cf::None, Pre::None, "", "network set name=<NETWORK> alias=<a,b,...|->", "the NETWORK= name the bots check for, or other names to accept", None),
     cmd!("ban", Some("list"), CMD_ADMIN_BAN, B::Ban, 0, 1, Cf::None, Pre::None, "", "ban list [#chan|*]", "the network's listed bans (one channel, or * = every channel)", None),
     cmd!("ban", Some("add"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; one opped bot sets it on the channel now (never on a bot or user)", None),
     cmd!("ban", Some("del"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban del <#chan|*> <mask>", "remove a listed ban", None),
@@ -852,7 +860,7 @@ const CMDS: &[CmdDef] = &[
 ];
 
 /// The root nouns, in help order, with what each groups.
-const GROUPS: [(&str, &str); 10] = [
+const GROUPS: [(&str, &str); 12] = [
     ("bot", "registered bots"),
     ("hub", "this hub and the hubs it links to"),
     ("log", "the hub log"),
@@ -860,6 +868,8 @@ const GROUPS: [(&str, &str); 10] = [
     ("option", "network option flags"),
     ("user", "admins and opers"),
     ("channel", "managed channels"),
+    ("server", "the IRC server pool"),
+    ("network", "the IRC network"),
     ("ban", "listed bans"),
     ("upgrade", "rolling upgrades"),
     ("display", "this session's screen"),
@@ -884,6 +894,8 @@ const CMD_FLAGS: &[(&str, &str, &str)] = &[
     ("channel", "set", "c"), ("channel", "op", "c"), ("channel", "invite", "c"),
     ("channel", "kick", "c"), ("channel", "ban", "c"),
     ("ban", "add", "c"), ("ban", "del", "c"),
+    ("server", "add", "s"), ("server", "set", "s"), ("server", "del", "s"),
+    ("server", "clear", "s"), ("network", "set", "s"),
     ("upgrade", "start", "u"), ("upgrade", "abort", "u"), ("upgrade", "forget", "u"),
     ("upgrade", "continue", "u"),
     ("upgrade", "keep", "u"),
@@ -943,6 +955,7 @@ fn flag_word(f: u8) -> &'static str {
         b'c' => "channels",
         b'h' => "hub",
         b'o' => "opers",
+        b's' => "servers",
         b'u' => "upgrades",
         _ => "?",
     }
@@ -1199,6 +1212,28 @@ const CMD_HELP: &[CmdHelp] = &[
      "ban add #ops *!*@203.0.113.7\nban add * *!*@*.badhost.example 1440 sticky open proxy"),
     ("ban", Some("del"), Some("#chan|*\tas listed by ban list\nmask\tthe mask exactly as ban list shows it"),
      "ban del #ops *!*@203.0.113.7"),
+    ("server", Some("list"), None, "server list"),
+    ("network", Some("show"), None, "network show"),
+    ("server", Some("add"),
+     Some("host[:port]\tthe server; no port = 6667; 6697 is TLS\n\
+           weight=\t1-100 (default 1): a weight-2 server takes twice the bots\n\
+           max=\t0-100 (default 0, no cap): bots on it before others are preferred"),
+     "server add irc.example.net\nserver add irc.example.net:6697 weight=2 max=20"),
+    ("server", Some("set"),
+     Some("host[:port]|uuid\tas server list shows it\nweight=\t1-100\nmax=\t0-100 (0 = no cap)\n\
+           enabled=\toff: no bot dials it (bots on it stay); on: back in use\n\
+           force\twith enabled=off on the last usable server"),
+     "server set irc.example.net weight=3\nserver set irc.example.net enabled=off"),
+    ("server", Some("del"),
+     Some("host[:port]|uuid\tas server list shows it; bots on it stay until they disconnect\n\
+           force\tneeded for the last usable server: without one no bot can reconnect"),
+     "server del irc.old.example\nserver del irc.old.example force"),
+    ("server", Some("clear"), Some("host[:port]|uuid\ta server flagged wrong network (server list)"),
+     "server clear irc.example.net"),
+    ("network", Some("set"),
+     Some("name=\tthe NETWORK= value the bots check (learned from the first bot that connects)\n\
+           alias=\tother names accepted, comma separated (up to 8), or - for none"),
+     "network set name=EFnet\nnetwork set alias=EFNet"),
     ("upgrade", Some("status"), None, "upgrade status"),
     ("upgrade", Some("releases"), None, "upgrade releases"),
     ("upgrade", Some("history"), Some("run\tthe run, as upgrade history lists it, or the start of its id (4 or more characters)"),
@@ -1290,6 +1325,15 @@ const ARG_COMP: &[ArgComp] = &[
     ("user", Some("mask"), Some(0), Ck::Words("add del")),
     ("channel", Some("set"), Some(0), Ck::Words("default")),
     ("channel", Some("set"), None, Ck::ChSet),
+    ("server", Some("add"), None, Ck::Words("weight= max=")),
+    (
+        "server",
+        Some("set"),
+        None,
+        Ck::Words("weight= max= enabled=on enabled=off force"),
+    ),
+    ("server", Some("del"), Some(1), Ck::Words("force")),
+    ("network", Some("set"), None, Ck::Words("name= alias=")),
     ("ban", Some("list"), Some(0), Ck::Words("*")),
     ("ban", Some("add"), Some(0), Ck::Words("*")),
     ("ban", Some("add"), Some(2), Ck::Words("perm sticky")),
@@ -2096,25 +2140,10 @@ impl Ui {
                 fmt::glyph(&c, fmt::G_OFF),
             )
         };
-        // other hubs up/down
-        for bj in &b {
-            if bj.typ != b'H' || bj.depth < 1 {
-                continue;
-            }
-            if let Some(ai) = a
-                .iter()
-                .find(|ai| ai.typ == b'H' && ai.uuid == bj.uuid && ai.name == bj.name)
-                && ai.online != bj.online
-            {
-                let l = fmtb(&[
-                    if bj.online { g_on } else { g_warn },
-                    b" hub ",
-                    &bj.name,
-                    if bj.online { b" is up" } else { b" went down" },
-                ]);
-                self.human_event(c_cut(&l, 256), if bj.online { RL_DIM } else { RL_WARN });
-            }
-        }
+        let g_dash = {
+            let c = self.ctx(fmt::FMT_MODE_NORMAL, &sl);
+            fmt::glyph(&c, fmt::G_DASH)
+        };
         // bots in / out / moved: the hub is the nearest H row above
         let hubs = |rows: &[TRow]| -> Vec<Vec<u8>> {
             let mut h: Vec<u8> = Vec::new();
@@ -2129,14 +2158,98 @@ impl Ui {
         };
         let hub_a = hubs(&a);
         let hub_b = hubs(&b);
+        // other hubs up / down.  A hub out of reach takes its bots out of our
+        // tree, but they may still be on it: they are named with the hub as
+        // unseen, not as disconnected; a hub back brings its bots in one line.
+        let mut came = vec![false; b.len()];
+        let mut went = vec![false; a.len()];
+        for bj in &b {
+            if bj.typ != b'H' || bj.depth < 1 {
+                continue;
+            }
+            let Some(ai) = a
+                .iter()
+                .find(|ai| ai.typ == b'H' && ai.uuid == bj.uuid && ai.name == bj.name)
+            else {
+                continue;
+            };
+            if ai.online == bj.online {
+                continue;
+            }
+            let mut names: Vec<u8> = Vec::new();
+            let mut n = 0usize;
+            if bj.online {
+                for (k, bk) in b.iter().enumerate() {
+                    if bk.typ != b'B' || hub_b[k] != bj.name {
+                        continue;
+                    }
+                    if a.iter().any(|am| am.typ == b'B' && am.uuid == bk.uuid) {
+                        continue; // it was in the tree already
+                    }
+                    came[k] = true;
+                    event_name(&mut names, &bk.name, n);
+                    n += 1;
+                }
+            } else {
+                for (k, ak) in a.iter().enumerate() {
+                    if ak.typ != b'B' || hub_a[k] != ai.name {
+                        continue;
+                    }
+                    if b.iter().any(|bm| bm.typ == b'B' && bm.uuid == ak.uuid) {
+                        continue; // still in the tree (moved)
+                    }
+                    went[k] = true;
+                    event_name(&mut names, &ak.name, n);
+                    n += 1;
+                }
+            }
+            event_more(&mut names, n);
+            let l = if bj.online {
+                if n > 0 {
+                    fmtb(&[
+                        g_on,
+                        b" hub ",
+                        &bj.name,
+                        b" is back ",
+                        g_dash,
+                        format!(" {n} bot{} with it: ", if n == 1 { "" } else { "s" }).as_bytes(),
+                        &names,
+                    ])
+                } else {
+                    fmtb(&[g_on, b" hub ", &bj.name, b" is back"])
+                }
+            } else if n > 0 {
+                fmtb(&[
+                    g_warn,
+                    b" hub ",
+                    &bj.name,
+                    b" out of reach (down, or split from us) ",
+                    g_dash,
+                    format!(
+                        " {n} bot{} behind it unseen: ",
+                        if n == 1 { "" } else { "s" }
+                    )
+                    .as_bytes(),
+                    &names,
+                ])
+            } else {
+                fmtb(&[
+                    g_warn,
+                    b" hub ",
+                    &bj.name,
+                    b" out of reach (down, or split from us)",
+                ])
+            };
+            self.human_event(c_cut(&l, 512), if bj.online { RL_DIM } else { RL_WARN });
+        }
         for (j, bj) in b.iter().enumerate() {
-            if bj.typ != b'B' {
+            if bj.typ != b'B' || came[j] {
                 continue;
             }
             match a.iter().position(|ai| ai.typ == b'B' && ai.uuid == bj.uuid) {
                 None => {
                     let l = fmtb(&[g_on, b" bot ", &bj.name, b" connected to ", &hub_b[j]]);
-                    self.human_event(c_cut(&l, 256), RL_DIM);
+                    self.human_event(c_cut(&l, 512), RL_DIM);
                 }
                 Some(i) if hub_a[i] != hub_b[j] => {
                     let l = fmtb(&[
@@ -2148,18 +2261,18 @@ impl Ui {
                         b" to ",
                         &hub_b[j],
                     ]);
-                    self.human_event(c_cut(&l, 256), RL_DIM);
+                    self.human_event(c_cut(&l, 512), RL_DIM);
                 }
                 _ => {}
             }
         }
         for (i, ai) in a.iter().enumerate() {
-            if ai.typ != b'B' {
+            if ai.typ != b'B' || went[i] {
                 continue;
             }
             if !b.iter().any(|bj| bj.typ == b'B' && bj.uuid == ai.uuid) {
                 let l = fmtb(&[g_off, b" bot ", &ai.name, b" disconnected from ", &hub_a[i]]);
-                self.human_event(c_cut(&l, 256), RL_DIM);
+                self.human_event(c_cut(&l, 512), RL_DIM);
             }
         }
     }
@@ -2910,7 +3023,7 @@ fn help_command(c: &Ctx, f: &mut Flines, d: &CmdDef) {
             RL_HEAD,
             b" Admin flags: letter, name, what it lets the admin change",
         );
-        for &l in b"abchou" {
+        for &l in USER_FLAG_LETTERS.as_bytes() {
             let cmds = flag_cmds(l);
             let line = if l == b'a' {
                 format!(
@@ -3123,6 +3236,86 @@ fn build_payload(
             }
             b.payload = o;
             return Ok(b);
+        }
+        B::Pool => {
+            // server list/add/set/del/clear, network show/set (CMD_ADMIN_POOL)
+            if (0..na).any(|i| a(i).contains(&b'|')) {
+                return bad("'|' is not allowed here", hint);
+            }
+            if c.cmd == "network" {
+                if c.sub == Some("show") {
+                    b"net".to_vec()
+                } else {
+                    // set name=<x> alias=<a,b>: one k=v list, an alias list's
+                    // ',' as ';'
+                    let mut o: Vec<u8> = b"netset|".to_vec();
+                    for i in 0..na {
+                        if !a(i).contains(&b'=') {
+                            return bad(
+                                "network set takes name=<NETWORK> and/or alias=<a,b,...>",
+                                hint,
+                            );
+                        }
+                        if i > 0 && o.len() + 1 < CAP {
+                            o.push(b',');
+                        }
+                        for &ch in a(i) {
+                            if o.len() + 1 >= CAP {
+                                break;
+                            }
+                            o.push(if ch == b',' { b';' } else { ch });
+                        }
+                    }
+                    b.payload = o;
+                    return Ok(b);
+                }
+            } else if c.sub == Some("list") {
+                b"list".to_vec()
+            } else if a(0).contains(&b',') {
+                return bad("one server: host[:port] or its uuid", hint);
+            } else if c.sub == Some("del") {
+                let force = na > 1 && eq_ic(a(1), "force");
+                if na > 1 && !force {
+                    return bad("server del <host[:port]|uuid> [force]", hint);
+                }
+                fmtb(&[b"del|", a(0), b"|", if force { b"1" } else { b"0" }])
+            } else if c.sub == Some("clear") {
+                fmtb(&[b"clear|", a(0)])
+            } else {
+                // add / set: host-or-uuid, then k=v words ("force" for set)
+                let sub = c.sub.unwrap_or("");
+                let usage: &str = if sub == "add" {
+                    "server add <host[:port]> [weight=<1-100>] [max=<0-100>]"
+                } else {
+                    "server set <host[:port]|uuid> weight=<1-100> max=<0-100> enabled=on|off"
+                };
+                let mut o = fmtb(&[sub.as_bytes(), b"|", a(0), b"|"]);
+                if o.len() >= CAP {
+                    return too_long();
+                }
+                let mut kvn = 0;
+                for i in 1..na {
+                    let force = sub == "set" && eq_ic(a(i), "force");
+                    if !force && (!a(i).contains(&b'=') || a(i).contains(&b',')) {
+                        return bad(usage, hint);
+                    }
+                    let item: &[u8] = if force { b"force=1" } else { a(i) };
+                    let k = item.len() + usize::from(kvn > 0);
+                    if k >= CAP - o.len() {
+                        return too_long();
+                    }
+                    if kvn > 0 {
+                        o.push(b',');
+                    }
+                    o.extend_from_slice(item);
+                    kvn += 1;
+                }
+                if sub == "set" && kvn == 0 {
+                    return bad(usage, hint);
+                }
+                b.payload = o;
+                return Ok(b);
+            }
         }
         B::Ban => {
             if c.sub == Some("list") {
@@ -4938,6 +5131,20 @@ impl Ui {
             fmtb(&[b"Remove mask ", a3, b" from ", a2, b"? (y/N)"])
         } else if op == CMD_ADMIN_DEL_CHANNEL {
             fmtb(&[b"Remove ", &a1, b" from every bot? They part it. (y/N)"])
+        } else if op == CMD_ADMIN_POOL && c.sub == Some("del") {
+            if eq_ic(a2, "force") {
+                fmtb(&[
+                    b"Remove ",
+                    &a1,
+                    b" from the pool? If it is the last server, removing it could take all bots off IRC. (y/N)",
+                ])
+            } else {
+                fmtb(&[
+                    b"Remove ",
+                    &a1,
+                    b" from the pool? Bots on it stay until they disconnect. (y/N)",
+                ])
+            }
         } else if op == CMD_ADMIN_UPGRADE_STATUS && c.sub == Some("abort") {
             b"Abort the running upgrade and roll back what it moved? (y/N)".to_vec()
         } else if op == CMD_ADMIN_UPGRADE_STATUS && c.sub == Some("forget") {
@@ -7314,6 +7521,35 @@ impl Drop for Ui {
         crate::crypto::wipe(&mut self.term);
         crate::crypto::wipe(&mut self.core);
     }
+}
+
+/// A comma list of bot names for one event line: at most EVENT_NAMES_MAX
+/// names (each cut to 40 bytes), in a 320-byte buffer (C `sbl_name`).
+const EVENT_NAMES_MAX: usize = 8;
+fn event_name(l: &mut Vec<u8>, name: &[u8], idx: usize) {
+    if idx < EVENT_NAMES_MAX {
+        let part = cat_bytes(
+            if idx > 0 { b", " } else { b"" },
+            &name[..name.len().min(40)],
+        );
+        let room = 319usize.saturating_sub(l.len());
+        l.extend_from_slice(&part[..part.len().min(room)]);
+    }
+}
+
+/// " +N more" after the names when there were more than EVENT_NAMES_MAX.
+fn event_more(l: &mut Vec<u8>, n: usize) {
+    if n > EVENT_NAMES_MAX {
+        let part = format!(" +{} more", n - EVENT_NAMES_MAX).into_bytes();
+        let room = 319usize.saturating_sub(l.len());
+        l.extend_from_slice(&part[..part.len().min(room)]);
+    }
+}
+
+fn cat_bytes(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut v = a.to_vec();
+    v.extend_from_slice(b);
+    v
 }
 
 #[cfg(test)]

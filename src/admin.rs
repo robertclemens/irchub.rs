@@ -3497,6 +3497,435 @@ fn admin_set_ssh(state: &mut HubState, ci: usize, payload: &str) -> bool {
     send_reply(state, ci, &mut r)
 }
 
+// ---- server pool console (CMD_ADMIN_POOL, 2.5.4) ---------------------------
+
+/// The ','-separated items of a k=v list as the C loop walks them: an empty
+/// item counts, but the walk stops once nothing is left (so a trailing ','
+/// adds none).
+fn pool_kv_items(list: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(list);
+    std::iter::from_fn(move || {
+        let p = rest.filter(|p| !p.is_empty())?;
+        match p.find(',') {
+            Some(e) => {
+                rest = Some(&p[e + 1..]);
+                Some(&p[..e])
+            }
+            None => {
+                rest = None;
+                Some(p)
+            }
+        }
+    })
+}
+
+/// "k=v,k=v": the value of `key`, cut to cap-1 bytes; None if absent.
+fn pool_kv(list: &str, key: &str, cap: usize) -> Option<String> {
+    pool_kv_items(list).find_map(|p| {
+        p.strip_prefix(key)
+            .and_then(|r| r.strip_prefix('='))
+            .map(|v| trunc_string(v, cap))
+    })
+}
+
+/// Every k of "k=v,..." is one of `allowed` (space separated).
+fn pool_kv_known(list: &str, allowed: &str) -> bool {
+    pool_kv_items(list).all(|p| match p.find('=') {
+        Some(eq) if eq > 0 && eq < 16 => allowed.split(' ').any(|a| a == &p[..eq]),
+        _ => false,
+    })
+}
+
+fn pool_num(v: &str, lo: i32, hi: i32) -> Option<i32> {
+    let n = parse_uint(v, hi as u64)? as i32;
+    (n >= lo).then_some(n)
+}
+
+fn pool_rec_kv(r: &mut Reply, s: &crate::pool_rec::PoolSrv) {
+    r.kv("uuid", &s.uuid);
+    r.kv("host", &s.host);
+    r.kvi("port", i64::from(s.port));
+    r.kvi("weight", i64::from(s.weight));
+    r.kvi("max", i64::from(s.max));
+    r.kv("state", crate::pool_rec::state_name(s.state));
+    if !s.seen.is_empty() {
+        r.kv("seen", &s.seen);
+    }
+}
+
+fn pool_effects(state: &mut HubState, ci: usize, r: &mut Reply) -> bool {
+    r.kvi("bots", local_bot_count(state));
+    r.kvi("peers", linked_peer_count(state));
+    send_reply(state, ci, r)
+}
+
+/// server list/add/set/del/clear, network show/set (C `admin_pool`).
+fn admin_pool(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    use crate::pool_rec::{
+        POOL_DEFAULT_NET, POOL_HOST_MAX, POOL_MAX_MAX, POOL_NET_ALIASES_MAX, POOL_NET_NAME_MAX,
+        POOL_WEIGHT_MAX, PoolSrv, PoolState,
+    };
+    let Some(sub) = wire_field(payload, 0, 8) else {
+        return admin_err(
+            state,
+            ci,
+            "pool.usage",
+            "server list, add, set, del or clear",
+            Some("help server"),
+        );
+    };
+    let what = wire_field(payload, 1, POOL_HOST_MAX + 16).unwrap_or_default();
+    let kv = wire_field(payload, 2, 256).unwrap_or_default();
+    let (mut net, net_ts) = crate::pool::net_get(state, POOL_DEFAULT_NET);
+    let mut r = Reply::new();
+
+    if sub == "list" {
+        let view = crate::pool::view_text(state).unwrap_or_default();
+        r.ok("pool.list");
+        r.kv("net", &net.net_id);
+        r.kv("name", &net.name);
+        r.kvi(
+            "usable",
+            storage::pool_eligible_count(state, POOL_DEFAULT_NET) as i64,
+        );
+        r.kvi("idle", crate::pool::idle_bots(state) as i64);
+        let rows: Vec<(PoolSrv, i64)> = state
+            .global_entries
+            .iter()
+            .filter(|e| e.key == "S")
+            .filter_map(|e| crate::pool_rec::srv_parse(&e.value).map(|s| (s, e.timestamp)))
+            .filter(|(s, _)| !s.deleted)
+            .collect();
+        r.kvi("count", rows.len() as i64); // before the records: a kv after one lands in it
+        for (s, ts) in &rows {
+            let needle = format!("E|{}|", s.uuid);
+            let (mut up, mut conn) = (0i64, 0i64);
+            if let Some(at) = view.find(&needle) {
+                let rest = &view[at + needle.len()..];
+                let (u, n) = crate::cstr::strtoll(rest);
+                if n > 0 {
+                    up = i64::from(u as i32);
+                    if let Some(after) = rest[n..].strip_prefix('|') {
+                        let (c, m) = crate::cstr::strtoll(after);
+                        if m > 0 {
+                            conn = i64::from(c as i32);
+                        }
+                    }
+                }
+            }
+            r.rec("server");
+            pool_rec_kv(&mut r, s);
+            r.kvi("up", up);
+            r.kvi("connecting", conn);
+            r.kvi("ts", *ts);
+        }
+        return send_reply(state, ci, &mut r);
+    }
+
+    if sub == "net" {
+        r.ok("pool.net");
+        r.kv("net", &net.net_id);
+        r.kv("name", &net.name);
+        r.kv("aliases", &net.aliases);
+        r.kvi(
+            "usable",
+            storage::pool_eligible_count(state, POOL_DEFAULT_NET) as i64,
+        );
+        r.kvi("idle", crate::pool::idle_bots(state) as i64);
+        r.kvi("ts", net_ts);
+        return send_reply(state, ci, &mut r);
+    }
+
+    if sub == "netset" {
+        let k = what.as_str(); // netset|<k=v,...>
+        if k.is_empty() || !pool_kv_known(k, "name alias") {
+            return admin_err(
+                state,
+                ci,
+                "pool.usage",
+                "network set name=<NETWORK> or alias=<a,b,...>",
+                Some("help network set"),
+            );
+        }
+        if let Some(nv) = pool_kv(k, "name", POOL_NET_NAME_MAX + 2) {
+            if !crate::pool_rec::net_name_ok(&nv) {
+                return admin_err(
+                    state,
+                    ci,
+                    "pool.bad_value",
+                    "a network name is 1-64 printable characters, no '|' or ','",
+                    None,
+                );
+            }
+            net.name = nv;
+        }
+        if let Some(v) = pool_kv(k, "alias", POOL_NET_ALIASES_MAX + 1) {
+            // the aliases ride the k=v list's own ','; the UI sends them with ';'
+            let mut v = v.replace(';', ",");
+            if v == "-" {
+                v.clear();
+            }
+            net.aliases = v;
+            if crate::pool_rec::net_format(&net).is_none() {
+                return admin_err(
+                    state,
+                    ci,
+                    "pool.bad_value",
+                    "aliases: up to 8 network names, comma separated (- for none)",
+                    None,
+                );
+            }
+        }
+        net.deleted = false;
+        if !crate::pool::net_put(state, &net) {
+            return admin_err(
+                state,
+                ci,
+                "pool.bad_value",
+                "not a valid network record",
+                None,
+            );
+        }
+        r.ok("pool.netset");
+        r.kv("net", &net.net_id);
+        r.kv("name", &net.name);
+        r.kv("aliases", &net.aliases);
+        return pool_effects(state, ci, &mut r);
+    }
+
+    if what.is_empty() {
+        return admin_err(
+            state,
+            ci,
+            "pool.usage",
+            "name a server: host[:port] or its uuid",
+            Some("help server"),
+        );
+    }
+
+    if sub == "add" {
+        let Some((host, port)) = crate::pool_rec::hostport_parse(&what) else {
+            return admin_err(
+                state,
+                ci,
+                "pool.bad_host",
+                "not a host[:port]",
+                Some("server add irc.example.net:6697"),
+            );
+        };
+        if !kv.is_empty() && !pool_kv_known(&kv, "weight max") {
+            return admin_err(
+                state,
+                ci,
+                "pool.usage",
+                "server add <host[:port]> [weight=<1-100>] [max=<0-100>]",
+                Some("help server add"),
+            );
+        }
+        let uuid = crate::pool_rec::srv_uuid(POOL_DEFAULT_NET, &host, port).unwrap_or_default();
+        let cur = crate::pool::srv_get(state, &uuid);
+        if cur.as_ref().is_some_and(|c| !c.deleted) {
+            return admin_err(
+                state,
+                ci,
+                "pool.exists",
+                "that server is already in the pool",
+                Some("server set to change it"),
+            );
+        }
+        let have = cur.is_some();
+        let mut s = PoolSrv {
+            uuid,
+            net_id: POOL_DEFAULT_NET.to_string(),
+            host,
+            port,
+            weight: cur.as_ref().map_or(1, |c| c.weight),
+            max: cur.as_ref().map_or(0, |c| c.max),
+            ..Default::default()
+        };
+        if let Some(v) = pool_kv(&kv, "weight", 16) {
+            match pool_num(&v, 1, POOL_WEIGHT_MAX) {
+                Some(n) => s.weight = n,
+                None => return admin_err(state, ci, "pool.bad_value", "weight is 1 to 100", None),
+            }
+        }
+        if let Some(v) = pool_kv(&kv, "max", 16) {
+            match pool_num(&v, 0, POOL_MAX_MAX) {
+                Some(n) => s.max = n,
+                None => {
+                    return admin_err(state, ci, "pool.bad_value", "max is 0 (none) to 100", None);
+                }
+            }
+        }
+        s.state = PoolState::Ok;
+        if !crate::pool::srv_put(state, &s) {
+            return admin_err(
+                state,
+                ci,
+                "pool.full",
+                "the pool is full (64 servers)",
+                Some("server del one first"),
+            );
+        }
+        crate::pool::strikes_clear(state, &s.uuid);
+        r.ok("pool.added");
+        pool_rec_kv(&mut r, &s);
+        r.kvb("revived", have);
+        return pool_effects(state, ci, &mut r);
+    }
+
+    let Some(mut s) = crate::pool::find(state, &what).filter(|s| !s.deleted) else {
+        return admin_err(
+            state,
+            ci,
+            "pool.not_found",
+            "no such server in the pool",
+            Some("server list"),
+        );
+    };
+
+    if sub == "set" {
+        if kv.is_empty() || !pool_kv_known(&kv, "weight max enabled") {
+            return admin_err(
+                state,
+                ci,
+                "pool.usage",
+                "server set <host[:port]|uuid> weight=<1-100> max=<0-100> enabled=on|off",
+                Some("help server set"),
+            );
+        }
+        if let Some(v) = pool_kv(&kv, "weight", 16) {
+            match pool_num(&v, 1, POOL_WEIGHT_MAX) {
+                Some(n) => s.weight = n,
+                None => return admin_err(state, ci, "pool.bad_value", "weight is 1 to 100", None),
+            }
+        }
+        if let Some(v) = pool_kv(&kv, "max", 16) {
+            match pool_num(&v, 0, POOL_MAX_MAX) {
+                Some(n) => s.max = n,
+                None => {
+                    return admin_err(state, ci, "pool.bad_value", "max is 0 (none) to 100", None);
+                }
+            }
+        }
+        if let Some(v) = pool_kv(&kv, "enabled", 16) {
+            if v != "on" && v != "off" {
+                return admin_err(state, ci, "pool.bad_value", "enabled is on or off", None);
+            }
+            let off = v == "off";
+            if off
+                && s.state == PoolState::Ok
+                && storage::pool_eligible_count(state, &s.net_id) <= 1
+                && !kv.contains("force=1")
+            {
+                let msg = trunc_string(
+                    &format!(
+                        "{} is the last usable server of network {}: disabling it could take all bots off IRC",
+                        crate::cstr::trunc(&s.host, 181),
+                        s.net_id
+                    ),
+                    320,
+                );
+                return admin_err(
+                    state,
+                    ci,
+                    "pool.last",
+                    &msg,
+                    Some("add another server first, or repeat with force"),
+                );
+            }
+            if off {
+                s.state = PoolState::Disabled;
+            } else if s.state == PoolState::Disabled {
+                s.state = PoolState::Ok;
+            }
+        }
+        if !crate::pool::srv_put(state, &s) {
+            return admin_err(
+                state,
+                ci,
+                "pool.bad_value",
+                "not a valid server record",
+                None,
+            );
+        }
+        r.ok("pool.set");
+        pool_rec_kv(&mut r, &s);
+        return pool_effects(state, ci, &mut r);
+    }
+
+    if sub == "clear" {
+        if s.state != PoolState::WrongNet {
+            return admin_err(
+                state,
+                ci,
+                "pool.not_flagged",
+                "that server is not flagged wrong network",
+                Some("server list"),
+            );
+        }
+        s.state = PoolState::Ok;
+        s.seen.clear();
+        if !crate::pool::srv_put(state, &s) {
+            return admin_err(
+                state,
+                ci,
+                "pool.bad_value",
+                "not a valid server record",
+                None,
+            );
+        }
+        crate::pool::strikes_clear(state, &s.uuid);
+        r.ok("pool.cleared");
+        pool_rec_kv(&mut r, &s);
+        return pool_effects(state, ci, &mut r);
+    }
+
+    if sub == "del" {
+        let force = kv == "1";
+        let last = s.state == PoolState::Ok && storage::pool_eligible_count(state, &s.net_id) <= 1;
+        if last && !force {
+            let msg = trunc_string(
+                &format!(
+                    "{} is the last usable server of network {}: removing it could take all bots off IRC",
+                    crate::cstr::trunc(&s.host, 181),
+                    s.net_id
+                ),
+                320,
+            );
+            return admin_err(
+                state,
+                ci,
+                "pool.last",
+                &msg,
+                Some("add another server first, or repeat with force"),
+            );
+        }
+        s.deleted = true;
+        if !crate::pool::srv_put(state, &s) {
+            return admin_err(
+                state,
+                ci,
+                "pool.bad_value",
+                "not a valid server record",
+                None,
+            );
+        }
+        crate::pool::strikes_clear(state, &s.uuid);
+        r.ok("pool.removed");
+        pool_rec_kv(&mut r, &s);
+        r.kvb("last", last);
+        return pool_effects(state, ci, &mut r);
+    }
+    admin_err(
+        state,
+        ci,
+        "pool.usage",
+        "server list, add, set, del or clear",
+        Some("help server"),
+    )
+}
+
 /// ban: list|<#c|*|""> | add|<#c|*>|<mask>|<min|perm>|<sticky 0/1>|<reason> | del|<#c|*>|<mask>
 fn admin_ban(state: &mut HubState, ci: usize, payload: &str) -> bool {
     let Some(sub) = wire_field(payload, 0, 8) else {
@@ -3654,6 +4083,7 @@ fn mf_payload_mutates(cmd: u8, payload: &str) -> bool {
     match cmd {
         CMD_ADMIN_CHAN_MODE | CMD_ADMIN_CHAN_SET => payload.contains('|'),
         CMD_ADMIN_BAN => !payload.starts_with("list"),
+        CMD_ADMIN_POOL => payload != "list" && payload != "net",
         CMD_ADMIN_NET_SET => !payload.is_empty(),
         _ => true,
     }
@@ -3735,6 +4165,7 @@ fn admin_flag_needed(state: &HubState, me: Option<usize>, cmd: u8, payload: &str
         CMD_ADMIN_CHAN_MODE | CMD_ADMIN_CHAN_SET | CMD_ADMIN_BAN => {
             mf_payload_mutates(cmd, payload).then_some('c')
         }
+        CMD_ADMIN_POOL => mf_payload_mutates(cmd, payload).then_some('s'),
         CMD_ADMIN_UPGRADE_NET => Some('u'),
         CMD_ADMIN_UPGRADE_STATUS => (payload == "abort"
             || payload == "forget"
@@ -3962,6 +4393,7 @@ fn admin_flag_word(f: char) -> &'static str {
         'b' => "bots",
         'c' => "channels",
         'h' => "hub",
+        's' => "servers",
         'o' => "opers",
         'u' => "upgrades",
         _ => "?",
@@ -4035,6 +4467,7 @@ pub fn console_admin_op(cmd: u8) -> bool {
             | CMD_ADMIN_CHAN_SET
             | CMD_ADMIN_BAN
             | CMD_ADMIN_NET_SET
+            | CMD_ADMIN_POOL
             | CMD_ADMIN_SET_SSH
             | CMD_ADMIN_UPGRADE_NET
             | CMD_ADMIN_UPGRADE_STATUS
@@ -4840,6 +5273,7 @@ pub fn handle_admin_command(
         CMD_ADMIN_CHAN_MODE => admin_chan_mode(state, ci, payload),
         CMD_ADMIN_CHAN_SET => admin_chan_set(state, ci, payload),
         CMD_ADMIN_BAN => admin_ban(state, ci, payload),
+        CMD_ADMIN_POOL => admin_pool(state, ci, payload),
         CMD_ADMIN_NET_SET => admin_net_set(state, ci, payload),
         CMD_ADMIN_SET_SSH => admin_set_ssh(state, ci, payload),
 
@@ -5270,7 +5704,9 @@ pub fn handle_admin_command(
                 0
             };
             let mut r = Reply::new();
-            crate::stats::report(up, &mut r, |r| stats_load(state, r));
+            crate::stats::report(up, &mut r, crate::pool::counts(state), |r| {
+                stats_load(state, r)
+            });
             send_reply(state, ci, &mut r)
         }
 

@@ -599,7 +599,34 @@ fn finish(
                 && c.conn_serial == e.reply_serial
         })
     {
-        let res = if bitch {
+        let res = if e.reply_own {
+            // a bot's own request: ok / denied (policy: no ~B2 around it) /
+            // none (nobody on any hub could: the bot may ask over IRC)
+            if ok {
+                format!(
+                    "{}|ok|{} by {} on {}",
+                    e.reply_rid,
+                    kw,
+                    crate::cstr::trunc(if by_nick.is_empty() { by_uuid } else { by_nick }, 32),
+                    crate::cstr::trunc(hub_name, 64)
+                )
+            } else if bitch {
+                format!(
+                    "{}|denied|not authorised on {} and +bitch is on",
+                    e.reply_rid,
+                    crate::cstr::trunc(&e.channel, 65)
+                )
+            } else {
+                let why = reasons(&e, 160);
+                format!(
+                    "{}|none|no bot could: {asked} asked on {hubs} hub{}{}{}",
+                    e.reply_rid,
+                    if hubs == 1 { "" } else { "s" },
+                    if why.is_empty() { "" } else { "; " },
+                    crate::cstr::trunc(&why, 121)
+                )
+            }
+        } else if bitch {
             format!(
                 "{}|fail|not authorised on {} and +bitch is on",
                 e.reply_rid,
@@ -1491,10 +1518,13 @@ pub fn process_user_chan_request(state: &mut HubState, ci: usize, payload: &str)
     if !crate::access::uchan_name_ok(&chan) || chan == "*" {
         return fail(state, "not a channel");
     }
+    // the mask is the person's live identity, never a pattern: the bot that
+    // acts checks the nick against it, and an unban matches bans to it
     if !uchan_field_ok(&nick, MAX_NICK)
         || !uchan_field_ok(&mask, MAX_MASK_LEN)
         || !mask.contains('!')
         || !mask.contains('@')
+        || !crate::storage::hostmask_literal(&mask)
     {
         return fail(state, "bad nick or hostmask");
     }

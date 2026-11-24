@@ -11,7 +11,7 @@ use crate::consts::*;
 use crate::cstr::atoll;
 use crate::state::{HubState, UchanRecord, UflagRecord, lww_accepts};
 
-fn uuid_shape(u: &str) -> bool {
+pub(crate) fn uuid_shape(u: &str) -> bool {
     let b = u.as_bytes();
     b.len() == 36
         && b.iter().enumerate().all(|(i, &c)| {
@@ -446,6 +446,62 @@ pub fn append(state: &HubState, out: &mut String, keep: Option<&dyn Fn(&str) -> 
         if keep.is_none_or(|k| k(&r.uuid)) {
             out.push_str(&format_uchan(r));
         }
+    }
+}
+
+/// hub_access_append_bot(): the uf|/uc| lines of a bot's config.  A bot
+/// older than POOL_MIN_BOT (pool false) knows no 's' flag: it would refuse
+/// the whole uf| and, replacing its table from the config, keep that admin
+/// with no flags at all (fail closed), so the letter is left out for it.
+/// Bots never send other users' records back, so the stripped copy goes
+/// nowhere.
+pub fn append_bot(state: &HubState, out: &mut String, pool: bool) {
+    if pool {
+        append(state, out, None);
+        return;
+    }
+    for r in &state.uflag_records {
+        let mut r = r.clone();
+        if let Some(i) = r.flags.find('s') {
+            r.flags.remove(i);
+        }
+        out.push_str(&format_uflag(&r));
+    }
+    for r in &state.uchan_records {
+        out.push_str(&format_uchan(r));
+    }
+}
+
+/// hub_access_sgrant_once(): once per mesh (hs|sgrant), every admin with b
+/// gets s (server pool plan D11).
+pub fn sgrant_once(state: &mut HubState) {
+    if state.sgrant_setting != 0 {
+        return;
+    }
+    let mut n = 0;
+    let todo: Vec<(String, String, i64)> = state
+        .uflag_records
+        .iter()
+        .filter(|r| r.flags.contains('b') && !r.flags.contains('s') && !r.flags.contains('a'))
+        .map(|r| (r.uuid.clone(), r.flags.clone(), r.timestamp))
+        .collect();
+    for (uuid, flags, ts) in todo {
+        let Some(canon) = uflags_canon(&format!("{flags}s")) else {
+            continue;
+        };
+        // stamp + 1, not now: every hub that runs this writes the same
+        // record, and any later change by an admin (a -s above all) stays
+        // newer.
+        if uflag_put(state, &uuid, &canon, ts + 1) {
+            n += 1;
+        }
+    }
+    crate::revoke::gsetting_set(state, "sgrant", 1);
+    if n > 0 {
+        crate::hlog_info!(
+            "[ACCESS] Gave the server flag +s to {n} admin{} with +b (once)\n",
+            if n == 1 { "" } else { "s" }
+        );
     }
 }
 

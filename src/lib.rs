@@ -44,6 +44,8 @@ pub mod mesh;
 pub mod modes;
 pub mod net;
 pub mod opflow;
+pub mod pool;
+pub mod pool_rec;
 pub mod presence;
 pub mod presence2;
 pub mod queue;

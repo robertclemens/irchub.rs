@@ -953,7 +953,7 @@ fn load_inner(state: &mut HubState, password: &str) -> bool {
             // so a hand-edited or damaged line is dropped, not trusted.  Case
             // variants of one channel / mask (from an older c|-style store)
             // merge there, newest stamp wins.
-            "C" | "D" | "B" => {
+            "C" | "D" | "B" | "N" | "S" => {
                 if let Some(p) = v.rfind('|') {
                     storage::put_record(state, k, &v[..p], atoll(&v[p + 1..]));
                 }

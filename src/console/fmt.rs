@@ -1599,8 +1599,9 @@ fn mesh_find(nodes: &[MNode], uuid: Option<&[u8]>) -> i32 {
     }
 }
 
-#[allow(clippy::needless_range_loop)] // the matrix is indexed both ways
-fn render_mesh(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+/// Every hub a reply names: self / peer / hub records, then hubs only a
+/// link names (at most 64).  C `mesh_nodes`.
+fn mesh_nodes(rep: &Creply) -> Vec<MNode<'_>> {
     let mut nodes: Vec<MNode> = Vec::new();
     for r in &rep.r {
         if nodes.len() >= 64 {
@@ -1637,6 +1638,167 @@ fn render_mesh(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             shrt: Vec::new(),
         });
     }
+    nodes
+}
+
+/// C snprintf at `o` into a `cap`-byte buffer: what fits is written, the
+/// buffer ends there, the full length comes back.
+fn csn_at(buf: &mut Vec<u8>, o: usize, cap: usize, text: &[u8]) -> usize {
+    buf.truncate(o);
+    let room = cap.saturating_sub(o).saturating_sub(1);
+    buf.extend_from_slice(&text[..text.len().min(room)]);
+    text.len()
+}
+
+/// The hub layout as configured (every gossiped link, up or down) and how it
+/// stands now (the up links): (parts the up links leave, layout, split,
+/// partial).  C `mesh_topology`.
+#[allow(clippy::needless_range_loop)] // the matrices are indexed both ways
+fn mesh_topology(rep: &Creply) -> (usize, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let nodes = mesh_nodes(rep);
+    let nn = nodes.len();
+    let mut conf = vec![[false; 64]; 64];
+    let mut up = vec![[false; 64]; 64];
+    let mut reported = [false; 64];
+    for r in rep.r.iter().filter(|r| r.is("link")) {
+        let (a, b) = (mesh_find(&nodes, r.rv("a")), mesh_find(&nodes, r.rv("b")));
+        if a < 0 || b < 0 || a == b {
+            continue;
+        }
+        let (a, b) = (a as usize, b as usize);
+        reported[a] = true;
+        conf[a][b] = true;
+        conf[b][a] = true;
+        if r.rv("state") == Some(b"up".as_slice()) {
+            up[a][b] = true;
+            up[b][a] = true;
+        }
+    }
+    let mut deg = [0usize; 64];
+    for a in 0..nn {
+        for b in 0..nn {
+            if conf[a][b] {
+                deg[a] += 1;
+            }
+        }
+    }
+    let edges: usize = deg[..nn].iter().sum::<usize>() / 2;
+    let comps = |g: &Vec<[bool; 64]>| -> (usize, [i32; 64]) {
+        let mut seen = [-1i32; 64];
+        let mut n = 0;
+        for s0 in 0..nn {
+            if seen[s0] >= 0 {
+                continue;
+            }
+            let mut q = vec![s0];
+            seen[s0] = n as i32;
+            let mut qh = 0;
+            while qh < q.len() {
+                let x = q[qh];
+                qh += 1;
+                for y in 0..nn {
+                    if seen[y] < 0 && g[x][y] {
+                        seen[y] = n as i32;
+                        q.push(y);
+                    }
+                }
+            }
+            n += 1;
+        }
+        (n, seen)
+    };
+    let (cparts, _) = comps(&conf);
+    let (parts, comp) = comps(&up);
+    let mut center: Option<usize> = None;
+    let (mut d1, mut d2) = (0, 0);
+    for a in 0..nn {
+        if nn > 0 && deg[a] == nn - 1 {
+            center = Some(a);
+        }
+        d1 += usize::from(deg[a] == 1);
+        d2 += usize::from(deg[a] == 2);
+    }
+    let layout: Vec<u8> = if nn < 2 {
+        b"a single hub".to_vec()
+    } else if cparts > 1 {
+        format!("{nn} hubs, not all linked as configured").into_bytes()
+    } else if nn == 2 {
+        b"a pair of hubs".to_vec()
+    } else if edges == nn * (nn - 1) / 2 {
+        format!("full mesh of {nn} hubs").into_bytes()
+    } else if let (true, Some(c)) = (edges == nn - 1, center) {
+        cat(&[b"star around ", nodes[c].name])
+    } else if edges == nn - 1 && d1 == 2 && d2 == nn - 2 {
+        format!("chain of {nn} hubs").into_bytes()
+    } else if edges == nn - 1 {
+        format!("tree of {nn} hubs").into_bytes()
+    } else if edges == nn && d2 == nn {
+        format!("ring of {nn} hubs").into_bytes()
+    } else {
+        format!("partial mesh of {nn} hubs").into_bytes()
+    };
+    let layout = snp(96, layout);
+    const PCAP: usize = 96;
+    let mut partial: Vec<u8> = Vec::new();
+    let mut o = 0usize;
+    let mut miss = 0;
+    for a in 0..nn {
+        if reported[a] {
+            continue;
+        }
+        if miss < 2 {
+            let txt = cat(&[if miss > 0 { b", ".as_slice() } else { b"" }, nodes[a].name]);
+            let w = csn_at(&mut partial, o, PCAP, &txt);
+            if w < PCAP - o {
+                o += w;
+            }
+        }
+        miss += 1;
+    }
+    if miss > 2 {
+        csn_at(&mut partial, o, PCAP, format!(" +{}", miss - 2).as_bytes());
+    }
+    const SCAP: usize = 256;
+    let mut split: Vec<u8> = Vec::new();
+    if parts > 1 {
+        let mut o = csn_at(
+            &mut split,
+            0,
+            SCAP,
+            format!("split into {parts} parts:").as_bytes(),
+        );
+        'out: for c in 0..parts {
+            let mut first = true;
+            for a in 0..nn {
+                if o >= SCAP {
+                    break 'out;
+                }
+                if comp[a] != c as i32 {
+                    continue;
+                }
+                let sep: &[u8] = if first {
+                    if c > 0 { b" | " } else { b" " }
+                } else {
+                    b" "
+                };
+                let w = csn_at(&mut split, o, SCAP, &cat(&[sep, nodes[a].name]));
+                if w >= SCAP - o {
+                    break;
+                }
+                o += w;
+                first = false;
+            }
+            if o >= SCAP {
+                break;
+            }
+        }
+    }
+    (parts, layout, split, partial)
+}
+
+#[allow(clippy::needless_range_loop)] // the matrix is indexed both ways
+fn render_mesh(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let mut nodes = mesh_nodes(rep);
     let nn = nodes.len();
     if nn < 2 {
         return;
@@ -1932,33 +2094,60 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     }
     flines_add(out, RL_NORMAL, b"");
     render_mesh(ctx, rep, out);
-    // health
-    let issues = rep.r.iter().filter(|r| r.is("issue")).count();
+    // health: the layout, whether the up links hold it together, the issues
+    let mut issues = rep.r.iter().filter(|r| r.is("issue")).count();
+    let (parts, layout, split, partial) = mesh_topology(rep);
+    if parts > 1 {
+        issues += 1;
+    }
     flines_add(out, RL_NORMAL, b"");
     if issues == 0 {
         let h = snp(
-            96,
+            192,
             cat(&[
                 glyph(ctx, G_ON),
                 b" healthy ",
                 glyph(ctx, G_DASH),
-                b" every configured link is up, no unknown hubs",
+                b" ",
+                &layout,
+                b", every configured link up, no unknown hubs",
             ]),
         );
         title(ctx, out, b"Health", Some(&h));
+        if !partial.is_empty() {
+            line(
+                out,
+                RL_DIM,
+                &[b"  partial view: ", &partial, b" reported no links yet"],
+            );
+        }
         return;
     }
     let h = snp(
-        48,
+        160,
         cat(&[
             glyph(ctx, G_WARN),
             b" ",
             &num(issues),
             b" issue",
             pl(issues as i64),
+            b" ",
+            glyph(ctx, G_DOT),
+            b" ",
+            &layout,
         ]),
     );
     title(ctx, out, b"Health", Some(&h));
+    if parts > 1 {
+        line(out, RL_WARN, &[b"  ", glyph(ctx, G_WARN), b" ", &split]);
+    }
+    if !partial.is_empty() {
+        line(
+            out,
+            RL_DIM,
+            &[b"  partial view: ", &partial, b" reported no links yet"],
+        );
+    }
     let wg = glyph(ctx, G_WARN);
     for r in rep.r.iter().filter(|r| r.is("issue")) {
         let kind = r.rv("kind").unwrap_or(b"");
@@ -3157,6 +3346,8 @@ fn opname(op: u64) -> Option<&'static str> {
         0x82 => "CMD_ADMIN_PEER_REFS",
         0x83 => "CMD_LINK_SEQ",
         0x84 => "CMD_ADMIN_KICK_USER",
+        0x85 => "CMD_POOL_VIEW",
+        0x86 => "CMD_SERVER_REPORT",
         0x87 => "CMD_UPGRADE_HISTORY",
         0x88 => "CMD_UPGRADE_STAGE",
         0x89 => "CMD_UPGRADE_PROGRESS",
@@ -3172,6 +3363,8 @@ fn opname(op: u64) -> Option<&'static str> {
         0x93 => "CMD_ADMIN_BOT_RESYNC",
         0x94 => "CMD_SYNC_DIGEST",
         0x95 => "CMD_CHAN_WHO",
+        0x96 => "CMD_BOT_IRC_LINK",
+        0x97 => "CMD_ADMIN_POOL",
         _ => return None,
     })
 }
@@ -3247,7 +3440,150 @@ fn render_timers(ctx: &Ctx, rep: &Creply, ld: Option<&Crec>, out: &mut Flines) {
         }
     });
     title(ctx, out, b"Maintenance timers", right);
-    t.render(ctx, out);
+    // As many JOB / EVERY / NEXT RUN blocks side by side as the width takes
+    // (TIMER_COLS_MAX), rows filled down each block first; one block is the
+    // plain table.
+    let mut w = [0i32; 3];
+    for c in 0..3 {
+        w[c] = width_n(COLS[c].head.as_bytes());
+        for r in &t.cells {
+            w[c] = w[c].max(width_n(&r[c]));
+        }
+    }
+    let bw = w[0] + 2 + w[1] + 2 + w[2];
+    let nr = t.nr() as i32;
+    let mut k = 1i32;
+    while k < TIMER_COLS_MAX && k < nr && t.indent + (k + 1) * bw + k * TIMER_COL_GAP <= ctx.width {
+        k += 1;
+    }
+    if k == 1 {
+        t.render(ctx, out);
+        return;
+    }
+    let rows = (nr + k - 1) / k;
+    let heads: [&[u8]; 3] = [
+        COLS[0].head.as_bytes(),
+        COLS[1].head.as_bytes(),
+        COLS[2].head.as_bytes(),
+    ];
+    let mut b = Sb::default();
+    for r in -1..rows {
+        for blk in 0..k {
+            let idx = blk * rows + r;
+            if r >= 0 && idx >= nr {
+                break;
+            }
+            let x = t.indent + blk * (bw + TIMER_COL_GAP);
+            let cells: [&[u8]; 3] = if r < 0 {
+                heads
+            } else {
+                let row = &t.cells[idx as usize];
+                [&row[0], &row[1], &row[2]]
+            };
+            b.pad(x);
+            b.a(cells[0]);
+            b.pad(x + w[0] + 2 + w[1] - width_n(cells[1]));
+            b.a(cells[1]);
+            b.pad(x + w[0] + 2 + w[1] + 2 + w[2] - width_n(cells[2]));
+            b.a(cells[2]);
+        }
+        b.emit(out, if r < 0 { RL_HEAD } else { RL_NORMAL });
+    }
+}
+
+// ---- the stats sections, two side by side on a wide console -------------
+
+/// Stats view (tab 5): from STATS_GRID_MIN cells the sections go two side by
+/// side, each STATS_COL_W wide; the timers take up to TIMER_COLS_MAX blocks.
+const STATS_GRID_MIN: i32 = 104;
+const STATS_COL_W: i32 = 52;
+const STATS_LABEL_W: i32 = 13;
+const STATS_VALUE_W: i32 = 9;
+const TIMER_COLS_MAX: i32 = 3;
+const TIMER_COL_GAP: i32 = 4;
+
+#[derive(Default)]
+struct SSec {
+    title: Vec<u8>,
+    /// the rows' role (RL_WARN: pool unusable)
+    warn: bool,
+    items: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl SSec {
+    fn new(title: &[u8]) -> SSec {
+        SSec {
+            title: snp(64, title.to_vec()),
+            ..SSec::default()
+        }
+    }
+    fn count(&mut self, label: &str, v: u64) {
+        if self.items.len() < 12 {
+            self.items
+                .push((snp(16, label.as_bytes().to_vec()), snp(24, count(v))));
+        }
+    }
+    fn text(&mut self, label: &str, v: Vec<u8>) {
+        if self.items.len() < 12 {
+            self.items
+                .push((snp(16, label.as_bytes().to_vec()), snp(24, v)));
+        }
+    }
+    /// delta share and saved, as delta_kv.
+    fn delta(&mut self, r: &Crec) {
+        let (full, delta) = (r.rvu("full"), r.rvu("delta"));
+        let (of, db) = (r.rvu("delta_of"), r.rvu("delta_bytes"));
+        let share = (delta * 100).checked_div(full + delta).unwrap_or(0);
+        self.text("delta share", format!("{share}%").into_bytes());
+        self.text("saved", bytes(of.saturating_sub(db)));
+    }
+    /// Its title, then two "label  value" pairs a line, values right-aligned.
+    fn lines(&self) -> Vec<Sb> {
+        let mut out = Vec::new();
+        let mut b = Sb::default();
+        b.a(b" ");
+        b.a(&self.title);
+        out.push(b);
+        for pair in self.items.chunks(2) {
+            let mut b = Sb::default();
+            for (j, (label, value)) in pair.iter().enumerate() {
+                let x = 2 + j as i32 * (STATS_LABEL_W + STATS_VALUE_W + 4);
+                b.pad(x);
+                b.a(label);
+                b.pad(x + STATS_LABEL_W + STATS_VALUE_W - width_n(value));
+                b.a(value);
+            }
+            out.push(b);
+        }
+        out.truncate(8);
+        out
+    }
+}
+
+fn render_stats_grid(secs: &[SSec], out: &mut Flines) {
+    for p in (0..secs.len()).step_by(2) {
+        let l = secs[p].lines();
+        let r = secs.get(p + 1).map(SSec::lines).unwrap_or_default();
+        let rows = l.len().max(r.len());
+        let mut b = Sb::default();
+        for i in 0..rows {
+            if let Some(x) = l.get(i) {
+                b.a(&x.p);
+            }
+            if let Some(x) = r.get(i) {
+                b.pad(STATS_COL_W);
+                b.a(&x.p);
+            }
+            let role = if i == 0 {
+                RL_HEAD
+            } else if (i < l.len() && secs[p].warn) || (i < r.len() && secs[p + 1].warn) {
+                RL_WARN
+            } else {
+                RL_NORMAL
+            };
+            b.emit(out, role);
+        }
+    }
 }
 
 fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
@@ -3264,83 +3600,188 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let ld = rep.r.iter().rfind(|x| x.is("load"));
     let p2 = rep.r.iter().rfind(|x| x.is("p2"));
     let tr = rep.r.iter().rfind(|x| x.is("tree"));
-    let mut b = Sb::default();
-    if let Some(cfg) = cfg {
-        // A 2.5.3 hub answers sent= (all full) and no delta or pull.
-        line(out, RL_HEAD, &[b" Config pushes to bots"]);
-        let full = if cfg.rv("full").is_some() {
-            cfg.rvu("full")
-        } else {
-            cfg.rvu("sent")
-        };
-        count_kv(&mut b, "  full", full, 0);
-        count_kv(&mut b, "delta", cfg.rvu("delta"), 24);
-        count_kv(&mut b, "skipped (unchanged)", cfg.rvu("same"), 40);
-        count_kv(&mut b, "lost", cfg.rvu("lost"), 72);
-        b.emit(out, RL_NORMAL);
-        if cfg.rv("delta").is_some() {
-            count_kv(&mut b, "  pulls", cfg.rvu("pull"), 0);
-            delta_kv(&mut b, cfg);
+    let pl = rep.r.iter().rfind(|x| x.is("pool"));
+    if ctx.width >= STATS_GRID_MIN {
+        let mut secs: Vec<SSec> = Vec::new();
+        if let Some(cfg) = cfg {
+            let mut s = SSec::new(b"Config pushes to bots");
+            let full = if cfg.rv("full").is_some() {
+                cfg.rvu("full")
+            } else {
+                cfg.rvu("sent")
+            };
+            s.count("full", full);
+            s.count("delta", cfg.rvu("delta"));
+            s.count("skipped", cfg.rvu("same"));
+            s.count("lost", cfg.rvu("lost"));
+            if cfg.rv("delta").is_some() {
+                s.count("pulls", cfg.rvu("pull"));
+                s.delta(cfg);
+            }
+            secs.push(s);
+        }
+        if let Some(tr) = tr {
+            let mut s = SSec::new(b"Bot tree pushes");
+            s.count("full", tr.rvu("full"));
+            s.count("delta", tr.rvu("delta"));
+            s.count("pulls", tr.rvu("pull"));
+            s.delta(tr);
+            secs.push(s);
+        }
+        if let Some(sy) = sy {
+            let mut s = SSec::new(b"Sync frames from other hubs");
+            s.count("frames", sy.rvu("frames"));
+            s.count("no-op", sy.rvu("noop"));
+            s.count("records", sy.rvu("records"));
+            s.count("applied", sy.rvu("applied"));
+            if sy.rv("digests").is_some() {
+                s.count("digests", sy.rvu("digests"));
+                s.count("received", sy.rvu("digests_in"));
+                s.count("matched", sy.rvu("matched"));
+                s.count("repaired", sy.rvu("repaired"));
+                s.count("fallbacks", sy.rvu("fallbacks"));
+            }
+            secs.push(s);
+        }
+        if let Some(p2) = p2 {
+            let mut s = SSec::new(if p2.rvi("ready", 0) != 0 {
+                b"Presence v2".as_slice()
+            } else {
+                b"Presence v2 (waiting for a hub's record)"
+            });
+            s.count("deltas", p2.rvu("deltas"));
+            s.count("snapshots", p2.rvu("snaps"));
+            s.count("held", p2.rvu("held"));
+            s.count("pulls", p2.rvu("pulls"));
+            s.count("relays", p2.rvu("relays"));
+            s.count("digest misses", p2.rvu("miss"));
+            s.count("heals", p2.rvu("heals"));
+            s.count("jumps", p2.rvu("jumps"));
+            s.count("bad", p2.rvu("bad"));
+            s.count("drops", p2.rvu("drops"));
+            secs.push(s);
+        }
+        if let Some(pl) = pl {
+            let mut s = SSec::new(b"Server pool");
+            s.count("servers", pl.rvu("servers"));
+            s.count("usable", pl.rvu("usable"));
+            s.count("wrong net", pl.rvu("wrongnet"));
+            s.count("bots idle", pl.rvu("idle"));
+            s.count("reports", pl.rvu("reports"));
+            s.count("flagged", pl.rvu("flagged"));
+            s.count("views sent", pl.rvu("views"));
+            s.warn = !(pl.rvu("usable") != 0 || pl.rvu("servers") == 0);
+            secs.push(s);
+        }
+        if let Some(ld) = ld {
+            let mut s = SSec::new(b"Connections");
+            s.count("total", ld.rvu("clients"));
+            s.count("bots", ld.rvu("bots"));
+            s.count("hubs", ld.rvu("peers"));
+            s.count("consoles", ld.rvu("consoles"));
+            s.count("authing", ld.rvu("authing"));
+            secs.push(s);
+        }
+        render_stats_grid(&secs, out);
+    } else {
+        let mut b = Sb::default();
+        if let Some(cfg) = cfg {
+            // A 2.5.3 hub answers sent= (all full) and no delta or pull.
+            line(out, RL_HEAD, &[b" Config pushes to bots"]);
+            let full = if cfg.rv("full").is_some() {
+                cfg.rvu("full")
+            } else {
+                cfg.rvu("sent")
+            };
+            count_kv(&mut b, "  full", full, 0);
+            count_kv(&mut b, "delta", cfg.rvu("delta"), 24);
+            count_kv(&mut b, "skipped (unchanged)", cfg.rvu("same"), 40);
+            count_kv(&mut b, "lost", cfg.rvu("lost"), 72);
+            b.emit(out, RL_NORMAL);
+            if cfg.rv("delta").is_some() {
+                count_kv(&mut b, "  pulls", cfg.rvu("pull"), 0);
+                delta_kv(&mut b, cfg);
+                b.emit(out, RL_NORMAL);
+            }
+        }
+        if let Some(tr) = tr {
+            line(out, RL_HEAD, &[b" Bot tree pushes"]);
+            count_kv(&mut b, "  full", tr.rvu("full"), 0);
+            count_kv(&mut b, "delta", tr.rvu("delta"), 24);
+            count_kv(&mut b, "pulls", tr.rvu("pull"), 40);
+            b.emit(out, RL_NORMAL);
+            b.a(b" ");
+            delta_kv(&mut b, tr);
             b.emit(out, RL_NORMAL);
         }
-    }
-    if let Some(tr) = tr {
-        line(out, RL_HEAD, &[b" Bot tree pushes"]);
-        count_kv(&mut b, "  full", tr.rvu("full"), 0);
-        count_kv(&mut b, "delta", tr.rvu("delta"), 24);
-        count_kv(&mut b, "pulls", tr.rvu("pull"), 40);
-        b.emit(out, RL_NORMAL);
-        b.a(b" ");
-        delta_kv(&mut b, tr);
-        b.emit(out, RL_NORMAL);
-    }
-    if let Some(sy) = sy {
-        line(out, RL_HEAD, &[b" Sync frames from other hubs"]);
-        count_kv(&mut b, "  frames", sy.rvu("frames"), 0);
-        count_kv(&mut b, "no-op", sy.rvu("noop"), 24);
-        count_kv(&mut b, "records", sy.rvu("records"), 40);
-        count_kv(&mut b, "applied", sy.rvu("applied"), 60);
-        b.emit(out, RL_NORMAL);
-        if sy.rv("digests").is_some() {
-            // 2.5.4 hash-first rounds: sent, received, nothing to repair,
-            // kinds exchanged, whole-state fallbacks.
-            count_kv(&mut b, "  digests", sy.rvu("digests"), 0);
-            count_kv(&mut b, "received", sy.rvu("digests_in"), 24);
-            count_kv(&mut b, "matched", sy.rvu("matched"), 40);
-            count_kv(&mut b, "repaired", sy.rvu("repaired"), 60);
-            count_kv(&mut b, "fallbacks", sy.rvu("fallbacks"), 80);
+        if let Some(sy) = sy {
+            line(out, RL_HEAD, &[b" Sync frames from other hubs"]);
+            count_kv(&mut b, "  frames", sy.rvu("frames"), 0);
+            count_kv(&mut b, "no-op", sy.rvu("noop"), 24);
+            count_kv(&mut b, "records", sy.rvu("records"), 40);
+            count_kv(&mut b, "applied", sy.rvu("applied"), 60);
+            b.emit(out, RL_NORMAL);
+            if sy.rv("digests").is_some() {
+                // 2.5.4 hash-first rounds: sent, received, nothing to repair,
+                // kinds exchanged, whole-state fallbacks.
+                count_kv(&mut b, "  digests", sy.rvu("digests"), 0);
+                count_kv(&mut b, "received", sy.rvu("digests_in"), 24);
+                count_kv(&mut b, "matched", sy.rvu("matched"), 40);
+                count_kv(&mut b, "repaired", sy.rvu("repaired"), 60);
+                count_kv(&mut b, "fallbacks", sy.rvu("fallbacks"), 80);
+                b.emit(out, RL_NORMAL);
+            }
+        }
+        if let Some(p2) = p2 {
+            // Not ready: a linked hub's first record is not in yet (every hub runs v2).
+            let head: &[u8] = if p2.rvi("ready", 0) != 0 {
+                b" Presence v2"
+            } else {
+                b" Presence v2 (waiting for a hub's record)"
+            };
+            line(out, RL_HEAD, &[head]);
+            count_kv(&mut b, "  deltas", p2.rvu("deltas"), 0);
+            count_kv(&mut b, "snapshots", p2.rvu("snaps"), 24);
+            count_kv(&mut b, "held", p2.rvu("held"), 40);
+            count_kv(&mut b, "pulls", p2.rvu("pulls"), 60);
+            count_kv(&mut b, "relays", p2.rvu("relays"), 80);
+            b.emit(out, RL_NORMAL);
+            count_kv(&mut b, "  digest misses", p2.rvu("miss"), 0);
+            count_kv(&mut b, "heals", p2.rvu("heals"), 24);
+            count_kv(&mut b, "jumps", p2.rvu("jumps"), 40);
+            count_kv(&mut b, "bad", p2.rvu("bad"), 60);
+            count_kv(&mut b, "drops", p2.rvu("drops"), 80);
             b.emit(out, RL_NORMAL);
         }
-    }
-    if let Some(p2) = p2 {
-        // Not ready: a linked hub's first record is not in yet (every hub runs v2).
-        let head: &[u8] = if p2.rvi("ready", 0) != 0 {
-            b" Presence v2"
-        } else {
-            b" Presence v2 (waiting for a hub's record)"
-        };
-        line(out, RL_HEAD, &[head]);
-        count_kv(&mut b, "  deltas", p2.rvu("deltas"), 0);
-        count_kv(&mut b, "snapshots", p2.rvu("snaps"), 24);
-        count_kv(&mut b, "held", p2.rvu("held"), 40);
-        count_kv(&mut b, "pulls", p2.rvu("pulls"), 60);
-        count_kv(&mut b, "relays", p2.rvu("relays"), 80);
-        b.emit(out, RL_NORMAL);
-        count_kv(&mut b, "  digest misses", p2.rvu("miss"), 0);
-        count_kv(&mut b, "heals", p2.rvu("heals"), 24);
-        count_kv(&mut b, "jumps", p2.rvu("jumps"), 40);
-        count_kv(&mut b, "bad", p2.rvu("bad"), 60);
-        count_kv(&mut b, "drops", p2.rvu("drops"), 80);
-        b.emit(out, RL_NORMAL);
-    }
-    if let Some(ld) = ld {
-        line(out, RL_HEAD, &[b" Connections"]);
-        count_kv(&mut b, "  total", ld.rvu("clients"), 0);
-        count_kv(&mut b, "bots", ld.rvu("bots"), 24);
-        count_kv(&mut b, "hubs", ld.rvu("peers"), 40);
-        count_kv(&mut b, "consoles", ld.rvu("consoles"), 60);
-        count_kv(&mut b, "authing", ld.rvu("authing"), 80);
-        b.emit(out, RL_NORMAL);
+        if let Some(pl) = pl {
+            // 2.5.4 server pool
+            line(out, RL_HEAD, &[b" Server pool"]);
+            count_kv(&mut b, "  servers", pl.rvu("servers"), 0);
+            count_kv(&mut b, "usable", pl.rvu("usable"), 24);
+            count_kv(&mut b, "wrong net", pl.rvu("wrongnet"), 40);
+            count_kv(&mut b, "bots idle", pl.rvu("idle"), 60);
+            b.emit(
+                out,
+                if pl.rvu("usable") != 0 || pl.rvu("servers") == 0 {
+                    RL_NORMAL
+                } else {
+                    RL_WARN
+                },
+            );
+            count_kv(&mut b, "  reports", pl.rvu("reports"), 0);
+            count_kv(&mut b, "flagged", pl.rvu("flagged"), 24);
+            count_kv(&mut b, "views sent", pl.rvu("views"), 40);
+            b.emit(out, RL_NORMAL);
+        }
+        if let Some(ld) = ld {
+            line(out, RL_HEAD, &[b" Connections"]);
+            count_kv(&mut b, "  total", ld.rvu("clients"), 0);
+            count_kv(&mut b, "bots", ld.rvu("bots"), 24);
+            count_kv(&mut b, "hubs", ld.rvu("peers"), 40);
+            count_kv(&mut b, "consoles", ld.rvu("consoles"), 60);
+            count_kv(&mut b, "authing", ld.rvu("authing"), 80);
+            b.emit(out, RL_NORMAL);
+        }
     }
     render_timers(ctx, rep, ld, out);
     flines_add(out, RL_NORMAL, b"");
@@ -3888,12 +4329,13 @@ fn user_access(ctx: &Ctx, u: &Crec) -> Vec<u8> {
 /// "chu" -> "channels, opers, upgrades"; "a" -> "full admin".  C
 /// `flags_words` (cap bytes with the NUL).
 fn flags_words(flags: Option<&[u8]>, cap: usize) -> Vec<u8> {
-    const W: [(u8, &str); 6] = [
+    const W: [(u8, &str); 7] = [
         (b'a', "full admin"),
         (b'b', "bots"),
         (b'c', "channels"),
         (b'h', "hub"),
         (b'o', "opers"),
+        (b's', "servers"),
         (b'u', "upgrades"),
     ];
     let mut out: Vec<u8> = Vec::new();
@@ -5325,6 +5767,263 @@ fn ban_row_cmp(a: &&Crec, b: &&Crec) -> std::cmp::Ordering {
         return c;
     }
     a.rvi("ts", 0).cmp(&b.rvi("ts", 0))
+}
+
+// ===========================================================================
+// Server pool (server list / network show, 2.5.4)
+// ===========================================================================
+fn pool_row_cmp(x: &&Crec, y: &&Crec) -> std::cmp::Ordering {
+    let c = ci_cmp(x.rv("host").unwrap_or(b""), y.rv("host").unwrap_or(b""));
+    if c != 0 {
+        return c.cmp(&0);
+    }
+    x.rvi("port", 0).cmp(&y.rvi("port", 0))
+}
+
+fn pool_state_text(c: &Crec) -> Vec<u8> {
+    let st = c.rv("state").unwrap_or(b"?");
+    if st == b"wrongnet" {
+        snp(
+            96,
+            cat(&[
+                b"wrong network (",
+                if c.rvs("seen").is_some() {
+                    c.rv("seen").unwrap_or(b"")
+                } else {
+                    b"none named"
+                },
+                b")",
+            ]),
+        )
+    } else if st == b"disabled" {
+        b"disabled".to_vec()
+    } else {
+        b"ok".to_vec()
+    }
+}
+
+fn render_pool_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    let (count, usable, idle) = (r.rvi("count", 0), r.rvi("usable", 0), r.rvi("idle", 0));
+    let right = snp(
+        160,
+        cat(&[
+            &num(count),
+            b" server",
+            pl(count),
+            b" ",
+            glyph(ctx, G_DOT),
+            b" ",
+            &num(usable),
+            b" usable ",
+            glyph(ctx, G_DOT),
+            b" network ",
+            if r.rvs("name").is_some() {
+                r.rv("name").unwrap_or(b"")
+            } else {
+                b"(name not learned yet)"
+            },
+        ]),
+    );
+    title(ctx, out, b"Servers", Some(&right));
+    let mut rows: Vec<&Crec> = rep.r.iter().filter(|c| c.is("server")).collect();
+    if rows.is_empty() {
+        empty_note(
+            out,
+            "no servers: hub-managed bots cannot connect to IRC",
+            Some("server add <host[:port]>"),
+        );
+        return;
+    }
+    rows.sort_by(pool_row_cmp);
+    const COLS: [Col; 7] = [
+        col("HOST", b'L', 1),
+        col("PORT", b'R', 1),
+        col("STATE", b'L', 1),
+        col("BOTS", b'R', 1),
+        col("WEIGHT", b'R', 2),
+        col("MAX", b'R', 2),
+        col("ADDED", b'L', 2),
+    ];
+    let mut t = Tbl::new(&COLS, -1, 1, 1);
+    for c in rows {
+        let port = num(c.rvi("port", 0));
+        let st = pool_state_text(c);
+        let (up, conn) = (c.rvi("up", 0), c.rvi("connecting", 0));
+        let bots = if conn != 0 {
+            cat(&[&num(up), b" +", &num(conn)])
+        } else {
+            num(up)
+        };
+        let wt = num(c.rvi("weight", 1));
+        let mx = if c.rvi("max", 0) != 0 {
+            num(c.rvi("max", 0))
+        } else {
+            glyph(ctx, G_DASH).to_vec()
+        };
+        let when_s = when_ago(ctx, c.rvi("ts", 0), 64);
+        let bad = c.rv("state").is_some_and(|x| x != b"ok");
+        t.row(
+            ctx,
+            if bad { RL_WARN } else { RL_NORMAL },
+            None,
+            &[
+                c.rv("host"),
+                Some(&port),
+                Some(&st),
+                Some(&bots),
+                Some(&wt),
+                Some(&mx),
+                Some(&when_s),
+            ],
+        );
+    }
+    t.render(ctx, out);
+    if usable == 0 {
+        warn(
+            ctx,
+            out,
+            b"no usable server: bots that disconnect cannot reconnect",
+        );
+    }
+    if idle > 0 {
+        let w = snp(
+            96,
+            cat(&[
+                &num(idle),
+                b" bot",
+                pl(idle),
+                b" waiting for a usable server",
+            ]),
+        );
+        warn(ctx, out, &w);
+    }
+}
+
+fn render_pool_net(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    title(ctx, out, b"Network", Some(r.rv("net").unwrap_or(b"main")));
+    const L: i32 = 9;
+    card_line(
+        out,
+        L,
+        b"name",
+        Some(if r.rvs("name").is_some() {
+            r.rv("name").unwrap_or(b"")
+        } else {
+            b"(not learned yet: the first bot names it)"
+        }),
+        RL_NORMAL,
+    );
+    card_line(
+        out,
+        L,
+        b"aliases",
+        Some(if r.rvs("aliases").is_some() {
+            r.rv("aliases").unwrap_or(b"")
+        } else {
+            glyph(ctx, G_DASH)
+        }),
+        RL_NORMAL,
+    );
+    let (usable, idle) = (r.rvi("usable", 0), r.rvi("idle", 0));
+    let v = snp(96, cat(&[&num(usable), b" usable"]));
+    card_line(
+        out,
+        L,
+        b"servers",
+        Some(&v),
+        if usable != 0 { RL_NORMAL } else { RL_WARN },
+    );
+    let v = snp(96, cat(&[&num(idle), b" waiting for a server"]));
+    card_line(
+        out,
+        L,
+        b"idle",
+        Some(&v),
+        if idle != 0 { RL_WARN } else { RL_NORMAL },
+    );
+}
+
+fn render_pool_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    let code = rep.code.as_slice();
+    if code == b"pool.netset" {
+        ok(
+            ctx,
+            b"Network set",
+            Some(if r.rvs("name").is_some() {
+                r.rv("name").unwrap_or(b"")
+            } else {
+                b"(name not learned)"
+            }),
+            out,
+        );
+        if let Some(a) = r.rvs("aliases") {
+            effect(ctx, out, &snp(600, cat(&[b"also accepted: ", a])));
+        }
+        push_effects(ctx, r, out);
+        return;
+    }
+    let subj = snp(
+        300,
+        cat(&[r.rv("host").unwrap_or(b"?"), b":", &num(r.rvi("port", 0))]),
+    );
+    let what: &[u8] = if code == b"pool.added" {
+        if r.rvb("revived") {
+            b"Server back"
+        } else {
+            b"Server added"
+        }
+    } else if code == b"pool.removed" {
+        b"Server removed"
+    } else if code == b"pool.cleared" {
+        b"Wrong-network flag cleared"
+    } else {
+        b"Server set"
+    };
+    ok(ctx, what, Some(&subj), out);
+    if code == b"pool.removed" {
+        effect(
+            ctx,
+            out,
+            if r.rvb("last") {
+                b"it was the last usable server: no bot can reconnect until one is added"
+            } else {
+                b"bots on it stay until they disconnect"
+            },
+        );
+    } else {
+        let st = pool_state_text(r);
+        let d = glyph(ctx, G_DOT);
+        let ph = if r.rvi("max", 0) != 0 {
+            cat(&[
+                b"weight ",
+                &num(r.rvi("weight", 1)),
+                b" ",
+                d,
+                b" max ",
+                &num(r.rvi("max", 0)),
+                b" ",
+                d,
+                b" ",
+                &st,
+            ])
+        } else {
+            cat(&[
+                b"weight ",
+                &num(r.rvi("weight", 1)),
+                b" ",
+                d,
+                b" no cap ",
+                d,
+                b" ",
+                &st,
+            ])
+        };
+        effect(ctx, out, &snp(160, ph));
+    }
+    push_effects(ctx, r, out);
 }
 
 fn render_ban_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
@@ -7209,6 +7908,12 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
         render_channel_mode(ctx, rep, out);
     } else if c == b"channel.set" {
         render_settings_change(ctx, rep, out);
+    } else if c == b"pool.list" {
+        render_pool_list(ctx, rep, out);
+    } else if c == b"pool.net" {
+        render_pool_net(ctx, rep, out);
+    } else if has(b"pool.") {
+        render_pool_change(ctx, rep, out);
     } else if c == b"ban.list" {
         render_ban_list(ctx, rep, out);
     } else if has(b"ban.") {
