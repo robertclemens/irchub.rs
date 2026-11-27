@@ -13,7 +13,9 @@ use crate::cstr::{now, trunc_string};
 use crate::opflow::{add_pending_chan_request, chan_kind_valid, forward_seen_check_and_add};
 use crate::presence::{bot_nick_from_config, roster_clean};
 use crate::reply::Reply;
-use crate::state::{ChanElect, ChanElectBot, ChanElectHub, ChanElectPhase, ClientType, HubState};
+use crate::state::{
+    ChanElect, ChanElectBot, ChanElectHub, ChanElectPhase, ChanElectTarget, ClientType, HubState,
+};
 use crate::{client, crypto, queue};
 
 fn find(state: &HubState, id: &str) -> Option<usize> {
@@ -23,17 +25,76 @@ fn find(state: &HubState, id: &str) -> Option<usize> {
         .position(|e| e.active && e.id == id)
 }
 
-/// End an election: the slot is free and a `who` answer's buffer goes.
+/// End an election: the slot is free and a `who` answer's buffer and a
+/// batch's targets go.
 fn release(state: &mut HubState, ei: usize) {
     let e = &mut state.chan_elections[ei];
     crypto::wipe(&mut e.who_buf); // it holds the key
     e.who_buf = Vec::new();
+    e.tg = None;
     e.active = false;
 }
 
-fn alloc(state: &mut HubState) -> Option<usize> {
-    let i = state.chan_elections.iter().position(|e| !e.active)?;
+/// Elections this hub holds a copy of now (hub stats).
+pub fn in_flight(state: &HubState) -> usize {
+    state.chan_elections.iter().filter(|e| e.active).count()
+}
+
+/// A bot's own request: the requester is neither the console nor a person.
+fn own_requester(state: &HubState, requester: &str) -> bool {
+    !requester.is_empty()
+        && requester != "ADMIN"
+        && !state.user_records.iter().any(|u| u.uuid == requester)
+}
+
+/// "Election table full": the first refusal is logged, the rest are counted
+/// and logged as one line every CHAN_ELECT_FULL_LOG s (full_flush).
+fn full_flush(state: &mut HubState, t: i64) {
+    if state.ce_full_n == 0 || t - state.ce_full_at < CHAN_ELECT_FULL_LOG {
+        return;
+    }
+    crate::hlog_warning!(
+        "[CHANREQ] Election table full: {} more request(s) refused in the last {} s\n",
+        state.ce_full_n,
+        CHAN_ELECT_FULL_LOG
+    );
+    state.ce_full_n = 0;
+    state.ce_full_at = t;
+}
+
+fn full_note(state: &mut HubState, own: bool, kind: &str, channel: &str) {
+    let t = now();
+    crate::stats::el_refused();
+    if state.ce_full_at != 0 && t - state.ce_full_at < CHAN_ELECT_FULL_LOG {
+        state.ce_full_n += 1;
+        return;
+    }
+    state.ce_full_at = t;
+    let n = in_flight(state);
+    if own {
+        crate::hlog_warning!(
+            "[CHANREQ] Election table full ({n} in flight, {CHAN_ELECT_RESERVE} kept for the console): refused {kind} for {channel}; further refusals are counted\n"
+        );
+    } else {
+        crate::hlog_warning!(
+            "[CHANREQ] Election table full ({n} in flight): refused {kind} for {channel}; further refusals are counted\n"
+        );
+    }
+}
+
+/// A free slot, or None (logged).  A bot's own request leaves the last
+/// CHAN_ELECT_RESERVE slots to the console and to persons.
+fn alloc(state: &mut HubState, own: bool, kind: &str, channel: &str) -> Option<usize> {
+    if own && in_flight(state) >= MAX_CHAN_ELECTIONS - CHAN_ELECT_RESERVE {
+        full_note(state, own, kind, channel);
+        return None;
+    }
+    let Some(i) = state.chan_elections.iter().position(|e| !e.active) else {
+        full_note(state, own, kind, channel);
+        return None;
+    };
     release(state, i);
+    crate::stats::el_started();
     let t = now();
     state.chan_elections[i] = ChanElect {
         from_fd: -1,
@@ -75,6 +136,210 @@ fn count(e: &ChanElect, st: u8) -> usize {
     e.bots.iter().filter(|b| b.st == st).count()
 }
 
+/// A hub version that takes ELECT_END and batched own-op elections.
+fn version_new(v: &str) -> bool {
+    !v.is_empty()
+        && crate::update::version_cmp(v, CHAN_ELECT_BATCH_MIN_HUB) != std::cmp::Ordering::Less
+}
+
+/// Every hub this one knows (gossip and its own links) runs
+/// CHAN_ELECT_BATCH_MIN_HUB or newer: only then may own op be batched.
+fn batch_ok(state: &HubState) -> bool {
+    state
+        .mesh_hubs
+        .iter()
+        .all(|m| m.uuid == state.hub_uuid || version_new(&m.version))
+        && (0..state.clients.len()).all(|ci| {
+            let c = &state.clients[ci];
+            !(c.typ == ClientType::Hub && c.authenticated)
+                || version_new(&crate::mesh::peer_version_str(state, ci))
+        })
+}
+
+/// A known hub's version from gossip ("" when unknown).
+fn hub_version(state: &HubState, uuid: &str) -> String {
+    state
+        .mesh_hubs
+        .iter()
+        .find(|m| m.uuid == uuid)
+        .map(|m| m.version.clone())
+        .unwrap_or_default()
+}
+
+/// ELECT_END to every 2.5.4+ peer except `skip`, once per election (the
+/// seen ring, key "end:<eid>").
+fn end_send(state: &mut HubState, id: &str, skip: Option<usize>) {
+    if forward_seen_check_and_add(state, &format!("end:{id}")) {
+        return;
+    }
+    for ci in 0..state.clients.len() {
+        let c = &state.clients[ci];
+        if Some(ci) != skip
+            && c.typ == ClientType::Hub
+            && c.authenticated
+            && version_new(&crate::mesh::peer_version_str(state, ci))
+        {
+            queue::send_urgent(&mut state.clients[ci], CMD_CHAN_ELECT_END, id);
+        }
+    }
+}
+
+/// The batch target `uuid`'s index, or None.
+fn target(e: &ChanElect, uuid: &str) -> Option<usize> {
+    e.tg.as_ref()?.iter().position(|t| t.uuid == uuid)
+}
+
+fn tg_count(e: &ChanElect, st: u8) -> usize {
+    e.tg.as_ref()
+        .map(|v| v.iter().filter(|t| t.st == st).count())
+        .unwrap_or(0)
+}
+
+/// Tell batch target t its answer: rid|status|detail to its bot (origin).
+fn tg_answer(state: &mut HubState, t: &ChanElectTarget, status: &str, detail: &str) {
+    if t.reply_fd < 0 {
+        return;
+    }
+    if let Some(ci) = state.clients.iter().position(|c| {
+        c.typ == ClientType::Bot
+            && c.authenticated
+            && c.fd == t.reply_fd
+            && c.conn_serial == t.reply_serial
+    }) {
+        let res = trunc_string(&format!("{}|{status}|{detail}", t.rid), 256);
+        client::send_cmd_to_bot(&mut state.clients[ci], CMD_USER_CHAN_RESULT, &res);
+    }
+}
+
+/// Target ti was served by bot `by` (ok) or refused for +bitch (!ok): the
+/// origin answers its bot, a relay reports it toward the origin.
+#[allow(clippy::too_many_arguments)]
+fn tg_served(
+    state: &mut HubState,
+    ei: usize,
+    ti: usize,
+    ok: bool,
+    by_uuid: &str,
+    by_nick: &str,
+    hub_name: &str,
+    detail: &str,
+) {
+    let t = {
+        let tg = state.chan_elections[ei].tg.as_mut().expect("batch");
+        tg[ti].st = if ok { b'o' } else { b'x' };
+        tg[ti].clone()
+    };
+    if !state.chan_elections[ei].origin {
+        let sub = format!("{}.{}", state.chan_elections[ei].id, t.uuid);
+        done_up_id(
+            state,
+            ei,
+            &sub,
+            by_uuid,
+            by_nick,
+            if ok { "ok" } else { "fail" },
+            if ok { detail } else { "bitch" },
+        );
+        return;
+    }
+    let d = if ok {
+        format!(
+            "op by {} on {}",
+            trunc_string(if by_nick.is_empty() { by_uuid } else { by_nick }, 32),
+            trunc_string(hub_name, 64)
+        )
+    } else {
+        format!(
+            "not authorised on {} and +bitch is on",
+            trunc_string(&state.chan_elections[ei].channel, 65)
+        )
+    };
+    tg_answer(state, &t, if ok { "ok" } else { "denied" }, &d);
+}
+
+/// Hand every waiting target to one ready local bot: one CHAN_DO each, id
+/// <eid>.<target>.  False when no ready bot is left.
+fn try_local_batch(state: &mut HubState, ei: usize) -> bool {
+    loop {
+        let e = &state.chan_elections[ei];
+        let ready = count(e, b'y');
+        if ready == 0 {
+            return false;
+        }
+        let k = pick(ready);
+        let Some(bi) = e
+            .bots
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.st == b'y')
+            .nth(k)
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        let buuid = e.bots[bi].uuid.clone();
+        state.chan_elections[ei].bots[bi].st = b't';
+        let mut sent = 0;
+        if let Some(ci) = bot(state, &buuid) {
+            let n = state.chan_elections[ei].tg.as_ref().map_or(0, |v| v.len());
+            for ti in 0..n {
+                let e = &state.chan_elections[ei];
+                let t = &e.tg.as_ref().expect("batch")[ti];
+                if t.st != b'p' {
+                    continue;
+                }
+                let act = trunc_string(
+                    &format!(
+                        "{}.{}|op|{}|{}|{}|{}",
+                        e.id, t.uuid, e.channel, t.uuid, t.nick, t.hostmask
+                    ),
+                    MAX_MASK_LEN + 320,
+                );
+                if !client::send_cmd_to_bot(&mut state.clients[ci], CMD_CHAN_DO, &act) {
+                    break;
+                }
+                state.chan_elections[ei].tg.as_mut().expect("batch")[ti].st = b'd';
+                sent += 1;
+            }
+        }
+        let e = &mut state.chan_elections[ei];
+        if sent == 0 {
+            e.bots[bi].reason = "unreachable".into();
+            continue;
+        }
+        e.doing = buuid;
+        e.phase = ChanElectPhase::LocalDo;
+        e.phase_at = now();
+        return true;
+    }
+}
+
+/// Nothing left to hand out: the origin ends, a relay reports "all served".
+fn batch_complete(state: &mut HubState, ei: usize) {
+    if state.chan_elections[ei].origin {
+        finish(state, ei, "ok", "", "", "", "");
+        return;
+    }
+    let id = state.chan_elections[ei].id.clone();
+    done_up_id(state, ei, &id, "", "", "ok", "batch done");
+    let e = &mut state.chan_elections[ei];
+    e.doing.clear();
+    e.phase = ChanElectPhase::Acked;
+    e.phase_at = now();
+}
+
+/// A batch's next step: done, the next ready local bot, or the mesh.
+fn batch_next(state: &mut HubState, ei: usize) {
+    let e = &state.chan_elections[ei];
+    if tg_count(e, b'p') == 0 && tg_count(e, b'd') == 0 {
+        batch_complete(state, ei);
+        return;
+    }
+    if !try_local_batch(state, ei) {
+        local_exhausted(state, ei);
+    }
+}
+
 /// Ask every local bot except the requester.
 fn probe_local(state: &mut HubState, ei: usize) {
     let (id, kind, channel, requester) = {
@@ -94,6 +359,9 @@ fn probe_local(state: &mut HubState, ei: usize) {
         }
         if state.clients[ci].id == requester {
             continue; // it cannot help itself
+        }
+        if target(&state.chan_elections[ei], &state.clients[ci].id).is_some() {
+            continue; // nor can a batch's bots
         }
         let uuid = state.clients[ci].id.clone();
         let nick = bot_nick_from_config(state, &uuid);
@@ -117,6 +385,9 @@ fn probe_local(state: &mut HubState, ei: usize) {
 
 /// Hand the action to one ready local bot.  False when none is left.
 fn try_local(state: &mut HubState, ei: usize) -> bool {
+    if state.chan_elections[ei].tg.is_some() {
+        return try_local_batch(state, ei);
+    }
     loop {
         let e = &state.chan_elections[ei];
         let ready = count(e, b'y');
@@ -524,6 +795,43 @@ pub fn process_who(state: &mut HubState, ci: usize, payload: &str) {
 /// The origin's end of an election: answer the console that asked, log, and
 /// free the slot.  status: "ok" (one bot did it), "bitch" (refused, D12),
 /// anything else = nobody could.
+/// A batched own op ends at the origin: every target still waiting gets
+/// none (its bot may ask over IRC), one summary line, ELECT_END.
+fn batch_finish(state: &mut HubState, ei: usize) {
+    let e = state.chan_elections[ei].clone();
+    let asked = e.bots.len() as i64 + e.hubs.iter().map(|h| h.asked).sum::<i64>();
+    let hubs = 1 + e.hubs.len() as i64;
+    let why = reasons(&e, 160);
+    let d = trunc_string(
+        &format!(
+            "no bot could: {asked} asked on {hubs} hub{}{}{}",
+            if hubs == 1 { "" } else { "s" },
+            if why.is_empty() { "" } else { "; " },
+            trunc_string(&why, 121)
+        ),
+        256,
+    );
+    let tg = e.tg.clone().unwrap_or_default();
+    let mut left = 0;
+    for t in tg.iter().filter(|t| t.st == b'p' || t.st == b'd') {
+        tg_answer(state, t, "none", &d);
+        left += 1;
+    }
+    crate::hlog_info!(
+        "[CHANREQ] own op for {} bot{} on {} (id:{}): {} opped, {} refused (+bitch), {left} left to ask over IRC\n",
+        tg.len(),
+        if tg.len() == 1 { "" } else { "s" },
+        e.channel,
+        e.id,
+        tg_count(&e, b'o'),
+        tg_count(&e, b'x')
+    );
+    if e.flooded {
+        end_send(state, &e.id, None);
+    }
+    release(state, ei);
+}
+
 fn finish(
     state: &mut HubState,
     ei: usize,
@@ -533,6 +841,10 @@ fn finish(
     hub_name: &str,
     detail: &str,
 ) {
+    if state.chan_elections[ei].tg.is_some() {
+        batch_finish(state, ei);
+        return;
+    }
     let e = state.chan_elections[ei].clone();
     let asked = e.bots.len() as i64 + e.hubs.iter().map(|h| h.asked).sum::<i64>();
     let hubs = 1 + e.hubs.len() as i64;
@@ -837,6 +1149,9 @@ fn finish(
             }
         }
     }
+    if e.flooded {
+        end_send(state, &e.id, None); // the relays free their copies
+    }
     release(state, ei);
 }
 
@@ -849,9 +1164,10 @@ fn up(state: &mut HubState, ei: usize, cmd: u8, payload: &str) {
     send_peer(state, fd, serial, cmd, payload);
 }
 
-fn done_up(
+fn done_up_id(
     state: &mut HubState,
     ei: usize,
+    id: &str,
     bot_uuid: &str,
     bot_nick: &str,
     status: &str,
@@ -859,8 +1175,7 @@ fn done_up(
 ) {
     let buf = trunc_string(
         &format!(
-            "{}|{}|{}|{bot_uuid}|{bot_nick}|{status}|{detail}",
-            state.chan_elections[ei].id,
+            "{id}|{}|{}|{bot_uuid}|{bot_nick}|{status}|{detail}",
             state.hub_uuid,
             hub_display_name(state)
         ),
@@ -869,11 +1184,46 @@ fn done_up(
     up(state, ei, CMD_CHAN_ELECT_DONE, &buf);
 }
 
+fn done_up(
+    state: &mut HubState,
+    ei: usize,
+    bot_uuid: &str,
+    bot_nick: &str,
+    status: &str,
+    detail: &str,
+) {
+    let id = state.chan_elections[ei].id.clone();
+    done_up_id(state, ei, &id, bot_uuid, bot_nick, status, detail);
+}
+
 /// Origin, nobody local can: the next hub with a ready bot, else nobody.  A
 /// bot that never answered the probe is not handed a blind old-style request:
 /// every bot the mesh admits (MESH_MIN_VERSION) answers probes, so silence
 /// means busy or gone, and the old fan-out skipped +bitch (D12).
 fn try_hub(state: &mut HubState, ei: usize) {
+    if state.chan_elections[ei].tg.is_some() {
+        // a batch goes only to a hub that reads its target list
+        let old: Vec<bool> = state.chan_elections[ei]
+            .hubs
+            .iter()
+            .map(|h| !version_new(&hub_version(state, &h.uuid)))
+            .collect();
+        let e = &mut state.chan_elections[ei];
+        for (h, o) in e.hubs.iter_mut().zip(old) {
+            if o {
+                h.tried = true;
+            }
+        }
+        for t in e.tg.as_mut().expect("batch").iter_mut() {
+            if t.st == b'd' {
+                t.st = b'p'; // the last hub's leftovers
+            }
+        }
+        if tg_count(e, b'p') == 0 {
+            finish(state, ei, "ok", "", "", "", "");
+            return;
+        }
+    }
     loop {
         let e = &state.chan_elections[ei];
         let ready: Vec<usize> = (0..e.hubs.len())
@@ -890,16 +1240,26 @@ fn try_hub(state: &mut HubState, ei: usize) {
             e.id.clone(),
         );
         state.chan_elections[ei].hubs[hi].tried = true;
-        if !send_peer(
-            state,
-            fd,
-            serial,
-            CMD_CHAN_ELECT_DO,
-            &format!("{id}|{uuid}|elect"),
-        ) {
+        let mut buf = format!("{id}|{uuid}|elect");
+        if let Some(tg) = &state.chan_elections[ei].tg {
+            let list: Vec<&str> = tg
+                .iter()
+                .filter(|t| t.st == b'p')
+                .map(|t| t.uuid.as_str())
+                .collect();
+            buf.push('|');
+            buf.push_str(&list.join(","));
+        }
+        let buf = trunc_string(&buf, 160 + CHAN_ELECT_BATCH_MAX * 65);
+        if !send_peer(state, fd, serial, CMD_CHAN_ELECT_DO, &buf) {
             continue; // that hub's link went away: the next one
         }
         let e = &mut state.chan_elections[ei];
+        if let Some(tg) = e.tg.as_mut() {
+            for t in tg.iter_mut().filter(|t| t.st == b'p') {
+                t.st = b'd';
+            }
+        }
         e.doing = uuid;
         e.phase = ChanElectPhase::MeshDo;
         e.phase_at = now();
@@ -944,6 +1304,7 @@ fn new_local_bot(state: &HubState, ei: usize) -> bool {
         c.typ == ClientType::Bot
             && c.authenticated
             && c.id != e.requester
+            && target(e, &c.id).is_none()
             && !e.bots.iter().any(|b| b.uuid == c.id)
     })
 }
@@ -1002,6 +1363,7 @@ fn local_exhausted(state: &mut HubState, ei: usize) {
         }
     }
     let e = &mut state.chan_elections[ei];
+    e.flooded = true;
     e.phase = ChanElectPhase::MeshWait;
     e.phase_at = now();
 }
@@ -1018,7 +1380,24 @@ pub fn start(
     hostmask: &str,
     admin: Option<(i32, u64)>,
 ) -> Option<usize> {
-    let ei = alloc(state)?;
+    start_x(
+        state, kind, channel, requester, nick, hostmask, admin, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_x(
+    state: &mut HubState,
+    kind: &str,
+    channel: &str,
+    requester: &str,
+    nick: &str,
+    hostmask: &str,
+    admin: Option<(i32, u64)>,
+    gather: bool,
+) -> Option<usize> {
+    let own = own_requester(state, requester);
+    let ei = alloc(state, own, kind, channel)?;
     let id = crate::opflow::generate_request_id();
     if kind == "key" && !add_pending_chan_request(state, &id, requester, kind, channel, -1) {
         return None;
@@ -1037,6 +1416,16 @@ pub fn start(
         e.requester = trunc_string(requester, 64);
         e.nick = trunc_string(nick, MAX_NICK);
         e.hostmask = trunc_string(hostmask, MAX_MASK_LEN);
+        if gather {
+            e.phase = ChanElectPhase::Gather;
+            e.phase_at = now();
+            crate::hlog_debug!(
+                "[CHANREQ] Election {}: own op on {channel}, gathering {} s\n",
+                e.id,
+                CHAN_ELECT_BATCH_WAIT
+            );
+            return Some(ei);
+        }
     }
     probe_local(state, ei);
     let e = &state.chan_elections[ei];
@@ -1051,6 +1440,65 @@ pub fn start(
         e.bots.len()
     );
     Some(ei)
+}
+
+/// Own op, every hub new enough?  (opflow's CHAN_REQUEST asks first.)
+pub fn batch_wanted(state: &HubState) -> bool {
+    batch_ok(state)
+}
+
+/// A local bot's own op: into the batch gathering for that channel, else a
+/// new one.  False when the table is full.
+pub fn batch_join(
+    state: &mut HubState,
+    ci: usize,
+    channel: &str,
+    nick: &str,
+    hostmask: &str,
+    rid: &str,
+) -> bool {
+    let me = state.clients[ci].id.clone();
+    let found = state.chan_elections.iter().position(|x| {
+        x.active
+            && x.origin
+            && x.phase == ChanElectPhase::Gather
+            && x.channel.eq_ignore_ascii_case(channel)
+            && x.tg
+                .as_ref()
+                .is_some_and(|v| v.len() < CHAN_ELECT_BATCH_MAX || v.iter().any(|t| t.uuid == me))
+    });
+    let fresh = found.is_none();
+    let ei = match found {
+        Some(ei) => ei,
+        None => {
+            let Some(ei) = start_x(state, "op", channel, &me, nick, hostmask, None, true) else {
+                return false;
+            };
+            state.chan_elections[ei].tg = Some(Vec::with_capacity(CHAN_ELECT_BATCH_MAX));
+            ei
+        }
+    };
+    let (fd, serial) = (state.clients[ci].fd, state.clients[ci].conn_serial);
+    let t = ChanElectTarget {
+        uuid: me.clone(),
+        nick: trunc_string(nick, MAX_NICK),
+        hostmask: trunc_string(hostmask, MAX_MASK_LEN),
+        rid: trunc_string(rid, USER_CHAN_RID_MAX + 1),
+        reply_fd: fd,
+        reply_serial: serial,
+        st: b'p',
+    };
+    let tg = state.chan_elections[ei].tg.as_mut().expect("batch");
+    match tg.iter().position(|x| x.uuid == me) {
+        Some(i) => tg[i] = t,
+        None => {
+            tg.push(t);
+            if !fresh {
+                crate::stats::el_batched();
+            }
+        }
+    }
+    true
 }
 
 /// A local bot's answer to PROBE: eid|1| or eid|0|reason.
@@ -1093,15 +1541,23 @@ fn final_fail(e: &ChanElect, detail: &str) -> bool {
 
 /// The bot we handed the action to reports: eid|ok|detail or eid|fail|detail.
 pub fn process_done(state: &mut HubState, ci: usize, payload: &str) {
-    let id = wire_field(payload, 0, 64).unwrap_or_default();
+    let full = wire_field(payload, 0, 64).unwrap_or_default();
     let status = wire_field(payload, 1, 8).unwrap_or_default();
     let detail = wire_tail(payload, 2, 95).unwrap_or_default();
+    // a batch: <eid>.<target uuid>
+    let (id, sub) = match full.split_once('.') {
+        Some((a, b)) => (a.to_string(), Some(b.to_string())),
+        None => (full, None),
+    };
     let Some(ei) = (!id.is_empty()).then(|| find(state, &id)).flatten() else {
         return;
     };
     let from = state.clients[ci].id.clone();
     let e = &state.chan_elections[ei];
     if e.phase != ChanElectPhase::LocalDo || e.doing != from {
+        return;
+    }
+    if sub.is_some() != e.tg.is_some() {
         return;
     }
     let clean = roster_clean(&detail, 96);
@@ -1111,6 +1567,34 @@ pub fn process_done(state: &mut HubState, ci: usize, payload: &str) {
         .rfind(|b| b.uuid == from)
         .map(|b| b.nick.clone())
         .unwrap_or_default();
+    if let Some(sub) = sub {
+        let Some(ti) = target(e, &sub) else {
+            return;
+        };
+        if e.tg.as_ref().expect("batch")[ti].st != b'd' {
+            return;
+        }
+        let hn = hub_display_name(state).to_string();
+        if status == "ok" {
+            tg_served(state, ei, ti, true, &from, &nick, &hn, &clean);
+        } else if status == "fail" && final_fail(&state.chan_elections[ei], &clean) {
+            tg_served(state, ei, ti, false, &from, &nick, &hn, &clean);
+        } else {
+            let e = &mut state.chan_elections[ei];
+            e.tg.as_mut().expect("batch")[ti].st = b'p'; // the next ready bot gets it
+            if let Some(b) = e.bots.iter_mut().rfind(|b| b.uuid == from) {
+                b.reason = roster_clean(
+                    if clean.is_empty() { "failed" } else { &clean },
+                    CHAN_ELECT_REASON_MAX,
+                );
+            }
+        }
+        if tg_count(&state.chan_elections[ei], b'd') == 0 {
+            state.chan_elections[ei].doing.clear();
+            batch_next(state, ei);
+        }
+        return;
+    }
     if status == "ok" {
         if e.origin {
             let hn = hub_display_name(state).to_string();
@@ -1180,8 +1664,16 @@ pub fn process_elect_fwd(state: &mut HubState, ci: usize, payload: &str) {
     if forward_seen_check_and_add(state, &id) {
         return; // another path got here first
     }
-    let Some(ei) = alloc(state) else {
-        crate::hlog_warning!("[CHANREQ] Election table full — not answering {id}\n");
+    let own = own_requester(state, &requester);
+    let Some(ei) = alloc(state, own, &kind, &channel) else {
+        // logged; the origin hears no answer from us, but the hubs behind us
+        // still get the question
+        for i in 0..state.clients.len() {
+            let c = &state.clients[i];
+            if c.typ == ClientType::Hub && c.authenticated && c.fd != fd {
+                queue::send_urgent(&mut state.clients[i], CMD_CHAN_ELECT_FWD, payload);
+            }
+        }
         return;
     };
     // A key travels home as CHAN_REPLY through the pending table, hop by hop.
@@ -1284,6 +1776,50 @@ pub fn process_elect_do(state: &mut HubState, ci: usize, payload: &str) {
     if mode != "elect" {
         return;
     }
+    // a batch: the targets still waiting, as bot uuids; their nick and mask
+    // come from our own copy of each bot's record
+    let list = f(3, CHAN_ELECT_BATCH_MAX * 65 + 1);
+    if !list.is_empty() {
+        let mut tg: Vec<ChanElectTarget> = Vec::with_capacity(CHAN_ELECT_BATCH_MAX);
+        for tok in list.split(',').filter(|t| !t.is_empty()) {
+            if tg.len() >= CHAN_ELECT_BATCH_MAX {
+                break;
+            }
+            if tok.len() >= 64
+                || !tok.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+                || tg.iter().any(|t| t.uuid == tok)
+            {
+                continue;
+            }
+            let nick = state
+                .bot_entry(tok, "n")
+                .map(|v| trunc_string(v, MAX_NICK))
+                .unwrap_or_default();
+            if nick.is_empty() {
+                continue; // not a bot we know
+            }
+            let hostmask = state
+                .bot_entry(tok, "h")
+                .map(|v| trunc_string(v, MAX_MASK_LEN))
+                .unwrap_or_default();
+            tg.push(ChanElectTarget {
+                uuid: tok.to_string(),
+                nick,
+                hostmask,
+                reply_fd: -1,
+                st: b'p',
+                ..ChanElectTarget::default()
+            });
+        }
+        if tg.is_empty() {
+            state.chan_elections[ei].tg = Some(tg);
+            local_exhausted(state, ei);
+            return;
+        }
+        state.chan_elections[ei].tg = Some(tg);
+        batch_next(state, ei);
+        return;
+    }
     if !try_local(state, ei) {
         local_exhausted(state, ei);
     }
@@ -1292,7 +1828,7 @@ pub fn process_elect_do(state: &mut HubState, ci: usize, payload: &str) {
 /// ELECT_DONE: eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail.
 pub fn process_elect_done(state: &mut HubState, _ci: usize, payload: &str) {
     let f = |i, cap| wire_field(payload, i, cap).unwrap_or_default();
-    let (id, hub, name, bot_uuid, nick, status) = (
+    let (full, hub, name, bot_uuid, nick, status) = (
         f(0, 64),
         f(1, 64),
         f(2, 64),
@@ -1301,6 +1837,11 @@ pub fn process_elect_done(state: &mut HubState, _ci: usize, payload: &str) {
         f(5, 8),
     );
     let detail = wire_tail(payload, 6, 95).unwrap_or_default();
+    // a batch target's own report: <eid>.<uuid>
+    let (id, sub) = match full.split_once('.') {
+        Some((a, b)) => (a.to_string(), Some(b.to_string())),
+        None => (full, None),
+    };
     let Some(ei) = (!id.is_empty()).then(|| find(state, &id)).flatten() else {
         return;
     };
@@ -1312,7 +1853,36 @@ pub fn process_elect_done(state: &mut HubState, _ci: usize, payload: &str) {
     if e.phase != ChanElectPhase::MeshDo || e.doing != hub {
         return;
     }
+    if sub.is_some() && e.tg.is_none() {
+        return;
+    }
     let cn = roster_clean(if name.is_empty() { &hub } else { &name }, 64);
+    if let Some(sub) = sub {
+        let Some(ti) = target(e, &sub) else {
+            return;
+        };
+        if e.tg.as_ref().expect("batch")[ti].st != b'd' {
+            return;
+        }
+        let (cb, ck, cd) = (
+            roster_clean(&bot_uuid, 64),
+            roster_clean(&nick, MAX_NICK),
+            roster_clean(&detail, 96),
+        );
+        if status == "ok" {
+            tg_served(state, ei, ti, true, &cb, &ck, &cn, &cd);
+        } else if status == "fail" && final_fail(&state.chan_elections[ei], &cd) {
+            tg_served(state, ei, ti, false, &cb, &ck, &cn, &cd);
+        } else {
+            state.chan_elections[ei].tg.as_mut().expect("batch")[ti].st = b'p';
+        }
+        return;
+    }
+    if e.tg.is_some() {
+        // that hub is through: the next one for what is left
+        try_hub(state, ei);
+        return;
+    }
     if status == "ok" {
         finish(
             state,
@@ -1337,6 +1907,20 @@ pub fn process_elect_done(state: &mut HubState, _ci: usize, payload: &str) {
     } else {
         try_hub(state, ei);
     }
+}
+
+/// ELECT_END: eid.  The origin's election is over: free our copy (a
+/// relay's; the origin freed its own) and pass it on once.
+pub fn process_elect_end(state: &mut HubState, ci: usize, payload: &str) {
+    let id = wire_field(payload, 0, 64).unwrap_or_default();
+    if id.is_empty() || id.contains('.') {
+        return;
+    }
+    if let Some(ei) = find(state, &id).filter(|&ei| !state.chan_elections[ei].origin) {
+        release(state, ei);
+        crate::stats::el_ended();
+    }
+    end_send(state, &id, Some(ci));
 }
 
 /// hub_chan_mode_apply(): console entry point, apply a channel's stored modes
@@ -1365,6 +1949,7 @@ pub fn forget_admin(state: &mut HubState, serial: u64) {
 
 /// Drive every election one step.  Runs on every maintenance pass.
 pub fn tick(state: &mut HubState, t: i64) {
+    full_flush(state, t);
     for ei in 0..state.chan_elections.len() {
         let e = &state.chan_elections[ei];
         if !e.active {
@@ -1422,9 +2007,30 @@ pub fn tick(state: &mut HubState, t: i64) {
                 for b in e.bots.iter_mut().filter(|b| b.uuid == doing) {
                     b.reason = "no answer".into();
                 }
+                if let Some(tg) = e.tg.as_mut() {
+                    for x in tg.iter_mut().filter(|x| x.st == b'd') {
+                        x.st = b'p';
+                    }
+                    batch_next(state, ei);
+                    continue;
+                }
                 if !try_local(state, ei) {
                     local_exhausted(state, ei);
                 }
+            }
+            ChanElectPhase::Gather => {
+                if t - e.phase_at < CHAN_ELECT_BATCH_WAIT {
+                    continue;
+                }
+                probe_local(state, ei);
+                let e = &state.chan_elections[ei];
+                crate::hlog_debug!(
+                    "[CHANREQ] Election {}: own op for {} bot(s) on {}, {} local bot(s) asked\n",
+                    e.id,
+                    e.tg.as_ref().map_or(0, |v| v.len()),
+                    e.channel,
+                    e.bots.len()
+                );
             }
             ChanElectPhase::MeshWait => {
                 // every other hub we know of, or that any answer says exists
@@ -1450,7 +2056,20 @@ pub fn tick(state: &mut HubState, t: i64) {
                 }
                 try_hub(state, ei);
             }
-            ChanElectPhase::Acked => {}
+            ChanElectPhase::Acked => {
+                // A relay with no ready bot that routed no other hub's answer
+                // is never handed the action and has nothing to route: free its
+                // copy once the other hubs' answers can no longer arrive
+                // through it.
+                if !e.origin
+                    && e.hubs.is_empty()
+                    && count(e, b'y') == 0
+                    && e.doing.is_empty()
+                    && t - e.phase_at >= CHAN_ELECT_MESH_WAIT
+                {
+                    release(state, ei);
+                }
+            }
         }
     }
 }

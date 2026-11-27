@@ -432,9 +432,12 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
     let c = &mut state.clients[ci];
     // The bot's first config may have gone out before its version was known:
     // once it shows it takes the pool (or stops), it is owed one with
-    // (without) the N|/S| lines — a delta, since it already holds a base.
-    if crate::mesh::bot_version_takes_pool(&c.bot_version)
-        != crate::mesh::bot_version_takes_pool(&version)
+    // (without) the N|/S| lines — a delta, since it already holds a base.  A
+    // held first config (CFG_FIRST_HOLD) has not gone out: it is sent below.
+    let held = c.cfg_hold_at != 0 && !c.cfg_hold_done;
+    if !held
+        && crate::mesh::bot_version_takes_pool(&c.bot_version)
+            != crate::mesh::bot_version_takes_pool(&version)
     {
         c.cfg_owed = true;
         queue::cfg_owed_set();
@@ -446,6 +449,10 @@ pub fn process_bot_presence(state: &mut HubState, ci: usize, payload: &str) {
         || c.bot_link_ord != link_ord;
     c.bot_version = version.clone();
     c.bot_server = server.clone();
+    if held {
+        crate::client::cfg_hold_release(state, ci);
+    }
+    let c = &mut state.clients[ci];
     c.bot_variant = variant.clone();
     c.bot_started = started;
     c.bot_link_ord = link_ord;
@@ -693,8 +700,14 @@ fn roster_round(state: &HubState, round: i64, total: Option<usize>) -> Option<Ve
             },
             c.bot_link_ord
         );
-        // + the i| line
-        const ROW_CAP: usize = TREE_ROW_MAX + CRON_STATUS_MAX + 48 + 128;
+        // + the i| and j| riders
+        const ROW_CAP: usize = TREE_ROW_MAX
+            + CRON_STATUS_MAX
+            + 48
+            + 128
+            + crate::pool_rec::POOL_NET_NAME_MAX
+            + CHAN_STATE_MAX
+            + 48;
         if row.len() >= ROW_CAP {
             continue; // an unrepresentable row
         }
@@ -703,7 +716,7 @@ fn roster_round(state: &HubState, round: i64, total: Option<usize>) -> Option<Ve
         // a chunk never splits the two (an older hub skips the i| tag).
         if !c.bot_irc_link.is_empty() {
             let il = format!(
-                "i|{}|{}|{}|{}|\n",
+                "i|{}|{}|{}|{}|{}|\n",
                 c.id,
                 crate::pool_rec::POOL_DEFAULT_NET,
                 if c.bot_irc_entry.is_empty() {
@@ -711,10 +724,22 @@ fn roster_round(state: &HubState, round: i64, total: Option<usize>) -> Option<Ve
                 } else {
                     &c.bot_irc_entry
                 },
-                c.bot_irc_link
+                c.bot_irc_link,
+                if c.bot_irc_network.is_empty() {
+                    "-"
+                } else {
+                    &c.bot_irc_network
+                }
             );
             if il.len() < ROW_CAP - row.len() {
                 row.push_str(&il);
+            }
+        }
+        // bot show's channels line (an older hub skips the j| tag)
+        if !c.bot_chan_state.is_empty() {
+            let jl = format!("j|{}|{}|\n", c.id, c.bot_chan_state);
+            if jl.len() < ROW_CAP - row.len() {
+                row.push_str(&jl);
             }
         }
         if frame.len() + row.len() >= ROSTER_FRAME_BUDGET && rows > 0 {
@@ -1030,6 +1055,34 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
             {
                 e.irc_entry = roster_clean(if ent == "-" { "" } else { &ent }, POOL_UUID_LEN + 1);
                 e.irc_link = trunc_string(&lk, 12);
+                // field 4 (2.5.4): NETWORK=; absent or bad reads as unknown
+                e.irc_network = wire_field(body, 4, crate::pool_rec::POOL_NET_NAME_MAX + 2)
+                    .filter(|nw| nw != "-" && crate::pool_rec::net_name_ok(nw))
+                    .unwrap_or_default();
+            }
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("j|") {
+            // bot show's channels line, right after its b| row
+            if hub_uuid.is_empty() || hub_uuid == "-" {
+                continue;
+            }
+            use crate::admin::wire_field;
+            let (Some(bu), Some(list)) = (
+                wire_field(body, 0, 64),
+                wire_field(body, 1, CHAN_STATE_MAX + 2),
+            ) else {
+                continue;
+            };
+            if !crate::pool::chan_state_ok(&list) {
+                continue;
+            }
+            if let Some(e) = state
+                .roster
+                .iter_mut()
+                .find(|e| e.bot_uuid == bu && e.hub_uuid == hub_uuid)
+            {
+                e.chan_state = list;
             }
             continue;
         }
@@ -1195,6 +1248,8 @@ pub fn process_bot_roster(state: &mut HubState, from: usize, payload: &str) {
             // The i| line after the row fills these (pool, 2.5.4).
             irc_entry: String::new(),
             irc_link: String::new(),
+            irc_network: String::new(),
+            chan_state: String::new(),
         };
         roster_upsert(state, e);
     }

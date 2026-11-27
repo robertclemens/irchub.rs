@@ -739,11 +739,16 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str, pool: bool) -> String 
         }
         out.push_str(&format!("{}|{}|{}\n", e.key, e.value, e.timestamp));
     }
-    // No N| stored yet: the default (name not learned, split_wait 0), stamp 0
-    // so any real record beats it.
+    // No N| stored yet: the default (name not learned, split_wait 0, the
+    // default pace gap), stamp 0 so any real record beats it.
     if pool && !have_default_net {
         let d = crate::pool_rec::POOL_DEFAULT_NET;
-        out.push_str(&format!("N|{d}|{d}|||0|add|0\n"));
+        let pace = crate::pool::default_pace();
+        out.push_str(&format!("N|{d}|{d}|||0|{pace}|add|0\n"));
+    }
+    // R|: this bot's server order (pool.rs), stamp 0: computed, not stored.
+    if pool && let Some(ord) = crate::pool::order_line(state, uuid) {
+        out.push_str(&format!("R|{ord}|0\n"));
     }
     // K|: what the bots saw on IRC, after the c| lines it hangs off.
     learned_append(state, &mut out);
@@ -797,6 +802,22 @@ pub fn generate_bot_payload(state: &HubState, uuid: &str, pool: bool) -> String 
             }
             out.push_str(&format!("{}|{}|{}\n", e.key, e.value, e.timestamp));
         }
+    }
+
+    // hm|<ts>|<mask>: the bot's own mask as this hub holds it ("-" = none).
+    // Its join gate waits for this to carry the mask its 352 showed, so the
+    // other bots know it before it joins.  ts first: a nick may hold '|'.
+    let own = state
+        .bots
+        .iter()
+        .find(|b| b.uuid == uuid)
+        .and_then(|b| b.entry("h"));
+    match own {
+        Some(h) if !h.value.is_empty() => {
+            out.push_str(&format!("hm|{}|{}\n", h.timestamp, h.value))
+        }
+        Some(h) => out.push_str(&format!("hm|{}|-\n", h.timestamp)),
+        None => out.push_str("hm|0|-\n"),
     }
 
     // 3. Other bots as trusted-bot lines (for offline peer operation):
@@ -1789,7 +1810,8 @@ mod tests {
         assert!(!old.contains("N|") && !old.contains("pm|"));
         let p = generate_bot_payload(&s, uuid, true);
         assert!(
-            p.starts_with("N|main|main|||0|add|0\n") || p.contains("\nN|main|main|||0|add|0\n")
+            p.starts_with("N|main|main|||0|15|add|0\n")
+                || p.contains("\nN|main|main|||0|15|add|0\n")
         );
         assert!(!p.contains("pm|"));
         let su = crate::pool_rec::srv_uuid("main", "irc.x.net", 6667).unwrap();

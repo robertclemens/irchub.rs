@@ -33,10 +33,10 @@ struct Stats {
     tree_delta_of: AtomicU64,
     tree_pull: AtomicU64,
     /// CMD_SERVER_REPORTs taken in (server pool), entries this hub flagged
-    /// wrong network, CMD_POOL_VIEW frames queued to bots — 2.5.4.
+    /// wrong network, server-order recomputes that changed an order — 2.5.4.
     pool_reports: AtomicU64,
     pool_flagged: AtomicU64,
-    pool_views: AtomicU64,
+    pool_orders: AtomicU64,
     /// PEER_SYNC / PEER_BCAST frames processed.
     sync_frames: AtomicU64,
     /// ... of which changed nothing.
@@ -52,6 +52,10 @@ struct Stats {
     sd_match: AtomicU64,
     sd_kinds: AtomicU64,
     sd_full: AtomicU64,
+    el_started: AtomicU64,
+    el_batched: AtomicU64,
+    el_refused: AtomicU64,
+    el_ended: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -75,7 +79,7 @@ static STATS: Stats = Stats {
     tree_pull: AtomicU64::new(0),
     pool_reports: AtomicU64::new(0),
     pool_flagged: AtomicU64::new(0),
-    pool_views: AtomicU64::new(0),
+    pool_orders: AtomicU64::new(0),
     sync_frames: AtomicU64::new(0),
     sync_noop: AtomicU64::new(0),
     sync_records: AtomicU64::new(0),
@@ -85,6 +89,10 @@ static STATS: Stats = Stats {
     sd_match: AtomicU64::new(0),
     sd_kinds: AtomicU64::new(0),
     sd_full: AtomicU64::new(0),
+    el_started: AtomicU64::new(0),
+    el_batched: AtomicU64::new(0),
+    el_refused: AtomicU64::new(0),
+    el_ended: AtomicU64::new(0),
 };
 
 /// An authenticated frame this hub decrypted (`wire_len` includes the
@@ -142,8 +150,8 @@ pub fn pool_flagged() {
     STATS.pool_flagged.fetch_add(1, Relaxed);
 }
 
-pub fn pool_view() {
-    STATS.pool_views.fetch_add(1, Relaxed);
+pub fn pool_order() {
+    STATS.pool_orders.fetch_add(1, Relaxed);
 }
 
 /// The server pool's state for the stats `pool` record: live entries,
@@ -184,6 +192,24 @@ pub fn sd_full() {
     STATS.sd_full.fetch_add(1, Relaxed);
 }
 
+/// Channel-request elections: a copy taken, an own op that joined a batch,
+/// one refused (table full), a relay copy freed by ELECT_END.
+pub fn el_started() {
+    STATS.el_started.fetch_add(1, Relaxed);
+}
+
+pub fn el_batched() {
+    STATS.el_batched.fetch_add(1, Relaxed);
+}
+
+pub fn el_refused() {
+    STATS.el_refused.fetch_add(1, Relaxed);
+}
+
+pub fn el_ended() {
+    STATS.el_ended.fetch_add(1, Relaxed);
+}
+
 pub fn sync_frame() {
     STATS.sync_frames.fetch_add(1, Relaxed);
 }
@@ -209,6 +235,7 @@ pub fn report(
     uptime: i64,
     r: &mut crate::reply::Reply,
     pool: PoolCounts,
+    el_in_flight: usize,
     load: impl FnOnce(&mut crate::reply::Reply),
 ) {
     let g = |a: &AtomicU64| a.load(Relaxed);
@@ -239,7 +266,14 @@ pub fn report(
     r.kvi("idle", pool.idle as i64);
     r.kvu("reports", g(&s.pool_reports));
     r.kvu("flagged", g(&s.pool_flagged));
-    r.kvu("views", g(&s.pool_views));
+    r.kvu("orders", g(&s.pool_orders));
+    r.rec("elect");
+    r.kvi("in_flight", el_in_flight as i64);
+    r.kvi("slots", crate::consts::MAX_CHAN_ELECTIONS as i64);
+    r.kvu("started", g(&s.el_started));
+    r.kvu("batched", g(&s.el_batched));
+    r.kvu("refused", g(&s.el_refused));
+    r.kvu("ended", g(&s.el_ended));
     r.rec("sync");
     r.kvu("frames", g(&s.sync_frames));
     r.kvu("noop", g(&s.sync_noop));

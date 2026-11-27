@@ -115,6 +115,10 @@ pub const MAX_RECENT_PURGES: usize = 64;
 /// The full config push to bots is coalesced: however many updates land in a
 /// burst, the bots get one push per this many seconds, with the latest state.
 pub const BOT_CONFIG_PUSH_COALESCE: i64 = 1;
+/// A bot's first config on a link waits for its presence (the version says
+/// whether it takes the pool's N|/S|/R| lines), at most this many seconds:
+/// one full config with the pool instead of a pool-less one plus a delta.
+pub const CFG_FIRST_HOLD: i64 = 2;
 pub const PURGE_DEDUP_WINDOW: i64 = 3600;
 pub const PURGE_ID_HEX: usize = 16;
 /// Seconds a purge refuses re-creating older tombstones (the purge floor).
@@ -347,6 +351,13 @@ pub const CMD_CHAN_FWD_REPLY: u8 = 0x5D;
 //              is a reserved slot, always 0 and never read)
 //   ELECT_DO   hub->hub  eid|hub_uuid|elect
 //   ELECT_DONE hub->hub  eid|hub_uuid|hub_name|bot_uuid|bot_nick|status|detail
+//   ELECT_END  hub->hub  eid  (2.5.4: the origin's election is over; every
+//              hub frees its copy and passes it on once)
+// A batched own-op election (2.5.4, docs/plans/2026-11-24_elect_batch_plan.md)
+// serves several bots' own op at once: DO / DONE ids are <eid>.<target bot
+// uuid>, ELECT_DO adds a 4th field "uuid,uuid,..." (the targets still
+// waiting), the picked hub sends ELECT_DONE <eid>.<uuid> per target and then
+// one plain ELECT_DONE (ok: all served, fail: some left).
 // kind = op / invite / unban / key / mode / kick / ban; requester = a bot
 // uuid, or ADMIN.  kick: nick = the target, hostmask = the reason (may be
 // empty).  ban: hostmask = the mask, nick empty on the hubs and "*" in DO
@@ -359,6 +370,7 @@ pub const CMD_CHAN_ELECT_FWD: u8 = 0x71;
 pub const CMD_CHAN_ELECT_ACK: u8 = 0x72;
 pub const CMD_CHAN_ELECT_DO: u8 = 0x73;
 pub const CMD_CHAN_ELECT_DONE: u8 = 0x74;
+pub const CMD_CHAN_ELECT_END: u8 = 0x99;
 // 2.5.4 `channel who` (docs/plans/2026-11-21_channel_who_plan.md): election
 // kind "who" -- any bot in the channel whose WHO list is complete answers,
 // ops not needed.  The picked bot sends its view as CHAN_WHO chunks ahead of
@@ -386,15 +398,15 @@ pub const CMD_SERVER_REPORT: u8 = 0x86;
 // Gossiped hub <-> hub as a roster i| line after the bot's b| row (2.5.3 hubs
 // skip unknown roster tags).
 pub const CMD_BOT_IRC_LINK: u8 = 0x96;
-// Hub -> bot (pool bots only), volatile: the load on each pool entry, one
-//   E|<entry_uuid>|<up>|<connecting>\n
-// per live entry.  up counts the bots on the entry's real servers (two names
-// for one server share it).  Built from this hub's bots and the roster, sent
-// on change at most every POOL_VIEW_GAP s, whole each time.  As hub.h.
-pub const CMD_POOL_VIEW: u8 = 0x85;
-pub const POOL_VIEW_GAP: i64 = 2;
+// 0x85: reserved (an unreleased load view, replaced by the R| order).
 pub const POOL_VIEW_LINE_MAX: usize = 36 + 32; // POOL_UUID_LEN + 32
 pub const POOL_LINK_WORD_MAX: usize = 11;
+/// CMD_BOT_CHAN_STATE (bot show's channels line): comma-separated tokens, one
+/// per managed channel: `@#a` opped, `%#a` halfop, `+#a` voiced, `#a` in,
+/// `-#a:<why>` out (CHAN_STATE_WHYS), a final `~N` = N more that did not fit.
+/// Validated whole (pool::chan_state_ok); carried in the roster as `j|`.
+pub const CHAN_STATE_MAX: usize = 1024;
+pub const CHAN_STATE_WHYS: &str = "joining banned invite key full disabled kicked gate noirc";
 /// The bots keep a topic to this.
 pub const CHAN_WHO_TOPIC_MAX: usize = 512;
 /// Admin: invite a user (nick|#chan).
@@ -511,6 +523,22 @@ pub const CMD_CONFIG_DELTA: u8 = 0x91;
 /// dropped past CFG_RESYNC_TTL; the admin request carries the bot alone.
 pub const CMD_CFG_RESYNC: u8 = 0x92;
 pub const CMD_ADMIN_BOT_RESYNC: u8 = 0x93;
+/// `server rebalance force` (2.5.4): move one bot onto the first server of
+/// its order.  Hub <-> hub flood `"<id>|<ts>|<bot uuid>"` (deduplicated by id,
+/// dropped past CFG_RESYNC_TTL, only to peers that take the pool); the bot's
+/// own hub sends it the frame with its own uuid, and the bot reconnects there
+/// unless it is on it already.
+pub const CMD_BOT_MOVE: u8 = 0x98;
+/// Bot -> Hub: its channels, one token each (bot show).
+pub const CMD_BOT_CHAN_STATE: u8 = 0x9A;
+/// Hub -> Bot: dial this pinned hub next (bot move).
+pub const CMD_BOT_HUB_MOVE: u8 = 0x9B;
+/// Console: bot move <bot> hub|server <to>.
+pub const CMD_ADMIN_BOT_MOVE: u8 = 0x9C;
+/// Bots moved at once (and <= a quarter of those up).
+pub const REBALANCE_WAVE_MAX: usize = 5;
+/// s a wave may take before the next.
+pub const REBALANCE_WAVE_WAIT: i64 = 120;
 /// Console -> hub (2.5.4): the server pool.  list | add|<hp>|<k=v,...> |
 /// set|<what>|<k=v,...> | del|<what>|<0|1 force> | clear|<what> | net |
 /// netset|<k=v,...>.  The changing forms need +s.
@@ -582,7 +610,24 @@ pub const CHAN_ELECT_TTL: i64 = 40;
 /// HOLD_MAX + PROBE + MESH + DO + HUB_WAIT stays within CHAN_ELECT_TTL.
 pub const CHAN_ELECT_SETTLE: i64 = 10;
 pub const CHAN_ELECT_HOLD_MAX: i64 = 10;
-pub const MAX_CHAN_ELECTIONS: usize = 16;
+/// Every hub holds a copy of every election it relays, so the table is the
+/// mesh's elections in flight, not this hub's: 16 filled on a 10-hub net
+/// (nightly 2026-11-24).  A relay with nothing to do frees its copy
+/// CHAN_ELECT_MESH_WAIT s after its answer (elect::tick).
+pub const MAX_CHAN_ELECTIONS: usize = 64;
+/// A bot's own request (op / invite / key / unban) may take a slot only
+/// while fewer than MAX_CHAN_ELECTIONS - CHAN_ELECT_RESERVE are in flight:
+/// the rest stay free for console and person requests (2026-11-24).
+pub const CHAN_ELECT_RESERVE: usize = 16;
+/// Own-op batching: an origin op election gathers the local bots' own op
+/// requests for its channel CHAN_ELECT_BATCH_WAIT s before it probes, up to
+/// CHAN_ELECT_BATCH_MAX bots; only when every hub known runs
+/// CHAN_ELECT_BATCH_MIN_HUB (which also gates ELECT_END).
+pub const CHAN_ELECT_BATCH_WAIT: i64 = 1;
+pub const CHAN_ELECT_BATCH_MAX: usize = 32;
+pub const CHAN_ELECT_BATCH_MIN_HUB: &str = "2.5.4";
+/// "Election table full": one warning, then a count every this many s.
+pub const CHAN_ELECT_FULL_LOG: i64 = 60;
 pub const CHAN_ELECT_REASON_MAX: usize = 48;
 
 // Network-wide upgrade coordination (mirrors irchub/hub.h).
@@ -872,10 +917,13 @@ pub const MAX_POOL_SERVERS: usize = 64;
 pub const MAX_POOL_TOMBS: usize = 64;
 /// pool_rec::POOL_N_LINE_MAX / POOL_S_LINE_MAX spelled out: consts.rs is
 /// built standalone by the testnet tools (pool.rs tests check they agree).
-pub const POOL_N_LINE_MAX_CFG: usize = 2 + 16 + 32 + 64 + 8 * (64 + 1) + 4 + 3 + 20 + 16;
+pub const POOL_N_LINE_MAX_CFG: usize = 2 + 16 + 32 + 64 + 8 * (64 + 1) + 4 + 3 + 3 + 20 + 16;
 pub const POOL_S_LINE_MAX_CFG: usize = 2 + 36 + 16 + 253 + 5 + 3 + 4 + 8 + 64 + 3 + 20 + 16;
-pub const POOL_RECORDS_MAX: usize =
-    MAX_NETWORKS * POOL_N_LINE_MAX_CFG + (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX_CFG;
+/// pool_rec::POOL_R_LINE_MAX: a bot's R| order (in its payload only).
+pub const POOL_R_LINE_MAX_CFG: usize = 2 + 8 + 4 + 4 + 3 + 4 + 64 * (36 + 1) + 20 + 16;
+pub const POOL_RECORDS_MAX: usize = MAX_NETWORKS * POOL_N_LINE_MAX_CFG
+    + (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX_CFG
+    + POOL_R_LINE_MAX_CFG;
 /// The oldest hub a peer must run to be sent N|/S| sync lines, and the oldest
 /// bot sent them in its config.  A 2.5.3 hub reads an unknown sync key as a
 /// per-bot line and creates a phantom bot "S"/"N".
@@ -948,6 +996,8 @@ pub const BOT_FIELD_LINE: usize = 320;
 pub const USER_LINE_MAX: usize = 384;
 pub const MASK_LINE_MAX: usize = 352;
 pub const BLINE_MAX: usize = 448;
+/// hm|<ts>|<mask>\n: a bot's own mask in its config payload.
+pub const HM_LINE_MAX: usize = 3 + 20 + 1 + MAX_MASK_LEN + 1;
 pub const PEER_LINE_MAX: usize = 256;
 /// uf|<uuid>|<flags>|<ts>
 pub const UF_LINE_MAX: usize = 96;
@@ -989,6 +1039,7 @@ pub const MAX_CONFIG_PAYLOAD: usize = MAX_BOT_ENTRIES * GLOBAL_LINE_MAX
     + USER_ACCESS_RECORDS_MAX
     + BOT_SYNC_FIELDS * BOT_FIELD_LINE
     + MAX_BOTS * BLINE_MAX
+    + HM_LINE_MAX
     + MODES_RECORDS_MAX
     + POOL_RECORDS_MAX
     + PAYLOAD_SLACK;

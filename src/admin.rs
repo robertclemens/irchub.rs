@@ -13,8 +13,8 @@ use crate::consts::*;
 use crate::cstr::{now, split_fields, trunc_string};
 use crate::reply::Reply;
 use crate::state::{
-    BotConfig, BotRoster, ClientType, HubState, IpAcl, IpAclAdd, MaskRecord, ModesStatus,
-    PeerConfig, UserRecord, lww_next_ts, name_valid, parse_uint,
+    BotConfig, BotRoster, ClientType, HubState, IpAcl, IpAclAdd, Lane, MaskRecord, ModesStatus,
+    PeerConfig, QueuedMsg, UserRecord, lww_next_ts, name_valid, parse_uint,
 };
 use crate::{
     access, auth, client, console, crypto, mesh, modes, opflow, presence, queue, ratelimit,
@@ -127,6 +127,187 @@ fn roster_best<'a>(state: &'a HubState, uuid: &str) -> Option<&'a BotRoster> {
     best
 }
 
+/// Does the bot's hl| hub list hold this hub key (addr/fp,addr/fp...)?
+fn bot_hl_has(b: &BotConfig, ed_pub: &[u8]) -> bool {
+    let Some(hl) = b.entry("hl") else {
+        return false;
+    };
+    if !storage::hublist_valid(&hl.value) {
+        return false;
+    }
+    let fp = crypto::hl_fp(ed_pub);
+    hl.value
+        .split(',')
+        .any(|e| e.split_once('/').is_some_and(|(_, f)| f == fp))
+}
+
+/// bot move <bot> hub <hub> | server <server>: payload bot|kind|target.  Run
+/// on the bot's home hub, like bot kick (a console elsewhere is told where it
+/// is).  hub: the target must be in the bot's own hl| list (a pinned key) and
+/// linked; the bot is sent that hub's Ed25519 key (CMD_BOT_HUB_MOVE) and dials
+/// it next, its IRC link kept.  server: a usable pool entry; CMD_BOT_MOVE
+/// <bot>|<entry> moves its IRC link there now.  C `admin_bot_move`.
+fn admin_bot_move(state: &mut HubState, ci: usize, payload: &str) -> bool {
+    let f: Vec<&str> = payload.splitn(3, '|').collect();
+    if f.len() != 3 || f[0].is_empty() || !(f[1] == "hub" || f[1] == "server") || f[2].is_empty() {
+        return admin_err(
+            state,
+            ci,
+            "bot.usage",
+            "say which bot, hub or server, and where",
+            Some("bot move <bot> hub <hub>  |  bot move <bot> server <host[:port]>"),
+        );
+    }
+    let (sel, kind, to) = (trunc_string(f[0], 64), f[1], trunc_string(f[2], 272));
+    let bi = bot_by_uuid(state, &sel)
+        .filter(|&i| state.bots[i].is_active)
+        .or_else(|| {
+            state.bots.iter().position(|b| {
+                b.is_active
+                    && b.entry("n")
+                        .is_some_and(|n| n.value.eq_ignore_ascii_case(&sel))
+            })
+        });
+    let Some(bi) = bi else {
+        let msg = format!(
+            "no registered bot is called or has the uuid \"{}\"",
+            trunc_string(&sel, 65)
+        );
+        return admin_err(state, ci, "bot.not_found", &msg, Some("bot list"));
+    };
+    let uuid = state.bots[bi].uuid.clone();
+    let nick = presence::bot_nick_from_config(state, &uuid);
+    let who = if nick.is_empty() { uuid.clone() } else { nick };
+    let who = trunc_string(&who, 65);
+    let Some(bc) = local_bot_client(state, &uuid) else {
+        let msg = format!("{who} is not connected to this hub");
+        let mut r = Reply::new();
+        if let Some(e) = roster_best(state, &uuid) {
+            let hub_name = e.hub_name.clone();
+            let hint = format!("it is on {}: move it there", trunc_string(&hub_name, 65));
+            r.err("bot.not_local", Some(&msg), Some(&hint));
+            r.kv("hub_name", &hub_name);
+        } else {
+            r.err("bot.offline", Some(&msg), Some("bot show"));
+        }
+        return send_reply(state, ci, &mut r);
+    };
+    let mut r = Reply::new();
+    if kind == "hub" {
+        let me = hub_display_name(state).to_string();
+        if to.eq_ignore_ascii_case(&me) || to == state.hub_uuid {
+            let msg = format!("{who} is already on this hub");
+            r.err("bot.move_refused", Some(&msg), None);
+            return send_reply(state, ci, &mut r);
+        }
+        let Some(pi) = peer_find(state, &to) else {
+            let msg = format!(
+                "no hub {}: none with that uuid or name",
+                trunc_string(&to, 65)
+            );
+            return admin_err(state, ci, "peer.not_found", &msg, Some("hub list"));
+        };
+        let p = state.peers[pi].clone();
+        let why = if !p.has_pubkey {
+            Some("this hub holds no key for it")
+        } else if !bot_hl_has(&state.bots[bi], &p.ed_pub) {
+            Some("it is not in the bot's hub list")
+        } else if peer_client(state, &p).is_none() {
+            Some("it is not linked")
+        } else {
+            None
+        };
+        let name = if p.friendly_name.is_empty() {
+            p.uuid.clone()
+        } else {
+            p.friendly_name.clone()
+        };
+        if let Some(why) = why {
+            let shown = if p.friendly_name.is_empty() {
+                to.clone()
+            } else {
+                p.friendly_name.clone()
+            };
+            let msg = format!("{who} cannot move to {}: {why}", trunc_string(&shown, 65));
+            r.err("bot.move_refused", Some(&msg), Some("hub list"));
+            return send_reply(state, ci, &mut r);
+        }
+        let k = crypto::b64_encode(&p.ed_pub);
+        let sent = QueuedMsg::new(CMD_BOT_HUB_MOVE, Lane::Urgent, k.as_bytes())
+            .is_some_and(|m| crate::queue::enqueue(&mut state.clients[bc], m));
+        if !sent {
+            return admin_err(
+                state,
+                ci,
+                "bot.move_refused",
+                "the bot's link is full",
+                None,
+            );
+        }
+        crate::hlog_info!(
+            "[HUB] {}: moving bot {who} to hub {name}\n",
+            state.who_client(ci)
+        );
+        r.ok("bot.moved");
+        r.kv("bot", &who);
+        r.kv("kind", "hub");
+        r.kv("from", &me);
+        r.kv("to", &name);
+        return send_reply(state, ci, &mut r);
+    }
+    let Some(s) = crate::pool::find(state, &to).filter(|s| !s.deleted) else {
+        let msg = format!("no server {} in the pool", trunc_string(&to, 65));
+        return admin_err(state, ci, "server.not_found", &msg, Some("server list"));
+    };
+    let c = &state.clients[bc];
+    let takes_pool = crate::mesh::bot_version_takes_pool(&c.bot_version);
+    if s.state != crate::pool_rec::PoolState::Ok || !takes_pool {
+        let msg = format!(
+            "{who} cannot move to {}: {}",
+            trunc_string(&s.host, 65),
+            if s.state != crate::pool_rec::PoolState::Ok {
+                "that server is not usable"
+            } else {
+                "the bot takes no server pool"
+            }
+        );
+        r.err("bot.move_refused", Some(&msg), Some("server list"));
+        return send_reply(state, ci, &mut r);
+    }
+    if c.bot_irc_entry == s.uuid && c.bot_irc_link == "up" {
+        let msg = format!("{who} is already on {}", trunc_string(&s.host, 65));
+        r.err("bot.move_refused", Some(&msg), None);
+        return send_reply(state, ci, &mut r);
+    }
+    let pl = format!("{}|{}", c.id, s.uuid);
+    let sent = QueuedMsg::new(CMD_BOT_MOVE, Lane::Urgent, pl.as_bytes())
+        .is_some_and(|m| crate::queue::enqueue(&mut state.clients[bc], m));
+    if !sent {
+        return admin_err(
+            state,
+            ci,
+            "bot.move_refused",
+            "the bot's link is full",
+            None,
+        );
+    }
+    crate::hlog_info!(
+        "[HUB] {}: moving bot {who} to server {}:{}\n",
+        state.who_client(ci),
+        s.host,
+        s.port
+    );
+    r.ok("bot.moved");
+    r.kv("bot", &who);
+    r.kv("kind", "server");
+    r.kv("to", &format!("{}:{}", s.host, s.port));
+    r.kv(
+        "note",
+        "moved now; the server order may move it back at a rebalance",
+    );
+    send_reply(state, ci, &mut r)
+}
+
 fn bot_by_uuid(state: &HubState, uuid: &str) -> Option<usize> {
     state.bots.iter().position(|b| b.uuid == uuid)
 }
@@ -163,8 +344,9 @@ fn network_hubs(state: &HubState) -> (i64, i64) {
 }
 
 /// bot|uuid|nick|online|ver|base|started|server|hub|hub_uuid|hub_name|ip|
-///     since|fp|seen|auth|auth_ts — every field the hub has for one bot.
-///     started is the bot's own start (uptime), since its link to its hub.
+///     since|fp|seen|auth|auth_ts|mask|network|link|place|of|chans — every
+///     field the hub has for one bot.  started is the bot's own start
+///     (uptime), since its link to its hub; mask the stored h (also offline).
 fn reply_bot(state: &HubState, r: &mut Reply, b: &BotConfig) {
     let c = local_bot_client(state, &b.uuid).map(|i| &state.clients[i]);
     let e = if c.is_some() {
@@ -192,6 +374,33 @@ fn reply_bot(state: &HubState, r: &mut Reply, b: &BotConfig) {
         r.kv("nick", &n.value);
     }
     r.kvb("online", c.is_some() || e.is_some());
+    if let Some(h) = b.entry("h")
+        && !h.value.is_empty()
+    {
+        r.kv("mask", &h.value);
+    }
+    let (net, link, ent, chans) = match (c, e) {
+        (Some(c), _) => (
+            c.bot_irc_network.as_str(),
+            c.bot_irc_link.as_str(),
+            c.bot_irc_entry.as_str(),
+            c.bot_chan_state.as_str(),
+        ),
+        (None, Some(e)) => (
+            e.irc_network.as_str(),
+            e.irc_link.as_str(),
+            e.irc_entry.as_str(),
+            e.chan_state.as_str(),
+        ),
+        _ => ("", "", "", ""),
+    };
+    opt(r, "network", net);
+    opt(r, "link", link);
+    if let Some((place, of)) = crate::pool::order_place(state, &b.uuid, ent) {
+        r.kvi("place", place);
+        r.kvi("of", of);
+    }
+    opt(r, "chans", chans);
     if let Some(c) = c {
         opt(r, "ver", &c.bot_version);
         opt(r, "base", &c.bot_variant);
@@ -366,6 +575,37 @@ fn configured_peer_uuid(state: &HubState, uuid: &str) -> bool {
         .peers
         .iter()
         .any(|p| !p.uuid.is_empty() && p.uuid == uuid)
+}
+
+/// a and b are configured with each other, by either one's reported links.
+fn mesh_pair_linked(state: &HubState, a: &str, b: &str) -> bool {
+    [(a, b), (b, a)].iter().any(|(x, y)| {
+        presence::mesh_hub_find(state, x).is_some_and(|mi| {
+            let mh = &state.mesh_hubs[mi];
+            mh.have_links && mh.links.iter().any(|l| l.uuid == *y)
+        })
+    })
+}
+
+/// This hub and its configured peers are a full mesh of 3 or more: only then
+/// is a hub one of them links to, but this hub has not configured, a stray
+/// (Robert 2026-11-24).  On a ring, chain, star or tree it is the layout.
+fn configured_full_mesh(state: &HubState) -> bool {
+    let peers = &state.peers;
+    if peers.len() < 2 {
+        return false;
+    }
+    for (i, p) in peers.iter().enumerate() {
+        if p.uuid.is_empty() {
+            return false;
+        }
+        for q in &peers[i + 1..] {
+            if !q.uuid.is_empty() && !mesh_pair_linked(state, &p.uuid, &q.uuid) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// link|a|b|b_name|state: every link a hub reported (its roster gossip), and
@@ -639,6 +879,9 @@ fn list_peers(state: &mut HubState, ci: usize, sel: &str) -> bool {
         },
     );
     r.kvi("port", i64::from(state.port));
+    if !state.public_ip.is_empty() {
+        r.kv("public", &state.public_ip);
+    }
     let cron = crate::update::cron_status();
     if !cron.is_empty() {
         r.kv("cron", &cron);
@@ -699,7 +942,8 @@ fn list_peers(state: &mut HubState, ci: usize, sel: &str) -> bool {
             r.kvi("since", p.link_down_at);
         }
     }
-    for p in &state.peers {
+    let full = configured_full_mesh(state);
+    for p in state.peers.iter().filter(|_| full) {
         if p.uuid.is_empty() || peer_client(state, p).is_none() {
             continue;
         }
@@ -1173,6 +1417,12 @@ fn hub_show(state: &mut HubState, ci: usize) -> bool {
     if state.listen_port != 0 && state.listen_port != state.port {
         r.kvi("pending_port", i64::from(state.port));
     }
+    if !state.public_ip.is_empty() {
+        r.kv("public", &state.public_ip);
+        if state.public_ip_at > 0 {
+            r.kvi("public_at", state.public_ip_at);
+        }
+    }
     r.kv("key", &pub_b64);
     r.kv("fp", &fp);
     r.kv("ssh_fp", &ssh_fp);
@@ -1524,6 +1774,18 @@ fn create_bot(state: &mut HubState, ci: usize, payload: &str) -> bool {
             .map_or("no nick".to_string(), |n| trunc_string(&n.value, 64));
         let m = format!("uuid already registered ({n})");
         return admin_err(state, ci, "bot.exists", &m, Some("bot list"));
+    }
+    // the table holds deleted bots' tombstones too: a full one used to answer
+    // bot.added and store nothing (100-bot run, 2026-11-24)
+    if state.bots.len() >= MAX_BOTS {
+        let m = format!("this network already holds {MAX_BOTS} bots, the most it can");
+        return admin_err(
+            state,
+            ci,
+            "bot.full",
+            &m,
+            Some("bot del a bot first (hub purge now removes deleted bots' tombstones)"),
+        );
     }
     auth::add_bot_memory(state, &uuid_in, &nick, &pubkey_in);
     state.config_dirty = true;
@@ -3565,7 +3827,7 @@ fn admin_pool(state: &mut HubState, ci: usize, payload: &str) -> bool {
         POOL_DEFAULT_NET, POOL_HOST_MAX, POOL_MAX_MAX, POOL_NET_ALIASES_MAX, POOL_NET_NAME_MAX,
         POOL_WEIGHT_MAX, PoolSrv, PoolState,
     };
-    let Some(sub) = wire_field(payload, 0, 8) else {
+    let Some(sub) = wire_field(payload, 0, 16) else {
         return admin_err(
             state,
             ci,
@@ -3617,6 +3879,7 @@ fn admin_pool(state: &mut HubState, ci: usize, payload: &str) -> bool {
             pool_rec_kv(&mut r, s);
             r.kvi("up", up);
             r.kvi("connecting", conn);
+            r.kvi("assigned", crate::pool::order_first_count(state, &s.uuid));
             r.kvi("ts", *ts);
         }
         return send_reply(state, ci, &mut r);
@@ -3627,6 +3890,7 @@ fn admin_pool(state: &mut HubState, ci: usize, payload: &str) -> bool {
         r.kv("net", &net.net_id);
         r.kv("name", &net.name);
         r.kv("aliases", &net.aliases);
+        r.kvi("pace", i64::from(net.pace_gap));
         r.kvi(
             "usable",
             storage::pool_eligible_count(state, POOL_DEFAULT_NET) as i64,
@@ -3638,12 +3902,12 @@ fn admin_pool(state: &mut HubState, ci: usize, payload: &str) -> bool {
 
     if sub == "netset" {
         let k = what.as_str(); // netset|<k=v,...>
-        if k.is_empty() || !pool_kv_known(k, "name alias") {
+        if k.is_empty() || !pool_kv_known(k, "name alias pace") {
             return admin_err(
                 state,
                 ci,
                 "pool.usage",
-                "network set name=<NETWORK> or alias=<a,b,...>",
+                "network set name=<NETWORK>, alias=<a,b,...> or pace=<0-600>",
                 Some("help network set"),
             );
         }
@@ -3676,6 +3940,20 @@ fn admin_pool(state: &mut HubState, ci: usize, payload: &str) -> bool {
                 );
             }
         }
+        if let Some(pv) = pool_kv(k, "pace", 16) {
+            match pool_num(&pv, 0, crate::pool_rec::POOL_PACE_GAP_MAX) {
+                Some(n) => net.pace_gap = n,
+                None => {
+                    return admin_err(
+                        state,
+                        ci,
+                        "pool.bad_value",
+                        "pace is 0 to 600 seconds (0 = no pacing)",
+                        None,
+                    );
+                }
+            }
+        }
         net.deleted = false;
         if !crate::pool::net_put(state, &net) {
             return admin_err(
@@ -3690,7 +3968,129 @@ fn admin_pool(state: &mut HubState, ci: usize, payload: &str) -> bool {
         r.kv("net", &net.net_id);
         r.kv("name", &net.name);
         r.kv("aliases", &net.aliases);
+        r.kvi("pace", i64::from(net.pace_gap));
         return pool_effects(state, ci, &mut r);
+    }
+
+    if sub == "order" {
+        // order|[nick|uuid]: every bot's order (first server, delay), or one's
+        let ids = crate::pool::order_bots(state);
+        r.ok("pool.order");
+        r.kvi("pace", i64::from(net.pace_gap));
+        let mut shown = 0;
+        for u in &ids {
+            let nick = bot_by_uuid(state, u)
+                .and_then(|bi| state.bots[bi].entry("n"))
+                .map(|e| e.value.clone())
+                .unwrap_or_default();
+            if !what.is_empty() && what != *u && !nick.eq_ignore_ascii_case(&what) {
+                continue;
+            }
+            let Some((first, slot, slots)) = crate::pool::order_first(state, u) else {
+                continue;
+            };
+            let (w, cur) = crate::pool::bot_link(state, u);
+            let fs = crate::pool::srv_get(state, &first);
+            let cs = if cur.is_empty() {
+                None
+            } else {
+                crate::pool::srv_get(state, &cur)
+            };
+            r.rec("order");
+            r.kv("uuid", u);
+            r.kv("nick", &nick);
+            if let Some(fs) = &fs {
+                r.kv("first", &fs.host);
+                r.kvi("first_port", i64::from(fs.port));
+            }
+            r.kvi("slot", i64::from(slot));
+            r.kvi("slots", i64::from(slots));
+            r.kv("link", &w);
+            if let Some(cs) = &cs {
+                r.kv("on", &cs.host);
+                r.kvi("on_port", i64::from(cs.port));
+            }
+            r.kvi(
+                "off",
+                i64::from(w == "up" && !cur.is_empty() && cur != first),
+            );
+            shown += 1;
+        }
+        if !what.is_empty() && shown == 0 {
+            return admin_err(
+                state,
+                ci,
+                "pool.no_order",
+                "no server order for that bot",
+                Some("server order"),
+            );
+        }
+        return send_reply(state, ci, &mut r);
+    }
+
+    if sub == "rebalance" {
+        // rebalance|[force|stop]: preview, start the waves, or stop them
+        let ids = crate::pool::order_bots(state);
+        let n = ids.len() as i64;
+        let off = ids
+            .iter()
+            .filter(|u| crate::pool::rebalance_off_first(state, u))
+            .count() as i64;
+        if what == "stop" {
+            let was = state.rebalance.active;
+            state.rebalance.active = false;
+            state.rebalance.wave.clear();
+            r.ok("pool.rebalance");
+            r.kv("state", if was { "stopped" } else { "idle" });
+        } else if what == "force" {
+            if state.rebalance.active {
+                return admin_err(
+                    state,
+                    ci,
+                    "pool.rebalancing",
+                    "a rebalance is already running here",
+                    Some("server rebalance stop"),
+                );
+            }
+            state.rebalance = Default::default();
+            if off > 0 {
+                state.rebalance.active = true;
+                state.rebalance.by = mf_admin_name(state, ci);
+                crate::hlog_info!(
+                    "[POOL] Rebalance started by {}: {off} bot{} off their first server\n",
+                    state.rebalance.by,
+                    if off == 1 { "" } else { "s" }
+                );
+            }
+            r.ok("pool.rebalance");
+            r.kv("state", if off > 0 { "started" } else { "balanced" });
+        } else if what.is_empty() {
+            r.ok("pool.rebalance");
+            r.kv(
+                "state",
+                if state.rebalance.active {
+                    "running"
+                } else {
+                    "preview"
+                },
+            );
+        } else {
+            return admin_err(
+                state,
+                ci,
+                "pool.usage",
+                "server rebalance [force|stop]",
+                Some("help server rebalance"),
+            );
+        }
+        r.kvi("off", off);
+        r.kvi("bots", n);
+        r.kvi("pace", i64::from(net.pace_gap));
+        if state.rebalance.active {
+            r.kvi("moved", state.rebalance.moved);
+            r.kvi("waves", state.rebalance.waves);
+        }
+        return send_reply(state, ci, &mut r);
     }
 
     if what.is_empty() {
@@ -4083,7 +4483,13 @@ fn mf_payload_mutates(cmd: u8, payload: &str) -> bool {
     match cmd {
         CMD_ADMIN_CHAN_MODE | CMD_ADMIN_CHAN_SET => payload.contains('|'),
         CMD_ADMIN_BAN => !payload.starts_with("list"),
-        CMD_ADMIN_POOL => payload != "list" && payload != "net",
+        // read-only: list, net, order|<who>, the rebalance preview
+        CMD_ADMIN_POOL => {
+            payload != "list"
+                && payload != "net"
+                && !payload.starts_with("order|")
+                && payload != "rebalance|"
+        }
         CMD_ADMIN_NET_SET => !payload.is_empty(),
         _ => true,
     }
@@ -4133,7 +4539,8 @@ fn admin_flag_needed(state: &HubState, me: Option<usize>, cmd: u8, payload: &str
         | CMD_ADMIN_DEL
         | CMD_ADMIN_DISCONNECT_BOT
         | CMD_ADMIN_REKEY_BOT
-        | CMD_ADMIN_BOT_RESYNC => Some('b'),
+        | CMD_ADMIN_BOT_RESYNC
+        | CMD_ADMIN_BOT_MOVE => Some('b'),
         CMD_ADMIN_NET_SET if payload.starts_with("hubcron|") => Some('h'),
         CMD_ADMIN_NET_SET => mf_payload_mutates(cmd, payload).then_some('b'),
         CMD_ADMIN_ADD_PEER
@@ -4417,6 +4824,7 @@ pub fn console_admin_op(cmd: u8) -> bool {
             | CMD_ADMIN_LIST_REVOKED
             | CMD_ADMIN_CREATE_BOT
             | CMD_ADMIN_DEL
+            | CMD_ADMIN_BOT_MOVE
             | CMD_ADMIN_DISCONNECT_BOT
             | CMD_ADMIN_REKEY_BOT
             | CMD_ADMIN_BOT_RESYNC
@@ -5146,6 +5554,8 @@ pub fn handle_admin_command(
             send_reply(state, ci, &mut r)
         }
 
+        CMD_ADMIN_BOT_MOVE => admin_bot_move(state, ci, payload),
+
         CMD_ADMIN_DISCONNECT_BOT => {
             if payload.is_empty() {
                 return admin_err(
@@ -5704,9 +6114,13 @@ pub fn handle_admin_command(
                 0
             };
             let mut r = Reply::new();
-            crate::stats::report(up, &mut r, crate::pool::counts(state), |r| {
-                stats_load(state, r)
-            });
+            crate::stats::report(
+                up,
+                &mut r,
+                crate::pool::counts(state),
+                crate::elect::in_flight(state),
+                |r| stats_load(state, r),
+            );
             send_reply(state, ci, &mut r)
         }
 

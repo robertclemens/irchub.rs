@@ -470,6 +470,8 @@ const GLYPH_A: [&str; G_COUNT] = [
 pub struct Ctx<'a> {
     /// cells
     pub width: i32,
+    /// rows a view shows at once; 0 = unbounded (line mode)
+    pub height: i32,
     pub ascii: bool,
     /// Unix seconds
     pub now: i64,
@@ -1321,6 +1323,69 @@ fn render_bot_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     hint(out, b"bot show <uuid|nick> for one bot in detail");
 }
 
+/// "1st", "2nd", "3rd", "4th", "11th" ...
+fn ordinal(n: i64) -> Vec<u8> {
+    let (t, u) = (n % 100, n % 10);
+    let sfx = if (11..=13).contains(&t) {
+        "th"
+    } else if u == 1 {
+        "st"
+    } else if u == 2 {
+        "nd"
+    } else if u == 3 {
+        "rd"
+    } else {
+        "th"
+    };
+    format!("{n}{sfx}").into_bytes()
+}
+
+/// bot show's channels: the j| tokens drawn as "@#a  #b  #c (out: banned)",
+/// wrapped at the card's value column.
+fn bot_chans_lines(ctx: &Ctx, out: &mut Flines, label_w: i32, list: &[u8]) {
+    let col = 2 + label_w + 2;
+    let room = (ctx.width - col).max(20);
+    let mut b = Sb::default();
+    let (mut first_line, mut any) = (true, false);
+    for tok in list.split(|&c| c == b',') {
+        if tok.is_empty() || tok.len() >= crate::consts::CHAN_STATE_MAX {
+            break;
+        }
+        let cell: Vec<u8> = if tok[0] == b'~' {
+            cat(&[b"+", &tok[1..], b" more"])
+        } else if tok[0] == b'-' {
+            match tok.iter().position(|&c| c == b':') {
+                Some(i) => cat(&[&tok[1..i], b" (out: ", &tok[i + 1..], b")"]),
+                None => cat(&[&tok[1..], b" (out: ?)"]),
+            }
+        } else {
+            tok.to_vec()
+        };
+        let cw = str_width(&cell);
+        if any && b.w - col + 2 + cw > room {
+            b.emit(out, RL_NORMAL);
+            first_line = false;
+            any = false;
+        }
+        if !any {
+            if b.w == 0 {
+                b.a(b"  ");
+                if first_line {
+                    b.a(b"channels");
+                }
+                b.pad(col);
+            }
+        } else {
+            b.a(b"  ");
+        }
+        b.a(&cell);
+        any = true;
+    }
+    if any {
+        b.emit(out, RL_NORMAL);
+    }
+}
+
 fn render_bot_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let r = rep.r.iter().find(|x| x.is("bot"));
     let u = rep.r.iter().find(|x| x.is("upg"));
@@ -1344,6 +1409,18 @@ fn render_bot_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     title(ctx, out, &t, Some(&right));
     const L: i32 = 12;
     card_line(out, L, b"uuid", r.rv("uuid"), RL_NORMAL);
+    if let Some(mask) = r.rvs("mask") {
+        let v = snp(512, cat(&[mask, if on { b"" } else { b" (last known)" }]));
+        card(out, L, "usermask", &v, if on { RL_NORMAL } else { RL_DIM });
+    } else {
+        card(
+            out,
+            L,
+            "usermask",
+            b"not known yet (the bot has not been on IRC)",
+            RL_DIM,
+        );
+    }
     if on {
         let mut sb = Sb::default();
         sb.a(r.rvs("ver").unwrap_or(b"unknown version"));
@@ -1357,13 +1434,32 @@ fn render_bot_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             sb.a(&cat(&[b" ", dot, b" up ", &a, b" (started ", &b, b")"]));
         }
         card(out, L, "version", &sb.p, RL_NORMAL);
-        card(
-            out,
-            L,
-            "irc server",
-            r.rvs("server").unwrap_or(glyph(ctx, G_DASH)),
-            RL_NORMAL,
-        );
+        let mut is = Sb::default();
+        is.a(r.rvs("server").unwrap_or(glyph(ctx, G_DASH)));
+        if let Some(net) = r.rvs("network") {
+            is.a(&cat(&[b" (", net, b")"]));
+        }
+        if let Some(link) = r.rvs("link") {
+            is.a(&cat(&[b" ", dot, b" ", link]));
+        }
+        let (place, of) = (r.rvi("place", 0), r.rvi("of", 0));
+        if place > 0 && of > 0 {
+            is.a(&cat(&[
+                b" ",
+                dot,
+                b" ",
+                &ordinal(place),
+                b" of ",
+                &num(of),
+                b" in its order",
+            ]));
+        }
+        card(out, L, "irc server", &is.p, RL_NORMAL);
+        if let Some(chans) = r.rvs("chans") {
+            bot_chans_lines(ctx, out, L, chans);
+        } else {
+            card(out, L, "channels", b"not reported yet", RL_DIM);
+        }
         sb.reset();
         let local = r.rv("hub") == Some(b"local");
         sb.a(&cat(&[
@@ -1384,6 +1480,9 @@ fn render_bot_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         card(out, L, "hub", b"not connected to any hub", RL_DIM);
     }
     card(out, L, "key", r.rvs("fp").unwrap_or(b"(no key)"), RL_NORMAL);
+    if let Some(cron) = r.rvs("cron") {
+        card(out, L, "cron", cron, RL_NORMAL);
+    }
     let v = bot_last_seen(ctx, r, 512);
     card(out, L, "last seen", &v, RL_NORMAL);
     let v: Vec<u8> = if r.rvb("auth") && r.rvi("auth_ts", 0) > 0 {
@@ -1419,7 +1518,8 @@ fn render_bot_show(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     }
     const KNOWN: &[&str] = &[
         "uuid", "nick", "online", "ver", "base", "started", "server", "hub", "hub_uuid",
-        "hub_name", "ip", "since", "fp", "seen", "auth", "auth_ts",
+        "hub_name", "ip", "since", "fp", "seen", "auth", "auth_ts", "mask", "network", "link",
+        "place", "of", "chans", "cron",
     ];
     unknown_keys(ctx, out, r, KNOWN, L);
     if let Some(hu) = r.rvs("hub_uuid") {
@@ -2009,14 +2109,9 @@ fn render_peer_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let mut peers = 0;
     // The hub this console is on: first, in the same columns, its LINK saying so.
     if let Some(r) = rep.r.iter().find(|r| r.is("self")) {
-        let addr = snp(
-            96,
-            cat(&[
-                r.rv("bind_ip").unwrap_or(b"?"),
-                b":",
-                &num(r.rvi("port", 0)),
-            ]),
-        );
+        // the address others dial: the looked-up public one before a bind
+        let ip = r.rvs("public").or_else(|| r.rv("bind_ip"));
+        let addr = snp(96, cat(&[ip.unwrap_or(b"?"), b":", &num(r.rvi("port", 0))]));
         let bots = snp(16, num(r.rvi("bots", 0)));
         let link = snp(64, cat(&[glyph(ctx, G_DOT), b" this hub"]));
         let upt = snp(32, span_since(ctx, r.rvi("started", 0)));
@@ -2651,6 +2746,19 @@ fn render_hub_show(ctx: &Ctx, h: &Crec, out: &mut Flines) {
         ])
     };
     card(out, L, "listening", &snp(512, v), RL_NORMAL);
+    if let Some(p) = h.rvs("public") {
+        let a2 = when(h.rvi("public_at", 0), ctx.now);
+        let v = cat(&[
+            p,
+            b":",
+            &num(h.rvi("port", 0)),
+            b" ",
+            dot,
+            b" looked up ",
+            &a2,
+        ]);
+        card(out, L, "public", &snp(512, v), RL_NORMAL);
+    }
     // the 88-character key on one unbroken line (D10)
     card(
         out,
@@ -2735,6 +2843,8 @@ fn render_hub_show(ctx: &Ctx, h: &Crec, out: &mut Flines) {
         "port",
         "pending_bind_ip",
         "pending_port",
+        "public",
+        "public_at",
         "key",
         "fp",
         "ssh_fp",
@@ -3346,7 +3456,6 @@ fn opname(op: u64) -> Option<&'static str> {
         0x82 => "CMD_ADMIN_PEER_REFS",
         0x83 => "CMD_LINK_SEQ",
         0x84 => "CMD_ADMIN_KICK_USER",
-        0x85 => "CMD_POOL_VIEW",
         0x86 => "CMD_SERVER_REPORT",
         0x87 => "CMD_UPGRADE_HISTORY",
         0x88 => "CMD_UPGRADE_STAGE",
@@ -3365,6 +3474,11 @@ fn opname(op: u64) -> Option<&'static str> {
         0x95 => "CMD_CHAN_WHO",
         0x96 => "CMD_BOT_IRC_LINK",
         0x97 => "CMD_ADMIN_POOL",
+        0x98 => "CMD_BOT_MOVE",
+        0x99 => "CMD_CHAN_ELECT_END",
+        0x9A => "CMD_BOT_CHAN_STATE",
+        0x9B => "CMD_BOT_HUB_MOVE",
+        0x9C => "CMD_ADMIN_BOT_MOVE",
         _ => return None,
     })
 }
@@ -3601,6 +3715,7 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let p2 = rep.r.iter().rfind(|x| x.is("p2"));
     let tr = rep.r.iter().rfind(|x| x.is("tree"));
     let pl = rep.r.iter().rfind(|x| x.is("pool"));
+    let el = rep.r.iter().rfind(|x| x.is("elect"));
     if ctx.width >= STATS_GRID_MIN {
         let mut secs: Vec<SSec> = Vec::new();
         if let Some(cfg) = cfg {
@@ -3669,8 +3784,18 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             s.count("bots idle", pl.rvu("idle"));
             s.count("reports", pl.rvu("reports"));
             s.count("flagged", pl.rvu("flagged"));
-            s.count("views sent", pl.rvu("views"));
+            s.count("orders computed", pl.rvu("orders"));
             s.warn = !(pl.rvu("usable") != 0 || pl.rvu("servers") == 0);
+            secs.push(s);
+        }
+        if let Some(el) = el {
+            let mut s = SSec::new(b"Channel requests");
+            s.count("in flight", el.rvu("in_flight"));
+            s.count("slots", el.rvu("slots"));
+            s.count("started", el.rvu("started"));
+            s.count("batched", el.rvu("batched"));
+            s.count("refused", el.rvu("refused"));
+            s.count("ended early", el.rvu("ended"));
             secs.push(s);
         }
         if let Some(ld) = ld {
@@ -3770,7 +3895,18 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
             );
             count_kv(&mut b, "  reports", pl.rvu("reports"), 0);
             count_kv(&mut b, "flagged", pl.rvu("flagged"), 24);
-            count_kv(&mut b, "views sent", pl.rvu("views"), 40);
+            count_kv(&mut b, "orders computed", pl.rvu("orders"), 40);
+            b.emit(out, RL_NORMAL);
+        }
+        if let Some(el) = el {
+            line(out, RL_HEAD, &[b" Channel requests"]);
+            count_kv(&mut b, "  in flight", el.rvu("in_flight"), 0);
+            count_kv(&mut b, "slots", el.rvu("slots"), 24);
+            count_kv(&mut b, "started", el.rvu("started"), 40);
+            b.emit(out, RL_NORMAL);
+            count_kv(&mut b, "  batched", el.rvu("batched"), 0);
+            count_kv(&mut b, "refused", el.rvu("refused"), 24);
+            count_kv(&mut b, "ended early", el.rvu("ended"), 40);
             b.emit(out, RL_NORMAL);
         }
         if let Some(ld) = ld {
@@ -3816,52 +3952,150 @@ fn render_stats(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         col("OUT FRAMES", b'R', 2),
         col("OUT BYTES", b'R', 2),
     ];
-    let mut t = Tbl::new(&COLS, -1, 1, 1);
-    let mut tot = [0u64; 4];
+    if ix.is_empty() {
+        empty_note(out, "no traffic yet", None);
+        return;
+    }
     let fmt4 = |v: &[u64; 4]| -> Vec<Vec<u8>> {
         (0..4)
             .map(|q| if q % 2 == 1 { bytes(v[q]) } else { count(v[q]) })
             .collect()
     };
+    // The rows once, as text: the table is laid out one-up or two-up below.
+    let mut rows: Vec<[Vec<u8>; 6]> = Vec::with_capacity(ix.len() + 1);
+    let mut tot = [0u64; 4];
     for &k in &ix {
         let r = &rep.r[k];
         let code = r.rv("code").unwrap_or(b"?");
-        let op = strtoull(code, 16);
-        let name = if op < 256 {
-            opname(op).unwrap_or("?")
-        } else {
-            "?"
-        };
         let v = [r.rvu("rx_f"), r.rvu("rx_b"), r.rvu("tx_f"), r.rvu("tx_b")];
         for q in 0..4 {
             tot[q] = tot[q].wrapping_add(v[q]);
         }
         let c = fmt4(&v);
-        let cells = [
-            Some(code),
-            Some(s(name)),
-            Some(c[0].as_slice()),
-            Some(&c[1]),
-            Some(&c[2]),
-            Some(&c[3]),
-        ];
-        t.row(ctx, RL_NORMAL, None, &cells);
+        rows.push([
+            code.to_vec(),
+            stats_op_name(code).as_bytes().to_vec(),
+            c[0].clone(),
+            c[1].clone(),
+            c[2].clone(),
+            c[3].clone(),
+        ]);
     }
-    if !ix.is_empty() {
-        let c = fmt4(&tot);
-        let cells = [
-            Some(b"total".as_slice()),
-            Some(b" "),
-            Some(&c[0]),
-            Some(&c[1]),
-            Some(&c[2]),
-            Some(&c[3]),
-        ];
-        t.row(ctx, RL_HEAD, None, &cells);
-        t.render(ctx, out);
+    let c = fmt4(&tot);
+    let total = [
+        b"total".to_vec(),
+        b" ".to_vec(),
+        c[0].clone(),
+        c[1].clone(),
+        c[2].clone(),
+        c[3].clone(),
+    ];
+    let n = rows.len();
+    // Rows [a, b) as one table; with_total adds the total row.
+    let table = |ctx: &Ctx, a: usize, b: usize, with_total: bool| -> Tbl {
+        let mut t = Tbl::new(&COLS, -1, 1, 1);
+        for r in &rows[a..b] {
+            let cells = [
+                Some(r[0].as_slice()),
+                Some(&r[1]),
+                Some(&r[2]),
+                Some(&r[3]),
+                Some(&r[4]),
+                Some(&r[5]),
+            ];
+            t.row(ctx, RL_NORMAL, None, &cells);
+        }
+        if with_total {
+            let cells = [
+                Some(total[0].as_slice()),
+                Some(&total[1]),
+                Some(&total[2]),
+                Some(&total[3]),
+                Some(&total[4]),
+                Some(&total[5]),
+            ];
+            t.row(ctx, RL_HEAD, None, &cells);
+        }
+        t
+    };
+    // One-up width: the widest line of the whole table laid out in one row.
+    let t = table(ctx, 0, n, true);
+    let wide_ctx = Ctx {
+        width: 1 << 14,
+        ..*ctx
+    };
+    let mut one = Flines::new();
+    t.render(&wide_ctx, &mut one);
+    let w1 = one.iter().map(|l| str_width(&l.text)).max().unwrap_or(0);
+    // the page so far plus the one-up table: two-up only past the view
+    let one_up = one.len() as i32;
+    if n >= TRAFFIC_SPLIT_MIN
+        && ctx.height > 0
+        && out.len() as i32 + one_up > ctx.height
+        && ctx.width >= 2 * w1 + TRAFFIC_COL_GAP
+    {
+        // Two-up: down the left half, then down the right; the total ends
+        // the right one.  Each half is laid out at its own one-up width.
+        let h = (n + 2) / 2; // the left takes the odd row, the right the total
+        let half = Ctx { width: w1, ..*ctx };
+        let (mut l, mut r) = (Flines::new(), Flines::new());
+        table(&half, 0, h, false).render(&half, &mut l);
+        table(&half, h, n, true).render(&half, &mut r);
+        let lw = l.iter().map(|x| str_width(&x.text)).max().unwrap_or(0);
+        let mut b = Sb::default();
+        for i in 0..l.len().max(r.len()) {
+            // a line has one style: a left row and a right row that differ
+            // (an opcode beside the bold total) go on lines of their own, the
+            // right one under its column
+            if let (Some(x), Some(y)) = (l.get(i), r.get(i))
+                && x.role != y.role
+            {
+                b.a(&x.text);
+                b.emit(out, x.role);
+                b.pad(lw + TRAFFIC_COL_GAP);
+                b.a(&y.text);
+                b.emit(out, y.role);
+                continue;
+            }
+            if let Some(x) = l.get(i) {
+                b.a(&x.text);
+            }
+            if let Some(x) = r.get(i) {
+                b.pad(lw + TRAFFIC_COL_GAP);
+                b.a(&x.text);
+            }
+            let role = match (l.get(i), r.get(i)) {
+                (Some(x), _) => x.role,
+                (None, Some(y)) => y.role,
+                _ => RL_NORMAL,
+            };
+            b.emit(out, role);
+        }
     } else {
-        empty_note(out, "no traffic yet", None);
+        t.render(ctx, out);
     }
+}
+
+/// Traffic by message: one column while the whole page fits the view's
+/// height; two-up (TRAFFIC_COL_GAP apart) only when it would not, the view is
+/// wide enough for two copies of the table and it has at least
+/// TRAFFIC_SPLIT_MIN opcodes.  Line mode (height 0) always one column.
+const TRAFFIC_SPLIT_MIN: usize = 8;
+const TRAFFIC_COL_GAP: i32 = 4;
+
+/// The NAME cell for a stats "code" ("0x%02X").  Every opcode a supported
+/// version sends is in opname; anything else (a retired value, a test's
+/// probe, a hostile peer) is "unknown": match it by its code.
+fn stats_op_name(code: &[u8]) -> &'static str {
+    let digits = code
+        .strip_prefix(b"0x")
+        .or_else(|| code.strip_prefix(b"0X"))
+        .unwrap_or(code);
+    if digits.is_empty() || digits.len() > 2 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return "unknown";
+    }
+    let op = strtoull(digits, 16);
+    opname(op).unwrap_or("unknown")
 }
 
 // ===========================================================================
@@ -5836,11 +6070,12 @@ fn render_pool_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         return;
     }
     rows.sort_by(pool_row_cmp);
-    const COLS: [Col; 7] = [
+    const COLS: [Col; 8] = [
         col("HOST", b'L', 1),
         col("PORT", b'R', 1),
         col("STATE", b'L', 1),
         col("BOTS", b'R', 1),
+        col("FIRST", b'R', 1),
         col("WEIGHT", b'R', 2),
         col("MAX", b'R', 2),
         col("ADDED", b'L', 2),
@@ -5855,6 +6090,7 @@ fn render_pool_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         } else {
             num(up)
         };
+        let first = num(c.rvi("assigned", 0));
         let wt = num(c.rvi("weight", 1));
         let mx = if c.rvi("max", 0) != 0 {
             num(c.rvi("max", 0))
@@ -5872,6 +6108,7 @@ fn render_pool_list(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
                 Some(&port),
                 Some(&st),
                 Some(&bots),
+                Some(&first),
                 Some(&wt),
                 Some(&mx),
                 Some(&when_s),
@@ -5926,6 +6163,19 @@ fn render_pool_net(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         }),
         RL_NORMAL,
     );
+    let pace = r.rvi("pace", 0);
+    let v = if pace > 0 {
+        snp(
+            96,
+            cat(&[
+                &num(pace),
+                b" s between two dials of one server from one host",
+            ]),
+        )
+    } else {
+        b"off".to_vec()
+    };
+    card_line(out, L, b"pace", Some(&v), RL_NORMAL);
     let (usable, idle) = (r.rvi("usable", 0), r.rvi("idle", 0));
     let v = snp(96, cat(&[&num(usable), b" usable"]));
     card_line(
@@ -5945,6 +6195,152 @@ fn render_pool_net(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     );
 }
 
+/// server order: one row per bot, its first server and where it is now.
+fn render_pool_order(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let rows: Vec<&Crec> = rep.r.iter().filter(|c| c.is("order")).collect();
+    let nr = rows.len() as i64;
+    let off = rows.iter().filter(|c| c.rvb("off")).count() as i64;
+    let pace = rep.res.rvi("pace", 0);
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let (nrs, offs, paces) = (num(nr), num(off), num(pace));
+    parts.extend_from_slice(&[
+        &nrs,
+        b" bot",
+        pl(nr),
+        b" ",
+        glyph(ctx, G_DOT),
+        b" ",
+        &offs,
+        b" off their first ",
+        glyph(ctx, G_DOT),
+    ]);
+    if pace > 0 {
+        parts.extend_from_slice(&[b" pace ", &paces, b" s"]);
+    } else {
+        parts.push(b" pace off");
+    }
+    let right = snp(160, cat(&parts));
+    title(ctx, out, b"Server order", Some(&right));
+    if rows.is_empty() {
+        empty_note(
+            out,
+            "no orders yet: the hubs give every bot one once the pool has a server",
+            Some("server add <host[:port]>"),
+        );
+        return;
+    }
+    const COLS: [Col; 5] = [
+        col("BOT", b'L', 1),
+        col("FIRST", b'L', 1),
+        col("SLOT", b'R', 2),
+        col("NOW ON", b'L', 1),
+        col("UUID", b'L', 3),
+    ];
+    let mut t = Tbl::new(&COLS, -1, 1, 1);
+    for c in rows {
+        let first = match c.rvs("first") {
+            Some(f) => snp(300, cat(&[f, b":", &num(c.rvi("first_port", 0))])),
+            None => glyph(ctx, G_DASH).to_vec(),
+        };
+        let slot = if c.rvi("slots", 1) > 1 {
+            snp(
+                32,
+                cat(&[&num(c.rvi("slot", 0) + 1), b" of ", &num(c.rvi("slots", 1))]),
+            )
+        } else {
+            glyph(ctx, G_DASH).to_vec()
+        };
+        let link = c.rv("link").unwrap_or(b"");
+        let on = match c.rvs("on") {
+            Some(o) if link == b"up" => snp(300, cat(&[o, b":", &num(c.rvi("on_port", 0))])),
+            _ if !link.is_empty() => link.to_vec(),
+            _ => b"not linked here".to_vec(),
+        };
+        let nick: &[u8] = c.rvs("nick").unwrap_or(glyph(ctx, G_DASH));
+        t.row(
+            ctx,
+            if c.rvb("off") { RL_WARN } else { RL_NORMAL },
+            None,
+            &[
+                Some(nick),
+                Some(&first),
+                Some(&slot),
+                Some(&on),
+                c.rv("uuid"),
+            ],
+        );
+    }
+    t.render(ctx, out);
+}
+
+fn render_pool_rebalance(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
+    let r = &rep.res;
+    let st = r.rv("state").unwrap_or(b"");
+    let (off, bots) = (r.rvi("off", 0), r.rvi("bots", 0));
+    let line = snp(
+        200,
+        cat(&[
+            &num(off),
+            b" of ",
+            &num(bots),
+            b" bot",
+            pl(bots),
+            b" off their first server",
+        ]),
+    );
+    if st == b"started" {
+        ok(ctx, b"Rebalance started", Some(&line), out);
+        effect(
+            ctx,
+            out,
+            b"moving them in waves: at most 5 bots and a quarter of those up at once, one per host",
+        );
+    } else if st == b"balanced" {
+        ok(
+            ctx,
+            b"Nothing to move",
+            Some(b"every bot up is on its first server"),
+            out,
+        );
+    } else if st == b"stopped" {
+        ok(ctx, b"Rebalance stopped", Some(&line), out);
+    } else if st == b"idle" {
+        ok(ctx, b"No rebalance running", Some(&line), out);
+    } else {
+        let running = st == b"running";
+        title(
+            ctx,
+            out,
+            b"Rebalance",
+            Some(if running { b"running" } else { b"preview" }),
+        );
+        const L: i32 = 7;
+        card_line(
+            out,
+            L,
+            b"off",
+            Some(&line),
+            if off != 0 { RL_WARN } else { RL_NORMAL },
+        );
+        if running {
+            let waves = r.rvi("waves", 0);
+            let m = snp(
+                96,
+                cat(&[
+                    &num(r.rvi("moved", 0)),
+                    b" moved in ",
+                    &num(waves),
+                    b" wave",
+                    pl(waves),
+                ]),
+            );
+            card_line(out, L, b"so far", Some(&m), RL_NORMAL);
+        } else if off != 0 {
+            hint(out, b"server rebalance force");
+        }
+    }
+}
+
 fn render_pool_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
     let r = &rep.res;
     let code = rep.code.as_slice();
@@ -5962,6 +6358,13 @@ fn render_pool_change(ctx: &Ctx, rep: &Creply, out: &mut Flines) {
         if let Some(a) = r.rvs("aliases") {
             effect(ctx, out, &snp(600, cat(&[b"also accepted: ", a])));
         }
+        let pace = r.rvi("pace", 0);
+        let pc = if pace > 0 {
+            snp(80, cat(&[b"pace ", &num(pace), b" s"]))
+        } else {
+            b"pace off".to_vec()
+        };
+        effect(ctx, out, &pc);
         push_effects(ctx, r, out);
         return;
     }
@@ -7912,6 +8315,10 @@ pub fn reply(ctx: &Ctx, rep: &Creply, _words: &[u8], out: &mut Flines) {
         render_pool_list(ctx, rep, out);
     } else if c == b"pool.net" {
         render_pool_net(ctx, rep, out);
+    } else if c == b"pool.order" {
+        render_pool_order(ctx, rep, out);
+    } else if c == b"pool.rebalance" {
+        render_pool_rebalance(ctx, rep, out);
     } else if has(b"pool.") {
         render_pool_change(ctx, rep, out);
     } else if c == b"ban.list" {

@@ -371,7 +371,7 @@ pub fn peer_version_level(state: &HubState, ci: usize) -> u8 {
 
 /// The peer's version as `peer_version_level` reads it ("" unknown).  C
 /// `peer_version_str`.
-fn peer_version_str(state: &HubState, ci: usize) -> String {
+pub(crate) fn peer_version_str(state: &HubState, ci: usize) -> String {
     let cu = crate::upgrade::peer_uuid_of(state, ci);
     if cu.is_empty() {
         return String::new();

@@ -224,6 +224,20 @@ fn hex32(h: &[u8; 32]) -> String {
 /// PULL, `bot resync`).  Plan §4.3a: the one queued frame always has base S;
 /// S moves only when a frame is written (`queue::cfg_frame_written`).
 pub fn send_config_to_bot(state: &mut HubState, ci: usize, force: bool) {
+    // The first config of a link waits for the bot's version (CFG_FIRST_HOLD):
+    // released by its presence or by flush_bot_config.
+    if !state.clients[ci].cfg_hold_done {
+        let c = &mut state.clients[ci];
+        if c.bot_version.is_empty() {
+            if c.cfg_hold_at == 0 {
+                c.cfg_hold_at = crate::cstr::now();
+                state.cfg_holds += 1;
+            }
+            return;
+        }
+        c.cfg_hold_done = true;
+        c.cfg_hold_at = 0;
+    }
     let id = state.clients[ci].id.clone();
     let pool = crate::mesh::bot_version_takes_pool(&state.clients[ci].bot_version);
     let payload = Zeroizing::new(storage::generate_bot_payload(state, &id, pool));
@@ -383,7 +397,37 @@ pub fn broadcast_full_config_to_all_bots(state: &mut HubState) {
 
 /// hub_flush_bot_config(): send the owed full config push to every local
 /// bot (maintenance loop).
+/// End a bot's first-config hold: the config goes out now (full).
+pub fn cfg_hold_release(state: &mut HubState, ci: usize) {
+    if state.clients[ci].cfg_hold_done {
+        return;
+    }
+    state.clients[ci].cfg_hold_done = true;
+    state.clients[ci].cfg_hold_at = 0;
+    send_config_to_bot(state, ci, true);
+}
+
 pub fn flush_bot_config(state: &mut HubState, now_ts: i64) {
+    if state.cfg_holds > 0 {
+        // recounted here: a held bot that dropped its link leaves no count
+        let mut held = 0;
+        for ci in 0..state.clients.len() {
+            let c = &state.clients[ci];
+            if c.typ != ClientType::Bot || c.cfg_hold_at == 0 || c.cfg_hold_done {
+                continue;
+            }
+            if now_ts - c.cfg_hold_at < CFG_FIRST_HOLD {
+                held += 1;
+                continue;
+            }
+            let who = state.who_client(ci);
+            crate::hlog_debug!(
+                "[HUB] {who} sent no presence within {CFG_FIRST_HOLD} s: config sent without it\n"
+            );
+            cfg_hold_release(state, ci);
+        }
+        state.cfg_holds = held;
+    }
     if now_ts - state.last_bot_config_push < BOT_CONFIG_PUSH_COALESCE {
         return;
     }
@@ -1398,6 +1442,17 @@ fn process_bot_command(state: &mut HubState, ci: usize, cmd: u8, payload: &str) 
                 presence::presence_event(state);
             }
         }
+        CMD_BOT_CHAN_STATE => {
+            if crate::pool::bot_chan_state(state, ci, payload) {
+                presence::roster_mark_dirty(state, true);
+                presence::presence_event(state);
+            } else if !crate::pool::chan_state_ok(payload) {
+                crate::hlog_debug!(
+                    "[HUB] Malformed channel state from {} dropped\n",
+                    state.who_client(ci)
+                );
+            }
+        }
         // Phase 5: the bot's tree diverged from a delta — send it the whole one.
         CMD_BOT_TREE_PULL => presence::tree_pull(state, ci),
         CMD_ACTIVITY => crate::activity::process(state, ci, payload),
@@ -1735,6 +1790,7 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         CMD_UPGRADE_PLAN => upgrade::plan_process(state, ci, payload),
         CMD_UPGRADE_FORGET => upgrade::peer_forget(state, ci, payload),
         CMD_CFG_RESYNC => peer_cfg_resync(state, ci, payload),
+        CMD_BOT_MOVE => crate::pool::peer_bot_move(state, ci, payload),
         CMD_SYNC_DIGEST => mesh::process_sync_digest(state, ci, payload),
         CMD_PRESENCE2 => crate::presence2::rx(state, ci, payload),
         CMD_HUB_ROLLCALL => crate::rollcall::peer_rollcall(state, ci, payload),
@@ -1745,6 +1801,7 @@ fn handle_peer_frame(state: &mut HubState, ci: usize, cmd: u8, payload: &str) {
         CMD_CHAN_ELECT_ACK => crate::elect::process_elect_ack(state, ci, payload),
         CMD_CHAN_ELECT_DO => crate::elect::process_elect_do(state, ci, payload),
         CMD_CHAN_ELECT_DONE => crate::elect::process_elect_done(state, ci, payload),
+        CMD_CHAN_ELECT_END => crate::elect::process_elect_end(state, ci, payload),
         CMD_CHAN_WHO => crate::elect::process_who(state, ci, payload),
         // A peer driving a run we are a node of...
         CMD_UPGRADE_PREPARE => upgrade::peer_prepare(state, ci, payload),

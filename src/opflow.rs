@@ -814,9 +814,23 @@ pub fn process_chan_request(state: &mut HubState, ci: usize, payload: &str) {
         "[HUB] CHAN_REQUEST {kind} from {id} for {channel}\n",
         id = state.who_client(ci)
     );
+    // Own op, every hub new enough: one election serves every local bot that
+    // asks within CHAN_ELECT_BATCH_WAIT s (a new channel: all of them).
+    if kind == "op" && !rid.is_empty() && crate::elect::batch_wanted(state) {
+        if !crate::elect::batch_join(state, ci, &channel, &nick, &hostmask, &rid) {
+            chan_own_answer(
+                state,
+                ci,
+                &rid,
+                "none",
+                "too many channel requests in flight",
+            );
+        }
+        return;
+    }
+
     // One bot answers it (CMD_CHAN_PROBE).
     let Some(ei) = crate::elect::start(state, &kind, &channel, &id, &nick, &hostmask, None) else {
-        crate::hlog_warning!("[CHANREQ] Election table full — dropping {kind} for {channel}\n");
         chan_own_answer(
             state,
             ci,

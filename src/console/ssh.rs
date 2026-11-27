@@ -745,6 +745,17 @@ async fn console_task(
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
     let _ = handle.eof(ch).await;
     let _ = handle.close(ch).await;
+    // The client's own close means it has every byte before ours.  A
+    // disconnect queued with the last output (a script whose stdin ended at
+    // once) can otherwise go out without it; libssh flushes, russh may not.
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(e) = ev.recv().await {
+            if matches!(e, Ev::Close) {
+                break;
+            }
+        }
+    })
+    .await;
     let _ = handle
         .disconnect(
             russh::Disconnect::ByApplication,

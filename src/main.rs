@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use zeroize::Zeroizing;
 
+use irchub::cli_fmt as cli;
 use irchub::consts::*;
 use irchub::cstr::{now, trunc_string};
 use irchub::state::Lane;
@@ -472,7 +473,8 @@ fn maintenance(state: &mut HubState) {
     // Bot presence: gossip our own bots to the peers, expire entries nobody
     // refreshed, and push the tree to bots when it changed.  All volatile.
     presence::presence_tick(state, t);
-    irchub::pool::view_tick(state, t); // server pool load to the bots
+    irchub::pool::order_tick(state, t); // the bots' server orders
+    irchub::pool::rebalance_tick(state, t); // server rebalance force waves
 
     // Rolling network upgrade: one step per tick (no-op unless running).
     upgrade::tick(state, t);
@@ -482,6 +484,9 @@ fn maintenance(state: &mut HubState) {
 
     // Hub roll calls (the upgrade gates): end the ones whose wait ran out.
     irchub::rollcall::tick(state, t);
+
+    // This hub's public address: at start, then daily (never blocks).
+    irchub::pubip::tick(state, t);
 
     // Expired bans: one `del` per ban, self-throttled to BAN_SWEEP_INTERVAL.
     irchub::modes::bans_sweep(state, t);
@@ -673,256 +678,433 @@ fn maintenance(state: &mut HubState) {
 /// .public.b64 — show its fingerprint and confirm.  None on EOF.
 fn setup_read_pubkey(who: &str) -> Option<String> {
     loop {
-        let input = tool::prompt_line(
-            &format!("Public key for '{who}' (paste the 88 chars, or a path to the .public.b64): "),
-            4096,
-        );
+        let input = cli::ask("public key", 4096);
+        if cli::eof() {
+            return None;
+        }
         if input.is_empty() {
-            println!("A public key is required (run ./keygen {who} on the admin's machine).");
+            cli::err(&format!(
+                "a public key is required: run ./keygen {who} on the admin's machine"
+            ));
             continue;
         }
         // Private and public key files have the same shape; refuse a keygen
         // private file by name before it gets published in the a| record.
         if input.contains(".private.") {
-            println!(
-                "That is a PRIVATE key file — it stays with the admin. Use the matching .public.b64."
-            );
+            cli::err("that is a PRIVATE key file: it stays with the admin; give the .public.b64");
             continue;
         }
         let key = match crypto::pubkey_b64_decode(&input) {
-            Some(raw) => Some((input.clone(), raw)),
+            Some(raw) => Some((input.to_string(), raw)),
             None => {
-                let from_file = fs::read_to_string(&input).ok();
-                let line = from_file
-                    .as_ref()
-                    .and_then(|s| s.lines().next())
-                    .map(|l| l.trim_end_matches([' ', '\t', '\r', '\n']).to_string());
+                let from_file = fs::read_to_string(&*input).ok();
+                // C: the first line, cut at its first blank
+                let line = from_file.as_ref().map(|s| {
+                    let l = s.lines().next().unwrap_or("");
+                    l.split([' ', '\t', '\r', '\n'])
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                });
                 match line
                     .as_deref()
+                    .filter(|l| !l.is_empty())
                     .and_then(|l| crypto::pubkey_b64_decode(l).map(|r| (l.to_string(), r)))
                 {
                     Some(v) => Some(v),
                     None => {
-                        println!(
-                            "Not an 88-char public key{}. Use the .public.b64 — never the .private.b64.",
+                        cli::err(&format!(
+                            "not an 88-char public key{} (the .public.b64, never the .private.b64)",
                             if from_file.is_some() {
                                 " in that file"
                             } else {
                                 ""
                             }
-                        );
+                        ));
                         None
                     }
                 }
             }
         };
         let Some((b64, raw)) = key else { continue };
-        let yn = tool::prompt_line(
-            &format!(
-                "  Key fingerprint: {} — use this key? (Y/n): ",
-                crypto::key_fingerprint(&raw)
-            ),
-            16,
-        );
-        if !yn.starts_with('n') && !yn.starts_with('N') {
+        cli::kv("fingerprint", &crypto::key_fingerprint(&raw));
+        if cli::ask_yes("use this key?", true) {
             return Some(b64);
+        }
+        if cli::eof() {
+            return None;
         }
     }
 }
 
-fn run_setup(state: &mut HubState) -> i32 {
-    println!("--- Setup ---");
-
-    let port = tool::prompt_line("Port: ", 32);
-    state.port = irchub::cstr::atoi(&port);
-
-    let bind = tool::prompt_line("Bind IP (default 0.0.0.0): ", 65);
-    state.bind_ip = if bind.is_empty() {
-        "0.0.0.0".to_string()
+/// The two lines other nodes paste, from -setup's summary and -id.  The
+/// address is the looked-up public one, else a specific bind (a wildcard
+/// tells nobody).
+fn print_paste_lines(state: &HubState, pub_b64: &str) {
+    let ip = irchub::pubip::dial_address(state).unwrap_or("<this-hub's-address>");
+    let name = if state.hub_friendly_name.is_empty() {
+        "-"
     } else {
-        trunc_string(&bind, 64)
+        state.hub_friendly_name.as_str()
     };
-
-    loop {
-        let name = tool::prompt_line("Friendly Name (A-Z a-z 0-9 . _ -, max 63): ", 128);
-        if name_valid(&name) {
-            state.hub_friendly_name = name;
-            break;
-        }
-        if name.is_empty() {
-            eprintln!("No hub name given.");
-            return 1;
-        }
-        println!(
-            "Invalid name: it is written into config lines and peer handshakes, so 1-63 letters, digits, '.', '_' or '-'."
-        );
-    }
-
-    let Some(uuid) = crypto::gen_uuid_v4() else {
-        eprintln!("RNG failure.");
-        return 1;
-    };
-    state.hub_uuid = uuid;
-    println!("Generated UUID: {}", state.hub_uuid);
-
-    loop {
-        let p1 = tool::read_pass_hidden("Config Password: ", MAX_PASS);
-        if p1.is_empty() {
-            println!("Password cannot be empty.");
-            continue;
-        }
-        let p2 = tool::read_pass_hidden("Confirm Config Password: ", MAX_PASS);
-        if *p1 != *p2 {
-            println!("Passwords do not match. Try again.");
-            continue;
-        }
-        state.set_config_pass(&p1);
-        break;
-    }
-
-    // Per-hub independent keypair (no shared-keypair mesh).  Generate fresh
-    // and export only the public key; the private key stays inside the
-    // encrypted config — no plaintext hub_private.b64 file is dumped.
-    println!("\n[*] Generating per-hub Curve25519 keypair (Ed25519 + X25519)...");
-    let Some((priv64, pub64)) = crypto::generate_combined_keypair() else {
-        println!("Key generation failed.");
-        return 1;
-    };
-    state.set_hub_priv(&priv64);
-    state.set_hub_pub(&pub64);
-    state.hub_keys_loaded = true;
-    let pub_b64 = crypto::b64_encode(&pub64);
-    {
-        let f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open("hub_public.b64");
-        if let Ok(mut f) = f {
-            let _ = write!(f, "{pub_b64}");
-        }
-    }
-    println!("[+] Public key saved to: hub_public.b64");
-    println!("[+] Public key: {pub_b64}\n");
-    println!("    ┌─────────────────────────────────────────────────┐");
-    println!("    │ Save this public key + this hub's UUID.         │");
-    println!("    │   - Bots adding this hub need its ip:port and   │");
-    println!("    │     public key (ircbot -setup asks for both).   │");
-    println!("    │   - Other hubs adding this hub need the         │");
-    println!("    │     UUID + ip:port + pubkey (console: hub add). │");
-    println!("    │ The hub's PRIVATE key never leaves this machine │");
-    println!("    │ (stored encrypted inside .irchub.cnf).          │");
-    println!("    └─────────────────────────────────────────────────┘");
-    println!("[+] Curve25519 keypair generated.");
-    // What ssh shows admins on their first login to the console.
-    println!(
-        "[+] SSH console host key: ssh-ed25519 {}",
-        irchub::console::ssh_fingerprint(&state.hub_ed25519_pub)
+    cli::skv(
+        "other hubs",
+        "paste on the console of EACH hub that links to this one:",
     );
-    println!("    Admins check it on first connect (keygen --ssh-fingerprint");
-    println!("    hub_public.b64 prints the same line).");
-    println!("[+] ./irchub -id prints this hub's uuid and keys again at any time.");
-
-    // Admin user setup — creates the first a| and m| records.  Admins have no
-    // password: the operator generates the admin's keypair on the admin's own
-    // machine (keygen <name>) and imports only the PUBLIC key here.  The hub
-    // never sees or prints a user's private key.
-    println!("\n--- First Admin Setup ---");
-    println!("This creates the first named admin, who can log into the hub's SSH");
-    println!("console and command bots over IRC. Admins sign in with a Curve25519 key,");
-    println!("not a password: on the admin's own machine run");
-    println!("    ./keygen <name>      (irchub/bin/keygen or ircbot/utils/keygen)");
-    println!("keep the <ts>_<name>.private.b64 there (chmod 600), and give this");
-    println!("wizard the <ts>_<name>.public.b64.\n");
-
-    let mut admin_name = String::new();
-    while admin_name.is_empty() {
-        let n = tool::prompt_line("Admin friendly name (no spaces, e.g. admin): ", 64);
-        if n.is_empty() {
-            break;
-        }
-        if n.contains(' ') || n.contains('|') {
-            println!("Name cannot contain spaces or '|'. Try again.");
-            continue;
-        }
-        admin_name = n;
+    print!(
+        "\n   hub add {ip} {} {} {name} {pub_b64}\n\n",
+        state.port, state.hub_uuid
+    );
+    cli::note(
+        "Hub links are not shared through the mesh: every hub this one links with needs \
+         this line, and this hub needs a hub add for each of them.",
+    );
+    cli::skv("bots", "paste on IRC (or give to ircbot -setup):");
+    print!("\n   +hub {ip}:{} {pub_b64}\n\n", state.port);
+    if !state.public_ip.is_empty() {
+        cli::note(&format!(
+            "{} is this host's public address; hubs and bots on the same LAN can dial its \
+             LAN address instead.",
+            state.public_ip
+        ));
     }
-    if admin_name.is_empty() {
-        eprintln!("No admin name given; setup aborted.");
-        return 1;
+}
+
+/// -setup: can this hub listen on ip:port?  A throwaway listener, bound
+/// like the real one, then closed.  Err gets the reason.
+fn setup_test_bind(ip: &str, port: i32) -> Result<(), String> {
+    let Ok(a) = ip.parse::<std::net::Ipv4Addr>() else {
+        return Err("not an IPv4 address".to_string());
+    };
+    match std::net::TcpListener::bind(std::net::SocketAddrV4::new(a, port as u16)) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(match e.kind() {
+            std::io::ErrorKind::AddrInUse => format!("port {port} is already in use"),
+            std::io::ErrorKind::AddrNotAvailable => {
+                format!("{ip} is not an address of this host")
+            }
+            std::io::ErrorKind::PermissionDenied => "ports below 1024 need privileges".to_string(),
+            // strerror's text, as the C hub prints it
+            _ => {
+                let t = e.to_string();
+                t.split(" (os error").next().unwrap_or(&t).to_string()
+            }
+        }),
     }
+}
 
-    let Some(admin_pub_b64) = setup_read_pubkey(&admin_name) else {
-        eprintln!("No public key given; setup aborted.");
-        return 1;
-    };
+fn run_setup(state: &mut HubState) -> i32 {
+    cli::header("irchub", HUB_VERSION, "setup");
+    cli::note(&format!(
+        "No {HUB_CONFIG_FILE} here yet: these steps write one, encrypted with a config password."
+    ));
+    let (mut admin_name, mut pub_b64_keep, mut id_fp, mut sshfp);
+    loop {
+        let mut step = 0;
+        // a restart (no at the summary) begins from nothing
+        state.user_records.clear();
+        state.mask_records.clear();
+        admin_name = String::new();
 
-    let Some(new_uuid) = crypto::gen_uuid_v4() else {
-        eprintln!("RNG failure.");
-        return 1;
-    };
-    let t = now();
-    state.user_records.push(UserRecord {
-        uuid: new_uuid.clone(),
-        name: admin_name.clone(),
-        pubkey_b64: admin_pub_b64,
-        has_pubkey: true,
-        typ: 'a',
-        is_active: true,
-        last_seen: 0,
-        timestamp: t,
-    });
-
-    let mut masks_added = 0;
-    println!("\nEnter usermasks for this admin (e.g. nick!*@*.example.com).");
-    println!("Press Enter with no mask when done (at least one required).\n");
-    while state.mask_records.len() < MAX_HUB_USER_MASKS {
-        let mask = tool::prompt_line(
-            &format!(
-                "Usermask {}{}: ",
-                masks_added + 1,
-                if masks_added == 0 {
-                    " (required)"
-                } else {
-                    " (or Enter to finish)"
-                }
-            ),
-            MAX_MASK_LEN,
+        step += 1;
+        cli::step(step, "Listening");
+        cli::note(
+            "bind ip: one IPv4 address of this host to listen on, or empty for 0.0.0.0 (every \
+             address).  Both are test-bound before going on.",
         );
-        if mask.is_empty() {
-            if masks_added == 0 {
-                println!("At least one usermask is required.");
+        loop {
+            let pb = cli::ask("port", 16);
+            if cli::eof() {
+                return 1;
+            }
+            match pb.parse::<i64>() {
+                Ok(v) if v > 0 && v < 65536 => state.port = v as i32,
+                _ => {
+                    cli::err("a port is 1-65535");
+                    continue;
+                }
+            }
+            let bind = cli::ask("bind ip (empty = 0.0.0.0)", 65);
+            if cli::eof() {
+                return 1;
+            }
+            if !bind.is_empty() && bind.parse::<std::net::Ipv4Addr>().is_err() {
+                cli::err("not an IPv4 address (a.b.c.d), or leave it empty for 0.0.0.0");
                 continue;
             }
+            state.bind_ip = if bind.is_empty() {
+                "0.0.0.0".to_string()
+            } else {
+                trunc_string(&bind, 64)
+            };
+            if let Err(why) = setup_test_bind(&state.bind_ip, state.port) {
+                cli::err(&format!(
+                    "cannot listen on {}:{}: {why}",
+                    state.bind_ip, state.port
+                ));
+                continue;
+            }
+            cli::ok(&format!(
+                "{}:{} is free{}",
+                state.bind_ip,
+                state.port,
+                if bind.is_empty() {
+                    " (0.0.0.0: every address of this host)"
+                } else {
+                    ""
+                }
+            ));
             break;
         }
-        if !mask.contains('!') || !mask.contains('@') {
-            println!("Invalid — mask must contain '!' and '@'. Try again.");
-            continue;
+
+        // What other hubs and bots should dial.  Display only: it fills the
+        // paste lines below, and the running hub looks it up again at every
+        // start and daily (public| in the config).
+        step += 1;
+        cli::step(step, "Public address");
+        cli::note("Looked up over DNS (OpenDNS, then Google, then Cloudflare).");
+        if let Some((ip, src)) = irchub::pubip::lookup() {
+            state.public_ip = ip;
+            state.public_ip_at = irchub::cstr::now();
+            cli::ok(&format!(
+                "{} ({})",
+                state.public_ip,
+                if src >= 0 {
+                    irchub::pubip::source_name(src)
+                } else {
+                    "test hook"
+                }
+            ));
+        } else {
+            state.public_ip.clear();
+            state.public_ip_at = 0;
+            cli::note(
+                "no answer: the lines below show <this-hub's-address>; the running hub tries \
+                 again at start (hub show prints it).",
+            );
         }
-        state.mask_records.push(MaskRecord {
-            uuid: new_uuid.clone(),
-            mask,
+
+        step += 1;
+        cli::step(step, "Name");
+        cli::note("Shown on every console and in the mesh; 1-63 letters, digits, '.', '_' or '-'.");
+        loop {
+            let name = cli::ask("name", 128);
+            if cli::eof() {
+                cli::err("no hub name given");
+                return 1;
+            }
+            if name.len() > 63 {
+                cli::err("longer than 63 characters");
+                continue;
+            }
+            if name_valid(&name) {
+                state.hub_friendly_name = name.to_string();
+                break;
+            }
+            cli::err(
+                "it is written into config lines and hub handshakes: 1-63 letters, digits, '.', '_' or '-'",
+            );
+        }
+
+        step += 1;
+        cli::step(step, "Config password");
+        loop {
+            let p1 = cli::ask_secret("password", MAX_PASS);
+            let p2 = cli::ask_secret("confirm", MAX_PASS);
+            if !p1.is_empty() && *p1 == *p2 {
+                cli::ok("the passwords match");
+                state.set_config_pass(&p1);
+                break;
+            }
+            if cli::eof() {
+                return 1;
+            }
+            cli::err("the passwords do not match, or are empty: again");
+        }
+
+        // Per-hub independent keypair (no shared-keypair mesh).  Generate
+        // fresh and export only the public key; the private key stays inside
+        // the encrypted config — no plaintext hub_private.b64 file is dumped.
+        step += 1;
+        cli::step(step, "Identity (generated here, Curve25519)");
+        let Some(uuid) = crypto::gen_uuid_v4() else {
+            cli::err("RNG failure");
+            return 1;
+        };
+        state.hub_uuid = uuid;
+        let Some((priv64, pub64)) = crypto::generate_combined_keypair() else {
+            cli::err("key generation failed");
+            return 1;
+        };
+        state.set_hub_priv(&priv64);
+        state.set_hub_pub(&pub64);
+        state.hub_keys_loaded = true;
+        id_fp = crypto::key_fingerprint(&pub64);
+        pub_b64_keep = crypto::b64_encode(&pub64);
+        {
+            let f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o644)
+                .open("hub_public.b64");
+            if let Ok(mut f) = f {
+                let _ = write!(f, "{pub_b64_keep}");
+            }
+        }
+        // What ssh shows admins on their first login to the console.
+        sshfp = irchub::console::ssh_fingerprint(&state.hub_ed25519_pub);
+        cli::kv("uuid", &state.hub_uuid);
+        cli::kv("public key", &pub_b64_keep);
+        cli::kv("fingerprint", &id_fp);
+        cli::kv("host key", &format!("ssh-ed25519 {sshfp}"));
+        cli::note(&format!(
+            "The public key is also in hub_public.b64; the private key never leaves this machine (it is stored encrypted in {HUB_CONFIG_FILE}).  ./irchub -id prints all of this again at any time."
+        ));
+
+        // Admin user setup — creates the first a| and m| records.  Admins
+        // have no password: the operator generates the admin's keypair on the
+        // admin's own machine (keygen <name>) and imports only the PUBLIC key
+        // here.  The hub never sees or prints a user's private key.
+        step += 1;
+        cli::step(step, "First admin");
+        cli::note(
+            "The first named admin can log in to this hub's SSH console and command bots over IRC.  Admins sign in with a Curve25519 key, not a password: on the admin's own machine run ./keygen <name> (irchub/bin/keygen or ircbot/utils/keygen), keep the <ts>_<name>.private.b64 there (chmod 600) and give the <ts>_<name>.public.b64 here.",
+        );
+        while admin_name.is_empty() {
+            let n = cli::ask("name", 64);
+            if cli::eof() {
+                break;
+            }
+            if n.contains(' ') || n.contains('|') {
+                cli::err("a name with no spaces or '|' (e.g. admin)");
+                continue;
+            }
+            admin_name = n.to_string();
+        }
+        if admin_name.is_empty() {
+            cli::err("no admin name given: setup stopped");
+            return 1;
+        }
+        let Some(admin_pub_b64) = setup_read_pubkey(&admin_name) else {
+            cli::err("no public key given: setup stopped");
+            return 1;
+        };
+        let Some(admin_uuid) = crypto::gen_uuid_v4() else {
+            cli::err("RNG failure");
+            return 1;
+        };
+        let t = now();
+        state.user_records.push(UserRecord {
+            uuid: admin_uuid.clone(),
+            name: admin_name.clone(),
+            pubkey_b64: admin_pub_b64.clone(),
+            has_pubkey: true,
+            typ: 'a',
             is_active: true,
-            last_used: 0,
+            last_seen: 0,
             timestamp: t,
         });
-        masks_added += 1;
-    }
 
-    println!("[+] Admin '{admin_name}' created with {masks_added} usermask(s), UUID {new_uuid}");
-    println!(
-        "    Their SSH key:     <ts>_{admin_name}_ed25519 (keygen writes it with the IRC key)"
-    );
-    println!(
-        "    then log in with:  ssh -i <ts>_{admin_name}_ed25519 -p <hub port> {admin_name}@<hub>"
-    );
+        cli::note(
+            "Usermasks the admin is known by on IRC (e.g. nick!*@*.example.com); an empty line ends the list, at least one.",
+        );
+        let mut masks_added = 0;
+        while state.mask_records.len() < MAX_HUB_USER_MASKS {
+            let mask = cli::ask(&format!("usermask {}", masks_added + 1), MAX_MASK_LEN);
+            if cli::eof() {
+                break;
+            }
+            if mask.is_empty() {
+                if masks_added == 0 {
+                    cli::err("at least one usermask");
+                    continue;
+                }
+                break;
+            }
+            if !mask.contains('!') || !mask.contains('@') {
+                cli::err("a usermask holds '!' and '@' (nick!user@host)");
+                continue;
+            }
+            state.mask_records.push(MaskRecord {
+                uuid: admin_uuid.clone(),
+                mask: mask.to_string(),
+                is_active: true,
+                last_used: 0,
+                timestamp: t,
+            });
+            masks_added += 1;
+        }
+
+        // The summary: every answer, and what to paste elsewhere.
+        cli::summary("Summary");
+        cli::skv("name", &state.hub_friendly_name);
+        cli::skv(
+            "listening",
+            &format!(
+                "{}:{}{}",
+                state.bind_ip,
+                state.port,
+                if state.bind_ip == "0.0.0.0" {
+                    " (every address)"
+                } else {
+                    ""
+                }
+            ),
+        );
+        cli::skv(
+            "public",
+            if state.public_ip.is_empty() {
+                "(not found)"
+            } else {
+                &state.public_ip
+            },
+        );
+        cli::skv("uuid", &state.hub_uuid);
+        cli::skv("key", &id_fp);
+        cli::skv("host key", &format!("ssh-ed25519 {sshfp}"));
+        let afp = crypto::pubkey_b64_decode(&admin_pub_b64)
+            .map(|r| crypto::key_fingerprint(&r))
+            .unwrap_or_else(|| "?".to_string());
+        cli::skv(
+            "admin",
+            &format!("{admin_name} {} key {afp}", cli::g(cli::Glyph::Dot)),
+        );
+        for (i, m) in state.mask_records.iter().enumerate() {
+            cli::skv(if i == 0 { "usermasks" } else { "" }, &m.mask);
+        }
+        cli::skv(
+            "admin login",
+            &format!(
+                "ssh -i <ts>_{admin_name}_ed25519 -p {} {admin_name}@{}",
+                state.port,
+                irchub::pubip::dial_address(state).unwrap_or("<this hub>")
+            ),
+        );
+        print_paste_lines(state, &pub_b64_keep);
+        cli::rule();
+        if cli::ask_yes(&format!("write {HUB_CONFIG_FILE}?"), true) {
+            break;
+        }
+        if cli::eof() {
+            return 1;
+        }
+        cli::note("Starting over.");
+        state.hub_ed25519_priv.wipe();
+        state.hub_x25519_priv.wipe();
+        state.config_pass.wipe();
+    }
 
     config::write(state);
     state.config_pass.wipe();
     state.config_key_forget();
-    println!("Done.");
+    println!();
+    cli::ok(&format!("wrote {HUB_CONFIG_FILE} and hub_public.b64"));
+    cli::kv("next", "./irchub -p, then ./irchub");
+    cli::note(&format!(
+        "-p writes a machine-bound password file, so the hub starts without typing the password; ./irchub alone asks for it.  The admin's SSH key is the <ts>_{admin_name}_ed25519 keygen wrote with the IRC key."
+    ));
+    println!();
     state.hub_ed25519_priv.wipe();
     state.hub_x25519_priv.wipe();
     0
@@ -1426,40 +1608,45 @@ fn identity(password: Zeroizing<String>) -> i32 {
     let pub_b64 = crypto::b64_encode(&pub64);
     let mut ed = [0u8; 32];
     ed.copy_from_slice(&pub64[..32]);
-    // bind_ip is what the mesh is told to dial; a wildcard tells nobody.
     let wild = state.bind_ip.is_empty() || state.bind_ip == "0.0.0.0";
-    let ip = if wild {
-        "<this-hub's-address>"
-    } else {
-        state.bind_ip.as_str()
-    };
     let name = if state.hub_friendly_name.is_empty() {
         "-"
     } else {
         state.hub_friendly_name.as_str()
     };
-    println!("Hub name:        {name}");
-    println!("Hub UUID:        {}", state.hub_uuid);
-    println!("Hub public key:  {pub_b64}");
-    println!("Key fingerprint: {}", crypto::key_fingerprint(&pub64));
-    println!(
-        "SSH host key:    ssh-ed25519 {}",
-        irchub::console::ssh_fingerprint(&ed)
+    cli::header("irchub", HUB_VERSION, "identity");
+    println!();
+    cli::skv("name", name);
+    cli::skv("uuid", &state.hub_uuid);
+    cli::skv(
+        "listening",
+        &format!(
+            "{}:{}",
+            if wild {
+                "0.0.0.0"
+            } else {
+                state.bind_ip.as_str()
+            },
+            state.port
+        ),
     );
-    println!(
-        "Listening:       {}:{}",
-        if wild {
-            "0.0.0.0"
+    // -id is offline and read-only: the address the running hub last looked up
+    cli::skv(
+        "public",
+        if state.public_ip.is_empty() {
+            "(not looked up yet)"
         } else {
-            state.bind_ip.as_str()
+            &state.public_ip
         },
-        state.port
     );
-    println!(
-        "Other hubs:      hub add {ip} {} {} {name} {pub_b64}",
-        state.port, state.hub_uuid
+    cli::skv("public key", &pub_b64);
+    cli::skv("fingerprint", &crypto::key_fingerprint(&pub64));
+    cli::skv(
+        "host key",
+        &format!("ssh-ed25519 {}", irchub::console::ssh_fingerprint(&ed)),
     );
-    println!("Bots:            +hub {ip}:{} {pub_b64}", state.port);
+    print_paste_lines(&state, &pub_b64);
+    cli::rule();
     0
 }
 
@@ -1512,23 +1699,32 @@ fn main() {
 
     // -p: create/replace .irchub.pass from an interactive password prompt.
     if passfile_mode {
+        cli::header("irchub", HUB_VERSION, "password file");
+        cli::note(&format!(
+            "{HUB_PASS_FILE} holds the config password, bound to this machine, so the hub starts without typing it."
+        ));
+        println!();
         let pass = loop {
-            let p1 = tool::read_pass_hidden("Config Password: ", MAX_PASS);
+            let p1 = cli::ask_secret("password", MAX_PASS);
             if p1.is_empty() {
-                eprintln!("Password cannot be empty.");
+                cli::err("the password cannot be empty");
                 std::process::exit(1);
             }
-            let p2 = tool::read_pass_hidden("Confirm Config Password: ", MAX_PASS);
+            let p2 = cli::ask_secret("confirm", MAX_PASS);
             if *p1 == *p2 {
                 break p1;
             }
-            println!("Passwords do not match. Try again.");
+            cli::err("the passwords do not match: again");
         };
         if passfile_create(HUB_PASS_FILE, &pass) {
-            println!("Saved: {HUB_PASS_FILE} (0600, machine-bound)");
+            cli::ok(&format!(
+                "wrote {HUB_PASS_FILE} (0600, bound to this machine)"
+            ));
+            cli::kv("next", "./irchub");
+            println!();
             return;
         }
-        eprintln!("Failed to create {HUB_PASS_FILE}.");
+        cli::err(&format!("could not write {HUB_PASS_FILE}"));
         std::process::exit(1);
     }
 

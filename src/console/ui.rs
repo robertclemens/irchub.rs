@@ -790,6 +790,7 @@ const CMDS: &[CmdDef] = &[
     cmd!("bot", Some("add"), CMD_ADMIN_CREATE_BOT, B::Pipe, 3, 0, Cf::None, Pre::None, "", "bot add <nick> <uuid> <key>", "register a bot from the identity its -setup printed", Some("uuid and key: run ./ircbot -id on the bot's host")),
     cmd!("bot", Some("del"), CMD_ADMIN_DEL, B::Arg, 1, 0, Cf::Yn, Pre::BotDel, "", "bot del <uuid|nick>", "delete a bot everywhere for good (asks y/N; wipes its config and stops it)", None),
     cmd!("bot", Some("kick"), CMD_ADMIN_DISCONNECT_BOT, B::Arg, 1, 0, Cf::Yn, Pre::BotKick, "", "bot kick <uuid|nick>", "drop its connection to this hub (asks y/N; it reconnects)", None),
+    cmd!("bot", Some("move"), CMD_ADMIN_BOT_MOVE, B::Pipe, 3, 0, Cf::None, Pre::None, "", "bot move <uuid|nick> hub|server <to>", "move a bot to another of its hubs, or its IRC link to another pool server", Some("run it on the bot's hub; hub list shows where bots are")),
     cmd!("bot", Some("rekey"), CMD_ADMIN_REKEY_BOT, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot rekey <uuid>", "how to rekey a bot (only the bot can)", None),
     cmd!("bot", Some("resync"), CMD_ADMIN_BOT_RESYNC, B::Arg, 1, 0, Cf::None, Pre::None, "", "bot resync <uuid|nick|all>", "send a bot (or every bot) its whole config again, from whichever hub it is on", None),
     cmd!("bot", Some("tree"), CMD_CONSOLE, B::Fixed, 0, 0, Cf::None, Pre::None, "get|tree", "bot tree", "every hub and bot as a tree", None),
@@ -836,8 +837,10 @@ const CMDS: &[CmdDef] = &[
     cmd!("server", Some("set"), CMD_ADMIN_POOL, B::Pool, 2, 3, Cf::None, Pre::None, "", "server set <host[:port]|uuid> weight=<1-100> max=<0-100> enabled=on|off", "change one server's weight, cap or whether bots use it", None),
     cmd!("server", Some("del"), CMD_ADMIN_POOL, B::Pool, 1, 1, Cf::Yn, Pre::None, "", "server del <host[:port]|uuid> [force]", "remove a server (asks y/N; the last usable one only with force)", None),
     cmd!("server", Some("clear"), CMD_ADMIN_POOL, B::Pool, 1, 0, Cf::None, Pre::None, "", "server clear <host[:port]|uuid>", "undo a wrong-network flag", None),
+    cmd!("server", Some("order"), CMD_ADMIN_POOL, B::Pool, 0, 1, Cf::None, Pre::None, "", "server order [nick|uuid]", "the server order the hubs gave each bot: its first server, where it is now", None),
+    cmd!("server", Some("rebalance"), CMD_ADMIN_POOL, B::Pool, 0, 1, Cf::None, Pre::None, "", "server rebalance [force|stop]", "how many bots are off their first server; force moves them there in waves", None),
     cmd!("network", Some("show"), CMD_ADMIN_POOL, B::Pool, 0, 0, Cf::None, Pre::None, "", "network show", "the IRC network the bots check for, and how many servers are usable", None),
-    cmd!("network", Some("set"), CMD_ADMIN_POOL, B::Pool, 1, 1, Cf::None, Pre::None, "", "network set name=<NETWORK> alias=<a,b,...|->", "the NETWORK= name the bots check for, or other names to accept", None),
+    cmd!("network", Some("set"), CMD_ADMIN_POOL, B::Pool, 1, 2, Cf::None, Pre::None, "", "network set name=<NETWORK> alias=<a,b,...|-> pace=<0-600>", "the NETWORK= name the bots check for, other names to accept, the pace gap", None),
     cmd!("ban", Some("list"), CMD_ADMIN_BAN, B::Ban, 0, 1, Cf::None, Pre::None, "", "ban list [#chan|*]", "the network's listed bans (one channel, or * = every channel)", None),
     cmd!("ban", Some("add"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban add <#chan|*> <mask> [<min>|perm] [sticky] [reason]", "list a ban; one opped bot sets it on the channel now (never on a bot or user)", None),
     cmd!("ban", Some("del"), CMD_ADMIN_BAN, B::Ban, 2, 0, Cf::None, Pre::None, "", "ban del <#chan|*> <mask>", "remove a listed ban", None),
@@ -882,6 +885,7 @@ const GROUPS: [(&str, &str); 12] = [
 const CMD_FLAGS: &[(&str, &str, &str)] = &[
     ("bot", "add", "b"),
     ("bot", "del", "b"), ("bot", "kick", "b"), ("bot", "rekey", "b"),
+    ("bot", "move", "b"),
     ("bot", "resync", "b"),
     ("bot", "set", "b"),
     ("hub", "add", "h"), ("hub", "del", "h"), ("hub", "set", "h"),
@@ -895,7 +899,7 @@ const CMD_FLAGS: &[(&str, &str, &str)] = &[
     ("channel", "kick", "c"), ("channel", "ban", "c"),
     ("ban", "add", "c"), ("ban", "del", "c"),
     ("server", "add", "s"), ("server", "set", "s"), ("server", "del", "s"),
-    ("server", "clear", "s"), ("network", "set", "s"),
+    ("server", "clear", "s"), ("network", "set", "s"), ("server", "rebalance", "s"),
     ("upgrade", "start", "u"), ("upgrade", "abort", "u"), ("upgrade", "forget", "u"),
     ("upgrade", "continue", "u"),
     ("upgrade", "keep", "u"),
@@ -1012,6 +1016,11 @@ const CMD_HELP: &[CmdHelp] = &[
     ("bot", Some("kick"), Some("uuid|nick\ta connected bot's uuid or its nick (Tab completes both); asks y/N; \
                                  it reconnects"),
      concat!("bot kick alpha\nbot kick ", ex_uuid!())),
+    ("bot", Some("move"), Some("uuid|nick\ta bot connected to this hub (Tab completes both)\n\
+                                hub|server\thub: another hub in the bot's own hub list (a key it pinned); server: a \
+                                usable server of the pool\n\
+                                to\tthe hub's name or uuid, or the server's host[:port]"),
+     "bot move alpha hub hub2\nbot move alpha server irc2.example.net:6667"),
     ("bot", Some("rekey"), Some("uuid\tthe bot's uuid; prints how to rekey it on its host"),
      concat!("bot rekey ", ex_uuid!())),
     ("bot", Some("resync"), Some("uuid|nick|all\tthe bot's uuid or its nick (Tab completes both), or all.  \
@@ -1213,6 +1222,13 @@ const CMD_HELP: &[CmdHelp] = &[
     ("ban", Some("del"), Some("#chan|*\tas listed by ban list\nmask\tthe mask exactly as ban list shows it"),
      "ban del #ops *!*@203.0.113.7"),
     ("server", Some("list"), None, "server list"),
+    ("server", Some("order"), Some("nick|uuid\tone bot (Tab completes); without it every bot"),
+     "server order\nserver order bunny_"),
+    ("server", Some("rebalance"),
+     Some("force\tmove the bots that are off their first server there, a few at a time: at most 5 bots and a quarter of those up per wave, one \
+           per host, the next wave when they are back and the pace gap has passed\n\
+           stop\tstop the waves this hub drives"),
+     "server rebalance\nserver rebalance force"),
     ("network", Some("show"), None, "network show"),
     ("server", Some("add"),
      Some("host[:port]\tthe server; no port = 6667; 6697 is TLS\n\
@@ -1232,8 +1248,9 @@ const CMD_HELP: &[CmdHelp] = &[
      "server clear irc.example.net"),
     ("network", Some("set"),
      Some("name=\tthe NETWORK= value the bots check (learned from the first bot that connects)\n\
-           alias=\tother names accepted, comma separated (up to 8), or - for none"),
-     "network set name=EFnet\nnetwork set alias=EFNet"),
+           alias=\tother names accepted, comma separated (up to 8), or - for none\n\
+           pace=\ts between two dials of one server from one host (default 15, 0 = off)"),
+     "network set name=EFnet\nnetwork set alias=EFNet\nnetwork set pace=30"),
     ("upgrade", Some("status"), None, "upgrade status"),
     ("upgrade", Some("releases"), None, "upgrade releases"),
     ("upgrade", Some("history"), Some("run\tthe run, as upgrade history lists it, or the start of its id (4 or more characters)"),
@@ -1294,8 +1311,11 @@ const LEVEL_WORDS: &str = "none error warning info debug";
 const ARG_COMP: &[ArgComp] = &[
     ("help", None, Some(0), Ck::Group),
     ("bot", Some("show"), Some(0), Ck::BotNick),
+    ("server", Some("order"), Some(0), Ck::BotNick),
     ("bot", Some("del"), Some(0), Ck::BotNick),
     ("bot", Some("kick"), Some(0), Ck::BotOn),
+    ("bot", Some("move"), Some(0), Ck::BotOn),
+    ("bot", Some("move"), Some(1), Ck::Words("hub server")),
     ("bot", Some("rekey"), Some(0), Ck::Bot),
     ("bot", Some("resync"), Some(0), Ck::BotNickOr("all")),
     (
@@ -1333,7 +1353,12 @@ const ARG_COMP: &[ArgComp] = &[
         Ck::Words("weight= max= enabled=on enabled=off force"),
     ),
     ("server", Some("del"), Some(1), Ck::Words("force")),
-    ("network", Some("set"), None, Ck::Words("name= alias=")),
+    (
+        "network",
+        Some("set"),
+        None,
+        Ck::Words("name= alias= pace="),
+    ),
     ("ban", Some("list"), Some(0), Ck::Words("*")),
     ("ban", Some("add"), Some(0), Ck::Words("*")),
     ("ban", Some("add"), Some(2), Ck::Words("perm sticky")),
@@ -1642,6 +1667,7 @@ impl Ui {
     fn ctx<'a>(&'a self, mode: i32, slog: &'a [u8]) -> Ctx<'a> {
         Ctx {
             width: self.out_width(),
+            height: 0,
             ascii: self.ascii && self.line_mode,
             now: now_s(),
             admin: &self.admin,
@@ -3252,7 +3278,7 @@ fn build_payload(
                     for i in 0..na {
                         if !a(i).contains(&b'=') {
                             return bad(
-                                "network set takes name=<NETWORK> and/or alias=<a,b,...>",
+                                "network set takes name=<NETWORK>, alias=<a,b,...> and/or pace=<0-600>",
                                 hint,
                             );
                         }
@@ -3271,6 +3297,21 @@ fn build_payload(
                 }
             } else if c.sub == Some("list") {
                 b"list".to_vec()
+            } else if c.sub == Some("order") {
+                fmtb(&[b"order|", if na > 0 { a(0) } else { b"" }])
+            } else if c.sub == Some("rebalance") {
+                let word: &[u8] = if na > 0 { a(0) } else { b"" };
+                if !word.is_empty() && !eq_ic(word, "force") && !eq_ic(word, "stop") {
+                    return bad("server rebalance [force|stop]", hint);
+                }
+                let w: &[u8] = if eq_ic(word, "force") {
+                    b"force"
+                } else if eq_ic(word, "stop") {
+                    b"stop"
+                } else {
+                    b""
+                };
+                fmtb(&[b"rebalance|", w])
             } else if a(0).contains(&b',') {
                 return bad("one server: host[:port] or its uuid", hint);
             } else if c.sub == Some("del") {
@@ -6565,7 +6606,11 @@ impl Ui {
                 None => return,
             };
             let w = self.cols;
-            let mut s = self.sb_bottom(v);
+            let floor_line = self.sb_floor(v, w, h);
+            // From where the pane is drawn: an anchor the ring has since rolled
+            // past (lines dropped while scrolled up) is shown at the floor, and
+            // paging from below sb.first would stop before moving at all.
+            let mut s = self.sb_bottom(v).max(floor_line);
             let mut moved = 0;
             while moved < h - 1 {
                 let ns = s + dir;
@@ -6586,7 +6631,7 @@ impl Ui {
                     moved += wrap_rows(&l.map(|l| l.text.clone()).unwrap_or_default(), w);
                 }
             }
-            self.anchor[v] = s.max(self.sb_floor(v, w, h));
+            self.anchor[v] = s.max(floor_line);
         } else {
             let mut top = if self.anchor[v] < 0 {
                 0
@@ -6625,6 +6670,7 @@ impl Ui {
                 let mut c = self.ctx(fmt::FMT_MODE_VIEW, &sl);
                 c.ascii = self.ascii;
                 c.width = w;
+                c.height = h as i32;
                 let words: &[u8] = if view == V_UPG {
                     b"upgrade status"
                 } else {

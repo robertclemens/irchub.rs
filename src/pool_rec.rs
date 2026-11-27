@@ -1,11 +1,17 @@
-//! Server pool records N| and S| (2.5.4): pool_rec.c in the C hub and bot,
+//! Server pool records N|, S| and R| (2.5.4): pool_rec.c in the C hub and bot,
 //! rule for rule.  Byte-identical in irchub.rs and ircbot.rs.  Plan:
 //! irchub/docs/plans/2026-10-29_server_pool_plan.md §3.  Pure apart from
 //! SHA-256: no I/O, no globals.
 //!
 //! Stored value (the line minus its "N|"/"S|" tag and its trailing |<ts>):
-//!   N: <net_id>|<label>|<name>|<aliases csv>|<split_wait min>|<add|del>
+//!   N: <net_id>|<label>|<name>|<aliases csv>|<split_wait min>|<pace_gap s>|<add|del>
 //!   S: <uuid>|<net_id>|<host>|<port>|<weight>|<max>|<state>|<seen>|<add|del>
+//!   R: <gen 8 hex>|<slot>|<slots>|<pace_gap s>|<uuid>,<uuid>,...
+//!      slot (0-based) of slots = the bots of one origin with this first
+//!      server; with slots > 1 a dial waits for a second t where
+//!      t % (slots * pace_gap) == slot * pace_gap (one host, one clock)
+//!      a bot's server order, computed by the hubs (never stored on a hub,
+//!      cached by the bot; server order plan 2026-11-24)
 //!
 //! An S| uuid is derived, never chosen: the first 16 bytes of
 //! SHA-256(<net_id> "|" <key>) with the RFC 9562 version-8 / variant bits set,
@@ -23,6 +29,10 @@ pub const POOL_NET_NAME_MAX: usize = 64; // a NETWORK= value
 pub const POOL_NET_ALIASES: usize = 8; // aliases per network
 pub const POOL_NET_ALIASES_MAX: usize = POOL_NET_ALIASES * (POOL_NET_NAME_MAX + 1);
 pub const POOL_SPLIT_WAIT_MAX: i32 = 1440; // minutes
+pub const POOL_PACE_GAP_DEFAULT: i32 = 15; // s between two dials of one server
+pub const POOL_PACE_GAP_MAX: i32 = 600; // s; 0 = no pacing
+pub const POOL_ORDER_MAX: usize = 64; // servers in one R| order
+pub const POOL_ORDER_SLOTS_MAX: i32 = 1000; // bots in one slot group
 pub const POOL_HOST_MAX: usize = 253;
 pub const POOL_WEIGHT_MAX: i32 = 100;
 pub const POOL_MAX_MAX: i32 = 100; // soft cap on bots per entry; 0 = none
@@ -39,6 +49,7 @@ pub const POOL_N_LINE_MAX: usize = 2
     + POOL_NET_ALIASES_MAX
     + 4
     + 3
+    + 3
     + 20
     + 16;
 pub const POOL_S_LINE_MAX: usize = 2
@@ -53,6 +64,8 @@ pub const POOL_S_LINE_MAX: usize = 2
     + 3
     + 20
     + 16;
+pub const POOL_R_LINE_MAX: usize =
+    2 + 8 + 4 + 4 + 3 + 4 + POOL_ORDER_MAX * (POOL_UUID_LEN + 1) + 20 + 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PoolState {
@@ -69,6 +82,8 @@ pub struct PoolNet {
     pub name: String,
     pub aliases: String,
     pub split_wait: i32,
+    /// 0..POOL_PACE_GAP_MAX
+    pub pace_gap: i32,
     pub deleted: bool,
 }
 
@@ -87,6 +102,21 @@ pub struct PoolSrv {
     /// NETWORK= that flagged it
     pub seen: String,
     pub deleted: bool,
+}
+
+/// A bot's R| server order (C `pool_order_t`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PoolOrder {
+    /// FNV-1a 32 of the rest of the value
+    pub generation: u32,
+    /// 0..slots-1
+    pub slot: i32,
+    /// 1..POOL_ORDER_SLOTS_MAX
+    pub slots: i32,
+    /// the network's pace gap
+    pub gap: i32,
+    /// 1..POOL_ORDER_MAX server uuids
+    pub ids: Vec<String>,
 }
 
 /// Exactly `want` '|'-separated fields (the C split_fields; its scratch cap
@@ -257,7 +287,7 @@ pub fn state_parse(s: &str) -> Option<PoolState> {
 
 /// Parse a stored N| value.  None on any shape, cap or charset error.
 pub fn net_parse(value: &str) -> Option<PoolNet> {
-    let f = split_fields(value, 6, POOL_N_LINE_MAX)?;
+    let f = split_fields(value, 7, POOL_N_LINE_MAX)?;
     if !net_id_ok(f[0]) || !text_ok(f[1], POOL_NET_LABEL_MAX) {
         return None;
     }
@@ -268,13 +298,15 @@ pub fn net_parse(value: &str) -> Option<PoolNet> {
         return None;
     }
     let split_wait = num_ok(f[4], POOL_SPLIT_WAIT_MAX)?;
-    let deleted = op_parse(f[5])?;
+    let pace_gap = num_ok(f[5], POOL_PACE_GAP_MAX)?;
+    let deleted = op_parse(f[6])?;
     Some(PoolNet {
         net_id: f[0].to_string(),
         label: f[1].to_string(),
         name: f[2].to_string(),
         aliases: f[3].to_string(),
         split_wait,
+        pace_gap,
         deleted,
     })
 }
@@ -322,12 +354,13 @@ pub fn srv_parse(value: &str) -> Option<PoolSrv> {
 /// invalid or longer than the C buffer would take.
 pub fn net_format(n: &PoolNet) -> Option<String> {
     let s = format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
         n.net_id,
         n.label,
         n.name,
         n.aliases,
         n.split_wait,
+        n.pace_gap,
         if n.deleted { "del" } else { "add" }
     );
     (s.len() < POOL_N_LINE_MAX && net_parse(&s).is_some()).then_some(s)
@@ -399,6 +432,104 @@ pub fn hostport_parse(input: &str) -> Option<(String, i32)> {
     host_ok(host).then(|| (host.to_string(), port))
 }
 
+// ---- R| ----------------------------------------------------------------------
+
+fn fnv32(s: &[u8]) -> u32 {
+    let mut h: u32 = 2166136261;
+    for &c in s {
+        h ^= u32::from(c);
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
+fn uuid_shape(s: &[u8]) -> bool {
+    s.len() == POOL_UUID_LEN
+        && s.iter().enumerate().all(|(i, &c)| {
+            if i == 8 || i == 13 || i == 18 || i == 23 {
+                c == b'-'
+            } else {
+                c.is_ascii_digit() || (b'a'..=b'f').contains(&c)
+            }
+        })
+}
+
+/// "<slot>|<slots>|<gap>|<ids>" of an order; None when it is not a valid one.
+fn order_body(o: &PoolOrder) -> Option<String> {
+    if o.ids.is_empty()
+        || o.ids.len() > POOL_ORDER_MAX
+        || !(1..=POOL_ORDER_SLOTS_MAX).contains(&o.slots)
+        || !(0..o.slots).contains(&o.slot)
+        || !(0..=POOL_PACE_GAP_MAX).contains(&o.gap)
+    {
+        return None;
+    }
+    let mut out = format!("{}|{}|{}|", o.slot, o.slots, o.gap);
+    for (i, id) in o.ids.iter().enumerate() {
+        if !uuid_shape(id.as_bytes()) || o.ids[..i].contains(id) {
+            return None;
+        }
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(id);
+    }
+    (out.len() < POOL_R_LINE_MAX).then_some(out)
+}
+
+/// Format an R| value, filling `o.generation` from the rest; None if the order is
+/// invalid or longer than the C buffer would take.
+pub fn order_format(o: &mut PoolOrder) -> Option<String> {
+    let body = order_body(o)?;
+    o.generation = fnv32(body.as_bytes());
+    let v = format!("{:08x}|{body}", o.generation);
+    (v.len() < POOL_R_LINE_MAX).then_some(v)
+}
+
+/// Parse an R| value: None on a gen that does not match, a repeated or
+/// malformed id, or an empty order.
+pub fn order_parse(value: &str) -> Option<PoolOrder> {
+    let f = split_fields(value, 5, POOL_R_LINE_MAX)?;
+    let g = f[0].as_bytes();
+    if g.len() != 8
+        || !g
+            .iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+    {
+        return None;
+    }
+    let generation = u32::from_str_radix(f[0], 16).ok()?;
+    let slot = num_ok(f[1], POOL_ORDER_SLOTS_MAX)?;
+    let slots = num_ok(f[2], POOL_ORDER_SLOTS_MAX)?;
+    let gap = num_ok(f[3], POOL_PACE_GAP_MAX)?;
+    let mut ids: Vec<String> = Vec::new();
+    let list = f[4];
+    if !list.is_empty() {
+        // a leading, doubled or trailing ',' leaves an empty part: refused
+        for p in list.split(',') {
+            if ids.len() >= POOL_ORDER_MAX
+                || !uuid_shape(p.as_bytes())
+                || ids.iter().any(|x| x == p)
+            {
+                return None;
+            }
+            ids.push(p.to_string());
+        }
+    }
+    if ids.is_empty() {
+        return None;
+    }
+    let o = PoolOrder {
+        generation,
+        slot,
+        slots,
+        gap,
+        ids,
+    };
+    let body = order_body(&o)?;
+    (fnv32(body.as_bytes()) == generation).then_some(o)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,9 +563,62 @@ mod tests {
         let v = srv_format(&s).unwrap();
         assert_eq!(srv_parse(&v).unwrap(), s);
         assert!(srv_parse(&v.replace("|6697|", "|6667|")).is_none()); // uuid no longer derived
-        let n = net_parse("main|main|EFnet|EFNet,efnet|0|add").unwrap();
+        let n = net_parse("main|main|EFnet|EFNet,efnet|0|15|add").unwrap();
         assert!(net_matches(&n, "efNET"));
-        assert_eq!(net_format(&n).unwrap(), "main|main|EFnet|EFNet,efnet|0|add");
+        assert_eq!(n.pace_gap, 15);
+        assert_eq!(
+            net_format(&n).unwrap(),
+            "main|main|EFnet|EFNet,efnet|0|15|add"
+        );
+        assert!(net_parse("main|main|EFnet|EFNet,efnet|0|add").is_none()); // 6 fields
+        assert!(net_parse("main|main|EFnet||0|601|add").is_none());
+    }
+
+    #[test]
+    fn order_matches_c() {
+        // vectors from pool_rec.c (a C harness against irchub/ircbot pool_rec.c)
+        let mut o = PoolOrder {
+            generation: 0,
+            slot: 1,
+            slots: 3,
+            gap: 15,
+            ids: vec![
+                "60be3bd3-8d40-8411-81ac-96a777cd8710".into(),
+                "e55d6c0e-5410-8298-ae4e-2a88b713c421".into(),
+                "00000000-0000-8000-8000-000000000001".into(),
+            ],
+        };
+        let v = order_format(&mut o).unwrap();
+        assert_eq!(
+            v,
+            "d298d0f3|1|3|15|60be3bd3-8d40-8411-81ac-96a777cd8710,\
+             e55d6c0e-5410-8298-ae4e-2a88b713c421,00000000-0000-8000-8000-000000000001"
+        );
+        assert_eq!(order_parse(&v).unwrap(), o);
+        let mut one = PoolOrder {
+            slots: 1,
+            ids: vec!["60be3bd3-8d40-8411-81ac-96a777cd8710".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            order_format(&mut one).unwrap(),
+            "a9850126|0|1|0|60be3bd3-8d40-8411-81ac-96a777cd8710"
+        );
+        assert!(order_parse("00000000|0|1|0|60be3bd3-8d40-8411-81ac-96a777cd8710").is_none());
+        assert!(order_parse("a9850126|0|1|0|60be3bd3-8d40-8411-81ac-96a777cd8710,").is_none());
+        assert!(order_parse("a9850126|0|1|0|").is_none());
+        assert!(order_parse("x").is_none());
+        let mut bad = one.clone();
+        bad.slot = 1; // slot < slots
+        assert!(order_format(&mut bad).is_none());
+        bad.slot = 0;
+        bad.slots = 0;
+        assert!(order_format(&mut bad).is_none());
+        let mut dup = o.clone();
+        dup.ids[1] = dup.ids[0].clone();
+        assert!(order_format(&mut dup).is_none());
+        assert_eq!(POOL_R_LINE_MAX, 2429);
+        assert_eq!(POOL_N_LINE_MAX, 680);
     }
 
     #[test]

@@ -140,6 +140,12 @@ pub fn write(state: &mut HubState) {
             &state.bind_ip
         }
     ));
+    if !state.public_ip.is_empty() {
+        buf.push_str(&format!(
+            "public|{}|{}\n",
+            state.public_ip, state.public_ip_at
+        ));
+    }
     buf.push_str(&format!("uuid|{}\n", state.hub_uuid));
     buf.push_str(&format!("hub_name|{}\n", state.hub_friendly_name));
     // No 'admin|' line is written: admins authenticate with the public keys
@@ -777,6 +783,14 @@ fn load_inner(state: &mut HubState, password: &str) -> bool {
         match k {
             "port" => state.port = crate::cstr::atoi(v),
             "bind_ip" => state.bind_ip = trunc_string(v, 64),
+            // public|<ip>|<ts>: only ever a looked-up global IPv4 address
+            "public" => {
+                let (ip, at) = v.split_once('|').unwrap_or((v, ""));
+                if crate::pubip::is_global(ip) {
+                    state.public_ip = ip.to_string();
+                    state.public_ip_at = crate::cstr::atoll(at).max(0);
+                }
+            }
             "uuid" => state.hub_uuid = trunc_string(v, 64),
             // Only update when non-empty, so an empty line cannot blank out
             // an existing name.

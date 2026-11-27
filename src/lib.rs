@@ -11,6 +11,7 @@
 //! | `hub_storage.c`   | `storage`                                         |
 //! | `hub_modes.c`     | `modes`, `glob_overlap` (+ `glob_overlap.c`)      |
 //! | `hub_config.c`    | `config`                                          |
+//! | `hub_pubip.c`     | `pubip`                                           |
 //! | `hub_connlimits.c`| `connlimits`                                      |
 //! | `hub_main.c`      | `main.rs`, `logging`, `net`, `tool`               |
 //! | `hub_logic.c`     | `queue`, `ratelimit`, `auth`, `presence`, `mesh`, |
@@ -29,6 +30,7 @@ pub mod activity;
 pub mod admin;
 pub mod auth;
 pub mod cfg_delta;
+pub mod cli_fmt;
 pub mod client;
 pub mod config;
 pub mod connlimits;
@@ -48,6 +50,7 @@ pub mod pool;
 pub mod pool_rec;
 pub mod presence;
 pub mod presence2;
+pub mod pubip;
 pub mod queue;
 pub mod ratelimit;
 pub mod reply;

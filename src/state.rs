@@ -316,6 +316,22 @@ pub enum ChanElectPhase {
     /// Origin: its mesh view is still settling (restart or relink); asks the
     /// mesh once it has, CHAN_ELECT_HOLD_MAX at most.
     Hold,
+    /// Origin, batched own op: collecting the local bots' own op requests
+    /// for CHAN_ELECT_BATCH_WAIT s before the probe.
+    Gather,
+}
+
+/// One bot a batched own-op election serves.  st: p waiting, d handed to the
+/// current bot / hub, o opped, x denied (+bitch).  reply_fd -1 on a relay.
+#[derive(Clone, Debug, Default)]
+pub struct ChanElectTarget {
+    pub uuid: String,
+    pub nick: String,
+    pub hostmask: String,
+    pub rid: String,
+    pub reply_fd: i32,
+    pub reply_serial: u64,
+    pub st: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -390,6 +406,11 @@ pub struct ChanElect {
     pub who_seq: i64,
     pub who_done: bool,
     pub who_bad: bool,
+    /// Origin: ELECT_FWD went out (ELECT_END follows at the end).
+    pub flooded: bool,
+    /// A batched own op (CHAN_ELECT_BATCH_MAX); None for every other
+    /// election.  tg[0] is the requester above.
+    pub tg: Option<Vec<ChanElectTarget>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1009,6 +1030,10 @@ pub struct BotRoster {
     pub irc_entry: String,
     /// pool: connecting / up / down / idle
     pub irc_link: String,
+    /// i| field 4: the server's NETWORK= ("" = unknown)
+    pub irc_network: String,
+    /// j|: the bot's channels (bot show), "" = none
+    pub chan_state: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,8 +1294,10 @@ pub struct HubClient {
     /// unknown).
     pub bot_irc_entry: String,
     pub bot_irc_link: String,
-    /// Had the current CMD_POOL_VIEW.
-    pub pool_view_sent: bool,
+    /// 005 NETWORK= (IRC_LINK 4th field), "" = unknown.
+    pub bot_irc_network: String,
+    /// CMD_BOT_CHAN_STATE, "" = none.
+    pub bot_chan_state: String,
     /// "c" / "rs", empty = unreported.
     pub bot_variant: String,
     pub bot_cron: String,
@@ -1305,6 +1332,10 @@ pub struct HubClient {
     pub cfg_next: Option<Zeroizing<Vec<u8>>>,
     pub cfg_queued: bool,
     pub cfg_owed: bool,
+    /// CFG_FIRST_HOLD: when the first config was held (0 = not held), and
+    /// whether the hold is over (a config may go out).
+    pub cfg_hold_at: i64,
+    pub cfg_hold_done: bool,
     /// Hash-first anti-entropy (CMD_SYNC_DIGEST) on a peer link: rounds sent
     /// (every SYNC_DIGEST_FULL_EVERY-th is full), the kinds that differed in
     /// consecutive rounds with their counts, and the last stuck warning.
@@ -1410,7 +1441,8 @@ impl HubClient {
             bot_server: String::new(),
             bot_irc_entry: String::new(),
             bot_irc_link: String::new(),
-            pool_view_sent: false,
+            bot_irc_network: String::new(),
+            bot_chan_state: String::new(),
             bot_variant: String::new(),
             bot_cron: String::new(),
             cron_sent: 0,
@@ -1424,6 +1456,8 @@ impl HubClient {
             cfg_next: None,
             cfg_queued: false,
             cfg_owed: false,
+            cfg_hold_at: 0,
+            cfg_hold_done: false,
             sd_rounds: 0,
             sd_stuck: Vec::new(),
             sd_warned: 0,
@@ -1535,6 +1569,11 @@ pub struct HubState {
     /// since take effect on the next start (the console's "pending").
     pub listen_ip: String,
     pub listen_port: i32,
+    /// This hub's public IPv4 address as the DNS "what is my address"
+    /// servers see it (`pubip`): looked up at -setup, every start and daily,
+    /// kept as public|<ip>|<ts>.  Display and advice only; never set by hand.
+    pub public_ip: String,
+    pub public_ip_at: i64,
     pub hub_uuid: String,
     /// `realpath(argv[0])` — the binary an upgrade replaces, and the one
     /// `<exe>.prev` sits beside.  Empty when it could not be resolved, which
@@ -1597,6 +1636,10 @@ pub struct HubState {
     pub pending_op_requests: Vec<PendingOpRequest>,
     pub pending_chan_requests: Vec<PendingChanRequest>,
     pub chan_elections: Vec<ChanElect>,
+    /// "Election table full": when the last warning went out, and the
+    /// refusals counted since (elect::full_note / full_flush).
+    pub ce_full_at: i64,
+    pub ce_full_n: u32,
     pub rollcalls: Vec<HubRollcall>,
     pub upg_start_wait: UpgStartWait,
     pub step_rollcall: StepRollcall,
@@ -1618,10 +1661,13 @@ pub struct HubState {
     pub sgrant_setting: i32,
     pub sgrant_ts: i64,
     /// Server pool (pool.rs, volatile): the wrong-network strike lists per
-    /// entry, and the last CMD_POOL_VIEW sent (when, and its SHA-256).
+    /// entry, the bots' server orders, and the `server rebalance force`
+    /// waves this hub drives.
     pub pool_strikes: Vec<crate::pool::PoolStrikes>,
-    pub pool_view_last_sent: i64,
-    pub pool_view_hash: [u8; 32],
+    /// C `g_linked`: (entry uuid, NETWORK=) a "linked" report last warned about.
+    pub pool_linked: Vec<(String, String)>,
+    pub pool_order: crate::pool::OrderState,
+    pub rebalance: crate::pool::Rebalance,
     pub cron_recs: Vec<CronRec>,
     /// The plan as every hub knows it: this hub's own copy of what its driver
     /// last published, and when it last heard the driver.
@@ -1745,6 +1791,8 @@ pub struct HubState {
     /// last`), so the 60 s self-throttle lives in the state.
     pub bans_swept_at: i64,
     pub last_bot_config_push: i64,
+    /// Bots whose first config is held for their presence (CFG_FIRST_HOLD).
+    pub cfg_holds: usize,
     pub last_config_write: i64,
     /// Set on peer connect/disconnect; clears after gossip.
     pub mesh_state_dirty: bool,
@@ -1831,6 +1879,8 @@ impl HubState {
             bind_ip: String::new(),
             listen_ip: String::new(),
             listen_port: 0,
+            public_ip: String::new(),
+            public_ip_at: 0,
             hub_uuid: String::new(),
             executable_path: String::new(),
             hub_friendly_name: String::new(),
@@ -1861,6 +1911,8 @@ impl HubState {
             pending_op_requests: vec![PendingOpRequest::default(); MAX_PENDING_OP_REQUESTS],
             pending_chan_requests: vec![PendingChanRequest::default(); MAX_PENDING_CHAN_REQUESTS],
             chan_elections: vec![ChanElect::default(); MAX_CHAN_ELECTIONS],
+            ce_full_at: 0,
+            ce_full_n: 0,
             rollcalls: vec![HubRollcall::default(); MAX_ROLLCALLS],
             upg_start_wait: UpgStartWait::default(),
             step_rollcall: StepRollcall::default(),
@@ -1905,8 +1957,9 @@ impl HubState {
             sgrant_setting: 0,
             sgrant_ts: 0,
             pool_strikes: vec![crate::pool::PoolStrikes::default(); MAX_POOL_SERVERS],
-            pool_view_last_sent: 0,
-            pool_view_hash: [0; 32],
+            pool_linked: Vec::new(),
+            pool_order: Default::default(),
+            rebalance: Default::default(),
             cron_recs: Vec::new(),
             splan: Default::default(),
             splan_seen: 0,
@@ -1930,6 +1983,7 @@ impl HubState {
             bot_config_pending: false,
             bans_swept_at: 0,
             last_bot_config_push: 0,
+            cfg_holds: 0,
             last_config_write: 0,
             mesh_state_dirty: false,
             next_lamport_seq: 0,
